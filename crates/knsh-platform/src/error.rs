@@ -40,6 +40,20 @@ pub enum Operation {
     Clock,
     /// Reading random bytes.
     Random,
+    /// Opening a SQLite database connection.
+    DatabaseOpen,
+    /// Configuring a SQLite connection (busy timeout, journal mode, synchronous mode).
+    DatabaseConfigure,
+    /// Compiling SQL text into a prepared statement.
+    Prepare,
+    /// Binding a parameter value to a prepared statement.
+    Bind,
+    /// Running a prepared statement one step.
+    Step,
+    /// Reading a column of the current result row.
+    Column,
+    /// Running SQL text without parameters (`sqlite3_exec`).
+    Execute,
 }
 
 impl Operation {
@@ -59,7 +73,128 @@ impl Operation {
             Self::Wait => "wait",
             Self::Clock => "clock",
             Self::Random => "random",
+            Self::DatabaseOpen => "database open",
+            Self::DatabaseConfigure => "database configure",
+            Self::Prepare => "prepare statement",
+            Self::Bind => "bind parameter",
+            Self::Step => "step statement",
+            Self::Column => "read column",
+            Self::Execute => "execute statement",
         }
+    }
+}
+
+/// A SQLite result code, extended form (for example `2067`, `SQLITE_CONSTRAINT_UNIQUE`), as returned by the system
+/// library with extended result codes enabled (KNSH-010).
+///
+/// The text SQLite attaches to an error (`sqlite3_errmsg`) is deliberately not kept: it can quote SQL text, schema
+/// names or values (`near "...": syntax error`), and errors are logged and sent over the wire (NFR-PRIV-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SqliteCode(i32);
+
+impl SqliteCode {
+    /// `SQLITE_ERROR`: generic error, for example an SQL syntax error.
+    pub const ERROR: Self = Self(1);
+    /// `SQLITE_BUSY`: the database is locked by another connection and the busy timeout ran out.
+    pub const BUSY: Self = Self(5);
+    /// `SQLITE_NOMEM`: an allocation failed.
+    pub const NOMEM: Self = Self(7);
+    /// `SQLITE_READONLY`: a write was attempted on a read-only connection.
+    pub const READONLY: Self = Self(8);
+    /// `SQLITE_CANTOPEN`: the database file could not be opened.
+    pub const CANTOPEN: Self = Self(14);
+    /// `SQLITE_TOOBIG`: a string or blob exceeds the size limit (also used for SQL text too long to pass).
+    pub const TOOBIG: Self = Self(18);
+    /// `SQLITE_CONSTRAINT`: a constraint (unique, not null, check, foreign key) was violated.
+    pub const CONSTRAINT: Self = Self(19);
+    /// `SQLITE_MISMATCH`: a column holds a different type than the reader asked for, or text is not UTF-8.
+    pub const MISMATCH: Self = Self(20);
+    /// `SQLITE_MISUSE`: the API was used incorrectly (for example a column read with no current row, several
+    /// statements in one `prepare`, or a NUL byte inside SQL text). Raised by this wrapper before calling SQLite.
+    pub const MISUSE: Self = Self(21);
+    /// `SQLITE_RANGE`: a parameter or column index is out of range, or the wrong number of parameters was bound.
+    pub const RANGE: Self = Self(25);
+    /// `SQLITE_CONSTRAINT_UNIQUE`: a `UNIQUE` constraint was violated.
+    pub const CONSTRAINT_UNIQUE: Self = Self(2067);
+    /// `SQLITE_CONSTRAINT_PRIMARYKEY`: a `PRIMARY KEY` constraint was violated.
+    pub const CONSTRAINT_PRIMARYKEY: Self = Self(1555);
+    /// `SQLITE_CONSTRAINT_NOTNULL`: a `NOT NULL` constraint was violated.
+    pub const CONSTRAINT_NOTNULL: Self = Self(1299);
+
+    /// Wraps a raw result code as SQLite returned it.
+    #[must_use]
+    pub const fn from_raw(code: i32) -> Self {
+        Self(code)
+    }
+
+    /// The extended result code, exactly as SQLite returned it.
+    #[must_use]
+    pub const fn extended(self) -> i32 {
+        self.0
+    }
+
+    /// The primary result code: the low eight bits of the extended code (for example `19` for `2067`).
+    #[must_use]
+    pub const fn primary(self) -> Self {
+        Self(self.0 & 0xff)
+    }
+
+    /// Whether this is any kind of constraint violation (`SQLITE_CONSTRAINT_*`).
+    #[must_use]
+    pub const fn is_constraint(self) -> bool {
+        self.0 & 0xff == Self::CONSTRAINT.0
+    }
+
+    /// Whether the database was locked by another connection (`SQLITE_BUSY_*`).
+    #[must_use]
+    pub const fn is_busy(self) -> bool {
+        self.0 & 0xff == Self::BUSY.0
+    }
+
+    /// The symbolic name of the primary code, for example `SQLITE_CONSTRAINT`. A fixed table rather than
+    /// `sqlite3_errstr`, so formatting an error needs no foreign call.
+    #[must_use]
+    pub const fn primary_name(self) -> &'static str {
+        match self.0 & 0xff {
+            0 => "SQLITE_OK",
+            1 => "SQLITE_ERROR",
+            2 => "SQLITE_INTERNAL",
+            3 => "SQLITE_PERM",
+            4 => "SQLITE_ABORT",
+            5 => "SQLITE_BUSY",
+            6 => "SQLITE_LOCKED",
+            7 => "SQLITE_NOMEM",
+            8 => "SQLITE_READONLY",
+            9 => "SQLITE_INTERRUPT",
+            10 => "SQLITE_IOERR",
+            11 => "SQLITE_CORRUPT",
+            12 => "SQLITE_NOTFOUND",
+            13 => "SQLITE_FULL",
+            14 => "SQLITE_CANTOPEN",
+            15 => "SQLITE_PROTOCOL",
+            16 => "SQLITE_EMPTY",
+            17 => "SQLITE_SCHEMA",
+            18 => "SQLITE_TOOBIG",
+            19 => "SQLITE_CONSTRAINT",
+            20 => "SQLITE_MISMATCH",
+            21 => "SQLITE_MISUSE",
+            22 => "SQLITE_NOLFS",
+            23 => "SQLITE_AUTH",
+            24 => "SQLITE_FORMAT",
+            25 => "SQLITE_RANGE",
+            26 => "SQLITE_NOTADB",
+            27 => "SQLITE_NOTICE",
+            28 => "SQLITE_WARNING",
+            100 => "SQLITE_ROW",
+            101 => "SQLITE_DONE",
+            _ => "SQLITE_UNKNOWN",
+        }
+    }
+}
+
+impl fmt::Display for SqliteCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} (code {})", self.primary_name(), self.0)
     }
 }
 
@@ -91,6 +226,14 @@ pub enum PlatformError {
     ClockOutOfRange,
     /// A test fake was asked for something its script does not cover (only produced by [`crate::testing`]).
     NotScripted,
+    /// A SQLite call failed, or the safe wrapper refused a call that SQLite would treat as misuse. Carries the
+    /// result code, never SQLite's message text (see [`SqliteCode`]).
+    Sqlite {
+        /// What was being done.
+        operation: Operation,
+        /// The extended result code.
+        code: SqliteCode,
+    },
 }
 
 impl PlatformError {
@@ -108,6 +251,22 @@ impl PlatformError {
         match self {
             Self::Os { errno, .. } => Some(*errno),
             Self::InvalidPath
+            | Self::NotCanonical(_)
+            | Self::TooLarge { .. }
+            | Self::UnknownProcessGroup
+            | Self::ClockOutOfRange
+            | Self::NotScripted
+            | Self::Sqlite { .. } => None,
+        }
+    }
+
+    /// The SQLite result code for a [`PlatformError::Sqlite`] failure, otherwise `None`.
+    #[must_use]
+    pub fn sqlite_code(&self) -> Option<SqliteCode> {
+        match self {
+            Self::Sqlite { code, .. } => Some(*code),
+            Self::Os { .. }
+            | Self::InvalidPath
             | Self::NotCanonical(_)
             | Self::TooLarge { .. }
             | Self::UnknownProcessGroup
@@ -141,6 +300,7 @@ impl fmt::Display for PlatformError {
             Self::UnknownProcessGroup => f.write_str("process group was not created by this instance or was reaped"),
             Self::ClockOutOfRange => f.write_str("wall clock is outside 1970-01-01 to 9999-12-31 UTC"),
             Self::NotScripted => f.write_str("test fake has no script for this call"),
+            Self::Sqlite { operation, code } => write!(f, "{} failed: {code}", operation.as_str()),
         }
     }
 }
@@ -154,7 +314,8 @@ impl std::error::Error for PlatformError {
             | Self::TooLarge { .. }
             | Self::UnknownProcessGroup
             | Self::ClockOutOfRange
-            | Self::NotScripted => None,
+            | Self::NotScripted
+            | Self::Sqlite { .. } => None,
         }
     }
 }
@@ -179,6 +340,24 @@ mod tests {
         assert!(text.starts_with("rename failed: "), "{text}");
         assert!(error.is_not_found());
         assert_eq!(PlatformError::InvalidPath.errno(), None);
+    }
+
+    #[test]
+    fn sqlite_error_shows_code_name_without_message_text() {
+        let error = PlatformError::Sqlite {
+            operation: Operation::Step,
+            code: SqliteCode::CONSTRAINT_UNIQUE,
+        };
+        assert_eq!(
+            error.to_string(),
+            "step statement failed: SQLITE_CONSTRAINT (code 2067)"
+        );
+        assert_eq!(error.sqlite_code(), Some(SqliteCode::CONSTRAINT_UNIQUE));
+        assert_eq!(error.errno(), None);
+        assert!(SqliteCode::CONSTRAINT_UNIQUE.is_constraint());
+        assert_eq!(SqliteCode::CONSTRAINT_UNIQUE.primary(), SqliteCode::CONSTRAINT);
+        assert_eq!(SqliteCode::from_raw(517).primary_name(), "SQLITE_BUSY");
+        assert!(SqliteCode::from_raw(517).is_busy());
     }
 
     #[test]

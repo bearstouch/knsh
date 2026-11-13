@@ -108,6 +108,20 @@ impl Fs for RealFs {
         file.write_all(data).map_err(os(Operation::Write))
     }
 
+    fn create_new(&self, path: &Path, mode: u32) -> Result<(), PlatformError> {
+        require_absolute(path)?;
+        // `create_new` is `O_CREAT | O_EXCL`: an existing file or a planted symlink fails with `EEXIST`.
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(path)
+            .map_err(os(Operation::Write))?;
+        // `open` applied the umask; `fchmod` sets the exact bits the caller asked for.
+        file.set_permissions(Permissions::from_mode(mode))
+            .map_err(os(Operation::Write))
+    }
+
     fn atomic_replace(&self, path: &Path, data: &[u8], mode: u32) -> Result<(), PlatformError> {
         let (dir, _) = split_target(path)?;
         let (mut file, temp) = create_temp(dir, mode)?;
@@ -285,6 +299,30 @@ mod tests {
         assert_eq!(fs.write(&link, b"evil", 0o600).unwrap_err().errno(), Some(libc::ELOOP));
         assert_eq!(fs::read(&victim).unwrap(), b"safe");
         assert_eq!(fs.metadata(&link).unwrap().kind, FileKind::Symlink);
+    }
+
+    #[test]
+    fn create_new_sets_exact_mode_and_refuses_existing_entries() {
+        let fs = RealFs::new();
+        let tmp = TempDir::new("create-new");
+        let file = tmp.0.join("db");
+        fs.create_new(&file, 0o600).unwrap();
+        let meta = fs.metadata(&file).unwrap();
+        assert_eq!((meta.kind, meta.len, meta.mode), (FileKind::File, 0, 0o600));
+        fs::write(&file, b"keep").unwrap();
+        assert_eq!(fs.create_new(&file, 0o600).unwrap_err().errno(), Some(libc::EEXIST));
+        assert_eq!(
+            fs::read(&file).unwrap(),
+            b"keep",
+            "an existing file must never be truncated"
+        );
+        let link = tmp.0.join("link");
+        symlink(tmp.0.join("elsewhere"), &link).unwrap();
+        assert_eq!(fs.create_new(&link, 0o600).unwrap_err().errno(), Some(libc::EEXIST));
+        assert!(
+            !tmp.0.join("elsewhere").exists(),
+            "a dangling symlink must not be followed"
+        );
     }
 
     #[test]
