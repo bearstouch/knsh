@@ -9,6 +9,7 @@
 | Agent socket | `~/Library/Application Support/knsh/run/agent.sock` |
 | User socket | `~/Library/Application Support/knsh/run/user.sock` |
 | Control service | XPC Mach service `knsh.control` (final name tied to the signing identity) |
+| Launch agent | `~/Library/LaunchAgents/knsh.knshd.plist`, label `knsh.knshd`, owner-only; written by `knsh daemon install` |
 | System log | Unified logging subsystem `knsh` |
 | Keychain secrets | Service `knsh` |
 

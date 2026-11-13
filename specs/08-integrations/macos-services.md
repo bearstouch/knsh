@@ -4,7 +4,7 @@ All macOS services sit behind one internal platform interface, called directly f
 
 | Service | Used for | Notes |
 | --- | --- | --- |
-| launchd | Running `knshd` as a user agent; creating `agent.sock`, `user.sock` and the control service before `knshd` runs | No other process can claim those names; restarts `knshd` on crash |
+| launchd | Running `knshd` as a user agent; creating `agent.sock`, `user.sock` and the control service before `knshd` runs | No other process can claim those names; restarts `knshd` on crash (`KeepAlive` → `Crashed`). Observed on macOS 26.6 (KNSH-012): restart after `SIGABRT`, not after `SIGKILL` (the next connection starts it on demand); each socket is bound with the default mode and set to `0600` just after, so the `0700` run directory must exist first; a `knshd` under `~/Desktop`, `~/Documents` or `~/Downloads` blocks on TCC consent at launch |
 | XPC | Control service `knsh.control` | Peer code-signing requirements in both directions |
 | Keychain | Policy signing key, authority trust record, secrets (service `knsh`) | Items readable only by `knshd`'s code signature |
 | LocalAuthentication | Touch ID or password for approvals, policy edits, grants, trust | Prompt shown by `knshd`; minimal Objective-C runtime calls or the Swift helper |

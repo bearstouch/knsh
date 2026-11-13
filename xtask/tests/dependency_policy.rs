@@ -46,7 +46,8 @@ const LAYOUT: &[(&str, &[&str])] = &[
             "knsh-checkpoint",
         ],
     ),
-    ("knsh", &["knsh-proto", "knsh-json"]),
+    // knsh-platform for engine paths and the launchd agent behind `knsh daemon install` (KNSH-012).
+    ("knsh", &["knsh-proto", "knsh-json", "knsh-platform"]),
     ("knsh-exec", &[]),
     // Dev-only checks crate: depends on nothing, and nothing may depend on it.
     ("xtask", &[]),

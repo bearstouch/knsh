@@ -17,6 +17,15 @@
 //! The [`engine_dirs`] module (KNSH-011) is the single source of engine paths ([`EnginePaths`]) and prepares them
 //! owner-only and excluded from Spotlight and Time Machine ([`ensure_engine_dirs`]), through the [`Fs`] trait.
 //!
+//! The [`launchd`] module (KNSH-012) defines the launch agent that runs `knshd` and owns its sockets, and three
+//! traits around it:
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`SocketActivation`] | Receive the sockets launchd created | `LaunchdSockets` | `FakeSocketActivation` |
+//! | [`PeerCredentials`] | Uid of the process at the other end of a connection | `SystemPeerCredentials` | `FixedPeerCredentials` |
+//! | [`ServiceManager`] | Load and unload the job | `Launchctl` | `RecordingServiceManager` |
+//!
 //! Later stories add Keychain, `LocalAuthentication`, XPC, `FSEvents` and APFS clones to the same interface.
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
@@ -41,6 +50,8 @@
 //! - `specs/08-integrations/macos-services.md`
 //! - `specs/04-non-functional-requirements/supply-chain.md` (system SQLite, no crates), FR-REC-08 (KNSH-010)
 //! - `specs/09-reference/file-locations.md`, NFR-PRIV-04, NFR-SEC-08 (engine directories, KNSH-011)
+//! - `specs/02-architecture/process-model.md`, `specs/02-architecture/endpoints.md`, NFR-REL-03 (launchd agent,
+//!   KNSH-012)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
@@ -51,6 +62,7 @@ mod clock;
 pub mod engine_dirs;
 mod error;
 mod fs;
+pub mod launchd;
 mod log;
 mod process;
 mod random;
@@ -72,6 +84,7 @@ pub use clock::{Clock, Monotonic};
 pub use engine_dirs::{EnginePaths, ensure_engine_dirs};
 pub use error::{Operation, PlatformError, SqliteCode};
 pub use fs::{FileKind, Fs, Metadata};
+pub use launchd::{LaunchAgent, PeerCredentials, ServiceManager, SocketActivation, install_agent, uninstall_agent};
 pub use log::{Field, Level, SystemLog, Value, render};
 pub use process::{ExitStatus, ProcessGroupId, Processes, Signal, SpawnRequest, Stdio};
 pub use random::Random;

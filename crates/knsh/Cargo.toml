@@ -18,6 +18,12 @@ doc = false
 [dependencies]
 knsh-proto = { path = "../knsh-proto" }
 knsh-json = { path = "../knsh-json" }
+# Engine paths and the launchd agent for `knsh daemon install` and `uninstall` (KNSH-012). knsh-platform is the
+# only route to system calls, so `knsh` itself stays free of `unsafe` and of `libc` (NFR-SUP-02).
+knsh-platform = { path = "../knsh-platform" }
+
+[dev-dependencies]
+knsh-platform = { path = "../knsh-platform", features = ["testing"] }
 
 [lints]
 workspace = true

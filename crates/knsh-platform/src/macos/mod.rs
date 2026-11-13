@@ -6,12 +6,14 @@
 
 mod clock;
 mod fs;
+mod launchd;
 mod log;
 mod process;
 mod random;
 
 pub use clock::SystemClock;
 pub use fs::RealFs;
+pub use launchd::{Launchctl, LaunchdSockets, SystemPeerCredentials};
 pub use log::UnifiedLog;
 pub use process::SystemProcesses;
 pub use random::SystemRandom;

@@ -2,7 +2,9 @@
 
 ## `knshd` lifecycle
 
-- `knshd` is a **launchd user agent**. launchd creates both sockets and the XPC service before `knshd` runs, starts it on first contact, and no other process can claim those names.
+- `knshd` is a **launchd user agent** (label `knsh.knshd`, installed by `knsh daemon install`, see [CLI](../06-api/cli.md#daemon-installation)). launchd creates both sockets and the XPC service before `knshd` runs, starts it on first contact, and no other process can claim those names.
+- `knshd` takes its sockets from launchd (`launch_activate_socket`) and never binds one itself; started any other way, it exits with an error.
+- `knshd` serves a `user.sock` connection only if the peer's effective uid (`getpeereid`) equals its own; any other peer, or one whose credentials cannot be read, is disconnected.
 - `knshd` stays alive while any envelope or recording session exists, and launchd restarts it if it crashes.
 - It exits after **10 idle minutes**.
 - Grants and pushed policy are kept in its state store and survive restarts; secrets supplied by the authority are memory-only and are lost on exit.

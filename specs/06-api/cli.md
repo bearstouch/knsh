@@ -17,6 +17,23 @@ The `knsh` binary wraps the API. Every command takes `--json` for machine-readab
 | `knsh profile use <profile>` | `user.sock` | Select a local profile; needs Touch ID |
 | `knsh authority trust --team-id <id> --identifier <bundle-id> --min-version <v>` | `user.sock` | Trust an authority; needs Touch ID or password |
 | `knsh forget [--session <id> \| --since <date>] [--with-checkpoints]` | `user.sock` | Delete records and optionally checkpoints |
+| `knsh daemon install` | — (launchd) | Install and load the `knshd` launch agent (see below) |
+| `knsh daemon uninstall` | — (launchd) | Unload the `knshd` launch agent and remove its property list; engine data is kept |
+
+## Daemon installation
+
+`knshd` runs only as a launchd user agent ([process model](../02-architecture/process-model.md)); `knsh daemon`
+installs and removes it without talking to `knshd`.
+
+- `knsh daemon install` uses the `knshd` binary in the same directory as the running `knsh` (after resolving
+  symlinks). It prepares the engine directories, writes `~/Library/LaunchAgents/knsh.knshd.plist` (owner-only,
+  atomically), unloads any loaded `knsh.knshd` job and loads the new one into the user's GUI domain (`gui/<uid>`).
+  Running it again replaces and reloads the definition. It fails with status 1 if run as root, `knshd` is missing,
+  `HOME` is unusable, a socket path does not fit a Unix socket address, or launchd refuses the job.
+- `knsh daemon uninstall` unloads the job (stopping `knshd`) and removes the property list. It succeeds when nothing
+  is installed. Records, checkpoints and configuration are kept (`knsh forget` deletes them).
+- The property list declares `user.sock` and `agent.sock` (mode `0600`) and the control service, starts `knshd` on
+  demand (`RunAtLoad` false) and restarts it after a crash (`KeepAlive` → `Crashed`).
 
 ## Shell invocation
 

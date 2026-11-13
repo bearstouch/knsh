@@ -447,6 +447,24 @@ impl Fs for MemFs {
         Ok(())
     }
 
+    fn remove_file(&self, path: &Path) -> Result<(), PlatformError> {
+        let mut state = lock(&self.state);
+        require_absolute(path)?;
+        state.check_fault(Operation::RemoveFile)?;
+        // Like `unlink`: a final symlink is removed itself, and a directory is refused.
+        let resolved = resolve(&state.nodes, path, false, Operation::RemoveFile)?;
+        match state.nodes.get(&resolved) {
+            Some(Node::File { .. } | Node::Symlink { .. }) => {
+                state.nodes.remove(&resolved);
+                state.owners.remove(&resolved);
+                state.xattrs.remove(&resolved);
+                Ok(())
+            }
+            Some(Node::Directory { .. }) => Err(os(Operation::RemoveFile, libc::EPERM)),
+            None => Err(os(Operation::RemoveFile, libc::ENOENT)),
+        }
+    }
+
     fn xattr(&self, path: &Path, name: &str, limit: usize) -> Result<Option<Vec<u8>>, PlatformError> {
         let mut state = lock(&self.state);
         require_absolute(path)?;
@@ -656,5 +674,20 @@ mod tests {
                 .unwrap_err()
                 .is_not_found()
         );
+    }
+
+    // KNSH-012: removal unlinks a file or the symlink itself, never a target or a directory.
+    #[test]
+    fn remove_file_unlinks_entries_but_not_directories() {
+        let fs = MemFs::new();
+        fs.write(Path::new("/f"), b"x", 0o600).unwrap();
+        fs.add_symlink(Path::new("/link"), Path::new("/f")).unwrap();
+        fs.remove_file(Path::new("/link")).unwrap();
+        assert_eq!(fs.contents(Path::new("/f")).unwrap(), b"x");
+        fs.remove_file(Path::new("/f")).unwrap();
+        assert!(fs.remove_file(Path::new("/f")).unwrap_err().is_not_found());
+        fs.create_dir(Path::new("/d"), 0o700).unwrap();
+        assert_eq!(fs.remove_file(Path::new("/d")).unwrap_err().errno(), Some(libc::EPERM));
+        assert_eq!(fs.remove_file(Path::new("rel")), Err(PlatformError::InvalidPath));
     }
 }

@@ -22,13 +22,57 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Invocation::Shell(_)) => not_implemented("shell mode"),
-        Ok(Invocation::Command(parsed)) => not_implemented(&format!("'knsh {}'", parsed.path.join(" "))),
+        Ok(Invocation::Command(parsed)) => match parsed.path.as_slice() {
+            ["daemon", action @ ("install" | "uninstall")] => daemon(action, parsed.json()),
+            _ => not_implemented(&format!("'knsh {}'", parsed.path.join(" "))),
+        },
         // Usage errors run nothing and exit with 2, like bash (KNSH-009).
         Err(error) => {
             report(&format!("knsh: {error}\nTry 'knsh --help' for more information.\n"));
             ExitCode::from(ArgsError::EXIT_STATUS)
         }
     }
+}
+
+/// Runs `knsh daemon install` or `uninstall` against the real filesystem and launchd (KNSH-012). Exits with 1 and
+/// the reason on stderr on failure.
+#[cfg(target_os = "macos")]
+fn daemon(action: &str, json: bool) -> ExitCode {
+    use knsh::cli::daemon::{self, Environment};
+    use knsh_platform::macos::{Launchctl, RealFs, effective_uid};
+
+    let home = std::env::var_os("HOME");
+    let Ok(knsh_exe) = std::env::current_exe() else {
+        report("knsh: cannot locate the running knsh binary\n");
+        return ExitCode::FAILURE;
+    };
+    let env = Environment {
+        home: home.as_deref(),
+        knsh_exe: &knsh_exe,
+        uid: effective_uid(),
+    };
+    let (fs, launchctl) = (RealFs::new(), Launchctl::new());
+    let outcome = if action == "install" {
+        daemon::install(&fs, &launchctl, env).map(|agent| daemon::installed_report(&agent, json))
+    } else {
+        daemon::uninstall(&fs, &launchctl, env).map(|removed| daemon::uninstalled_report(removed, json))
+    };
+    match outcome {
+        Ok(text) => {
+            let _ = std::io::stdout().write_all(text.as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            report(&format!("knsh: daemon {action} failed: {error}\n"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The launchd agent exists only on macOS so far (a systemd unit on Linux, KNSH-112).
+#[cfg(not(target_os = "macos"))]
+fn daemon(action: &str, _json: bool) -> ExitCode {
+    not_implemented(&format!("'knsh daemon {action}' on this platform"))
 }
 
 /// Reports that a correctly parsed invocation has no behaviour yet.
