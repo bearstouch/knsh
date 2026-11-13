@@ -3,6 +3,10 @@
 | Setting | Default or limit | Configurable | Source |
 | --- | --- | --- | --- |
 | `knshd` idle exit | 10 minutes | — | [process model](../02-architecture/process-model.md) |
+| `knshd` concurrent connections | 64 over both sockets; further connections are closed on accept | — | [process model](../02-architecture/process-model.md) |
+| First message (`hello`) timeout | 10 s after connecting, then the connection is closed | — | [process model](../02-architecture/process-model.md) |
+| Write to a client | 30 s blocked, then the connection is closed | — | [process model](../02-architecture/process-model.md) |
+| Shutdown grace | 5 s for in-flight requests, then connections are closed | — | [process model](../02-architecture/process-model.md) |
 | Authority decision timeout | 90 s, then deny | Yes; set shorter than the agent CLI's tool timeout | [authority](../03-functional-requirements/authority.md) |
 | Hook timeout | `timeout_ms` per hook (example 2000) | Per hook | [hooks](../03-functional-requirements/hooks.md) |
 | Rate limit | 5 denials of the same normalised line in 60 s → denied for 10 minutes | — | [hooks](../03-functional-requirements/hooks.md) |

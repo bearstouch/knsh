@@ -66,6 +66,11 @@ pub enum Operation {
     ActivateSocket,
     /// Reading the credentials of the process at the other end of a Unix socket (`getpeereid`, KNSH-012).
     PeerCredentials,
+    /// Creating, registering with or waiting on an event queue (`kqueue`, `kevent`, KNSH-013).
+    EventQueue,
+    /// Installing a handler so a termination signal can be observed instead of killing the process (`sigaction`,
+    /// KNSH-013).
+    WatchSignal,
 }
 
 impl Operation {
@@ -98,6 +103,8 @@ impl Operation {
             Self::RemoveFile => "remove file",
             Self::ActivateSocket => "activate launchd socket",
             Self::PeerCredentials => "read peer credentials",
+            Self::EventQueue => "event queue",
+            Self::WatchSignal => "watch signal",
         }
     }
 }

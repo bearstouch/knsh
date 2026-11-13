@@ -89,6 +89,7 @@ version = "0.0.0"
 dependencies = [
  "knsh-checkpoint",
  "knsh-core",
+ "knsh-json",
  "knsh-platform",
  "knsh-proto",
  "knsh-proxy",

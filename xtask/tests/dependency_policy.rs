@@ -38,6 +38,8 @@ const LAYOUT: &[(&str, &[&str])] = &[
         "knshd",
         &[
             "knsh-core",
+            // The frame codec and JSON values its connection server reads and writes (KNSH-013).
+            "knsh-json",
             "knsh-proto",
             "knsh-platform",
             "knsh-sandbox",

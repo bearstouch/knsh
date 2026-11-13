@@ -9,26 +9,12 @@
 //! process per user, never serving another macOS user. The socket is already owner-only; the check is the second
 //! layer, and it fails closed when the kernel cannot say who the peer is.
 //!
-//! Phase 1 placeholder: an admitted connection is closed straight away, because the dispatcher arrives with
-//! KNSH-013. `agent.sock` is activated (so launchd's sockets are both accounted for) but every connection on it is
-//! closed unserved until phase 2 (KNSH-048); refusing is the fail-closed answer for agents.
+//! Serving the admitted connections is the job of [`crate::server`] (KNSH-013).
 
-use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 use knsh_platform::launchd::{AGENT_SOCKET_NAME, USER_SOCKET_NAME};
-use knsh_platform::{Field, Level, PeerCredentials, PlatformError, SocketActivation, SystemLog, Value};
-
-/// Pause after an accept error that is not about one connection (for example `EMFILE`), so a persistent failure
-/// does not spin a core.
-const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
-
-/// Logged in place of an `errno` when a failure carries none. `knshd` may not depend on `libc` (NFR-SUP-02), and 0
-/// is never a real `errno`, so it reads unambiguously as "unknown".
-const UNKNOWN_ERRNO: i32 = 0;
+use knsh_platform::{PeerCredentials, PlatformError, SocketActivation};
 
 /// The listening sockets launchd created for `knshd`.
 #[derive(Debug)]
@@ -80,98 +66,12 @@ pub(crate) fn admit(credentials: &dyn PeerCredentials, own_uid: u32, stream: &Un
     }
 }
 
-/// Effects the accept loops need, shared by every endpoint thread.
-pub(crate) struct Context {
-    /// Who is at the other end of each connection.
-    pub(crate) credentials: Arc<dyn PeerCredentials>,
-    /// Where refusals are reported. Never receives message content.
-    pub(crate) log: Arc<dyn SystemLog>,
-    /// The user `knshd` runs as.
-    pub(crate) own_uid: u32,
-}
-
-/// Serves every listener on its own thread until all of them stop. Accept loops only stop on a broken listener, so
-/// returning at all is unexpected and the caller treats it as a failure.
-pub(crate) fn serve(listeners: Listeners, context: &Arc<Context>) {
-    let mut threads = Vec::new();
-    for listener in listeners.user {
-        let context = Arc::clone(context);
-        threads.push(thread::spawn(move || accept_loop(&listener, &context, handle_user)));
-    }
-    for listener in listeners.agent {
-        let context = Arc::clone(context);
-        threads.push(thread::spawn(move || accept_loop(&listener, &context, handle_agent)));
-    }
-    for thread in threads {
-        // A panicking accept loop is already reported by the panic hook; the others keep serving until they end.
-        let _ = thread.join();
-    }
-}
-
-/// Accepts connections on `listener` forever, passing each to `handle`.
-fn accept_loop(listener: &UnixListener, context: &Context, handle: fn(UnixStream, &Context)) {
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => handle(stream, context),
-            // The peer gave up before the accept, or a signal interrupted it: nothing is wrong with the listener.
-            Err(error) if is_per_connection(&error) => {}
-            Err(error) => {
-                context.log.log(
-                    Level::Error,
-                    "accept failed",
-                    &[Field::new(
-                        "errno",
-                        Value::Errno(error.raw_os_error().unwrap_or(UNKNOWN_ERRNO)),
-                    )],
-                );
-                thread::sleep(ACCEPT_BACKOFF);
-            }
-        }
-    }
-}
-
-/// Whether an accept error concerns one connection only, so the loop simply moves on.
-fn is_per_connection(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
-    )
-}
-
-/// A connection on `user.sock`: refused unless its peer is this user. Admitted connections are closed for now; the
-/// dispatcher arrives with KNSH-013.
-fn handle_user(stream: UnixStream, context: &Context) {
-    match admit(context.credentials.as_ref(), context.own_uid, &stream) {
-        Ok(()) => {}
-        Err(Refusal::OtherUser { peer_uid }) => context.log.log(
-            Level::Error,
-            "refused user.sock connection from another user",
-            &[Field::new("peer_uid", Value::U64(u64::from(peer_uid)))],
-        ),
-        Err(Refusal::UnknownPeer(error)) => context.log.log(
-            Level::Error,
-            "refused user.sock connection with unknown peer",
-            &[Field::new(
-                "errno",
-                Value::Errno(error.errno().unwrap_or(UNKNOWN_ERRNO)),
-            )],
-        ),
-    }
-    drop(stream);
-}
-
-/// A connection on `agent.sock`: closed unserved until phase 2 (KNSH-048). Agents fail closed.
-fn handle_agent(stream: UnixStream, _context: &Context) {
-    drop(stream);
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
     use std::path::PathBuf;
 
     use knsh_platform::Operation;
-    use knsh_platform::testing::{FakeSocketActivation, FixedPeerCredentials, RecordingLog};
+    use knsh_platform::testing::{FakeSocketActivation, FixedPeerCredentials};
 
     use super::*;
 
@@ -255,32 +155,5 @@ mod tests {
             admit(&FixedPeerCredentials::unavailable(), OWN_UID, &stream),
             Err(Refusal::UnknownPeer(_))
         ));
-    }
-
-    // A refused connection is closed and logged with the peer's uid only, never content.
-    #[test]
-    fn refused_connection_is_closed_and_logged() {
-        let log = Arc::new(RecordingLog::new());
-        let context = Context {
-            credentials: Arc::new(FixedPeerCredentials::uid(OWN_UID + 1)),
-            log: log.clone(),
-            own_uid: OWN_UID,
-        };
-        let (stream, mut peer) = UnixStream::pair().unwrap();
-        handle_user(stream, &context);
-        let mut buf = [0u8; 1];
-        assert_eq!(peer.read(&mut buf).unwrap(), 0, "connection must be closed");
-        let entries = log.entries();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].message, "refused user.sock connection from another user");
-    }
-
-    #[test]
-    fn accept_errors_about_one_connection_do_not_stop_the_loop() {
-        assert!(is_per_connection(&io::Error::from(io::ErrorKind::ConnectionAborted)));
-        assert!(is_per_connection(&io::Error::from(io::ErrorKind::Interrupted)));
-        assert!(!is_per_connection(&io::Error::from(io::ErrorKind::OutOfMemory)));
-        // A non-blocking listener would return this forever: it must take the back-off path, never spin.
-        assert!(!is_per_connection(&io::Error::from(io::ErrorKind::WouldBlock)));
     }
 }

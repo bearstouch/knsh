@@ -98,8 +98,8 @@ impl FromJson for StreamId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     /// A JSON message (stream 0). The payload is not parsed here: the protocol layer parses it with
-    /// [`parse`](crate::parse) and [`MAX_PAYLOAD`], and a parse error there concerns this message only (`-32700`),
-    /// not the connection.
+    /// [`parse`](crate::parse) and [`MAX_PAYLOAD`]. A parse error there is not a framing error: the reader stays
+    /// usable, and the protocol layer decides what follows (`knshd` answers `-32700` and closes, KNSH-013).
     Json(Vec<u8>),
     /// A piece of a binary stream. Chunks of different streams may interleave; chunks of one stream arrive in
     /// order.

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 knsh-core = { path = "../knsh-core" }
+knsh-json = { path = "../knsh-json" }
 knsh-proto = { path = "../knsh-proto" }
 knsh-platform = { path = "../knsh-platform" }
 knsh-sandbox = { path = "../knsh-sandbox" }

@@ -18,22 +18,24 @@ alive while any envelope or recording session exists and exits after 10 idle min
 **Acceptance criteria**
 *`knshd` connection server and dispatcher*
 
-- [ ] Each endpoint has its own dispatch table; a method not in that endpoint's table returns `-32601` (unknown)
+- [x] Each endpoint has its own dispatch table; a method not in that endpoint's table returns `-32601` (unknown)
       or `-32003` (known but not allowed on this endpoint).
-- [ ] The first message must be `hello`; anything else first gets `-32600` and the connection is closed.
-- [ ] Oversized frames close the connection before allocation (KNSH-004); malformed JSON returns `-32700` and the
+- [x] The first message must be `hello`; anything else first gets `-32600` and the connection is closed.
+- [x] Oversized frames close the connection before allocation (KNSH-004); malformed JSON returns `-32700` and the
       connection is closed.
-- [ ] A slow or stuck client cannot block other connections; the number of concurrent connections is bounded and
+- [x] A slow or stuck client cannot block other connections; the number of concurrent connections is bounded and
       excess connections are refused.
-- [ ] Shutdown stops accepting, lets in-flight requests finish within a bound, then closes.
-- [ ] No message content is written to the system log.
+- [x] Shutdown stops accepting, lets in-flight requests finish within a bound, then closes.
+- [x] No message content is written to the system log.
 
 *`knshd` idle exit and lifetime*
 
-- [ ] With no sessions and no connections, `knshd` exits after 10 minutes (injected clock).
-- [ ] Any active recording session, envelope or open connection resets the idle timer.
-- [ ] Exit is clean: pending record writes are committed first.
-- [ ] Human sessions with recording off never contact `knshd` (verified with KNSH-021).
+- [x] With no sessions and no connections, `knshd` exits after 10 minutes (injected clock).
+- [x] Any active recording session, envelope or open connection resets the idle timer. (Observed with a fake
+      session source; the session registry is wired in with KNSH-015.)
+- [x] Exit is clean: pending record writes are committed first. (Observed with a fake writer; the record store is
+      wired in with KNSH-016.)
+- [ ] Human sessions with recording off never contact `knshd` (verified with KNSH-021). **Pending** KNSH-021.
 
 **Unit tests**
 *`knshd` connection server and dispatcher*
