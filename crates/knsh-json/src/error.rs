@@ -41,6 +41,34 @@ pub enum ParseReason {
     TooDeep,
 }
 
+/// Why the frame codec refused a frame or a stream operation. Wrapped in [`JsonError::Frame`].
+///
+/// Every reason is a framing violation (`specs/06-api/wire-format.md#frames-unix-sockets`): the byte stream can no
+/// longer be trusted to be in step with the peer, so the connection must close ([`JsonError::is_fatal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameReason {
+    /// The length prefix is smaller than the type byte plus the stream ID, so the frame has no room for its header.
+    TooShort,
+    /// The input ended in the middle of a frame (after the first byte of its length prefix).
+    Truncated,
+    /// The type byte is not `0x01` (JSON), `0x02` (binary chunk) or `0x03` (end of stream).
+    UnknownType,
+    /// A JSON frame named a stream other than 0.
+    JsonOnStream,
+    /// A binary chunk or end-of-stream frame named stream 0, which is reserved for JSON messages.
+    StreamZero,
+    /// An end-of-stream frame carried a payload; it must be empty.
+    EndWithPayload,
+    /// A binary chunk or end-of-stream frame named a stream that is not open: never opened, or already ended.
+    UnknownStream,
+    /// A stream was opened while a stream with the same ID was still open.
+    StreamAlreadyOpen,
+    /// Opening one more stream would exceed [`MAX_OPEN_STREAMS`](crate::MAX_OPEN_STREAMS).
+    TooManyStreams,
+    /// A stream carried more bytes than the size its opening message declared, or ended with fewer.
+    LengthMismatch,
+}
+
 /// The JSON type a conversion expected, reported by [`JsonError::WrongType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -105,6 +133,25 @@ pub enum JsonError {
     /// A closed object ([`Fields::finish_closed`](crate::Fields::finish_closed)) held a field the reader does not
     /// know. The name is not reported because it comes from untrusted input.
     UnknownField,
+    /// A frame's payload exceeds the limit. Detected from the length prefix alone, before any memory is allocated
+    /// for the payload (NFR-SEC-07). Fatal: the connection must close.
+    ///
+    /// [`FrameWriter::write_json`](crate::FrameWriter::write_json) also returns it for an oversized message,
+    /// before writing anything; that writer stays usable, so closing is merely the safe default there.
+    FrameTooLarge {
+        /// Payload length the frame declared (or the writer was given), in bytes.
+        len: usize,
+        /// The payload limit, in bytes ([`MAX_PAYLOAD`](crate::MAX_PAYLOAD)).
+        limit: usize,
+    },
+    /// The frame codec refused a frame or a stream operation. Fatal: the connection must close.
+    Frame(FrameReason),
+    /// Reading or writing the underlying transport failed. Only the error kind is kept, so the error stays `Copy`
+    /// and carries no text from the operating system. Fatal: the connection must close.
+    Io(std::io::ErrorKind),
+    /// A base64 string (the fallback for clients without binary frames) was not canonical standard base64 with
+    /// padding.
+    InvalidBase64,
 }
 
 impl JsonError {
@@ -122,7 +169,32 @@ impl JsonError {
             | Self::MissingField(_)
             | Self::WrongType { .. }
             | Self::OutOfRange { .. }
-            | Self::UnknownField => false,
+            | Self::UnknownField
+            | Self::FrameTooLarge { .. }
+            | Self::Frame(_)
+            | Self::Io(_)
+            | Self::InvalidBase64 => false,
+        }
+    }
+
+    /// Whether the connection must close: the frame codec refused the byte stream or the transport failed, so the
+    /// next byte can no longer be trusted to start a frame (`specs/06-api/wire-format.md#frames-unix-sockets`,
+    /// NFR-SEC-07). Every other error concerns one message and leaves the connection usable.
+    #[must_use]
+    pub const fn is_fatal(&self) -> bool {
+        match self {
+            Self::FrameTooLarge { .. } | Self::Frame(_) | Self::Io(_) => true,
+            Self::InputTooLarge { .. }
+            | Self::Parse { .. }
+            | Self::DuplicateKey
+            | Self::IntegerOutOfRange
+            | Self::InvalidDecimal
+            | Self::TooDeep
+            | Self::MissingField(_)
+            | Self::WrongType { .. }
+            | Self::OutOfRange { .. }
+            | Self::UnknownField
+            | Self::InvalidBase64 => false,
         }
     }
 
@@ -160,6 +232,23 @@ impl fmt::Display for ParseReason {
     }
 }
 
+impl fmt::Display for FrameReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::TooShort => "frame length shorter than its header",
+            Self::Truncated => "input ended in the middle of a frame",
+            Self::UnknownType => "unknown frame type",
+            Self::JsonOnStream => "JSON frame on a stream other than 0",
+            Self::StreamZero => "binary frame on stream 0",
+            Self::EndWithPayload => "end-of-stream frame with a payload",
+            Self::UnknownStream => "frame for a stream that is not open",
+            Self::StreamAlreadyOpen => "stream is already open",
+            Self::TooManyStreams => "too many open streams",
+            Self::LengthMismatch => "stream length differs from the declared size",
+        })
+    }
+}
+
 impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -192,6 +281,12 @@ impl fmt::Display for JsonError {
             Self::OutOfRange { field: Some(name) } => write!(f, "field `{name}` is out of range"),
             Self::OutOfRange { field: None } => f.write_str("value is out of range"),
             Self::UnknownField => f.write_str("object has an unknown field"),
+            Self::FrameTooLarge { len, limit } => {
+                write!(f, "frame payload of {len} bytes exceeds the {limit}-byte limit")
+            }
+            Self::Frame(reason) => write!(f, "invalid frame: {reason}"),
+            Self::Io(kind) => write!(f, "transport error: {kind}"),
+            Self::InvalidBase64 => f.write_str("invalid base64"),
         }
     }
 }

@@ -13,7 +13,8 @@
 //! - `specs/06-api/handshake.md` (additive protocol: unknown fields are ignored)
 //! - `specs/02-architecture/implementation.md`
 //! - `specs/07-testing/fuzzing.md`
-//! - NFR-SEC-05, NFR-SEC-06, NFR-SUP-06
+//! - `specs/06-api/wire-format.md#frames-unix-sockets` (frame codec)
+//! - NFR-SEC-05, NFR-SEC-06, NFR-SEC-07, NFR-SUP-06
 //!
 //! # Strict JSON (KNSH-003)
 //!
@@ -28,21 +29,36 @@
 //! - [`write()`] emits compact JSON that [`parse`] reads back to an equal value.
 //! - [`ToJson`], [`FromJson`] and [`Fields`] replace `serde` for hand-written protocol structs.
 //!
-//! The frame codec arrives with KNSH-004.
+//! # Frames and binary streams (KNSH-004)
+//!
+//! - [`FrameReader`] reads length-prefixed frames (`specs/06-api/wire-format.md#frames-unix-sockets`) from any
+//!   [`std::io::Read`]: the 4-byte length is checked against [`MAX_PAYLOAD`] before anything else is read or
+//!   allocated (NFR-SEC-07); unknown types, JSON off stream 0, binary frames on stream 0 or on a stream not opened
+//!   through [`FrameReader::open_stream`], streams that break their declared size, and input ending inside a frame
+//!   or an open stream are all fatal ([`JsonError::is_fatal`]). Interleaved streams are delivered chunk by chunk
+//!   with their [`StreamId`].
+//! - [`FrameWriter`] writes frames to any [`std::io::Write`], splitting binary data into chunks of at most
+//!   [`MAX_PAYLOAD`] bytes.
+//! - [`base64_encode`], [`base64_decode`] and [`Base64Bytes`] carry raw bytes inside JSON for clients that declared
+//!   in `hello` that they cannot handle binary frames (`specs/06-api/handshake.md`).
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 #![forbid(unsafe_code)]
 
+mod base64;
 mod convert;
 mod error;
+mod frame;
 mod number;
 mod read;
 mod value;
 mod write;
 
+pub use base64::{Base64Bytes, base64_decode, base64_encode};
 pub use convert::{Fields, FromJson, IntString, ToJson};
-pub use error::{JsonError, Kind, ParseReason};
+pub use error::{FrameReason, JsonError, Kind, ParseReason};
+pub use frame::{Frame, FrameReader, FrameWriter, MAX_OPEN_STREAMS, MAX_PAYLOAD, StreamId};
 pub use number::{MAX_SAFE_INTEGER, Number};
 pub use read::{MAX_DEPTH, parse};
 pub use value::{Object, Value};
