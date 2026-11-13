@@ -10,8 +10,9 @@ everything else.
 | `json_reader` | No panic; rejections are parse errors (`-32700`); accepted input is UTF-8, at most 32 levels deep, and round-trips through the writer unchanged |
 | `json_writer_roundtrip` | Values built from fuzzer bytes are written as strict JSON that reads back equal, or refused exactly when deeper than 32 levels |
 | `frame_reader` | No panic; every delivered frame obeys the framing rules against an independent model of the open streams; every error is fatal and sticky; run with `-malloc_limit_mb=2`, so no allocation reaches 2 MiB (NFR-SEC-07) |
+| `toml_parser` | No panic; rejections name a line and column inside the input; accepted input is UTF-8, at most 32 levels deep, with every position inside the input, and round-trips through an independent TOML writer to an equal tree (KNSH-006) |
 
-The TOML target arrives with KNSH-006 and the bash target in phase 2.
+The bash target arrives in phase 2.
 
 ## Running
 
@@ -30,11 +31,14 @@ local runs.
 ## Layout
 
 - `fuzz_targets/` — one-line libFuzzer entry points.
-- `src/checks.rs` — the properties. Also compiled on stable by `crates/knsh-json/tests/fuzz_regressions.rs`, so it
-  depends only on `knsh-json` and `std`.
+- `src/checks.rs` — the JSON properties. Also compiled on stable by `crates/knsh-json/tests/fuzz_regressions.rs`, so
+  it depends only on `knsh-json` and `std`.
+- `src/toml_checks.rs` — the TOML property. Also compiled on stable by `crates/knsh-toml/tests/fuzz_regressions.rs`,
+  so it depends only on `knsh-toml` and `std`.
 - `corpus/<target>/` — checked-in seeds. `json_reader` holds every KNSH-003 accept/reject sample (prefixed `accept_` and
   `reject_`; a test checks none is missing); `frame_reader` holds valid, interleaved, oversized, truncated and
-  rule-breaking frame sequences; `json_writer_roundtrip` holds byte strings that build interesting values.
+  rule-breaking frame sequences; `json_writer_roundtrip` holds byte strings that build interesting values; `toml_parser` holds the policy-profile and hook
+  examples from the spec byte for byte (a test checks they match) plus accept and reject samples for each subset rule.
 - `regressions/<target>/` — crashing inputs kept forever. When a run fails, libFuzzer saves the input in
   `artifacts/<target>/` (CI uploads it as the `fuzz-crashes` artefact); fix the bug, copy the input here, and
   `cargo test` replays it on stable (`fuzz_regressions_replay`).

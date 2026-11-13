@@ -58,11 +58,16 @@ name = "knsh-fuzz"
 version = "0.0.0"
 dependencies = [
  "knsh-json",
+ "knsh-toml",
  "libfuzzer-sys",
 ]
 
 [[package]]
 name = "knsh-json"
+version = "0.0.0"
+
+[[package]]
+name = "knsh-toml"
 version = "0.0.0"
 
 [[package]]
