@@ -647,5 +647,8 @@ mod tests {
         fn set_xattr(&self, _: &Path, _: &str, _: &[u8]) -> Result<(), PlatformError> {
             Ok(())
         }
+        fn remove_file(&self, path: &Path) -> Result<(), PlatformError> {
+            self.0.remove_file(path)
+        }
     }
 }

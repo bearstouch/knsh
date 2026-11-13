@@ -152,6 +152,15 @@ pub trait Fs: Send + Sync {
     /// [`PlatformError::Os`] with [`Operation::WriteAttribute`](crate::Operation::WriteAttribute) (`ENOTSUP` if the
     /// filesystem has no extended attributes).
     fn set_xattr(&self, path: &Path, name: &str, value: &[u8]) -> Result<(), PlatformError>;
+
+    /// Removes the directory entry at `path` (`unlink`): a file, or a symlink itself, never its target. Used to remove
+    /// the launch agent property list on uninstall (KNSH-012).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::InvalidPath`]; [`PlatformError::Os`] with [`Operation::RemoveFile`](crate::Operation::RemoveFile)
+    /// (`ENOENT` if nothing exists there, `EPERM` for a directory).
+    fn remove_file(&self, path: &Path) -> Result<(), PlatformError>;
 }
 
 /// Refuses relative paths, which every [`Fs`] method rejects.

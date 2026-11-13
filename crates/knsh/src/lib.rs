@@ -5,12 +5,14 @@
 //!
 //! # Boundaries
 //!
-//! Talks to `knshd` only through the protocol. Depends on `knsh-proto` and `knsh-json`. Command-line parsing is
-//! written in-house ([`cli::args`]): the dependency policy allows no CLI-parsing crate.
+//! Talks to `knshd` only through the protocol. Depends on `knsh-proto` and `knsh-json`, and on `knsh-platform` for
+//! engine paths and the launchd agent that `knsh daemon` installs (KNSH-012). Command-line parsing is written
+//! in-house ([`cli::args`]): the dependency policy allows no CLI-parsing crate.
 //!
 //! # Specification
 //!
 //! - `specs/06-api/cli.md` (commands, `--json`, shell invocation) — [`cli`], KNSH-009
+//! - `specs/06-api/cli.md` "Daemon installation", `specs/02-architecture/process-model.md` — `cli::daemon`, KNSH-012
 //! - `specs/04-non-functional-requirements/supply-chain.md` (no third-party CLI crate)
 //! - `specs/03-functional-requirements/agent-integration.md`
 //! - `specs/08-integrations/terminals-and-shells.md` (login shell)

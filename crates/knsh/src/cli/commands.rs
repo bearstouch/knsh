@@ -113,6 +113,17 @@ pub static KNSH: Command = group(
             ],
             ..leaf("forget", "Delete records and optionally checkpoints")
         },
+        group(
+            "daemon",
+            "Install or remove the knshd launch agent",
+            &[
+                leaf("install", "Install and load the knshd launch agent"),
+                leaf(
+                    "uninstall",
+                    "Unload the knshd launch agent and remove it; engine data is kept",
+                ),
+            ],
+        ),
     ],
 );
 

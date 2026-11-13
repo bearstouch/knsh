@@ -221,6 +221,12 @@ impl Fs for RealFs {
         }
     }
 
+    fn remove_file(&self, path: &Path) -> Result<(), PlatformError> {
+        require_absolute(path)?;
+        // `unlink(2)`: removes a final symlink itself, and refuses a directory.
+        fs::remove_file(path).map_err(os(Operation::RemoveFile))
+    }
+
     fn xattr(&self, path: &Path, name: &str, limit: usize) -> Result<Option<Vec<u8>>, PlatformError> {
         let c_path = c_path(path)?;
         let c_name = c_name(name)?;
@@ -482,5 +488,22 @@ mod tests {
             fs.xattr(Path::new("relative"), name, 1),
             Err(PlatformError::InvalidPath)
         );
+    }
+
+    // KNSH-012: removal unlinks a symlink itself, never its target, and refuses a directory.
+    #[test]
+    fn remove_file_does_not_follow_symlinks_or_remove_directories() {
+        let dir = TempDir::new("remove");
+        let file = dir.0.join("f");
+        let link = dir.0.join("link");
+        fs::write(&file, b"x").unwrap();
+        symlink(&file, &link).unwrap();
+        let real = RealFs::new();
+        real.remove_file(&link).unwrap();
+        assert!(file.exists());
+        real.remove_file(&file).unwrap();
+        assert!(real.remove_file(&file).unwrap_err().is_not_found());
+        assert!(real.remove_file(&dir.0).is_err());
+        assert!(dir.0.exists());
     }
 }

@@ -19,5 +19,9 @@ knsh-proxy = { path = "../knsh-proxy" }
 knsh-store = { path = "../knsh-store" }
 knsh-checkpoint = { path = "../knsh-checkpoint" }
 
+[dev-dependencies]
+# Fakes for socket activation, peer credentials and the system log (KNSH-012). Test builds only.
+knsh-platform = { path = "../knsh-platform", features = ["testing"] }
+
 [lints]
 workspace = true

@@ -60,6 +60,12 @@ pub enum Operation {
     ReadAttribute,
     /// Writing an extended attribute (`setxattr`).
     WriteAttribute,
+    /// Removing a file (`unlink`).
+    RemoveFile,
+    /// Receiving a listening socket that launchd created for this job (`launch_activate_socket`, KNSH-012).
+    ActivateSocket,
+    /// Reading the credentials of the process at the other end of a Unix socket (`getpeereid`, KNSH-012).
+    PeerCredentials,
 }
 
 impl Operation {
@@ -89,6 +95,9 @@ impl Operation {
             Self::SetMode => "set mode",
             Self::ReadAttribute => "read extended attribute",
             Self::WriteAttribute => "write extended attribute",
+            Self::RemoveFile => "remove file",
+            Self::ActivateSocket => "activate launchd socket",
+            Self::PeerCredentials => "read peer credentials",
         }
     }
 }
@@ -251,6 +260,16 @@ pub enum PlatformError {
     UnexpectedKind,
     /// A backup or indexing exclusion was written but did not read back as written (KNSH-011, NFR-PRIV-04).
     ExclusionNotVerified,
+    /// A launch agent definition cannot be written safely: a label outside `[A-Za-z0-9._-]`, a program path that is
+    /// relative or not UTF-8, or a socket path longer than a Unix socket address holds (KNSH-012). launchd would
+    /// otherwise accept the property list and fail later, out of sight.
+    InvalidLaunchAgent,
+    /// `launchctl` exited unsuccessfully (KNSH-012). Carries its exit status, or `None` if a signal ended it.
+    /// Its output is not kept: it names paths and labels.
+    Launchctl {
+        /// The exit status.
+        status: Option<i32>,
+    },
 }
 
 impl PlatformError {
@@ -276,7 +295,9 @@ impl PlatformError {
             | Self::Sqlite { .. }
             | Self::ForeignOwner
             | Self::UnexpectedKind
-            | Self::ExclusionNotVerified => None,
+            | Self::ExclusionNotVerified
+            | Self::InvalidLaunchAgent
+            | Self::Launchctl { .. } => None,
         }
     }
 
@@ -294,7 +315,9 @@ impl PlatformError {
             | Self::NotScripted
             | Self::ForeignOwner
             | Self::UnexpectedKind
-            | Self::ExclusionNotVerified => None,
+            | Self::ExclusionNotVerified
+            | Self::InvalidLaunchAgent
+            | Self::Launchctl { .. } => None,
         }
     }
 
@@ -327,6 +350,11 @@ impl fmt::Display for PlatformError {
             Self::ForeignOwner => f.write_str("engine path is owned by another user"),
             Self::UnexpectedKind => f.write_str("engine path is not the expected kind of entry"),
             Self::ExclusionNotVerified => f.write_str("backup or indexing exclusion did not read back as written"),
+            Self::InvalidLaunchAgent => f.write_str(
+                "launch agent has an invalid label, a relative or non-UTF-8 program path, or a socket path too long",
+            ),
+            Self::Launchctl { status: Some(status) } => write!(f, "launchctl exited with status {status}"),
+            Self::Launchctl { status: None } => f.write_str("launchctl was ended by a signal"),
         }
     }
 }
@@ -344,7 +372,9 @@ impl std::error::Error for PlatformError {
             | Self::Sqlite { .. }
             | Self::ForeignOwner
             | Self::UnexpectedKind
-            | Self::ExclusionNotVerified => None,
+            | Self::ExclusionNotVerified
+            | Self::InvalidLaunchAgent
+            | Self::Launchctl { .. } => None,
         }
     }
 }

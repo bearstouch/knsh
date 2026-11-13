@@ -792,10 +792,10 @@ mod tests {
     #[test]
     fn json_flag_accepted_by_every_subcommand() {
         let leaves = leaves();
-        // The 14 leaf commands of specs/06-api/cli.md; a mismatch means the table and the page have drifted.
+        // The 16 leaf commands of specs/06-api/cli.md; a mismatch means the table and the page have drifted.
         assert_eq!(
             leaves.len(),
-            14,
+            16,
             "{:?}",
             leaves.iter().map(|(p, _)| p).collect::<Vec<_>>()
         );
