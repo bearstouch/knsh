@@ -43,6 +43,21 @@ retention_days = 30
 NPM_TOKEN = { secret = "npm-token", inject_for = ["npm publish"], hosts = ["registry.npmjs.org"] }
 ```
 
+## TOML subset
+
+The parser (`knsh-toml`) reads exactly this subset of TOML 1.0, with TOML 1.0 semantics, and rejects everything else with an error naming line and column. The same subset is used for hooks ([hook](hook.md)) and other configuration files.
+
+- Comments, blank lines, `\n` or `\r\n` line ends.
+- Bare, basic-quoted and literal-quoted keys, and dotted keys made of them.
+- `[table]`, `[a.b]` and `[[array-of-tables]]` headers.
+- Single-line basic strings (TOML 1.0 escapes) and single-line literal strings.
+- Decimal integers in the signed 64-bit range (underscores between digits allowed).
+- `true` and `false`.
+- Arrays, possibly over several lines, with comments between elements and an optional trailing comma.
+- Inline tables, on one line, without a trailing comma.
+
+Outside the subset, and rejected as such: dates and times, floats (including `inf` and `nan`), multi-line strings and hexadecimal, octal or binary integers. As in TOML, duplicate keys and tables defined twice (by headers, dotted keys or inline) are errors. A leading byte-order mark is rejected. Input is limited to 1 MiB and 32 levels of nested tables and arrays. A spec example that needs more TOML extends this list first.
+
 ## Keys
 
 | Key | Type | Meaning |

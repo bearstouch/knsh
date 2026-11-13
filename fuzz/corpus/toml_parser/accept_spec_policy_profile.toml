@@ -1,0 +1,36 @@
+name = "web-app"
+extends = "base"
+preset = "claude-code"            # what the CLI itself needs: API host, ~/.claude
+
+[fs]
+read  = "all"                    # everything except deny
+write = ["${PROJECT}", "${TMPDIR}"]
+deny  = ["~/.ssh", "~/.aws", "~/.gnupg", "~/Library/Keychains", "~/Library/Mail", "~/Library/Messages"]
+
+[exec]
+allow   = ["git", "npm", "node", "python3", "cargo", "make", "rg"]
+ask     = ["git push", "rm -rf *", "brew *"]
+deny    = ["sudo *", "security *", "launchctl *", "open *", "osascript *"]
+project_executables = "allow"    # node_modules/.bin, ./scripts: allow | ask | deny
+default = "ask"
+
+[network]
+mode  = "allowlist"              # none | allowlist
+hosts = ["registry.npmjs.org", "pypi.org"]
+approval_hosts = ["github.com"]  # only for commands whose class or approval includes them
+loopback = [3000, 5432]          # local dev servers and databases
+
+[approvals]
+irreversible = "ask"
+
+[checkpoints]
+roots = ["${PROJECT}"]
+required = true
+
+[recording]
+commands = true
+output = false
+retention_days = 30
+
+[secrets.env]
+NPM_TOKEN = { secret = "npm-token", inject_for = ["npm publish"], hosts = ["registry.npmjs.org"] }

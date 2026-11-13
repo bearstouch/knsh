@@ -1,0 +1,5 @@
+[[hooks]]
+event = "command.proposed"
+match = { binary = ["rm", "git"] }
+run = "~/.config/knsh/hooks/guard.sh"
+timeout_ms = 2000

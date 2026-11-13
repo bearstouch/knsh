@@ -21,6 +21,7 @@ cargo-fuzz = true
 # Test-only crate (NFR-SUP-05), exact pin, vendored in `vendor/` like every other crate.
 libfuzzer-sys = "=0.4.13"
 knsh-json = { path = "../crates/knsh-json" }
+knsh-toml = { path = "../crates/knsh-toml" }
 
 [[bin]]
 name = "json_reader"
@@ -39,6 +40,13 @@ bench = false
 [[bin]]
 name = "frame_reader"
 path = "fuzz_targets/frame_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "toml_parser"
+path = "fuzz_targets/toml_parser.rs"
 test = false
 doc = false
 bench = false
