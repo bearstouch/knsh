@@ -7,7 +7,7 @@ Reachable by processes inside envelopes. Every method is scoped to the caller's 
 | `exec.run` | Run a line and wait; returns the record ID, `executed_command`, exit code, output in the requested mode, and the decision |
 | `exec.start`, `exec.wait`, `exec.kill` | The same for long-running lines; output arrives as events |
 | `policy.check` | Dry run: what policy would decide for a line, without running it |
-| `records.query`, `records.output` | The session's own records and output ranges |
+| `records.query`, `records.output` | The session's own records and output ranges ([parameters](user-socket.md#records)) |
 | `events.subscribe`, `events.unsubscribe` | The session's own events, optionally from `since_seq` |
 | `checkpoint.list`, `checkpoint.diff`, `checkpoint.undo`, `checkpoint.redo` | The session's own changes, without `force` |
 | `session.info` | Actor, profile, state, recording settings |

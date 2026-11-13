@@ -788,7 +788,7 @@ mod tests {
                 if let Some(journal) = slot.lock().unwrap().as_ref() {
                     journal.push("handler finished");
                 }
-                Ok(knsh_json::Value::from(true))
+                Ok(knsh_json::Value::from(true).into())
             }),
         );
         (table, release, entered)

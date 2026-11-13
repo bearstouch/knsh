@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use knsh_json::{Object, Value};
+use knsh_json::{Object, StreamId, Value};
 use knsh_proto::{
     Availability, Backend, ByteTransport, Capabilities, Catalogue, CatalogueError, ErrorCode, Lookup, MethodName,
     Release, Request, RpcError,
@@ -60,15 +60,33 @@ pub(crate) struct Call<'a> {
     /// The endpoint the call arrived on.
     pub(crate) endpoint: Endpoint,
     /// How this connection receives raw bytes, as settled by `hello` (binary frames until then).
-    // Read by the first methods that return raw bytes (`records.output`); phase 1 has none, only tests read it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) bytes: ByteTransport,
+    /// The stream ID this call's raw bytes go on if the handler returns any ([`Answer::bytes`]). The handler names
+    /// it in its result; the connection writes the bytes on it right after the result.
+    pub(crate) stream: StreamId,
     /// The request.
     pub(crate) request: &'a Request,
 }
 
-/// What a handler returns: the `result` of a success response, or the error to answer with.
-pub(crate) type Reply = Result<Value, RpcError>;
+/// A successful answer: the `result`, and raw bytes to send after it on [`Call::stream`]
+/// (`specs/06-api/wire-format.md#frames-unix-sockets`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Answer {
+    /// The `result` member of the success response. When `bytes` is set, it names [`Call::stream`] and its size.
+    pub(crate) result: Value,
+    /// Raw bytes for a binary stream, sent in chunks after the result and closed with an end-of-stream frame.
+    pub(crate) bytes: Option<Vec<u8>>,
+}
+
+impl From<Value> for Answer {
+    /// A result with no raw bytes.
+    fn from(result: Value) -> Self {
+        Self { result, bytes: None }
+    }
+}
+
+/// What a handler returns: the answer of a success response, or the error to answer with.
+pub(crate) type Reply = Result<Answer, RpcError>;
 
 /// A method implementation. Shared by every connection thread, so it must be `Send + Sync`; it owns whatever
 /// services it needs.
@@ -278,18 +296,24 @@ pub(crate) mod tests {
         }
     }
 
+    /// The stream ID test calls use.
+    pub(crate) fn stream() -> StreamId {
+        StreamId::new(1).unwrap()
+    }
+
     /// Calls `method` on `endpoint` with binary frames.
     pub(crate) fn call(dispatcher: &Dispatcher, endpoint: Endpoint, method: &str) -> Reply {
         dispatcher.call(&Call {
             endpoint,
             bytes: ByteTransport::BinaryFrames,
+            stream: stream(),
             request: &request(method),
         })
     }
 
     /// A handler that answers `true`.
     pub(crate) fn ok_handler() -> Handler {
-        Arc::new(|_: &Call<'_>| Ok(Value::from(true)))
+        Arc::new(|_: &Call<'_>| Ok(Value::from(true).into()))
     }
 
     const TEST_METHODS: &[MethodSpec] = &[

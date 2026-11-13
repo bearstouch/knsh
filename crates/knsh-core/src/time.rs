@@ -5,6 +5,7 @@
 //! suffix. The current time is an effect: callers read it from the injected clock and pass it in.
 
 use std::fmt;
+use std::str::FromStr;
 
 use crate::error::CoreError;
 
@@ -97,6 +98,88 @@ impl fmt::Display for Timestamp {
     }
 }
 
+/// Converts a proleptic Gregorian date to days since 1970-01-01: the inverse of [`civil_from_days`], with the same
+/// March-based year. `None` before 1970.
+fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
+    // January and February count as months 10 and 11 of the previous shifted year.
+    let shifted_year = if month <= 2 { year.checked_sub(1)? } else { year };
+    let era = shifted_year / 400;
+    let year_of_era = shifted_year - era * 400; // [0, 399]
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 }; // [0, 11], March = 0
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1; // [0, 365]
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year; // [0, 146096]
+    (era * 146_097 + day_of_era).checked_sub(719_468)
+}
+
+/// The number of days in `month` of `year`.
+const fn days_in_month(year: u64, month: u64) -> u64 {
+    match month {
+        2 if (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// Reads a non-empty run of ASCII digits as a number; `None` for anything else. Callers pass at most six digits, so
+/// the value cannot overflow.
+fn digits(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    bytes.iter().try_fold(0u64, |acc, &byte| {
+        byte.is_ascii_digit().then(|| acc * 10 + u64::from(byte - b'0'))
+    })
+}
+
+impl FromStr for Timestamp {
+    type Err = CoreError;
+
+    /// Parses the engine's own RFC 3339 form: `YYYY-MM-DDTHH:MM:SS` followed by an optional `.` and one to six
+    /// fractional digits, then `Z`. Nothing else is accepted: no offsets other than `Z`, no lowercase `t`/`z`, no
+    /// leap second (`:60`), no more than microsecond precision. Clients filter records with the same text the
+    /// engine sends them, so a stricter reader costs nothing and leaves no room for two readings of one instant.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidTimestamp`] for any other text or an impossible date (such as February 30th);
+    /// [`CoreError::TimestampOutOfRange`] before 1970.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = s.as_bytes();
+        // `YYYY-MM-DDTHH:MM:SS` is 19 bytes, then an optional fraction, then `Z`.
+        let (Some(head), Some((&b'Z', rest))) = (bytes.get(..19), bytes.get(19..).and_then(<[u8]>::split_last)) else {
+            return Err(CoreError::InvalidTimestamp);
+        };
+        let separators_ok = [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')]
+            .iter()
+            .all(|&(index, expected)| head.get(index) == Some(&expected));
+        if !separators_ok {
+            return Err(CoreError::InvalidTimestamp);
+        }
+        // The separators are checked above, so each range is a fixed-width numeric field.
+        let number =
+            |range: std::ops::Range<usize>| head.get(range).and_then(digits).ok_or(CoreError::InvalidTimestamp);
+        let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+        let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+        let fraction = match rest {
+            [] => 0,
+            // One to six digits, scaled to microseconds: `.5` is 500000.
+            [b'.', fraction @ ..] if (1..=6).contains(&fraction.len()) => {
+                let value = digits(fraction).ok_or(CoreError::InvalidTimestamp)?;
+                (fraction.len()..6).fold(value, |value, _| value * 10)
+            }
+            _ => return Err(CoreError::InvalidTimestamp),
+        };
+        let date_ok = (1..=12).contains(&month) && day >= 1 && day <= days_in_month(year, month);
+        if !date_ok || hour > 23 || minute > 59 || second > 59 {
+            return Err(CoreError::InvalidTimestamp);
+        }
+        let days = days_from_civil(year, month, day).ok_or(CoreError::TimestampOutOfRange)?;
+        let seconds = days * SECONDS_PER_DAY + hour * 3_600 + minute * 60 + second;
+        Self::from_unix_micros(seconds * MICROS_PER_SECOND + fraction)
+    }
+}
+
 impl fmt::Debug for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Timestamp({self})")
@@ -153,6 +236,65 @@ mod tests {
         assert_eq!(earlier.as_unix_millis(), 1_794_506_531_204);
         assert!(earlier < later);
         assert!(earlier.to_string() < later.to_string());
+    }
+
+    // KNSH-016: `records.query` time filters read back exactly what the engine prints.
+    #[test]
+    fn timestamp_parses_its_own_text_form() {
+        for ts in [
+            Timestamp::UNIX_EPOCH,
+            at(1_794_506_531, 204_913),
+            at(951_782_400, 0),
+            Timestamp::from_unix_micros(MAX_MICROS).unwrap(),
+        ] {
+            assert_eq!(ts.to_string().parse::<Timestamp>(), Ok(ts));
+        }
+        // Shorter fractions and no fraction at all.
+        assert_eq!("1970-01-01T00:00:01Z".parse::<Timestamp>(), Ok(at(1, 0)));
+        assert_eq!("1970-01-01T00:00:01.5Z".parse::<Timestamp>(), Ok(at(1, 500_000)));
+        assert_eq!(
+            "2026-11-12T18:02:11.204913Z".parse::<Timestamp>(),
+            Ok(at(1_794_506_531, 204_913))
+        );
+    }
+
+    #[test]
+    fn timestamp_parse_rejects_anything_but_the_canonical_form() {
+        for bad in [
+            "",
+            "2026-11-12",
+            "2026-11-12T18:02:11",
+            "2026-11-12T18:02:11+00:00",
+            "2026-11-12t18:02:11Z",
+            "2026-11-12T18:02:11z",
+            "2026-11-12T18:02:11.Z",
+            "2026-11-12T18:02:11.1234567Z",
+            "2026-11-12T18:02:60Z",
+            "2026-11-12T24:00:00Z",
+            "2026-02-30T00:00:00Z",
+            "2100-02-29T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-00-01T00:00:00Z",
+            "+026-11-12T18:02:11Z",
+            "2026-11-12T18:02:11.12a4Z",
+            "2026-11-12 18:02:11Z",
+            "2026-11-12T18:02:11Zjunk",
+        ] {
+            assert_eq!(bad.parse::<Timestamp>(), Err(CoreError::InvalidTimestamp), "{bad}");
+        }
+        assert_eq!(
+            "1969-12-31T23:59:59Z".parse::<Timestamp>(),
+            Err(CoreError::TimestampOutOfRange)
+        );
+        assert_eq!("2000-02-29T00:00:00Z".parse::<Timestamp>(), Ok(at(951_782_400, 0)));
+    }
+
+    #[test]
+    fn days_from_civil_inverts_civil_from_days() {
+        for days in (0..(431 * 366)).step_by(7) {
+            let (year, month, day) = civil_from_days(days);
+            assert_eq!(days_from_civil(year, month, day), Some(days));
+        }
     }
 
     #[test]

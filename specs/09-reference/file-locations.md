@@ -3,7 +3,7 @@
 | Data | Path or name |
 | --- | --- |
 | Configuration, hooks and policy files | `~/.config/knsh/` (policies in `~/.config/knsh/policies/`; integrity-protected) |
-| Records, grants, pushed policy | `~/Library/Application Support/knsh/` |
+| Records, grants, pushed policy | `~/Library/Application Support/knsh/` (records in `records.db`, owner-only `0600`) |
 | Checkpoints, home volume | `~/Library/Application Support/knsh/checkpoints/` |
 | Checkpoints, other APFS volumes | `.knsh-checkpoints/` on that volume, when writable; otherwise plain copies in the home store |
 | Agent socket | `~/Library/Application Support/knsh/run/agent.sock` |
