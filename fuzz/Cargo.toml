@@ -1,0 +1,47 @@
+# Fuzz targets for the hand-written parsers of untrusted input (KNSH-005; NFR-SUP-05,
+# NFR-SUP-06; specs/07-testing/fuzzing.md). Test-only: this crate is its own workspace,
+# excluded from the shipped one (root Cargo.toml `exclude`), so `libfuzzer-sys` never
+# appears in the shipped dependency graph or its Cargo.lock.
+#
+# Run with the nightly toolchain: `cargo +nightly fuzz run <target>` (see fuzz/README.md).
+[package]
+name = "knsh-fuzz"
+description = "Fuzz targets for knsh parsers; test-only, never shipped"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace, so the root workspace never builds it.
+[workspace]
+
+[dependencies]
+# Test-only crate (NFR-SUP-05), exact pin, vendored in `vendor/` like every other crate.
+libfuzzer-sys = "=0.4.13"
+knsh-json = { path = "../crates/knsh-json" }
+
+[[bin]]
+name = "json_reader"
+path = "fuzz_targets/json_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_writer_roundtrip"
+path = "fuzz_targets/json_writer_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_reader"
+path = "fuzz_targets/frame_reader.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

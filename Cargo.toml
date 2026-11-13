@@ -19,6 +19,9 @@ members = [
     "crates/knsh-exec",
     "xtask",
 ]
+# Test-only fuzz targets (KNSH-005, NFR-SUP-05): a separate workspace with its own lockfile, so the
+# fuzzing crates never enter the shipped dependency graph.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.0.0"

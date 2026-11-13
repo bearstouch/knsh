@@ -1,1 +1,6 @@
 target/
+# Fuzzing output (KNSH-005): build products, crash artefacts and coverage. Saved crashes
+# worth keeping are copied into fuzz/regressions/ by hand.
+fuzz/target/
+fuzz/artifacts/
+fuzz/coverage/
