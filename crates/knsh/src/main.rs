@@ -13,6 +13,10 @@ use knsh::cli::commands::KNSH;
 /// Exit status while a parsed invocation has no behaviour yet (the subcommands arrive in later stories).
 const NOT_IMPLEMENTED_STATUS: u8 = 1;
 
+/// Exit status when the hosted shell cannot be started, as a shell reports a command it cannot run.
+#[cfg(target_os = "macos")]
+const EXEC_FAILED_STATUS: u8 = 127;
+
 /// Entry point: parse argv, then print help, report a usage error, or dispatch.
 fn main() -> ExitCode {
     match args::parse(&KNSH, std::env::args_os()) {
@@ -21,7 +25,7 @@ fn main() -> ExitCode {
             let _ = std::io::stdout().write_all(text.as_bytes());
             ExitCode::SUCCESS
         }
-        Ok(Invocation::Shell(_)) => not_implemented("shell mode"),
+        Ok(Invocation::Shell(shell)) => shell_mode(&shell),
         Ok(Invocation::Command(parsed)) => match parsed.path.as_slice() {
             ["daemon", action @ ("install" | "uninstall")] => daemon(action, parsed.json()),
             ["forget"] => forget(&parsed),
@@ -121,6 +125,76 @@ fn forget(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
 #[cfg(not(unix))]
 fn forget(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
     not_implemented("'knsh forget' on this platform")
+}
+
+/// Runs a shell-mode invocation. A human interactive shell is hosted in integration mode (KNSH-019); `-c` lines and
+/// scripts (the agent and unattended paths) arrive in later stories.
+fn shell_mode(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
+    use std::io::IsTerminal;
+
+    use knsh::integration::zsh;
+
+    let on_terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    if zsh::is_human_interactive(
+        shell.command.as_deref(),
+        &shell.operands,
+        shell.interactive,
+        on_terminal,
+    ) {
+        human_shell(shell)
+    } else {
+        not_implemented("shell mode")
+    }
+}
+
+/// Hosts stock zsh for a human (KNSH-019). Recording is off until KNSH-021 adds the switch, so `knsh` replaces
+/// itself with zsh: no telemetry, no `knshd`, and zsh's own exit status, signals and terminal handling.
+///
+/// If the startup directory cannot be installed, plain zsh starts without it after a one-line warning: a human
+/// shell is never refused (FR-SES-22).
+#[cfg(target_os = "macos")]
+fn human_shell(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
+    use std::path::Path;
+
+    use knsh::integration::{host, zsh};
+    use knsh_platform::EnginePaths;
+    use knsh_platform::macos::{RealFs, effective_uid};
+
+    let installed = std::env::var_os("HOME")
+        .ok_or_else(|| "HOME is not set".to_owned())
+        .and_then(|home| EnginePaths::for_home(Path::new(&home)).map_err(|error| error.to_string()))
+        .and_then(|paths| {
+            host::install_zsh_startup_dir(&RealFs::new(), &paths, effective_uid()).map_err(|error| error.to_string())
+        });
+    let startup_dir = match installed {
+        Ok(dir) => Some(dir),
+        Err(reason) => {
+            report(&format!(
+                "knsh: integration unavailable ({reason}); starting plain zsh\n"
+            ));
+            None
+        }
+    };
+    let user_zdotdir = std::env::var_os(zsh::ZDOTDIR_VAR);
+    let plan = zsh::ZshLaunch {
+        zsh: Path::new(zsh::SYSTEM_ZSH),
+        startup_dir: startup_dir.as_deref(),
+        user_zdotdir: user_zdotdir.as_deref(),
+        login: shell.login,
+        force_interactive: shell.interactive,
+        telemetry_fd: None,
+    }
+    .plan();
+    let error = host::exec(&plan);
+    // Like a shell that cannot find a command: 127 with the reason on stderr.
+    report(&format!("knsh: cannot start {}: {error}\n", zsh::SYSTEM_ZSH));
+    ExitCode::from(EXEC_FAILED_STATUS)
+}
+
+/// Integration mode is built for macOS first; other platforms arrive with the Linux stories.
+#[cfg(not(target_os = "macos"))]
+fn human_shell(_shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
+    not_implemented("integration mode on this platform")
 }
 
 /// Reports that a correctly parsed invocation has no behaviour yet.

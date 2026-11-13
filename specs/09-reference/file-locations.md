@@ -6,6 +6,7 @@
 | Records, grants, pushed policy | `~/Library/Application Support/knsh/` (records in `records.db`, owner-only `0600`) |
 | Checkpoints, home volume | `~/Library/Application Support/knsh/checkpoints/` |
 | Checkpoints, other APFS volumes | `.knsh-checkpoints/` on that volume, when writable; otherwise plain copies in the home store |
+| zsh startup wrapper (integration mode) | `~/Library/Application Support/knsh/shell/zsh/.zshenv` (owner-only; rewritten by `knsh` when outdated) |
 | Agent socket | `~/Library/Application Support/knsh/run/agent.sock` |
 | User socket | `~/Library/Application Support/knsh/run/user.sock` |
 | Control service | XPC Mach service `knsh.control` (final name tied to the signing identity) |
@@ -27,4 +28,5 @@
 | Session token | Envelopes | Authenticates `agent.sock` requests |
 | Proxy settings | Envelopes and supervised lines | Per-envelope or per-command proxy credentials |
 | `KNSH_RECORDING` | Recording sessions | `1` when recording |
+| `KNSH_ZSH_ZDOTDIR`, `KNSH_TELEMETRY_FD` | Only between `knsh` and its zsh startup wrapper | The user's `ZDOTDIR` and the telemetry descriptor; removed before any user file runs |
 | Secret variables | Matching supervised lines | As named in `[secrets.env]` |

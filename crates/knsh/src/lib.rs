@@ -18,10 +18,13 @@
 //!   [`cli::forget`] over [`cli::client`], KNSH-017
 //! - `specs/04-non-functional-requirements/supply-chain.md` (no third-party CLI crate)
 //! - `specs/03-functional-requirements/agent-integration.md`
-//! - `specs/08-integrations/terminals-and-shells.md` (login shell)
+//! - `specs/08-integrations/terminals-and-shells.md` (login shell; integration mode) — [`integration`], KNSH-019:
+//!   hosting stock zsh with its startup files unchanged, FR-SES-20, FR-SES-22, NFR-COMPAT-01, NFR-COMPAT-03,
+//!   NFR-COMPAT-06
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod integration;
