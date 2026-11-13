@@ -255,8 +255,9 @@ pub struct Catalogue {
     methods: &'static [MethodSpec],
 }
 
-/// Every method in the specification. Phase 1 implements `hello`, `records.query` and `records.output` (KNSH-016)
-/// and `records.forget` (KNSH-017); the rest arrive with their stories.
+/// Every method in the specification. Phase 1 implements `hello`, `records.query` and `records.output` (KNSH-016),
+/// `records.forget` (KNSH-017), and `events.subscribe` and `events.unsubscribe` (KNSH-018); the rest arrive with their
+/// stories.
 const ENGINE_METHODS: &[MethodSpec] = &[
     // Handshake (specs/06-api/handshake.md).
     MethodSpec::planned("hello", Endpoints::ALL).available(),
@@ -266,14 +267,15 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("exec.start", Endpoints::AGENT).requires(Backend::Sandbox),
     MethodSpec::planned("exec.wait", Endpoints::AGENT),
     MethodSpec::planned("exec.kill", Endpoints::AGENT),
-    MethodSpec::planned("events.unsubscribe", Endpoints::AGENT),
     MethodSpec::planned("session.info", Endpoints::AGENT),
     // Shared by agent.sock (own session) and user.sock (all sessions); the read and checkpoint methods are on the
     // control service too.
     MethodSpec::planned("policy.check", Endpoints::SOCKETS),
     MethodSpec::planned("records.query", Endpoints::ALL).available(),
     MethodSpec::planned("records.output", Endpoints::ALL).available(),
-    MethodSpec::planned("events.subscribe", Endpoints::ALL),
+    // Events (KNSH-018): agent.sock sees its own session, user.sock and the control service every session.
+    MethodSpec::planned("events.subscribe", Endpoints::ALL).available(),
+    MethodSpec::planned("events.unsubscribe", Endpoints::ALL).available(),
     MethodSpec::planned("checkpoint.list", Endpoints::ALL),
     MethodSpec::planned("checkpoint.diff", Endpoints::ALL),
     MethodSpec::planned("checkpoint.undo", Endpoints::ALL),
@@ -493,15 +495,28 @@ mod tests {
         }
     }
 
-    // Phase 1 implements the handshake, the record reads (KNSH-016) and, on user.sock only, `records.forget`
-    // (KNSH-017): no method is claimed before it exists.
+    // Phase 1 implements the handshake, the record reads (KNSH-016), on user.sock only `records.forget` (KNSH-017),
+    // and the event subscriptions (KNSH-018): no method is claimed before it exists.
     #[test]
-    fn phase1_lists_hello_and_record_methods_only() {
+    fn phase1_lists_hello_record_and_event_methods_only() {
         let caps = capabilities(Sandbox::Seatbelt);
         for endpoint in Endpoint::ALL {
             let expected: &[&str] = match endpoint {
-                Endpoint::User => &["hello", "records.query", "records.output", "records.forget"],
-                Endpoint::Agent | Endpoint::Control => &["hello", "records.query", "records.output"],
+                Endpoint::User => &[
+                    "hello",
+                    "records.query",
+                    "records.output",
+                    "events.subscribe",
+                    "events.unsubscribe",
+                    "records.forget",
+                ],
+                Endpoint::Agent | Endpoint::Control => &[
+                    "hello",
+                    "records.query",
+                    "records.output",
+                    "events.subscribe",
+                    "events.unsubscribe",
+                ],
             };
             assert_eq!(
                 names(Catalogue::ENGINE, endpoint, &caps),

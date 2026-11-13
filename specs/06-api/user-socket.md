@@ -5,7 +5,7 @@ Reachable by the user's processes outside envelopes. Every envelope and command 
 | Method | Purpose |
 | --- | --- |
 | `session.start_agent`, `session.list`, `session.end` | Start and manage agent sessions (`knsh agent`) |
-| `records.query`, `records.output`, `events.subscribe` | Read-only access to all sessions, for observers and the CLI |
+| `records.query`, `records.output`, `events.subscribe`, `events.unsubscribe` | Read-only access to all sessions, for observers and the CLI |
 | `checkpoint.*` | All checkpoint operations, including `restore` and `force` |
 | `approval.list`, `approval.approve`, `approval.deny` | Pending asks; approving needs Touch ID or password, checked by `knshd` |
 | `policy.check`, `policy.edit`, `profile.use`, `policy.grant` | Policy changes and grants need Touch ID or password |
@@ -65,3 +65,42 @@ Result: `{"deleted": n}`, the number of records deleted.
 
 Until checkpoints exist (phase 3), `with_checkpoints: true` is refused with `-32005` and `data.capability` `"checkpoints"`, before anything is deleted: the flag is never silently ignored.
 
+## Events
+
+`events.subscribe` and `events.unsubscribe` deliver the events of [../05-models/event.md](../05-models/event.md) live, with the delivery rules of [events](../03-functional-requirements/events.md) (KNSH-018). On `user.sock` a subscription sees every session, or one session with `session_id`. On `agent.sock` it sees only the caller's own session; until a session is bound to an `agent.sock` connection (KNSH-048) every call there is refused with `-32003`.
+
+### `events.subscribe`
+
+| Param | Type | Meaning |
+| --- | --- | --- |
+| `session_id` | ULID, optional | Only this session's events; every session when absent |
+| `since_seq` | int, optional | Resume after this `seq`: the buffered events after it are sent first. Requires `session_id`. Absent: only events published from now on |
+
+Result: `{"subscription_id": n, "oldest_seq": n | null, "latest_seq": n | null, "gap": bool}`. `subscription_id` is a positive integer, unique in the engine. With `session_id`, `oldest_seq` is the oldest `seq` still buffered (how far back a resume can reach) and `latest_seq` the newest published; without it both are `null`. `gap` is `true` when `since_seq` is older than the buffer: delivery then starts at `oldest_seq`, and the events in between are read from the record store (at most once beyond the buffer, FR-EVT-04). With `since_seq` inside the buffer, delivery resumes exactly after it, with no duplicate and no gap between the replayed and the live events. `since_seq: 0` replays the whole buffer.
+
+After the answer, each event arrives as a notification whose `method` is the event name and whose `params` are the event envelope plus `subscription_id`:
+
+```json
+{"jsonrpc": "2.0", "method": "session.state_changed", "params": {"event": "session.state_changed", "id": "01J…",
+  "seq": 3, "ts": "2026-11-12T18:02:11.204913Z", "session_id": "01J…", "actor": {"kind": "agent",
+  "agent_id": "claude-code"}, "data": {"from": "active", "to": "paused"}, "subscription_id": 1}}
+```
+
+Events of one session arrive in `seq` order; events of different sessions are not ordered relative to each other. The answer to `events.subscribe` always precedes its first event. Publishing never waits for a subscriber: each subscription queues at most 10,000 events, and a subscriber that falls further behind loses its oldest queued events. It is told with an `events.lost` notification, sent before any later event of that session:
+
+```json
+{"jsonrpc": "2.0", "method": "events.lost", "params": {"subscription_id": 1, "session_id": "01J…", "from_seq": 2,
+  "to_seq": 16}}
+```
+
+Every `seq` from `from_seq` to `to_seq` inclusive will never be delivered on this subscription. An event too large for one frame is announced the same way, as a range of one.
+
+Errors: malformed params, `since_seq` without `session_id`, `since_seq` newer than the session's latest event, and a connection that already holds 16 subscriptions are `-32602`. A session with no buffered events (never started, or ended and its buffer dropped) is `-32006` with `data.session_id`. The buffers of the 64 most recently ended sessions are kept, so a subscriber can still catch up on a session that just ended.
+
+### `events.unsubscribe`
+
+| Param | Type | Meaning |
+| --- | --- | --- |
+| `subscription_id` | int | A subscription made on the same connection |
+
+Result: `{}`. Nothing more is sent for the subscription after the answer. Another connection's subscription, or one already ended, is `-32602`. Closing the connection ends all its subscriptions.

@@ -528,16 +528,21 @@ fn serve_one(shared: &Shared, endpoint: Endpoint, stream: &UnixStream, registrat
         reader.deadline.set(None);
         let _ = stream.set_read_timeout(None);
     };
+    // Used by the event pump when a notification cannot be written: the reader, blocked in a read, then ends too.
+    let close = || {
+        let _ = stream.shutdown(Shutdown::Both);
+    };
     let closed = connection::serve(
         &reader,
         stream,
         endpoint,
         &shared.services.dispatcher,
         &mut lift_timeout,
+        &close,
     );
     match closed {
         Closed::Peer => {}
-        Closed::Frame(_) | Closed::Handshake | Closed::Parse | Closed::Write(_) => shared.log(
+        Closed::Frame(_) | Closed::Handshake | Closed::Parse | Closed::Write(_) | Closed::Thread => shared.log(
             Level::Info,
             "connection closed",
             &[

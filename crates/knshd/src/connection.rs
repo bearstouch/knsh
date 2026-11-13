@@ -18,19 +18,33 @@
 //! - **Binary streams.** A handler that returns raw bytes ([`Answer::bytes`]) names the stream [`Call::stream`] in
 //!   its result; the bytes follow the JSON answer in binary chunks, closed by an end-of-stream frame, before the next
 //!   message is read. If the result itself cannot be written, the `-32603` that replaces it opens no stream.
+//! - **Event notifications** (KNSH-018). Once the connection holds a subscription, a second thread, the *pump*,
+//!   writes its events as notifications while the first keeps reading requests. Both write through one lock on the
+//!   writer, and the reading thread holds it from dispatching a request until its answer is written, so the answer
+//!   to `events.subscribe` always precedes that subscription's events, and nothing of a subscription is written
+//!   after the answer to `events.unsubscribe`. An event too large for a frame is announced as lost instead
+//!   (`events.lost`), never dropped silently. When the connection ends, every subscription ends with it.
 //!
 //! The loop works on any blocking [`Read`] and [`Write`], so tests drive it over a socket pair. It never logs:
 //! [`Closed`] says why the connection ended, without any content.
 
 use std::io::{Read, Write};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::thread;
 
+use knsh_core::{Delivery, Lost, SubscriptionId};
 use knsh_json::{Frame, FrameReader, FrameWriter, JsonError, StreamId};
 use knsh_proto::{
     ByteTransport, ErrorCode, ErrorResponse, HelloParams, Message, ProtoError, Rejection, Request, RequestId, RpcError,
-    SuccessResponse, decode,
+    SuccessResponse, decode, event_notification, lost_notification,
 };
 
 use crate::dispatch::{Answer, Call, Dispatcher, Endpoint, HELLO, Reply};
+use crate::events::Subscriber;
+
+/// Deliveries the pump writes per turn of the writer lock, so a busy subscription never starves the answers to
+/// requests for long.
+const PUMP_BATCH: usize = 64;
 
 /// Why a connection ended. Holds no message content, so it can be logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,8 +57,10 @@ pub(crate) enum Closed {
     Handshake,
     /// A message was not strict-profile JSON; `-32700` was sent.
     Parse,
-    /// Writing an answer failed.
+    /// Writing an answer or an event notification failed.
     Write(JsonError),
+    /// The thread that writes event notifications could not be started; the connection's subscriptions were ended.
+    Thread,
 }
 
 impl Closed {
@@ -56,6 +72,7 @@ impl Closed {
             Self::Handshake => "handshake",
             Self::Parse => "parse",
             Self::Write(_) => "write",
+            Self::Thread => "thread",
         }
     }
 }
@@ -105,6 +122,8 @@ impl Step {
 struct Session<'a> {
     endpoint: Endpoint,
     dispatcher: &'a Dispatcher,
+    /// The connection's event subscriptions.
+    subscriber: &'a Subscriber,
     /// Whether `hello` has succeeded.
     greeted: bool,
     /// How raw bytes reach this client: binary frames until a `hello` opts out.
@@ -196,6 +215,7 @@ impl Session<'_> {
             bytes: self.bytes,
             stream: self.next_stream,
             request,
+            subscriber: self.subscriber,
         })
     }
 
@@ -233,56 +253,155 @@ fn failure(id: Option<RequestId>, error: RpcError) -> Message {
 /// Serves one connection until it ends, and says why it ended.
 ///
 /// `on_greeted` runs once, right after `hello` succeeds and before its answer is written; the server uses it to lift
-/// the handshake read timeout.
-pub(crate) fn serve<R: Read, W: Write>(
+/// the handshake read timeout. `shutdown` closes the underlying connection in both directions: the pump calls it when
+/// a notification cannot be written, so that the reading thread, blocked in a read, ends too.
+pub(crate) fn serve<R: Read, W: Write + Send>(
     reader: R,
     writer: W,
     endpoint: Endpoint,
     dispatcher: &Dispatcher,
     on_greeted: &mut dyn FnMut(),
+    shutdown: &(dyn Fn() + Sync),
 ) -> Closed {
     let mut reader = FrameReader::new(reader);
-    let mut writer = FrameWriter::new(writer);
+    let writer = Mutex::new(FrameWriter::new(writer));
+    let subscriber = Subscriber::new();
     let mut session = Session {
         endpoint,
         dispatcher,
+        subscriber: &subscriber,
         greeted: false,
         bytes: ByteTransport::BinaryFrames,
         next_stream: FIRST_STREAM,
     };
-    loop {
-        let payload = match reader.read_frame() {
-            Ok(Some(Frame::Json(payload))) => payload,
-            Ok(None) => return Closed::Peer,
-            // No method opens a binary stream yet, so the reader refuses every chunk as an unknown stream before it
-            // gets here. Should one arrive anyway, the stream is not ours to read: close.
-            Ok(Some(Frame::Chunk { .. } | Frame::End { .. })) => {
-                return Closed::Frame(JsonError::Frame(knsh_json::FrameReason::UnknownStream));
-            }
-            Err(error) => return Closed::Frame(error),
-        };
-        let was_greeted = session.greeted;
-        let step = session.handle(&payload);
-        // Free the payload (up to 1 MB) before a handler's answer is written, so a connection holds one at a time.
-        drop(payload);
-        if session.greeted && !was_greeted {
-            on_greeted();
-        }
-        if let Some(reply) = step.reply
-            && let Err(error) = write(&mut writer, &reply, step.stream.as_ref())
-        {
-            return Closed::Write(error);
-        }
-        if step.close {
-            // Once greeted, only malformed JSON closes the connection; before that, every close is the handshake
-            // rule (including malformed JSON as the first message).
-            return if session.greeted {
-                Closed::Parse
-            } else {
-                Closed::Handshake
+    thread::scope(|scope| {
+        let mut pump = None;
+        let closed = loop {
+            let payload = match reader.read_frame() {
+                Ok(Some(Frame::Json(payload))) => payload,
+                Ok(None) => break Closed::Peer,
+                // No method opens a binary stream yet, so the reader refuses every chunk as an unknown stream before
+                // it gets here. Should one arrive anyway, the stream is not ours to read: close.
+                Ok(Some(Frame::Chunk { .. } | Frame::End { .. })) => {
+                    break Closed::Frame(JsonError::Frame(knsh_json::FrameReason::UnknownStream));
+                }
+                Err(error) => break Closed::Frame(error),
             };
+            // Held from dispatch until the answer is written: the pump cannot slip a notification in between, so a
+            // subscription's events never precede the answer that names it, and none follow its unsubscribe.
+            let mut out = lock(&writer);
+            let was_greeted = session.greeted;
+            let step = session.handle(&payload);
+            // Free the payload (up to 1 MB) before a handler's answer is written, so a connection holds one at a time.
+            drop(payload);
+            if session.greeted && !was_greeted {
+                on_greeted();
+            }
+            if let Some(reply) = step.reply
+                && let Err(error) = write(&mut out, &reply, step.stream.as_ref())
+            {
+                break Closed::Write(error);
+            }
+            drop(out);
+            if step.close {
+                // Once greeted, only malformed JSON closes the connection; before that, every close is the handshake
+                // rule (including malformed JSON as the first message).
+                break if session.greeted {
+                    Closed::Parse
+                } else {
+                    Closed::Handshake
+                };
+            }
+            // The first subscription starts the pump; connections that never subscribe never get one.
+            if pump.is_none() && subscriber.is_subscribed() {
+                let spawned = thread::Builder::new()
+                    .name("knshd-events".to_owned())
+                    .spawn_scoped(scope, || pump_events(&writer, &subscriber, shutdown));
+                match spawned {
+                    Ok(handle) => pump = Some(handle),
+                    // Subscriptions that nothing would ever deliver must not be left looking alive.
+                    Err(_) => break Closed::Thread,
+                }
+            }
+        };
+        // Every subscription ends with the connection; the pump wakes, sees the close and returns.
+        subscriber.close();
+        let Some(pump) = pump else {
+            return closed;
+        };
+        // The pump may be blocked writing to a peer that stopped reading: closing the connection unblocks it.
+        shutdown();
+        match (closed, pump.join()) {
+            // The pump failed first and closed the connection under the reader: that failure is the reason.
+            (Closed::Peer | Closed::Frame(_), Ok(Err(error))) => Closed::Write(error),
+            (closed, _) => closed,
+        }
+    })
+}
+
+/// Takes the writer even if the other thread panicked while holding it: the frame writer has no state that a panic
+/// between two frames could corrupt, and a half-written frame only makes the peer close.
+fn lock<W>(writer: &Mutex<FrameWriter<W>>) -> MutexGuard<'_, FrameWriter<W>> {
+    writer.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The pump: waits for its connection's subscriptions to have something, then writes one batch of notifications
+/// under the writer lock, until the connection closes. On a write error it closes the connection and returns it.
+fn pump_events<W: Write>(
+    writer: &Mutex<FrameWriter<W>>,
+    subscriber: &Subscriber,
+    shutdown: &(dyn Fn() + Sync),
+) -> Result<(), JsonError> {
+    while subscriber.signal().wait() {
+        let mut out = lock(writer);
+        // Taken under the writer lock, so an unsubscribe answered before this cannot have its events written after.
+        let batch = subscriber.take(PUMP_BATCH);
+        let written = batch
+            .iter()
+            .try_for_each(|(id, delivery)| write_delivery(&mut out, *id, delivery))
+            .and_then(|()| out.flush());
+        if let Err(error) = written {
+            drop(out);
+            shutdown();
+            return Err(error);
         }
     }
+    Ok(())
+}
+
+/// Writes one delivery as a notification. An event that cannot be sent as one frame (too large) is announced as a
+/// lost range of exactly that event instead, so the subscriber knows to read it from the record store (FR-EVT-04).
+fn write_delivery<W: Write>(
+    writer: &mut FrameWriter<W>,
+    subscription: SubscriptionId,
+    delivery: &Delivery,
+) -> Result<(), JsonError> {
+    let lost = match delivery {
+        Delivery::Event(event) => {
+            if let Some(value) = notification_value(event_notification(subscription, event)) {
+                match writer.write_json(&value) {
+                    // Nothing was written; the writer is still usable for the replacement.
+                    Err(JsonError::TooDeep | JsonError::FrameTooLarge { .. }) => {}
+                    written => return written,
+                }
+            }
+            Lost {
+                session_id: event.session_id,
+                from_seq: event.seq,
+                to_seq: event.seq,
+            }
+        }
+        Delivery::Lost(lost) => *lost,
+    };
+    let value = notification_value(lost_notification(subscription, &lost)).ok_or(JsonError::TooDeep)?;
+    writer.write_json(&value)
+}
+
+/// A built notification as a JSON value, or `None` if it could not be built.
+fn notification_value(notification: Result<knsh_proto::Notification, ProtoError>) -> Option<knsh_json::Value> {
+    notification
+        .and_then(|notification| Message::Notification(notification).to_value())
+        .ok()
 }
 
 /// Writes one message, then `stream`'s bytes if the message went out as it was, and flushes. A result that cannot
@@ -366,7 +485,14 @@ mod tests {
     /// decoded.
     fn run_with(dispatcher: &Dispatcher, input: &[u8]) -> (Closed, Vec<Message>) {
         let mut output = Vec::new();
-        let closed = serve(Cursor::new(input), &mut output, Endpoint::User, dispatcher, &mut || {});
+        let closed = serve(
+            Cursor::new(input),
+            &mut output,
+            Endpoint::User,
+            dispatcher,
+            &mut || {},
+            &|| {},
+        );
         let mut reader = FrameReader::new(output.as_slice());
         let mut answers = Vec::new();
         while let Some(Frame::Json(payload)) = reader.read_frame().unwrap() {
@@ -433,6 +559,7 @@ mod tests {
             Endpoint::User,
             &dispatcher,
             &mut || {},
+            &|| {},
         );
         assert_eq!(closed, Closed::Handshake);
     }
@@ -504,7 +631,7 @@ mod tests {
     fn run_phase1(input: &[u8]) -> (Closed, Vec<Message>) {
         let dispatcher = crate::hello::phase1_dispatcher(
             crate::probe::probe(&crate::probe::tests::Machine::working().probes()),
-            crate::hello::tests::records(),
+            crate::hello::tests::handlers(),
         )
         .unwrap();
         run_with(&dispatcher, input)
@@ -584,6 +711,7 @@ mod tests {
             Endpoint::User,
             &dispatcher(),
             &mut || calls += 1,
+            &|| {},
         );
         assert_eq!(calls, 1);
     }
@@ -610,6 +738,7 @@ mod tests {
             Endpoint::User,
             &dispatcher,
             &mut || {},
+            &|| {},
         );
         let mut reader = FrameReader::new(output.as_slice());
         let Some(Frame::Json(payload)) = reader.read_frame().unwrap() else {
@@ -619,5 +748,274 @@ mod tests {
             error_code(&decode(&payload).unwrap()),
             (Some(RequestId::from(1u32)), ErrorCode::InternalError)
         );
+    }
+
+    /// A `user.sock` connection served on its own thread over a socket pair, with `hello` and the event methods of
+    /// `hub`. Returns the client end and the server thread, which answers why the connection closed.
+    fn served(
+        hub: &std::sync::Arc<crate::events::EventHub>,
+    ) -> (std::os::unix::net::UnixStream, std::thread::JoinHandle<Closed>) {
+        let mut user = Table::new().with(HELLO, ok_handler());
+        for (name, handler) in hub.handlers() {
+            user = user.with(name, handler);
+        }
+        let dispatcher = Dispatcher::from_tables(user, Table::new());
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let thread = std::thread::spawn(move || {
+            let stream = &server;
+            serve(stream, stream, Endpoint::User, &dispatcher, &mut || {}, &|| {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            })
+        });
+        (client, thread)
+    }
+
+    fn send(client: &std::os::unix::net::UnixStream, text: &str) {
+        let mut client = client;
+        client.write_all(&frames(&[text.as_bytes()])).unwrap();
+    }
+
+    fn next(reader: &mut FrameReader<&std::os::unix::net::UnixStream>) -> Message {
+        match reader.read_frame().unwrap() {
+            Some(Frame::Json(payload)) => decode(&payload).unwrap(),
+            other => panic!("expected a JSON message, got {other:?}"),
+        }
+    }
+
+    /// The `(method, seq)` of an event notification.
+    fn notified(message: &Message) -> (String, u64) {
+        let Message::Notification(notification) = message else {
+            panic!("expected a notification, got {message:?}")
+        };
+        let params = notification.params.as_ref().unwrap();
+        let seq = params
+            .get("seq")
+            .or_else(|| params.get("from_seq"))
+            .and_then(Value::as_i64)
+            .unwrap();
+        (notification.method.as_str().to_owned(), u64::try_from(seq).unwrap())
+    }
+
+    fn result(message: &Message) -> Value {
+        match message {
+            Message::Success(success) => success.result.clone(),
+            other => panic!("expected a result, got {other:?}"),
+        }
+    }
+
+    // KNSH-018: the answer names the subscription first, then the events follow as notifications in seq order: the
+    // replay after since_seq, then live events, with no duplicate and no gap even while events are being published.
+    #[test]
+    fn subscribe_streams_events_in_seq_order() {
+        use crate::events::tests::{agent, hub, sid, start};
+        use knsh_core::EventData;
+
+        let hub = hub();
+        start(&hub, 1);
+        for _ in 0..9 {
+            hub.publish(sid(1), &agent(), EventData::SessionIdle).unwrap();
+        }
+        let (client, server) = served(&hub);
+        let mut reader = FrameReader::new(&client);
+        send(&client, std::str::from_utf8(HELLO_REQ).unwrap());
+        assert!(matches!(next(&mut reader), Message::Success(_)));
+
+        // Publish concurrently with the subscribe: whatever interleaving happens, the stream must be gapless.
+        let publisher = {
+            let hub = std::sync::Arc::clone(&hub);
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    hub.publish(sid(1), &agent(), EventData::SessionIdle).unwrap();
+                }
+            })
+        };
+        send(
+            &client,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"events.subscribe","params":{{"session_id":"{}","since_seq":4}}}}"#,
+                sid(1)
+            ),
+        );
+        let answer = result(&next(&mut reader));
+        assert_eq!(
+            answer.as_object().unwrap().get("subscription_id"),
+            Some(&Value::from(1u32))
+        );
+        assert_eq!(answer.as_object().unwrap().get("gap"), Some(&Value::from(false)));
+        publisher.join().unwrap();
+        let seqs: Vec<u64> = (5..=210).map(|_| notified(&next(&mut reader)).1).collect();
+        assert_eq!(seqs, (5..=210).collect::<Vec<_>>());
+
+        drop(reader);
+        drop(client);
+        assert_eq!(server.join().unwrap(), Closed::Peer);
+    }
+
+    // KNSH-018: after the unsubscribe answer nothing more of that subscription is sent.
+    #[test]
+    fn unsubscribe_stops_delivery() {
+        use crate::events::tests::{agent, hub, sid, start};
+        use knsh_core::EventData;
+
+        let hub = hub();
+        start(&hub, 1);
+        let (client, server) = served(&hub);
+        let mut reader = FrameReader::new(&client);
+        send(&client, std::str::from_utf8(HELLO_REQ).unwrap());
+        next(&mut reader);
+        send(&client, r#"{"jsonrpc":"2.0","id":2,"method":"events.subscribe"}"#);
+        result(&next(&mut reader));
+        hub.publish(sid(1), &agent(), EventData::SessionIdle).unwrap();
+        assert_eq!(notified(&next(&mut reader)), ("session.idle".to_owned(), 2));
+
+        send(
+            &client,
+            r#"{"jsonrpc":"2.0","id":3,"method":"events.unsubscribe","params":{"subscription_id":1}}"#,
+        );
+        assert!(matches!(next(&mut reader), Message::Success(s) if s.id == RequestId::from(3u32)));
+        hub.publish(sid(1), &agent(), EventData::SessionIdle).unwrap();
+        // The next message is the answer to this request, not an event.
+        send(&client, r#"{"jsonrpc":"2.0","id":4,"method":"hello"}"#);
+        assert!(matches!(next(&mut reader), Message::Success(s) if s.id == RequestId::from(4u32)));
+        assert_eq!(hub.subscription_count(), 0);
+
+        drop(reader);
+        drop(client);
+        assert_eq!(server.join().unwrap(), Closed::Peer);
+    }
+
+    // KNSH-018 resource cleanup: closing the connection ends every subscription it made, and the pump thread with it.
+    #[test]
+    fn disconnect_ends_subscriptions() {
+        use crate::events::tests::{hub, start};
+
+        let hub = hub();
+        start(&hub, 1);
+        let (client, server) = served(&hub);
+        let mut reader = FrameReader::new(&client);
+        send(&client, std::str::from_utf8(HELLO_REQ).unwrap());
+        next(&mut reader);
+        for id in 2..5 {
+            send(
+                &client,
+                &format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"events.subscribe"}}"#),
+            );
+            result(&next(&mut reader));
+        }
+        assert_eq!(hub.subscription_count(), 3);
+        drop(reader);
+        drop(client);
+        assert_eq!(
+            server.join().unwrap(),
+            Closed::Peer,
+            "the server thread, pump included, finished"
+        );
+        assert_eq!(hub.subscription_count(), 0);
+    }
+
+    /// Writes to a socket until `fail` is set, then fails every write, like a peer whose socket broke.
+    struct BreakableWriter<'a> {
+        stream: &'a std::os::unix::net::UnixStream,
+        fail: &'a std::sync::atomic::AtomicBool,
+    }
+
+    impl Write for BreakableWriter<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let mut stream = self.stream;
+            stream.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // KNSH-018 resource cleanup: when a notification cannot be written, the pump closes the connection, the reading
+    // thread (blocked in a read) ends too, the connection reports the write failure and its subscriptions end.
+    #[test]
+    fn pump_write_failure_closes_the_connection() {
+        use crate::events::tests::{agent, hub, sid, start};
+        use knsh_core::EventData;
+
+        let hub = hub();
+        start(&hub, 1);
+        let mut user = Table::new().with(HELLO, ok_handler());
+        for (name, handler) in hub.handlers() {
+            user = user.with(name, handler);
+        }
+        let dispatcher = Dispatcher::from_tables(user, Table::new());
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = {
+            let fail = std::sync::Arc::clone(&fail);
+            std::thread::spawn(move || {
+                let stream = &server;
+                let writer = BreakableWriter { stream, fail: &fail };
+                serve(stream, writer, Endpoint::User, &dispatcher, &mut || {}, &|| {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                })
+            })
+        };
+        let mut reader = FrameReader::new(&client);
+        send(&client, std::str::from_utf8(HELLO_REQ).unwrap());
+        next(&mut reader);
+        send(&client, r#"{"jsonrpc":"2.0","id":2,"method":"events.subscribe"}"#);
+        result(&next(&mut reader));
+        assert_eq!(hub.subscription_count(), 1);
+
+        // The client keeps its end open and sends nothing: only the pump's failure can end the connection.
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        hub.publish(sid(1), &agent(), EventData::SessionIdle).unwrap();
+        assert!(matches!(thread.join().unwrap(), Closed::Write(_)));
+        assert_eq!(hub.subscription_count(), 0);
+        drop(reader);
+        drop(client);
+    }
+
+    // FR-EVT-04: an event too large for one frame is announced as lost, never dropped silently, and later events
+    // still arrive.
+    #[test]
+    fn oversized_event_is_reported_lost() {
+        use crate::events::tests::{agent, hub, sid, start};
+        use knsh_core::{CanonicalPath, EventData, RecordId, Redacted, Timestamp, Ulid};
+
+        let hub = hub();
+        start(&hub, 1);
+        let (client, server) = served(&hub);
+        let mut reader = FrameReader::new(&client);
+        send(&client, std::str::from_utf8(HELLO_REQ).unwrap());
+        next(&mut reader);
+        send(&client, r#"{"jsonrpc":"2.0","id":2,"method":"events.subscribe"}"#);
+        result(&next(&mut reader));
+        let at = Timestamp::from_unix_micros(0).unwrap();
+        hub.publish(
+            sid(1),
+            &agent(),
+            EventData::CommandFinished {
+                record_id: RecordId::from_ulid(Ulid::from_u128(1)),
+                command: Redacted::new("x".repeat(knsh_json::MAX_PAYLOAD)),
+                cwd: CanonicalPath::new("/tmp").unwrap(),
+                started_at: at,
+                ended_at: at,
+                exit_code: Some(0),
+            },
+        )
+        .unwrap();
+        hub.publish(sid(1), &agent(), EventData::SessionIdle).unwrap();
+        assert_eq!(notified(&next(&mut reader)), ("events.lost".to_owned(), 2));
+        assert_eq!(notified(&next(&mut reader)), ("session.idle".to_owned(), 3));
+
+        drop(reader);
+        drop(client);
+        assert_eq!(server.join().unwrap(), Closed::Peer);
     }
 }

@@ -49,6 +49,13 @@
 //! [`RecordsForgetParams`] reads and writes `records.forget` (`user.sock` only): a session, an instant, or both, and
 //! never neither. [`RecordsForgetResult`] carries the number of records deleted.
 //!
+//! # Events (KNSH-018)
+//!
+//! [`EventsSubscribeParams`], [`EventsSubscribeResult`] and [`EventsUnsubscribeParams`] read and write
+//! `events.subscribe` and `events.unsubscribe`. [`event_notification`] writes an event as a notification named after
+//! it, whose params are the envelope of `specs/05-models/event.md` ([`event_envelope`]) plus `subscription_id`;
+//! [`lost_notification`] announces events a subscriber fell too far behind to receive ([`EVENTS_LOST`]).
+//!
 //! Parameters and results of the other methods arrive with the stories that implement them.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -60,6 +67,7 @@ mod catalogue;
 mod envelope;
 mod error;
 mod error_code;
+mod events;
 mod hello;
 mod method;
 mod records;
@@ -82,6 +90,10 @@ pub use envelope::{
 };
 pub use error::{EnvelopeFault, ProtoError};
 pub use error_code::ErrorCode;
+pub use events::{
+    EVENTS_LOST, EventsSubscribeParams, EventsSubscribeResult, EventsUnsubscribeParams, event_envelope,
+    event_notification, lost_notification,
+};
 pub use method::{MAX_METHOD_NAME_LEN, MethodName};
 pub use records::{
     DEFAULT_RECORDS_PAGE, MAX_BASE64_OUTPUT, MAX_RECORDS_PAGE, MAX_RECORDS_TEXT_LEN, OUTPUT_CONTENT_TYPE, OutputData,

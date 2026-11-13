@@ -20,6 +20,8 @@
 //! - `specs/06-api/user-socket.md#records`, FR-REC-02, FR-REC-08, NFR-REL-05 (record store, `records.query` and
 //!   `records.output`, KNSH-016)
 //! - FR-REC-07, FR-REC-10, NFR-PRIV-03 (record retention and `records.forget`, KNSH-017)
+//! - `specs/05-models/event.md`, FR-EVT-01 to FR-EVT-04, FR-EVT-07, `specs/06-api/user-socket.md#events` (event bus,
+//!   `events.subscribe` and `events.unsubscribe`, KNSH-018)
 //!
 //! On start it prepares the engine directories (KNSH-011) and takes its sockets from launchd ([`endpoints`],
 //! KNSH-012). It then serves them ([`server`], KNSH-013): a kqueue accept loop hands each connection to its own
@@ -27,9 +29,11 @@
 //! ([`dispatch`]), generated from the method catalogue and the capabilities probed once at start ([`probe`],
 //! [`hello`], KNSH-014). It opens the record store in the engine data directory and answers `records.query` and
 //! `records.output` from it ([`records`], KNSH-016), and `records.forget` on `user.sock`; the store applies record
-//! retention on its own thread, at start and hourly (KNSH-017). It exits after ten idle minutes ([`lifetime`]) or when launchd
-//! stops it, finishing in-flight requests and committing pending writes first. The supervisor arrives in later
-//! stories.
+//! retention on its own thread, at start and hourly (KNSH-017). The event bus ([`events`], KNSH-018) numbers and
+//! buffers each session's events and serves `events.subscribe` and `events.unsubscribe`; a subscribed connection
+//! gets a second thread that writes its events as notifications. It exits after ten idle minutes ([`lifetime`]) or
+//! when launchd stops it, finishing in-flight requests and committing pending writes first. The supervisor arrives in
+//! later stories.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
@@ -42,6 +46,8 @@ mod connection;
 mod dispatch;
 #[cfg(target_os = "macos")]
 mod endpoints;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod events;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod hello;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -138,13 +144,14 @@ fn start() -> Result<(), StartError> {
     use std::sync::Arc;
 
     use knsh_platform::macos::{
-        LaunchdSockets, RealFs, SystemClock, SystemPeerCredentials, SystemProbes, SystemProcesses, UnifiedLog,
-        effective_uid,
+        LaunchdSockets, RealFs, SystemClock, SystemPeerCredentials, SystemProbes, SystemProcesses, SystemRandom,
+        UnifiedLog, effective_uid,
     };
     use knsh_platform::{EnginePaths, Field, Level, SystemLog, Value, ensure_engine_dirs};
 
     use knsh_store::{DATABASE_FILE, RecordStore, StoreConfig};
 
+    use crate::events::EventHub;
     use crate::lifetime::NoSessions;
     use crate::probe::{PROBE_TIMEOUT, Probes, probe};
     use crate::records::Records;
@@ -190,6 +197,15 @@ fn start() -> Result<(), StartError> {
             }
         };
         let records = Records::new(store);
+        // The event bus with the specified limits (10,000 events per session). Emitters arrive with the stories that
+        // create sessions (KNSH-021, KNSH-056); until then subscribers see no events.
+        let events = EventHub::new(
+            knsh_core::EventBus::default(),
+            clock.clone(),
+            Arc::new(SystemRandom::new()),
+        );
+        let mut handlers = records.handlers();
+        handlers.extend(events.handlers());
         // Probed once, before serving: every hello of this process reports the same result, and a restarted knshd
         // probes again (KNSH-014).
         let probed = probe(&Probes {
@@ -200,7 +216,7 @@ fn start() -> Result<(), StartError> {
             timeout: PROBE_TIMEOUT,
         });
         let services = Services {
-            dispatcher: hello::phase1_dispatcher(probed, records.handlers()).map_err(StartError::Dispatch)?,
+            dispatcher: hello::phase1_dispatcher(probed, handlers).map_err(StartError::Dispatch)?,
             credentials: Arc::new(SystemPeerCredentials::new()),
             log: Arc::clone(&log),
             own_uid: uid,

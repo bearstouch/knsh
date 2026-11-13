@@ -65,6 +65,10 @@ pub enum CoreError {
     /// A human session named an agent session as its parent; a human session inside an agent session would escape
     /// the agent's profile (FR-SES-03, FR-SES-12).
     HumanChildOfAgent,
+    /// An event named a different actor than the one its session started with (FR-SES-01).
+    EventActorMismatch,
+    /// `since_seq` was given without a session, or is newer than the session's latest event (KNSH-018).
+    InvalidSinceSeq,
 }
 
 impl fmt::Display for CoreError {
@@ -97,6 +101,10 @@ impl fmt::Display for CoreError {
                 f.write_str("a child agent's profile must equal or be stricter than its parent's")
             }
             Self::HumanChildOfAgent => f.write_str("a human session cannot be started inside an agent session"),
+            Self::EventActorMismatch => f.write_str("an event's actor must be its session's actor"),
+            Self::InvalidSinceSeq => {
+                f.write_str("since_seq needs a session and must not be newer than its latest event")
+            }
         }
     }
 }
