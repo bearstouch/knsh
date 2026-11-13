@@ -53,4 +53,8 @@ pub trait Clock: Send + Sync {
 
     /// The current monotonic reading. Never fails and never decreases between calls on the same clock.
     fn monotonic(&self) -> Monotonic;
+
+    /// Blocks the calling thread for `duration` of monotonic time. A fake clock advances itself instead of
+    /// blocking, so code that polls with a deadline (the capability probe, KNSH-014) is tested without real waits.
+    fn sleep(&self, duration: Duration);
 }

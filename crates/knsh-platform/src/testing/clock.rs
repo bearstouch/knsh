@@ -58,6 +58,11 @@ impl Clock for FakeClock {
     fn monotonic(&self) -> Monotonic {
         Monotonic::from_elapsed(lock(&self.state).monotonic)
     }
+
+    /// Advances both clocks by `duration` and returns at once: time passes only because the code under test waited.
+    fn sleep(&self, duration: Duration) {
+        self.advance(duration);
+    }
 }
 
 #[cfg(test)]

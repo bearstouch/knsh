@@ -71,6 +71,10 @@ pub enum Operation {
     /// Installing a handler so a termination signal can be observed instead of killing the process (`sigaction`,
     /// KNSH-013).
     WatchSignal,
+    /// Reading system information (`sysctlbyname`, for example the OS version; KNSH-014).
+    SystemInfo,
+    /// Creating, starting or stopping a file-event stream (`FSEventStreamCreate`, `FSEventStreamStart`; KNSH-014).
+    FileEvents,
 }
 
 impl Operation {
@@ -105,6 +109,8 @@ impl Operation {
             Self::PeerCredentials => "read peer credentials",
             Self::EventQueue => "event queue",
             Self::WatchSignal => "watch signal",
+            Self::SystemInfo => "read system information",
+            Self::FileEvents => "file events",
         }
     }
 }

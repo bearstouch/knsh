@@ -9,7 +9,7 @@ Reachable by the user's processes outside envelopes. Every envelope and command 
 | `checkpoint.*` | All checkpoint operations, including `restore` and `force` |
 | `approval.list`, `approval.approve`, `approval.deny` | Pending asks; approving needs Touch ID or password, checked by `knshd` |
 | `policy.check`, `policy.edit`, `profile.use`, `policy.grant` | Policy changes and grants need Touch ID or password |
-| `forget` | Delete records, optionally with checkpoints |
+| `records.forget` | Delete records, optionally with checkpoints (`knsh forget`) |
 
 ## Authentication
 

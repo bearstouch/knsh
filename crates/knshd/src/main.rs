@@ -15,11 +15,14 @@
 //! - `specs/09-reference/file-locations.md`, NFR-PRIV-04, NFR-SEC-08 (engine directories, KNSH-011)
 //! - NFR-REL-03, `specs/04-non-functional-requirements/security.md` "squats its endpoints" (launchd agent, KNSH-012)
 //! - `specs/06-api/README.md`, `specs/06-api/wire-format.md`, NFR-SEC-07 (connection server and dispatcher, KNSH-013)
+//! - `specs/06-api/handshake.md`, `specs/05-models/capabilities.md`, NFR-SEC-10, NFR-REL-08 (`hello`, method
+//!   catalogue and capability probe, KNSH-014)
 //!
 //! On start it prepares the engine directories (KNSH-011) and takes its sockets from launchd ([`endpoints`],
 //! KNSH-012). It then serves them ([`server`], KNSH-013): a kqueue accept loop hands each connection to its own
 //! thread, which reads frames ([`connection`]) and dispatches JSON-RPC methods through per-endpoint tables
-//! ([`dispatch`]). It exits after ten idle minutes ([`lifetime`]) or when launchd stops it, finishing in-flight
+//! ([`dispatch`]), generated from the method catalogue and the capabilities probed once at start ([`probe`],
+//! [`hello`], KNSH-014). It exits after ten idle minutes ([`lifetime`]) or when launchd stops it, finishing in-flight
 //! requests and committing pending writes first. The supervisor arrives in later stories.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -34,7 +37,11 @@ mod dispatch;
 #[cfg(target_os = "macos")]
 mod endpoints;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod hello;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod lifetime;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod probe;
 #[cfg(target_os = "macos")]
 mod server;
 
@@ -55,6 +62,8 @@ enum StartError {
     EngineDirs(PlatformError),
     /// launchd provided no socket: `knshd` was not started through its launch agent.
     NoLaunchdSockets(PlatformError),
+    /// The method catalogue and the implemented handlers disagree (a build defect).
+    Dispatch(dispatch::BuildError),
     /// The connection server failed to start, failed while serving, or could not commit pending writes on exit.
     #[cfg(target_os = "macos")]
     Serve(server::ServeError),
@@ -73,6 +82,7 @@ impl fmt::Display for StartError {
                 f,
                 "no sockets from launchd ({error}); knshd only runs from its launch agent, see 'knsh daemon install'"
             ),
+            Self::Dispatch(error) => write!(f, "cannot build dispatch tables: {error}"),
             #[cfg(target_os = "macos")]
             Self::Serve(error) => write!(f, "{error}"),
             Self::Unsupported => f.write_str("this platform is not supported yet"),
@@ -89,6 +99,7 @@ impl StartError {
             Self::BadHome(_) => "bad_home",
             Self::EngineDirs(_) => "engine_dirs",
             Self::NoLaunchdSockets(_) => "no_launchd_sockets",
+            Self::Dispatch(_) => "dispatch",
             #[cfg(target_os = "macos")]
             Self::Serve(error) => error.kind(),
             Self::Unsupported => "unsupported",
@@ -117,11 +128,14 @@ fn start() -> Result<(), StartError> {
     use std::path::Path;
     use std::sync::Arc;
 
-    use knsh_platform::macos::{LaunchdSockets, RealFs, SystemClock, SystemPeerCredentials, UnifiedLog, effective_uid};
+    use knsh_platform::macos::{
+        LaunchdSockets, RealFs, SystemClock, SystemPeerCredentials, SystemProbes, SystemProcesses, UnifiedLog,
+        effective_uid,
+    };
     use knsh_platform::{EnginePaths, Field, Level, SystemLog, Value, ensure_engine_dirs};
 
-    use crate::dispatch::Dispatcher;
     use crate::lifetime::{NoSessions, NothingPending};
+    use crate::probe::{PROBE_TIMEOUT, Probes, probe};
     use crate::server::{Config, Exit, Server, Services};
 
     let log: Arc<dyn SystemLog> = Arc::new(UnifiedLog::new(c"daemon"));
@@ -142,12 +156,22 @@ fn start() -> Result<(), StartError> {
         ensure_engine_dirs(&RealFs::new(), &paths, uid).map_err(StartError::EngineDirs)?;
         // Never a fallback bind: without launchd's sockets, knshd does not run (KNSH-012).
         let listeners = endpoints::activate(&LaunchdSockets::new()).map_err(StartError::NoLaunchdSockets)?;
+        let clock = Arc::new(SystemClock::new());
+        // Probed once, before serving: every hello of this process reports the same result, and a restarted knshd
+        // probes again (KNSH-014).
+        let probed = probe(&Probes {
+            processes: Arc::new(SystemProcesses::new()),
+            system: Arc::new(SystemProbes::new()),
+            clock: clock.clone(),
+            log: Arc::clone(&log),
+            timeout: PROBE_TIMEOUT,
+        });
         let services = Services {
-            dispatcher: Dispatcher::phase1(),
+            dispatcher: hello::phase1_dispatcher(probed).map_err(StartError::Dispatch)?,
             credentials: Arc::new(SystemPeerCredentials::new()),
             log: Arc::clone(&log),
             own_uid: uid,
-            clock: Arc::new(SystemClock::new()),
+            clock,
             // Until the session registry (KNSH-015) and record store (KNSH-016) are wired in, only open connections
             // keep knshd alive and nothing is buffered.
             activity: Arc::new(NoSessions),
