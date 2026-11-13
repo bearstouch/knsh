@@ -1,5 +1,6 @@
-//! launchd lifecycle integration test (KNSH-012): install the agent, connect to `user.sock`, observe launchd start
-//! `knshd`; crash it, observe launchd restart it, and reconnect; kill it, and observe the next connection start it.
+//! launchd lifecycle integration test (KNSH-012, KNSH-013): install the agent, connect to `user.sock` and complete
+//! `hello`, observe launchd start `knshd`; crash it, observe launchd restart it, and reconnect; kill it, and observe
+//! the next connection start it; stop it with `SIGTERM`, observe an orderly exit without a restart, and reconnect.
 //!
 //! Ignored by default because it loads a job into the logged-in user's GUI domain (`gui/<uid>`), which CI runners
 //! and SSH sessions may not have. Run it with:
@@ -17,15 +18,16 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::fs;
-use std::io::Read;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use knsh_json::{Frame, FrameReader, FrameWriter};
 use knsh_platform::macos::{Launchctl, RealFs, effective_uid};
 use knsh_platform::{EnginePaths, LaunchAgent, ServiceManager, install_agent};
+use knsh_proto::Message;
 
 /// How long to wait for launchd to (re)start `knshd`. Its default throttle between launches is 10 seconds.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -104,17 +106,34 @@ fn signal(name: &str, pid: u32) {
     assert!(status.success(), "kill -{name} {pid}");
 }
 
-/// Connects to `user.sock` and waits for `knshd` to accept and close the connection (the phase 1 placeholder
-/// before the dispatcher, KNSH-013). A connection nobody accepts would time out instead of reading end of file.
+/// Connects to `user.sock`, sends `hello` and waits for its answer (KNSH-013). A connection nobody accepts would
+/// time out instead.
 fn connect_and_get_served(socket: &Path) {
-    let mut stream = UnixStream::connect(socket).expect("connect to user.sock");
-    // macOS refuses socket options (`EINVAL`) once the peer has closed: knshd already accepted and closed it, and
-    // the read below returns end of file at once. Any other error is a real failure.
-    if let Err(error) = stream.set_read_timeout(Some(LAUNCH_TIMEOUT)) {
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+    let stream = UnixStream::connect(socket).expect("connect to user.sock");
+    stream.set_read_timeout(Some(LAUNCH_TIMEOUT)).unwrap();
+    let mut writer = FrameWriter::new(&stream);
+    let hello = knsh_json::parse(br#"{"jsonrpc":"2.0","id":1,"method":"hello"}"#, 1024).unwrap();
+    writer.write_json(&hello).unwrap();
+    writer.flush().unwrap();
+    let Some(Frame::Json(payload)) = FrameReader::new(&stream)
+        .read_frame()
+        .expect("knshd did not serve the connection")
+    else {
+        panic!("knshd closed the connection without answering hello");
+    };
+    assert!(
+        matches!(knsh_proto::decode(&payload), Ok(Message::Success(_))),
+        "hello failed"
+    );
+}
+
+/// Waits until launchd reports no running `knshd`.
+fn wait_for_exit(agent: &TestAgent) {
+    let deadline = Instant::now() + LAUNCH_TIMEOUT;
+    while agent.pid().is_some() {
+        assert!(Instant::now() < deadline, "knshd did not exit");
+        std::thread::sleep(Duration::from_millis(200));
     }
-    let mut buf = [0u8; 1];
-    assert_eq!(stream.read(&mut buf).expect("knshd did not serve the connection"), 0);
 }
 
 // KNSH-012 acceptance: on-demand start, owner-only sockets made by launchd, restart after a crash (NFR-REL-03), and
@@ -161,4 +180,12 @@ fn launchd_starts_knshd_on_demand_and_restarts_it_after_a_crash() {
     connect_and_get_served(&agent.user_socket());
     let third = agent.wait_for_pid(Some(second));
     assert_ne!(third, first);
+
+    // KNSH-013: SIGTERM (launchd stopping the job) is an orderly exit, not a crash: knshd finishes, commits and
+    // exits 0, launchd does not restart it, and the next connection starts it on demand.
+    signal("TERM", third);
+    wait_for_exit(&agent);
+    connect_and_get_served(&agent.user_socket());
+    let fourth = agent.wait_for_pid(Some(third));
+    assert_ne!(fourth, third);
 }

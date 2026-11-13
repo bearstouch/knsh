@@ -26,6 +26,10 @@
 //! | [`PeerCredentials`] | Uid of the process at the other end of a connection | `SystemPeerCredentials` | `FixedPeerCredentials` |
 //! | [`ServiceManager`] | Load and unload the job | `Launchctl` | `RecordingServiceManager` |
 //!
+//! The macOS backend also offers `macos::Kqueue` (KNSH-013), the event queue behind `knshd`'s accept loop: readable
+//! listeners, cross-thread wake-ups and termination signals (`SIGTERM` as an event, so shutdown is orderly). It is
+//! concrete rather than a trait: the server is tested over real sockets in a temporary directory.
+//!
 //! Later stories add Keychain, `LocalAuthentication`, XPC, `FSEvents` and APFS clones to the same interface.
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap

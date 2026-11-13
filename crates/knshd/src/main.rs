@@ -14,17 +14,29 @@
 //! - `specs/02-architecture/system-overview.md`
 //! - `specs/09-reference/file-locations.md`, NFR-PRIV-04, NFR-SEC-08 (engine directories, KNSH-011)
 //! - NFR-REL-03, `specs/04-non-functional-requirements/security.md` "squats its endpoints" (launchd agent, KNSH-012)
+//! - `specs/06-api/README.md`, `specs/06-api/wire-format.md`, NFR-SEC-07 (connection server and dispatcher, KNSH-013)
 //!
-//! Skeleton created by KNSH-001. On start it prepares the engine directories (KNSH-011), takes its sockets from
-//! launchd and serves them ([`endpoints`], KNSH-012). The dispatcher, idle exit and supervisor arrive in later
-//! stories.
+//! On start it prepares the engine directories (KNSH-011) and takes its sockets from launchd ([`endpoints`],
+//! KNSH-012). It then serves them ([`server`], KNSH-013): a kqueue accept loop hands each connection to its own
+//! thread, which reads frames ([`connection`]) and dispatches JSON-RPC methods through per-endpoint tables
+//! ([`dispatch`]). It exits after ten idle minutes ([`lifetime`]) or when launchd stops it, finishing in-flight
+//! requests and committing pending writes first. The supervisor arrives in later stories.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 #![forbid(unsafe_code)]
 
+// Platform-neutral, but only the macOS server uses them until the Linux backend exists.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod connection;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod dispatch;
 #[cfg(target_os = "macos")]
 mod endpoints;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod lifetime;
+#[cfg(target_os = "macos")]
+mod server;
 
 use std::fmt;
 use std::process::ExitCode;
@@ -43,8 +55,9 @@ enum StartError {
     EngineDirs(PlatformError),
     /// launchd provided no socket: `knshd` was not started through its launch agent.
     NoLaunchdSockets(PlatformError),
-    /// Every accept loop ended, so nothing is served any more.
-    Stopped,
+    /// The connection server failed to start, failed while serving, or could not commit pending writes on exit.
+    #[cfg(target_os = "macos")]
+    Serve(server::ServeError),
     /// This platform has no backend yet.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     Unsupported,
@@ -60,7 +73,8 @@ impl fmt::Display for StartError {
                 f,
                 "no sockets from launchd ({error}); knshd only runs from its launch agent, see 'knsh daemon install'"
             ),
-            Self::Stopped => f.write_str("every endpoint stopped accepting connections"),
+            #[cfg(target_os = "macos")]
+            Self::Serve(error) => write!(f, "{error}"),
             Self::Unsupported => f.write_str("this platform is not supported yet"),
         }
     }
@@ -75,7 +89,8 @@ impl StartError {
             Self::BadHome(_) => "bad_home",
             Self::EngineDirs(_) => "engine_dirs",
             Self::NoLaunchdSockets(_) => "no_launchd_sockets",
-            Self::Stopped => "stopped",
+            #[cfg(target_os = "macos")]
+            Self::Serve(error) => error.kind(),
             Self::Unsupported => "unsupported",
         }
     }
@@ -94,17 +109,31 @@ fn main() -> ExitCode {
     }
 }
 
-/// Everything `knshd` does: prepare its directories, take its sockets from launchd, then serve until killed.
+/// Everything `knshd` does: prepare its directories, take its sockets from launchd, then serve until idle or
+/// stopped. Returns `Ok` on an orderly exit, which launchd does not count as a crash: the next connection starts
+/// `knshd` again.
 #[cfg(target_os = "macos")]
 fn start() -> Result<(), StartError> {
     use std::path::Path;
     use std::sync::Arc;
 
-    use knsh_platform::macos::{LaunchdSockets, RealFs, SystemPeerCredentials, UnifiedLog, effective_uid};
+    use knsh_platform::macos::{LaunchdSockets, RealFs, SystemClock, SystemPeerCredentials, UnifiedLog, effective_uid};
     use knsh_platform::{EnginePaths, Field, Level, SystemLog, Value, ensure_engine_dirs};
+
+    use crate::dispatch::Dispatcher;
+    use crate::lifetime::{NoSessions, NothingPending};
+    use crate::server::{Config, Exit, Server, Services};
 
     let log: Arc<dyn SystemLog> = Arc::new(UnifiedLog::new(c"daemon"));
     let uid = effective_uid();
+    let fail = |error: StartError| {
+        log.log(
+            Level::Error,
+            "knshd failed",
+            &[Field::new("reason", Value::Static(error.kind()))],
+        );
+        error
+    };
 
     let prepare = || {
         // `HOME` rather than the password database: the launch agent sets it, and tests point it at an isolated home.
@@ -112,28 +141,36 @@ fn start() -> Result<(), StartError> {
         let paths = EnginePaths::for_home(Path::new(&home)).map_err(StartError::BadHome)?;
         ensure_engine_dirs(&RealFs::new(), &paths, uid).map_err(StartError::EngineDirs)?;
         // Never a fallback bind: without launchd's sockets, knshd does not run (KNSH-012).
-        endpoints::activate(&LaunchdSockets::new()).map_err(StartError::NoLaunchdSockets)
+        let listeners = endpoints::activate(&LaunchdSockets::new()).map_err(StartError::NoLaunchdSockets)?;
+        let services = Services {
+            dispatcher: Dispatcher::phase1(),
+            credentials: Arc::new(SystemPeerCredentials::new()),
+            log: Arc::clone(&log),
+            own_uid: uid,
+            clock: Arc::new(SystemClock::new()),
+            // Until the session registry (KNSH-015) and record store (KNSH-016) are wired in, only open connections
+            // keep knshd alive and nothing is buffered.
+            activity: Arc::new(NoSessions),
+            pending: Arc::new(NothingPending),
+        };
+        let server = Server::new(listeners, services, Config::DEFAULT).map_err(StartError::Serve)?;
+        server.stop_on_termination_signals().map_err(StartError::Serve)?;
+        Ok(server)
     };
-    let listeners = match prepare() {
-        Ok(listeners) => listeners,
-        Err(error) => {
-            log.log(
-                Level::Error,
-                "knshd failed to start",
-                &[Field::new("reason", Value::Static(error.kind()))],
-            );
-            return Err(error);
-        }
-    };
+    let server = prepare().map_err(fail)?;
 
     log.log(Level::Notice, "knshd started", &[]);
-    let context = Arc::new(endpoints::Context {
-        credentials: Arc::new(SystemPeerCredentials::new()),
-        log,
-        own_uid: uid,
-    });
-    endpoints::serve(listeners, &context);
-    Err(StartError::Stopped)
+    let exit = server.run().map_err(|error| fail(StartError::Serve(error)))?;
+    let reason = match exit {
+        Exit::Idle => "idle",
+        Exit::Stopped => "stopped",
+    };
+    log.log(
+        Level::Notice,
+        "knshd exiting",
+        &[Field::new("reason", Value::Static(reason))],
+    );
+    Ok(())
 }
 
 /// Everything `knshd` does. Only macOS has a backend so far (Linux later).

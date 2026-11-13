@@ -7,6 +7,8 @@
 - `knshd` serves a `user.sock` connection only if the peer's effective uid (`getpeereid`) equals its own; any other peer, or one whose credentials cannot be read, is disconnected.
 - `knshd` stays alive while any envelope or recording session exists, and launchd restarts it if it crashes.
 - It exits after **10 idle minutes**.
+- Serving: one thread waits on kqueue for connections; each connection gets its own thread, so a slow client blocks only itself. Connections are bounded (see [defaults and limits](../09-reference/defaults-and-limits.md)) and excess ones are closed on accept. A client must send `hello` first, within a bounded time.
+- Exiting, idle or on `SIGTERM` from launchd: `knshd` stops accepting, lets in-flight requests finish within a grace period, closes every connection, commits pending record writes, and exits with status 0. launchd does not restart it then; the next connection starts it again.
 - Grants and pushed policy are kept in its state store and survive restarts; secrets supplied by the authority are memory-only and are lost on exit.
 - Human sessions with recording off never start `knshd`.
 - If `knshd` cannot be reached, no agent command runs (there is no supervisor), and human sessions continue normally ([reliability](../04-non-functional-requirements/reliability.md)).
