@@ -14,14 +14,17 @@ telemetry lines to a descriptor inherited from `knsh`, which forwards them (KNSH
 rewritten.
 
 **Acceptance criteria**
-- [ ] The user's `.zshenv`, `.zprofile`, `.zshrc`, `.zlogin` run in the same order and with the same `$ZDOTDIR`
+- [x] The user's `.zshenv`, `.zprofile`, `.zshrc`, `.zlogin` run in the same order and with the same `$ZDOTDIR`
       semantics as plain zsh; a test rc file that records its order produces the same trace under `knsh` and zsh.
-- [ ] Existing `preexec`/`precmd` hooks of the user (and of frameworks such as oh-my-zsh) still run.
-- [ ] If the telemetry descriptor is closed or `knsh`'s forwarder is gone, the hooks do nothing and never print
+- [x] Existing `preexec`/`precmd` hooks of the user (and of frameworks such as oh-my-zsh) still run.
+- [x] If the telemetry descriptor is closed or `knsh`'s forwarder is gone, the hooks do nothing and never print
       errors or delay the prompt.
 - [ ] Exit status, signals, job control and terminal ownership behave as in plain zsh; `knsh` exits with zsh's
-      status.
-- [ ] With recording off, no telemetry is produced and `knshd` is not contacted.
+      status. *Partly verified: with recording off `knsh` execs zsh, so these are zsh's own. Exit status is tested,
+      and job control was observed on a pseudo-terminal. With recording on (child mode), the exit status and signal
+      deaths are tested. Pending: a manual check of job control and terminal ownership in child mode on a real
+      terminal, once KNSH-021 makes child mode reachable from the binary.*
+- [x] With recording off, no telemetry is produced and `knshd` is not contacted.
 
 **Unit tests**
 - `startup_wrapper_sources_user_files_in_zsh_order` — generated wrapper content.

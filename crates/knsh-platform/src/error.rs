@@ -75,6 +75,13 @@ pub enum Operation {
     SystemInfo,
     /// Creating, starting or stopping a file-event stream (`FSEventStreamCreate`, `FSEventStreamStart`; KNSH-014).
     FileEvents,
+    /// Creating a pipe (`pipe`; the telemetry descriptor of integration mode, KNSH-019).
+    Pipe,
+    /// Reading or changing descriptor flags (`fcntl`: close-on-exec, non-blocking; KNSH-019).
+    DescriptorFlags,
+    /// Changing what a signal does to this process (`sigaction`; ignoring job-control signals while a hosted shell
+    /// runs, KNSH-019).
+    SignalDisposition,
 }
 
 impl Operation {
@@ -111,6 +118,9 @@ impl Operation {
             Self::WatchSignal => "watch signal",
             Self::SystemInfo => "read system information",
             Self::FileEvents => "file events",
+            Self::Pipe => "create pipe",
+            Self::DescriptorFlags => "set descriptor flags",
+            Self::SignalDisposition => "set signal disposition",
         }
     }
 }

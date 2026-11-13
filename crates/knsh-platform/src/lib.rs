@@ -64,6 +64,8 @@
 //! - `specs/02-architecture/process-model.md`, `specs/02-architecture/endpoints.md`, NFR-REL-03 (launchd agent,
 //!   KNSH-012)
 //! - `specs/05-models/capabilities.md`, NFR-SEC-10, NFR-REL-08 (capability probe, KNSH-014)
+//! - `specs/08-integrations/terminals-and-shells.md`, FR-SES-22 (telemetry pipe, job-control signals and signal
+//!   re-raising for a hosted shell, `macos::shell_host`, KNSH-019)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 

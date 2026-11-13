@@ -62,6 +62,8 @@ const RUN_DIR: &str = "run";
 const CHECKPOINTS_DIR: &str = "checkpoints";
 /// Policy files, inside the configuration directory.
 const POLICIES_DIR: &str = "policies";
+/// The zsh startup directory of integration mode, below the data directory (KNSH-019).
+const ZSH_STARTUP_DIR: [&str; 2] = ["shell", "zsh"];
 /// Agent socket, inside the run directory.
 const AGENT_SOCKET: &str = "agent.sock";
 /// User socket, inside the run directory.
@@ -148,6 +150,13 @@ impl EnginePaths {
     #[must_use]
     pub fn policies_dir(&self) -> PathBuf {
         self.config.join(POLICIES_DIR)
+    }
+
+    /// `~/Library/Application Support/knsh/shell/zsh/`: the startup directory `knsh` points `ZDOTDIR` at when it
+    /// hosts zsh in integration mode (KNSH-019). Created by `knsh`, not by [`ensure_engine_dirs`].
+    #[must_use]
+    pub fn zsh_startup_dir(&self) -> PathBuf {
+        join_all(&self.data, &ZSH_STARTUP_DIR)
     }
 
     /// The directories [`ensure_engine_dirs`] creates, each listed after its parent.
@@ -533,6 +542,7 @@ mod tests {
             paths.user_socket(),
             paths.config_dir().to_path_buf(),
             paths.policies_dir(),
+            paths.zsh_startup_dir(),
         ];
         for path in every_path.iter().chain(&paths.private_dirs()) {
             assert!(
@@ -546,6 +556,10 @@ mod tests {
             Path::new("/Users/u/Library/Application Support/knsh/run/agent.sock")
         );
         assert_eq!(paths.policies_dir(), Path::new("/Users/u/.config/knsh/policies"));
+        assert_eq!(
+            paths.zsh_startup_dir(),
+            Path::new("/Users/u/Library/Application Support/knsh/shell/zsh")
+        );
     }
 
     // "No path literals elsewhere": engine path components appear in no other Rust source of the workspace.
