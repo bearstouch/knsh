@@ -54,6 +54,12 @@ pub enum Operation {
     Column,
     /// Running SQL text without parameters (`sqlite3_exec`).
     Execute,
+    /// Changing the permission bits of a path (`chmod`).
+    SetMode,
+    /// Reading an extended attribute (`getxattr`).
+    ReadAttribute,
+    /// Writing an extended attribute (`setxattr`).
+    WriteAttribute,
 }
 
 impl Operation {
@@ -80,6 +86,9 @@ impl Operation {
             Self::Step => "step statement",
             Self::Column => "read column",
             Self::Execute => "execute statement",
+            Self::SetMode => "set mode",
+            Self::ReadAttribute => "read extended attribute",
+            Self::WriteAttribute => "write extended attribute",
         }
     }
 }
@@ -234,6 +243,14 @@ pub enum PlatformError {
         /// The extended result code.
         code: SqliteCode,
     },
+    /// An engine path is owned by another user, so it is never used: whoever owns it could read or replace engine
+    /// data (KNSH-011, NFR-SEC-08). Fail closed rather than adopt or repair it.
+    ForeignOwner,
+    /// An engine path exists but is the wrong kind of entry (for example a symlink or a file where a directory must
+    /// be). A symlink could redirect engine data elsewhere, so it is refused rather than followed (KNSH-011).
+    UnexpectedKind,
+    /// A backup or indexing exclusion was written but did not read back as written (KNSH-011, NFR-PRIV-04).
+    ExclusionNotVerified,
 }
 
 impl PlatformError {
@@ -256,7 +273,10 @@ impl PlatformError {
             | Self::UnknownProcessGroup
             | Self::ClockOutOfRange
             | Self::NotScripted
-            | Self::Sqlite { .. } => None,
+            | Self::Sqlite { .. }
+            | Self::ForeignOwner
+            | Self::UnexpectedKind
+            | Self::ExclusionNotVerified => None,
         }
     }
 
@@ -271,7 +291,10 @@ impl PlatformError {
             | Self::TooLarge { .. }
             | Self::UnknownProcessGroup
             | Self::ClockOutOfRange
-            | Self::NotScripted => None,
+            | Self::NotScripted
+            | Self::ForeignOwner
+            | Self::UnexpectedKind
+            | Self::ExclusionNotVerified => None,
         }
     }
 
@@ -301,6 +324,9 @@ impl fmt::Display for PlatformError {
             Self::ClockOutOfRange => f.write_str("wall clock is outside 1970-01-01 to 9999-12-31 UTC"),
             Self::NotScripted => f.write_str("test fake has no script for this call"),
             Self::Sqlite { operation, code } => write!(f, "{} failed: {code}", operation.as_str()),
+            Self::ForeignOwner => f.write_str("engine path is owned by another user"),
+            Self::UnexpectedKind => f.write_str("engine path is not the expected kind of entry"),
+            Self::ExclusionNotVerified => f.write_str("backup or indexing exclusion did not read back as written"),
         }
     }
 }
@@ -315,7 +341,10 @@ impl std::error::Error for PlatformError {
             | Self::UnknownProcessGroup
             | Self::ClockOutOfRange
             | Self::NotScripted
-            | Self::Sqlite { .. } => None,
+            | Self::Sqlite { .. }
+            | Self::ForeignOwner
+            | Self::UnexpectedKind
+            | Self::ExclusionNotVerified => None,
         }
     }
 }

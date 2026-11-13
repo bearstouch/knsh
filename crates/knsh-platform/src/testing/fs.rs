@@ -18,6 +18,9 @@ const MAX_SYMLINKS: u32 = 32;
 /// Name of the temporary file an atomic replace creates in the target's directory.
 const TEMP_NAME: &str = ".knsh.fake.tmp";
 
+/// User id the fake runs as unless [`MemFs::with_uid`] says otherwise (the first user account on macOS).
+pub const DEFAULT_UID: u32 = 501;
+
 #[derive(Debug, Clone)]
 enum Node {
     File { data: Vec<u8>, mode: u32 },
@@ -31,13 +34,24 @@ struct State {
     nodes: BTreeMap<PathBuf, Node>,
     /// Pending faults: the next time a call reaches the step, it fails with the `errno` (first match, used once).
     faults: Vec<(Operation, i32)>,
+    /// The user the fake runs as: owner of every node it creates.
+    uid: u32,
+    /// Bits cleared from the mode of new files and directories by the calls the real backend applies a umask to.
+    umask: u32,
+    /// Owner of each node; a node missing here is owned by `uid`.
+    owners: BTreeMap<PathBuf, u32>,
+    /// Extended attributes of each node, by name.
+    xattrs: BTreeMap<PathBuf, BTreeMap<String, Vec<u8>>>,
 }
 
 /// An in-memory filesystem.
 ///
 /// Paths are resolved like the kernel does: symlinks in any component are followed (the final one only where the
 /// real call follows it), `..` applies after resolution, and missing or non-directory components fail with `ENOENT`
-/// or `ENOTDIR`. There is no umask: modes are stored exactly as given.
+/// or `ENOTDIR`. There is no umask unless [`MemFs::set_umask`] sets one.
+///
+/// Every node is owned by the fake's user ([`DEFAULT_UID`] or [`MemFs::with_uid`]) unless [`MemFs::set_owner`] says
+/// otherwise; like the kernel, [`Fs::set_mode`] on a node owned by someone else fails with `EPERM`.
 ///
 /// [`MemFs::inject_fault`] makes the next call that reaches a given step fail. [`Fs::atomic_replace`] goes through
 /// the same steps as the real backend (`Write`, `SyncFile`, `Rename`, `SyncDirectory`), so a test can fail any one
@@ -54,17 +68,55 @@ impl Default for MemFs {
 }
 
 impl MemFs {
-    /// A filesystem holding only the root directory (mode `0o755`).
+    /// A filesystem holding only the root directory (mode `0o755`, owned by root), running as [`DEFAULT_UID`].
     #[must_use]
     pub fn new() -> Self {
+        Self::with_uid(DEFAULT_UID)
+    }
+
+    /// A filesystem holding only the root directory (mode `0o755`, owned by root), running as `uid`.
+    #[must_use]
+    pub fn with_uid(uid: u32) -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert(PathBuf::from("/"), Node::Directory { mode: 0o755 });
+        let mut owners = BTreeMap::new();
+        owners.insert(PathBuf::from("/"), 0);
         Self {
             state: Mutex::new(State {
                 nodes,
                 faults: Vec::new(),
+                uid,
+                umask: 0,
+                owners,
+                xattrs: BTreeMap::new(),
             }),
         }
+    }
+
+    /// The user id the fake runs as.
+    #[must_use]
+    pub fn uid(&self) -> u32 {
+        lock(&self.state).uid
+    }
+
+    /// Sets the umask applied by [`Fs::create_dir`] and [`Fs::write`] to new entries, as the real backend's
+    /// `mkdir` and `open` do. Setup helper.
+    pub fn set_umask(&self, umask: u32) {
+        lock(&self.state).umask = umask & 0o777;
+    }
+
+    /// Makes `path` (exactly, no symlinks followed) owned by `uid`, as if another user had created it. Setup helper.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Os`] with `ENOENT` if nothing exists at `path`.
+    pub fn set_owner(&self, path: &Path, uid: u32) -> Result<(), PlatformError> {
+        let mut state = lock(&self.state);
+        if !state.nodes.contains_key(path) {
+            return Err(os(Operation::Metadata, libc::ENOENT));
+        }
+        state.owners.insert(path.to_path_buf(), uid);
+        Ok(())
     }
 
     /// Makes the next call that reaches `operation` fail with `errno`. Faults queue up and each is used once.
@@ -136,6 +188,18 @@ fn os(operation: Operation, errno: i32) -> PlatformError {
 }
 
 impl State {
+    /// Owner of the node at exactly `path`.
+    fn owner(&self, path: &Path) -> u32 {
+        self.owners.get(path).copied().unwrap_or(self.uid)
+    }
+
+    /// Inserts a node created by the fake's user, dropping any owner or attributes left by a node it replaces.
+    fn insert_new(&mut self, path: PathBuf, node: Node) {
+        self.owners.remove(&path);
+        self.xattrs.remove(&path);
+        self.nodes.insert(path, node);
+    }
+
     /// Fails with the first pending fault for `operation`, consuming it.
     fn check_fault(&mut self, operation: Operation) -> Result<(), PlatformError> {
         match self.faults.iter().position(|(op, _)| *op == operation) {
@@ -238,7 +302,7 @@ impl Fs for MemFs {
         state.check_fault(Operation::Write)?;
         let resolved = resolve(&state.nodes, path, false, Operation::Write)?;
         let mode = match state.nodes.get(&resolved) {
-            None => mode & 0o7777,
+            None => mode & 0o7777 & !state.umask,
             Some(Node::File { mode, .. }) => *mode,
             Some(Node::Directory { .. }) => return Err(os(Operation::Write, libc::EISDIR)),
             // Like `O_NOFOLLOW`: a final symlink is refused, not followed.
@@ -263,7 +327,7 @@ impl Fs for MemFs {
         if state.nodes.contains_key(&resolved) {
             return Err(os(Operation::Write, libc::EEXIST));
         }
-        state.nodes.insert(
+        state.insert_new(
             resolved,
             Node::File {
                 data: Vec::new(),
@@ -303,7 +367,7 @@ impl Fs for MemFs {
         let temp_node = state.nodes.remove(&temp);
         renamed?;
         if let Some(node) = temp_node {
-            state.nodes.insert(target, node);
+            state.insert_new(target, node);
         }
 
         // Step 4: flush the directory. The new contents are already in place, as on a real disk.
@@ -318,7 +382,8 @@ impl Fs for MemFs {
         if state.nodes.contains_key(&resolved) {
             return Err(os(Operation::CreateDirectory, libc::EEXIST));
         }
-        state.nodes.insert(resolved, Node::Directory { mode: mode & 0o7777 });
+        let mode = mode & 0o7777 & !state.umask;
+        state.insert_new(resolved, Node::Directory { mode });
         Ok(())
     }
 
@@ -327,21 +392,25 @@ impl Fs for MemFs {
         require_absolute(path)?;
         state.check_fault(Operation::Metadata)?;
         let resolved = resolve(&state.nodes, path, false, Operation::Metadata)?;
+        let uid = state.owner(&resolved);
         match state.nodes.get(&resolved) {
             Some(Node::File { data, mode }) => Ok(Metadata {
                 kind: FileKind::File,
                 len: data.len() as u64,
                 mode: *mode,
+                uid,
             }),
             Some(Node::Directory { mode }) => Ok(Metadata {
                 kind: FileKind::Directory,
                 len: 0,
                 mode: *mode,
+                uid,
             }),
             Some(Node::Symlink { target }) => Ok(Metadata {
                 kind: FileKind::Symlink,
                 len: target.as_os_str().len() as u64,
                 mode: 0o755,
+                uid,
             }),
             None => Err(os(Operation::Metadata, libc::ENOENT)),
         }
@@ -356,6 +425,63 @@ impl Fs for MemFs {
             return Err(os(Operation::Canonicalise, libc::ENOENT));
         }
         Ok(CanonicalPath::new(resolved)?)
+    }
+
+    fn set_mode(&self, path: &Path, mode: u32) -> Result<(), PlatformError> {
+        let mut state = lock(&self.state);
+        require_absolute(path)?;
+        state.check_fault(Operation::SetMode)?;
+        // Like `AT_SYMLINK_NOFOLLOW`: a final symlink is the node changed, never its target.
+        let resolved = resolve(&state.nodes, path, false, Operation::SetMode)?;
+        if !state.nodes.contains_key(&resolved) {
+            return Err(os(Operation::SetMode, libc::ENOENT));
+        }
+        if state.owner(&resolved) != state.uid {
+            return Err(os(Operation::SetMode, libc::EPERM));
+        }
+        match state.nodes.get_mut(&resolved) {
+            Some(Node::File { mode: current, .. } | Node::Directory { mode: current }) => *current = mode & 0o7777,
+            // Symlink modes are not modelled: `metadata` always reports `0o755` for them.
+            Some(Node::Symlink { .. }) | None => {}
+        }
+        Ok(())
+    }
+
+    fn xattr(&self, path: &Path, name: &str, limit: usize) -> Result<Option<Vec<u8>>, PlatformError> {
+        let mut state = lock(&self.state);
+        require_absolute(path)?;
+        if name.contains('\0') {
+            return Err(PlatformError::InvalidPath);
+        }
+        state.check_fault(Operation::ReadAttribute)?;
+        let resolved = resolve(&state.nodes, path, false, Operation::ReadAttribute)?;
+        if !state.nodes.contains_key(&resolved) {
+            return Err(os(Operation::ReadAttribute, libc::ENOENT));
+        }
+        match state.xattrs.get(&resolved).and_then(|attrs| attrs.get(name)) {
+            Some(value) if value.len() > limit => Err(PlatformError::TooLarge { limit: limit as u64 }),
+            Some(value) => Ok(Some(value.clone())),
+            None => Ok(None),
+        }
+    }
+
+    fn set_xattr(&self, path: &Path, name: &str, value: &[u8]) -> Result<(), PlatformError> {
+        let mut state = lock(&self.state);
+        require_absolute(path)?;
+        if name.contains('\0') {
+            return Err(PlatformError::InvalidPath);
+        }
+        state.check_fault(Operation::WriteAttribute)?;
+        let resolved = resolve(&state.nodes, path, false, Operation::WriteAttribute)?;
+        if !state.nodes.contains_key(&resolved) {
+            return Err(os(Operation::WriteAttribute, libc::ENOENT));
+        }
+        state
+            .xattrs
+            .entry(resolved)
+            .or_default()
+            .insert(name.to_owned(), value.to_vec());
+        Ok(())
     }
 }
 
@@ -486,5 +612,49 @@ mod tests {
             Some(libc::EEXIST)
         );
         assert!(fs.contents(Path::new("/state/target")).is_none());
+    }
+
+    #[test]
+    fn owners_umask_and_set_mode_behave_like_the_kernel() {
+        let fs = MemFs::with_uid(600);
+        assert_eq!(fs.uid(), 600);
+        assert_eq!(fs.metadata(Path::new("/")).unwrap().uid, 0);
+        fs.set_umask(0o077);
+        fs.create_dir(Path::new("/d"), 0o755).unwrap();
+        let meta = fs.metadata(Path::new("/d")).unwrap();
+        assert_eq!((meta.mode, meta.uid), (0o700, 600));
+        fs.set_mode(Path::new("/d"), 0o750).unwrap();
+        assert_eq!(fs.metadata(Path::new("/d")).unwrap().mode, 0o750);
+
+        fs.set_owner(Path::new("/d"), 0).unwrap();
+        assert_eq!(
+            fs.set_mode(Path::new("/d"), 0o700).unwrap_err().errno(),
+            Some(libc::EPERM)
+        );
+        assert!(fs.set_owner(Path::new("/nope"), 0).unwrap_err().is_not_found());
+    }
+
+    #[test]
+    fn xattrs_round_trip_without_following_symlinks() {
+        let fs = MemFs::new();
+        fs.add_dir_all(Path::new("/d")).unwrap();
+        fs.add_symlink(Path::new("/link"), Path::new("/d")).unwrap();
+        assert_eq!(fs.xattr(Path::new("/d"), "a", 8).unwrap(), None);
+        fs.set_xattr(Path::new("/link"), "a", b"on-link").unwrap();
+        assert_eq!(fs.xattr(Path::new("/d"), "a", 8).unwrap(), None, "followed the symlink");
+        fs.set_xattr(Path::new("/d"), "a", b"value").unwrap();
+        assert_eq!(
+            fs.xattr(Path::new("/d"), "a", 8).unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+        assert_eq!(
+            fs.xattr(Path::new("/d"), "a", 4),
+            Err(PlatformError::TooLarge { limit: 4 })
+        );
+        assert!(
+            fs.set_xattr(Path::new("/missing"), "a", b"")
+                .unwrap_err()
+                .is_not_found()
+        );
     }
 }

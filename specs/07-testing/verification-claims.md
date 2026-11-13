@@ -14,6 +14,7 @@ The design relies on these platform behaviours. Each must be verified before pha
 | C8 | Seatbelt can limit process information, signals and Unix-socket connections as specified | One test per rule |
 | C9 | Common tools honour per-command proxy credentials | curl, git, npm, pip, cargo and Node's HTTP clients |
 | C10 | The proxy can read the TLS server name without decrypting | Check against curl, git and npm |
+| C11 | Engine directories are kept out of Spotlight (KNSH-011) | **Observed failing on macOS 26.6:** a uniquely named file in a non-hidden directory holding `.metadata_never_index` below the volume root was found by `mdfind`; files under a `*.noindex` directory, a hidden directory and `~/Library/Application Support/` were not. Choose a working mechanism, then check on macOS 14, 15 and current that `mdfind` does not find a file in each engine directory after indexing settles |
 
 ## Endpoint Security (macOS 27+)
 

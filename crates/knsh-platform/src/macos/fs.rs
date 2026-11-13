@@ -1,8 +1,10 @@
 //! The real filesystem, through the standard library's safe wrappers over the POSIX calls.
 
+use std::ffi::CString;
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -66,6 +68,23 @@ fn fill_temp(file: &mut File, data: &[u8], mode: u32) -> Result<(), PlatformErro
         .map_err(os(Operation::Write))?;
     file.write_all(data).map_err(os(Operation::Write))?;
     file.sync_all().map_err(os(Operation::SyncFile))
+}
+
+/// The `errno` of the last failed system call, as the crate error for `operation`.
+fn last_os_error(operation: Operation) -> PlatformError {
+    PlatformError::from_io(operation, &io::Error::last_os_error())
+}
+
+/// An absolute path as a C string for the `libc` calls the standard library does not wrap. A path with an inner NUL
+/// byte cannot be passed to the system and is refused.
+fn c_path(path: &Path) -> Result<CString, PlatformError> {
+    require_absolute(path)?;
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| PlatformError::InvalidPath)
+}
+
+/// An extended attribute name as a C string; an inner NUL byte is refused like one in a path.
+fn c_name(name: &str) -> Result<CString, PlatformError> {
+    CString::new(name).map_err(|_| PlatformError::InvalidPath)
 }
 
 impl Fs for RealFs {
@@ -172,6 +191,7 @@ impl Fs for RealFs {
             kind,
             len: meta.len(),
             mode: meta.permissions().mode() & 0o7777,
+            uid: meta.uid(),
         })
     }
 
@@ -180,6 +200,84 @@ impl Fs for RealFs {
         // `fs::canonicalize` is `realpath(3)`: it follows every symlink, including `/var` -> `/private/var`.
         let resolved = fs::canonicalize(path).map_err(os(Operation::Canonicalise))?;
         Ok(CanonicalPath::new(resolved)?)
+    }
+
+    fn set_mode(&self, path: &Path, mode: u32) -> Result<(), PlatformError> {
+        let c_path = c_path(path)?;
+        // `mode_t` is 16 bits on macOS; the permission mask always fits.
+        let mode = libc::mode_t::try_from(mode & 0o7777).map_err(|_| PlatformError::Os {
+            operation: Operation::SetMode,
+            errno: libc::EINVAL,
+        })?;
+        // `std::fs::set_permissions` follows a final symlink; `AT_SYMLINK_NOFOLLOW` makes a symlink swapped in at an
+        // engine path change only the link, never whatever it points to.
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call; `AT_FDCWD` is ignored because
+        // the path is absolute. The call reads nothing else from our memory.
+        let rc = unsafe { libc::fchmodat(libc::AT_FDCWD, c_path.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(last_os_error(Operation::SetMode))
+        }
+    }
+
+    fn xattr(&self, path: &Path, name: &str, limit: usize) -> Result<Option<Vec<u8>>, PlatformError> {
+        let c_path = c_path(path)?;
+        let c_name = c_name(name)?;
+        // A buffer of exactly `limit` bytes: a longer value fails with `ERANGE` instead of growing the allocation.
+        let mut buf = vec![0u8; limit];
+        // SAFETY: both strings are valid and NUL-terminated; `buf` is a writable region of exactly `buf.len()` bytes
+        // that outlives the call, and `getxattr` writes at most that many bytes into it. Position 0 is required for
+        // every attribute but resource forks.
+        let read = unsafe {
+            libc::getxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        };
+        // A negative result is a failure; otherwise it is the number of bytes written, at most `buf.len()`.
+        let Ok(len) = usize::try_from(read) else {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOATTR) => Ok(None),
+                Some(libc::ERANGE) => Err(PlatformError::TooLarge { limit: limit as u64 }),
+                _ => Err(PlatformError::from_io(Operation::ReadAttribute, &error)),
+            };
+        };
+        // With an empty buffer `getxattr` reports the value's size instead of failing with `ERANGE`, so a length
+        // past the buffer is a value too large for `limit`, never bytes that were read.
+        if len > buf.len() {
+            return Err(PlatformError::TooLarge { limit: limit as u64 });
+        }
+        buf.truncate(len);
+        Ok(Some(buf))
+    }
+
+    fn set_xattr(&self, path: &Path, name: &str, value: &[u8]) -> Result<(), PlatformError> {
+        let c_path = c_path(path)?;
+        let c_name = c_name(name)?;
+        // SAFETY: both strings are valid and NUL-terminated; `value` is a readable region of exactly `value.len()`
+        // bytes that outlives the call. Options 0 | `XATTR_NOFOLLOW` create or replace the attribute on the path
+        // itself, never on a symlink's target.
+        let rc = unsafe {
+            libc::setxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(last_os_error(Operation::WriteAttribute))
+        }
     }
 }
 
@@ -334,5 +432,55 @@ mod tests {
         let meta = fs.metadata(&dir).unwrap();
         assert_eq!((meta.kind, meta.mode), (FileKind::Directory, 0o700));
         assert_eq!(fs.create_dir(&dir, 0o700).unwrap_err().errno(), Some(libc::EEXIST));
+    }
+
+    #[test]
+    fn metadata_reports_the_owner() {
+        let fs = RealFs::new();
+        let tmp = TempDir::new("owner");
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(fs.metadata(&tmp.0).unwrap().uid, uid);
+    }
+
+    // NFR-SEC-08: tightening must never follow a symlink planted at an engine path to its target.
+    #[test]
+    fn set_mode_sets_exact_bits_and_does_not_follow_symlinks() {
+        let fs = RealFs::new();
+        let tmp = TempDir::new("chmod");
+        let dir = tmp.0.join("d");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, Permissions::from_mode(0o755)).unwrap();
+        fs.set_mode(&dir, 0o700).unwrap();
+        assert_eq!(fs.metadata(&dir).unwrap().mode, 0o700);
+
+        let victim = tmp.0.join("victim");
+        fs::write(&victim, b"x").unwrap();
+        fs::set_permissions(&victim, Permissions::from_mode(0o644)).unwrap();
+        let link = tmp.0.join("link");
+        symlink(&victim, &link).unwrap();
+        fs.set_mode(&link, 0o600).unwrap();
+        assert_eq!(fs.metadata(&victim).unwrap().mode, 0o644, "symlink target was changed");
+        assert!(fs.set_mode(&tmp.0.join("missing"), 0o700).unwrap_err().is_not_found());
+    }
+
+    #[test]
+    fn xattr_round_trips_and_respects_limit() {
+        let fs = RealFs::new();
+        let tmp = TempDir::new("xattr");
+        let name = "com.knsh.test";
+        assert_eq!(fs.xattr(&tmp.0, name, 16).unwrap(), None);
+        fs.set_xattr(&tmp.0, name, b"value").unwrap();
+        assert_eq!(fs.xattr(&tmp.0, name, 16).unwrap().as_deref(), Some(&b"value"[..]));
+        assert_eq!(fs.xattr(&tmp.0, name, 5).unwrap().as_deref(), Some(&b"value"[..]));
+        assert_eq!(fs.xattr(&tmp.0, name, 4), Err(PlatformError::TooLarge { limit: 4 }));
+        assert_eq!(fs.xattr(&tmp.0, name, 0), Err(PlatformError::TooLarge { limit: 0 }));
+        fs.set_xattr(&tmp.0, name, b"v2").unwrap();
+        assert_eq!(fs.xattr(&tmp.0, name, 16).unwrap().as_deref(), Some(&b"v2"[..]));
+        assert_eq!(fs.set_xattr(&tmp.0, "bad\0name", b""), Err(PlatformError::InvalidPath));
+        assert_eq!(
+            fs.xattr(Path::new("relative"), name, 1),
+            Err(PlatformError::InvalidPath)
+        );
     }
 }

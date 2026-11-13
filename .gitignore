@@ -4,3 +4,5 @@ target/
 fuzz/target/
 fuzz/artifacts/
 fuzz/coverage/
+# Temporary home directories of engine-directory integration tests (KNSH-011), removed when the tests end.
+crates/*/.knsh-test-home-*/
