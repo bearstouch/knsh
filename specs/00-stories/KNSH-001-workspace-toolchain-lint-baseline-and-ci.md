@@ -44,7 +44,7 @@ dependency hygiene, so that the rules in `CLAUDE.md` are enforced, not remembere
 - [ ] Licence, advisory and duplicate-version checks run (`cargo deny`), installed in CI only and never added to the
       workspace (NFR-SUP-04).
 - [ ] Any failing step fails the pipeline; there are no "allowed to fail" steps.
-- [ ] A local script `scripts/check.sh` runs the same steps in the same order.
+- [x] A local script `scripts/check.sh` runs the same steps in the same order.
 
 **Unit tests**
 *Cargo workspace, toolchain and lint baseline*

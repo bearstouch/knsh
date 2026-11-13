@@ -1,0 +1,15 @@
+[package]
+name = "knsh-core"
+description = "Pure domain model of Kinetic Shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+knsh-bash = { path = "../knsh-bash" }
+knsh-json = { path = "../knsh-json" }
+knsh-toml = { path = "../knsh-toml" }
+
+[lints]
+workspace = true

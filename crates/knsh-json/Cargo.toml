@@ -1,0 +1,10 @@
+[package]
+name = "knsh-json"
+description = "Strict JSON (I-JSON profile) reader and writer and the length-prefixed frame codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+# Every build works without network access (NFR-SUP-03): crates.io is replaced by
+# the vendored sources in `vendor/`, and cargo is told never to touch the network.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+
+[net]
+offline = true

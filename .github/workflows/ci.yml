@@ -1,0 +1,75 @@
+# Quality gates for every push and pull request (KNSH-001; CLAUDE.md "Toolchain and commands").
+# Each step calls scripts/check.sh, so this pipeline and the local script run the same
+# commands in the same order. No step is allowed to fail (no `continue-on-error`).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_OFFLINE: "true"
+
+jobs:
+  checks:
+    name: checks (macOS, Apple silicon)
+    # Pinned runner image and Xcode, recorded here as KNSH-001 requires:
+    #   runner: macos-15 (arm64, Apple silicon), Xcode 16.4.
+    # Bump both deliberately, in a PR of their own.
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Record platform
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          sw_vers
+          xcodebuild -version
+
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install  # no argument: installs what rust-toolchain.toml names
+          rustc --version
+          cargo --version
+
+      - name: Install cargo-deny (CI-only tool, never a workspace dependency)
+        # Installed from outside the repository so the workspace's offline/vendored
+        # cargo configuration does not apply to the tool install.
+        working-directory: ${{ runner.temp }}
+        env:
+          CARGO_NET_OFFLINE: "false"
+        run: cargo install --locked cargo-deny@0.20.2
+
+      - name: Format
+        run: scripts/check.sh fmt
+
+      - name: Lint
+        run: scripts/check.sh clippy
+
+      - name: Build (offline, network denied by Seatbelt)
+        run: scripts/check.sh build
+
+      - name: Docs
+        run: scripts/check.sh doc
+
+      - name: Test
+        run: scripts/check.sh test
+
+      - name: Dependency checks (licences, advisories, duplicate versions)
+        run: scripts/check.sh deny

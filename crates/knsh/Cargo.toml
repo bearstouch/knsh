@@ -1,0 +1,18 @@
+[package]
+name = "knsh"
+description = "Shell front end, agent client, shims and CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "knsh"
+path = "src/main.rs"
+
+[dependencies]
+knsh-proto = { path = "../knsh-proto" }
+knsh-json = { path = "../knsh-json" }
+
+[lints]
+workspace = true

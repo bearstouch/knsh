@@ -1,0 +1,5 @@
+# `unwrap_used`, `expect_used` and `panic` are denied in the workspace lints table
+# (Cargo.toml) but stay allowed inside `#[cfg(test)]` code and `#[test]` functions.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
