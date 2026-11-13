@@ -5,7 +5,8 @@
 //!
 //! The rule is a pure function of the injected monotonic clock ([`IdleTimer`]), so tests move time instead of waiting
 //! ten minutes. What keeps `knshd` alive besides connections ([`Activity`]) and what must be saved before it exits
-//! ([`PendingWrites`]) are traits, filled in by the session registry (KNSH-015) and the record store (KNSH-016).
+//! ([`PendingWrites`]) are traits, filled in by the session registry (KNSH-015) and the record store (KNSH-016,
+//! `crate::records::Records`).
 
 use std::fmt;
 use std::time::Duration;
@@ -41,16 +42,6 @@ pub(crate) trait PendingWrites: Send + Sync {
     ///
     /// [`CommitFailed`] if something could not be committed; `knshd` then exits with a failure status.
     fn commit(&self) -> Result<(), CommitFailed>;
-}
-
-/// Nothing is buffered. Used until the record store (KNSH-016) is wired into `knshd`.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct NothingPending;
-
-impl PendingWrites for NothingPending {
-    fn commit(&self) -> Result<(), CommitFailed> {
-        Ok(())
-    }
 }
 
 /// Pending writes could not be committed. Carries only a fixed name of what failed, so it can be logged.
@@ -161,8 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_keep_nothing_alive_and_commit_nothing() {
+    fn default_keeps_nothing_alive() {
         assert!(!NoSessions.keeps_alive());
-        assert_eq!(NothingPending.commit(), Ok(()));
     }
 }

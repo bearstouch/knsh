@@ -33,6 +33,13 @@
 //! - [`SessionRegistry`]: the live sessions, unique IDs, parent links (FR-SES-03) with the [`ProfileOrder`] hook
 //!   for agent children, and "not found or ended" for sessions that have ended (`-32006`).
 //!
+//! # Execution records (KNSH-016)
+//!
+//! [`ExecutionRecord`] is one record of `specs/05-models/execution-record.md`: its text fields are [`Redacted`] or
+//! typed (FR-REC-11), and the agent-only fields sit in [`RecordDetails`] so a human record can drop them as one unit
+//! (FR-REC-09). [`OutputInfo`] describes a capped output stream (FR-REC-06) and [`OutputStream`] names it.
+//! [`Timestamp`] also parses its own text form, for time filters.
+//!
 //! All failures are reported through the single crate error, [`CoreError`].
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -42,6 +49,7 @@
 mod error;
 mod id;
 mod path;
+mod record;
 mod redacted;
 mod registry;
 mod session;
@@ -51,6 +59,7 @@ mod ulid;
 pub use error::CoreError;
 pub use id::{CheckpointId, EventId, GrantId, RecordId, RequestId, SessionId};
 pub use path::CanonicalPath;
+pub use record::{ExecutionRecord, OutputInfo, OutputStream, RecordDetails};
 pub use redacted::{REDACTED_MARKER, Redacted};
 pub use registry::{EqualProfileOnly, ProfileOrder, SessionRegistry};
 pub use session::{

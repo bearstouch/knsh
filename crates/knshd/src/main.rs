@@ -17,13 +17,17 @@
 //! - `specs/06-api/README.md`, `specs/06-api/wire-format.md`, NFR-SEC-07 (connection server and dispatcher, KNSH-013)
 //! - `specs/06-api/handshake.md`, `specs/05-models/capabilities.md`, NFR-SEC-10, NFR-REL-08 (`hello`, method
 //!   catalogue and capability probe, KNSH-014)
+//! - `specs/06-api/user-socket.md#records`, FR-REC-02, FR-REC-08, NFR-REL-05 (record store, `records.query` and
+//!   `records.output`, KNSH-016)
 //!
 //! On start it prepares the engine directories (KNSH-011) and takes its sockets from launchd ([`endpoints`],
 //! KNSH-012). It then serves them ([`server`], KNSH-013): a kqueue accept loop hands each connection to its own
 //! thread, which reads frames ([`connection`]) and dispatches JSON-RPC methods through per-endpoint tables
 //! ([`dispatch`]), generated from the method catalogue and the capabilities probed once at start ([`probe`],
-//! [`hello`], KNSH-014). It exits after ten idle minutes ([`lifetime`]) or when launchd stops it, finishing in-flight
-//! requests and committing pending writes first. The supervisor arrives in later stories.
+//! [`hello`], KNSH-014). It opens the record store in the engine data directory and answers `records.query` and
+//! `records.output` from it ([`records`], KNSH-016). It exits after ten idle minutes ([`lifetime`]) or when launchd
+//! stops it, finishing in-flight requests and committing pending writes first. The supervisor arrives in later
+//! stories.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
@@ -42,6 +46,9 @@ mod hello;
 mod lifetime;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod probe;
+// The record store is built on macOS only until the Linux SQLite backend exists.
+#[cfg(target_os = "macos")]
+mod records;
 #[cfg(target_os = "macos")]
 mod server;
 
@@ -134,8 +141,11 @@ fn start() -> Result<(), StartError> {
     };
     use knsh_platform::{EnginePaths, Field, Level, SystemLog, Value, ensure_engine_dirs};
 
-    use crate::lifetime::{NoSessions, NothingPending};
+    use knsh_store::{DATABASE_FILE, RecordStore, StoreConfig};
+
+    use crate::lifetime::NoSessions;
     use crate::probe::{PROBE_TIMEOUT, Probes, probe};
+    use crate::records::Records;
     use crate::server::{Config, Exit, Server, Services};
 
     let log: Arc<dyn SystemLog> = Arc::new(UnifiedLog::new(c"daemon"));
@@ -156,6 +166,25 @@ fn start() -> Result<(), StartError> {
         ensure_engine_dirs(&RealFs::new(), &paths, uid).map_err(StartError::EngineDirs)?;
         // Never a fallback bind: without launchd's sockets, knshd does not run (KNSH-012).
         let listeners = endpoints::activate(&LaunchdSockets::new()).map_err(StartError::NoLaunchdSockets)?;
+        // A store that cannot be opened (newer schema, foreign or unsafe file) is reported and left untouched; knshd
+        // still serves, so a human session is never blocked by it, and the record methods answer -32603.
+        let store = match RecordStore::open(
+            &RealFs::new(),
+            &paths.data_dir().join(DATABASE_FILE),
+            uid,
+            StoreConfig::default(),
+        ) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                log.log(
+                    Level::Error,
+                    "record store unavailable",
+                    &[Field::new("reason", Value::Static(error.kind()))],
+                );
+                None
+            }
+        };
+        let records = Records::new(store);
         let clock = Arc::new(SystemClock::new());
         // Probed once, before serving: every hello of this process reports the same result, and a restarted knshd
         // probes again (KNSH-014).
@@ -167,15 +196,15 @@ fn start() -> Result<(), StartError> {
             timeout: PROBE_TIMEOUT,
         });
         let services = Services {
-            dispatcher: hello::phase1_dispatcher(probed).map_err(StartError::Dispatch)?,
+            dispatcher: hello::phase1_dispatcher(probed, records.handlers()).map_err(StartError::Dispatch)?,
             credentials: Arc::new(SystemPeerCredentials::new()),
             log: Arc::clone(&log),
             own_uid: uid,
             clock,
-            // Until the session registry (KNSH-015) and record store (KNSH-016) are wired in, only open connections
-            // keep knshd alive and nothing is buffered.
+            // Until the session registry (KNSH-015) is wired in, only open connections keep knshd alive. Records are
+            // committed as they are written; on exit knshd waits for queued store jobs.
             activity: Arc::new(NoSessions),
-            pending: Arc::new(NothingPending),
+            pending: Arc::new(records),
         };
         let server = Server::new(listeners, services, Config::DEFAULT).map_err(StartError::Serve)?;
         server.stop_on_termination_signals().map_err(StartError::Serve)?;

@@ -20,24 +20,24 @@ only) is wired in phase 2 using the same handler with a scope parameter.
 **Acceptance criteria**
 *Record store schema and writer*
 
-- [ ] Schema version is stored; migrations run forward in a transaction; a database with a newer version is not
+- [x] Schema version is stored; migrations run forward in a transaction; a database with a newer version is not
       opened for writing and is reported, never overwritten (persistence rule).
-- [ ] The writer is single-threaded (one writer thread), and a record is committed before the caller is answered.
-- [ ] Human records store only `command`, `cwd`, `started_at`, `ended_at`, `exit_code` — other columns stay null
+- [x] The writer is single-threaded (one writer thread), and a record is committed before the caller is answered.
+- [x] Human records store only `command`, `cwd`, `started_at`, `ended_at`, `exit_code` — other columns stay null
       even if the caller supplies them (FR-REC-09).
-- [ ] Output blobs are capped at 1 MB per stream by default; beyond it head and tail are kept with a skipped-byte
+- [x] Output blobs are capped at 1 MB per stream by default; beyond it head and tail are kept with a skipped-byte
       count (FR-REC-06).
-- [ ] No API takes secret values; text fields take `Redacted<String>` or an already-redacted type (FR-REC-11).
-- [ ] The database file lives under the engine data directory with 0600.
+- [x] No API takes secret values; text fields take `Redacted<String>` or an already-redacted type (FR-REC-11).
+- [x] The database file lives under the engine data directory with 0600.
 
 *`records.query` and `records.output`*
 
-- [ ] `records.query` filters by session, time range and text match on `command`, with a page size limit and a
+- [x] `records.query` filters by session, time range and text match on `command`, with a page size limit and a
       cursor; results are ordered by `record_id`.
-- [ ] `records.output` returns a byte range of a stream as a binary stream (or base64 if the client opted out),
+- [x] `records.output` returns a byte range of a stream as a binary stream (or base64 if the client opted out),
       with total size; ranges beyond the end are clamped.
-- [ ] Large byte counts are sent as strings (±2^53 rule).
-- [ ] A query scope parameter restricts results to one session; the handler cannot return records outside the
+- [x] Large byte counts are sent as strings (±2^53 rule).
+- [x] A query scope parameter restricts results to one session; the handler cannot return records outside the
       scope (tested now, used on `agent.sock` in phase 2).
 
 **Unit tests**

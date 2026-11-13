@@ -37,6 +37,13 @@
 //! - [`HelloParams`], [`negotiate`] and [`HelloResult`] are the handshake itself; [`ByteTransport`] records a
 //!   client's opt-out of binary frames (base64 inside JSON instead).
 //!
+//! # Records (KNSH-016)
+//!
+//! [`RecordsQueryParams`] and [`RecordsOutputParams`] read `records.query` and `records.output` strictly (canonical
+//! IDs, the engine's timestamp form, byte counts as strings); [`RecordsQueryResult`] and [`RecordsOutputResult`]
+//! write their answers, with the raw bytes either announced as a binary stream or inlined as base64
+//! ([`OutputData`]).
+//!
 //! Parameters and results of the other methods arrive with the stories that implement them.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -50,6 +57,7 @@ mod error;
 mod error_code;
 mod hello;
 mod method;
+mod records;
 
 pub use capability::{
     Backend, Capabilities, CheckpointBackend, FileEvents, NONE, NetworkFilter, Platform, Sandbox, Secrets,
@@ -70,3 +78,7 @@ pub use envelope::{
 pub use error::{EnvelopeFault, ProtoError};
 pub use error_code::ErrorCode;
 pub use method::{MAX_METHOD_NAME_LEN, MethodName};
+pub use records::{
+    DEFAULT_RECORDS_PAGE, MAX_BASE64_OUTPUT, MAX_RECORDS_PAGE, MAX_RECORDS_TEXT_LEN, OUTPUT_CONTENT_TYPE, OutputData,
+    RecordEntry, RecordsOutputParams, RecordsOutputResult, RecordsQueryParams, RecordsQueryResult,
+};

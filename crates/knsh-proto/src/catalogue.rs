@@ -255,7 +255,8 @@ pub struct Catalogue {
     methods: &'static [MethodSpec],
 }
 
-/// Every method in the specification. Phase 1 implements `hello` only; the rest arrive with their stories.
+/// Every method in the specification. Phase 1 implements `hello`, `records.query` and `records.output` (KNSH-016);
+/// the rest arrive with their stories.
 const ENGINE_METHODS: &[MethodSpec] = &[
     // Handshake (specs/06-api/handshake.md).
     MethodSpec::planned("hello", Endpoints::ALL).available(),
@@ -270,8 +271,8 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     // Shared by agent.sock (own session) and user.sock (all sessions); the read and checkpoint methods are on the
     // control service too.
     MethodSpec::planned("policy.check", Endpoints::SOCKETS),
-    MethodSpec::planned("records.query", Endpoints::ALL),
-    MethodSpec::planned("records.output", Endpoints::ALL),
+    MethodSpec::planned("records.query", Endpoints::ALL).available(),
+    MethodSpec::planned("records.output", Endpoints::ALL).available(),
     MethodSpec::planned("events.subscribe", Endpoints::ALL),
     MethodSpec::planned("checkpoint.list", Endpoints::ALL),
     MethodSpec::planned("checkpoint.diff", Endpoints::ALL),
@@ -491,14 +492,14 @@ mod tests {
         }
     }
 
-    // Phase 1 implements the handshake only: no method is claimed before it exists.
+    // Phase 1 implements the handshake and the record reads (KNSH-016): no method is claimed before it exists.
     #[test]
-    fn phase1_lists_hello_only() {
+    fn phase1_lists_hello_and_record_reads_only() {
         let caps = capabilities(Sandbox::Seatbelt);
         for endpoint in Endpoint::ALL {
             assert_eq!(
                 names(Catalogue::ENGINE, endpoint, &caps),
-                ["hello"],
+                ["hello", "records.query", "records.output"],
                 "{}",
                 endpoint.name()
             );

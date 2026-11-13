@@ -32,6 +32,11 @@ pub enum CoreError {
     PathNul,
     /// A timestamp was outside the range RFC 3339 can express (years 1970 to 9999 here).
     TimestampOutOfRange,
+    /// A timestamp text was not in the engine's RFC 3339 form (`YYYY-MM-DDTHH:MM:SS[.ffffff]Z`) or named an
+    /// impossible date or time.
+    InvalidTimestamp,
+    /// A record or output stream name was not one the model defines (`stdout` or `stderr`).
+    InvalidOutputStream,
     /// An agent identifier was empty, too long or held a character outside `[A-Za-z0-9._-]`.
     InvalidAgentId,
     /// A profile name was empty, too long or held a character outside `[A-Za-z0-9._-]`.
@@ -75,6 +80,8 @@ impl fmt::Display for CoreError {
             Self::PathEmptyComponent => f.write_str("canonical path contains an empty component or trailing '/'"),
             Self::PathNul => f.write_str("canonical path contains a NUL byte"),
             Self::TimestampOutOfRange => f.write_str("timestamp is outside 1970-01-01 to 9999-12-31 UTC"),
+            Self::InvalidTimestamp => f.write_str("timestamp must be YYYY-MM-DDTHH:MM:SS[.ffffff]Z"),
+            Self::InvalidOutputStream => f.write_str("output stream must be stdout or stderr"),
             Self::InvalidAgentId => f.write_str("agent_id must be 1 to 64 characters from [A-Za-z0-9._-]"),
             Self::InvalidProfileName => f.write_str("profile name must be 1 to 64 characters from [A-Za-z0-9._-]"),
             Self::AgentIdRequired => f.write_str("an agent session requires actor.agent_id"),

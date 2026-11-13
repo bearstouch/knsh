@@ -15,6 +15,9 @@
 | Event buffer | Last 10,000 events per session | — | [events](../03-functional-requirements/events.md) |
 | Record retention | 30 days or 2 GB, first reached | Per profile | [execution records](../03-functional-requirements/execution-records.md) |
 | Recorded output per stream | 1 MB, then head and tail | Yes | [execution records](../03-functional-requirements/execution-records.md) |
+| `records.query` page size | 100 by default, at most 1000 | No | [user socket](../06-api/user-socket.md#records) |
+| `records.query` text filter | 4096 bytes | No | [user socket](../06-api/user-socket.md#records) |
+| `records.output` inline base64 | 512 KiB per call | No | [user socket](../06-api/user-socket.md#records) |
 | `full` output mode | 1 MB per stream | — | [output modes](../03-functional-requirements/output-modes.md) |
 | `errors_only` stdout lines | Last 20 | — | [output modes](../03-functional-requirements/output-modes.md) |
 | Frame payload | 1 MB | — | [wire format](../06-api/wire-format.md) |

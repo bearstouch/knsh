@@ -52,7 +52,10 @@ impl Handshake {
                 .collect(),
         };
         // Writing fixed keys and bounded values cannot fail; if it ever did, the client gets no partial report.
-        result.to_json().map_err(|_| RpcError::new(ErrorCode::InternalError))
+        result
+            .to_json()
+            .map(Into::into)
+            .map_err(|_| RpcError::new(ErrorCode::InternalError))
     }
 }
 
@@ -61,13 +64,13 @@ fn handler(handshake: Arc<Handshake>) -> Handler {
     Arc::new(move |call: &Call<'_>| handshake.answer(call))
 }
 
-/// The dispatcher `knshd` serves in phase 1: the engine catalogue, the probed capabilities, and the one implemented
-/// method, `hello`.
+/// The dispatcher `knshd` serves in phase 1: the engine catalogue, the probed capabilities, `hello`, and the
+/// `others` implemented elsewhere (`records.query` and `records.output`, KNSH-016).
 ///
 /// # Errors
 ///
 /// [`BuildError`] if the catalogue and the handlers disagree (a programming error caught at start-up).
-pub(crate) fn phase1_dispatcher(probed: Probed) -> Result<Dispatcher, BuildError> {
+pub(crate) fn phase1_dispatcher(probed: Probed, others: Handlers) -> Result<Dispatcher, BuildError> {
     let catalogue = Catalogue::ENGINE;
     let capabilities = Arc::clone(&probed.capabilities);
     let handshake = Arc::new(Handshake {
@@ -75,12 +78,13 @@ pub(crate) fn phase1_dispatcher(probed: Probed) -> Result<Dispatcher, BuildError
         probed,
         advisory: ADVISORY,
     });
-    let handlers: Handlers = [(HELLO, handler(handshake))].into_iter().collect();
+    let mut handlers = others;
+    handlers.insert(HELLO, handler(handshake));
     Dispatcher::build(catalogue, capabilities, &handlers)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use knsh_json::{Object, Value};
     use knsh_proto::{ByteTransport, MethodName, Request, RequestId};
 
@@ -98,6 +102,11 @@ mod tests {
         }
     }
 
+    /// The record handlers without a store.
+    pub(crate) fn records() -> Handlers {
+        crate::records::Records::unavailable().handlers()
+    }
+
     const PARAMS: &str = r#"{"client":"test","client_version":"1.0","protocols":[1]}"#;
 
     fn hello(dispatcher: &Dispatcher, endpoint: Endpoint, params: &str) -> Result<Object, RpcError> {
@@ -106,9 +115,10 @@ mod tests {
             .call(&Call {
                 endpoint,
                 bytes: ByteTransport::BinaryFrames,
+                stream: crate::dispatch::tests::stream(),
                 request: &request,
             })
-            .map(|value| value.as_object().cloned().unwrap())
+            .map(|answer| answer.result.as_object().cloned().unwrap())
     }
 
     fn capabilities(result: &Object) -> &Object {
@@ -127,7 +137,7 @@ mod tests {
 
     #[test]
     fn hello_reports_version_protocol_platform_and_advisory() {
-        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes())).unwrap();
+        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes()), records()).unwrap();
         let result = hello(&dispatcher, Endpoint::User, PARAMS).unwrap();
         assert_eq!(
             result.get("engine_version").and_then(Value::as_str),
@@ -156,7 +166,7 @@ mod tests {
         for machine in [Machine::working(), Machine::failing()] {
             let probed = probe(&machine.probes());
             let capabilities = Arc::clone(&probed.capabilities);
-            let dispatcher = phase1_dispatcher(probed).unwrap();
+            let dispatcher = phase1_dispatcher(probed, records()).unwrap();
             for endpoint in Endpoint::ALL {
                 let result = hello(&dispatcher, endpoint, PARAMS).unwrap();
                 let mut listed = methods(&result);
@@ -174,7 +184,7 @@ mod tests {
     // KNSH-014: version negotiation. No shared protocol is refused with -32005 naming `protocol`.
     #[test]
     fn unsupported_protocol_list_is_refused() {
-        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes())).unwrap();
+        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes()), records()).unwrap();
         let error = hello(
             &dispatcher,
             Endpoint::User,
@@ -203,7 +213,7 @@ mod tests {
 
     #[test]
     fn malformed_hello_params_are_invalid_params() {
-        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes())).unwrap();
+        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes()), records()).unwrap();
         for params in ["{}", r#"{"client":"c","client_version":"1","protocols":"1"}"#] {
             let error = hello(&dispatcher, Endpoint::User, params).unwrap_err();
             assert_eq!(error.code, ErrorCode::InvalidParams, "{params}");
@@ -213,7 +223,7 @@ mod tests {
     // KNSH-014, NFR-SEC-10: missing backends are reported as `none`, never omitted.
     #[test]
     fn missing_backend_reported_as_none() {
-        let dispatcher = phase1_dispatcher(probe(&Machine::failing().probes())).unwrap();
+        let dispatcher = phase1_dispatcher(probe(&Machine::failing().probes()), records()).unwrap();
         let result = hello(&dispatcher, Endpoint::User, PARAMS).unwrap();
         let capabilities = capabilities(&result);
         for field in ["sandbox", "network_filter", "file_events", "secrets"] {
@@ -232,7 +242,7 @@ mod tests {
 
     #[test]
     fn binary_opt_out_is_echoed() {
-        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes())).unwrap();
+        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes()), records()).unwrap();
         let result = hello(
             &dispatcher,
             Endpoint::User,
@@ -247,7 +257,7 @@ mod tests {
     fn probe_runs_once_per_lifetime() {
         let system = Arc::new(knsh_platform::testing::FakeSystemProbe::working(15));
         let machine = Machine::new(knsh_platform::testing::Script::Exits(0), system.clone());
-        let dispatcher = phase1_dispatcher(probe(&machine.probes())).unwrap();
+        let dispatcher = phase1_dispatcher(probe(&machine.probes()), records()).unwrap();
         let after_probe = system.calls();
         for _ in 0..3 {
             hello(&dispatcher, Endpoint::User, PARAMS).unwrap();

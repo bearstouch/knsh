@@ -15,19 +15,22 @@
 //!   no requests that a client could answer.
 //! - **Byte transport.** A successful `hello` with `binary_frames: false` switches the connection to base64 inside
 //!   JSON for raw bytes (KNSH-014); every later handler sees the choice in [`Call::bytes`].
+//! - **Binary streams.** A handler that returns raw bytes ([`Answer::bytes`]) names the stream [`Call::stream`] in
+//!   its result; the bytes follow the JSON answer in binary chunks, closed by an end-of-stream frame, before the next
+//!   message is read. If the result itself cannot be written, the `-32603` that replaces it opens no stream.
 //!
 //! The loop works on any blocking [`Read`] and [`Write`], so tests drive it over a socket pair. It never logs:
 //! [`Closed`] says why the connection ended, without any content.
 
 use std::io::{Read, Write};
 
-use knsh_json::{Frame, FrameReader, FrameWriter, JsonError};
+use knsh_json::{Frame, FrameReader, FrameWriter, JsonError, StreamId};
 use knsh_proto::{
     ByteTransport, ErrorCode, ErrorResponse, HelloParams, Message, ProtoError, Rejection, Request, RequestId, RpcError,
     SuccessResponse, decode,
 };
 
-use crate::dispatch::{Call, Dispatcher, Endpoint, HELLO, Reply};
+use crate::dispatch::{Answer, Call, Dispatcher, Endpoint, HELLO, Reply};
 
 /// Why a connection ended. Holds no message content, so it can be logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +65,8 @@ impl Closed {
 struct Step {
     /// The answer to send, if any.
     reply: Option<Message>,
+    /// Raw bytes to send after the answer, on this stream.
+    stream: Option<(StreamId, Vec<u8>)>,
     /// Whether the connection is closed after the answer.
     close: bool,
 }
@@ -70,6 +75,7 @@ impl Step {
     const fn reply(message: Message) -> Self {
         Self {
             reply: Some(message),
+            stream: None,
             close: false,
         }
     }
@@ -77,17 +83,20 @@ impl Step {
     const fn reply_and_close(message: Message) -> Self {
         Self {
             reply: Some(message),
+            stream: None,
             close: true,
         }
     }
 
     const NOTHING: Self = Self {
         reply: None,
+        stream: None,
         close: false,
     };
 
     const CLOSE: Self = Self {
         reply: None,
+        stream: None,
         close: true,
     };
 }
@@ -100,6 +109,9 @@ struct Session<'a> {
     greeted: bool,
     /// How raw bytes reach this client: binary frames until a `hello` opts out.
     bytes: ByteTransport,
+    /// The stream ID the next call may open. Every stream is ended before the next message is read, so IDs never
+    /// collide; they still advance so that a client never sees an ID reused back to back.
+    next_stream: StreamId,
 }
 
 impl Session<'_> {
@@ -117,10 +129,11 @@ impl Session<'_> {
         match message {
             Message::Request(request) if request.method.as_str() == HELLO => {
                 match self.call(&request) {
-                    Ok(result) => {
+                    // `hello` returns no raw bytes, so only the result is sent.
+                    Ok(answer) => {
                         self.greeted = true;
                         self.settle_bytes(&request);
-                        Step::reply(success(request.id, result))
+                        Step::reply(success(request.id, answer.result))
                     }
                     // A failed handshake (for example no common protocol, KNSH-014) ends the connection.
                     Err(error) => Step::reply_and_close(failure(Some(request.id), error)),
@@ -137,23 +150,35 @@ impl Session<'_> {
     /// After `hello`: requests are dispatched; client notifications and responses are ignored.
     fn handle_message(&mut self, message: Message) -> Step {
         match message {
-            Message::Request(request) => Step::reply(self.dispatch(request)),
+            Message::Request(request) => self.dispatch(request),
             Message::Notification(_) | Message::Success(_) | Message::Error(_) => Step::NOTHING,
         }
     }
 
-    fn dispatch(&mut self, request: Request) -> Message {
+    fn dispatch(&mut self, request: Request) -> Step {
         match self.call(&request) {
-            Ok(result) => {
+            Ok(Answer { result, bytes }) => {
                 // A repeated `hello` echoes its own `binary_frames` choice, so the connection must follow it too;
                 // otherwise the client would be told one transport and sent the other.
                 if request.method.as_str() == HELLO {
                     self.settle_bytes(&request);
                 }
-                success(request.id, result)
+                let stream = bytes.map(|bytes| (self.take_stream(), bytes));
+                Step {
+                    stream,
+                    ..Step::reply(success(request.id, result))
+                }
             }
-            Err(error) => failure(Some(request.id), error),
+            Err(error) => Step::reply(failure(Some(request.id), error)),
         }
+    }
+
+    /// Uses up the stream ID the last call was offered, and moves on to the next (skipping 0, which is reserved
+    /// for JSON messages).
+    fn take_stream(&mut self) -> StreamId {
+        let taken = self.next_stream;
+        self.next_stream = StreamId::new(taken.get().wrapping_add(1)).unwrap_or(FIRST_STREAM);
+        taken
     }
 
     /// Adopts the byte transport of a `hello` that succeeded. The handler accepted these params, so they parse; the
@@ -169,6 +194,7 @@ impl Session<'_> {
         self.dispatcher.call(&Call {
             endpoint: self.endpoint,
             bytes: self.bytes,
+            stream: self.next_stream,
             request,
         })
     }
@@ -189,6 +215,12 @@ impl Session<'_> {
         }
     }
 }
+
+/// The first stream ID of a connection.
+const FIRST_STREAM: StreamId = match StreamId::new(1) {
+    Some(id) => id,
+    None => unreachable!(),
+};
 
 fn success(id: RequestId, result: knsh_json::Value) -> Message {
     Message::Success(SuccessResponse { id, result })
@@ -216,6 +248,7 @@ pub(crate) fn serve<R: Read, W: Write>(
         dispatcher,
         greeted: false,
         bytes: ByteTransport::BinaryFrames,
+        next_stream: FIRST_STREAM,
     };
     loop {
         let payload = match reader.read_frame() {
@@ -236,7 +269,7 @@ pub(crate) fn serve<R: Read, W: Write>(
             on_greeted();
         }
         if let Some(reply) = step.reply
-            && let Err(error) = write(&mut writer, &reply)
+            && let Err(error) = write(&mut writer, &reply, step.stream.as_ref())
         {
             return Closed::Write(error);
         }
@@ -252,16 +285,27 @@ pub(crate) fn serve<R: Read, W: Write>(
     }
 }
 
-/// Writes one message and flushes it. A result that cannot be written as strict JSON (too deep, too large) is
-/// replaced by `-32603` for the same request, so the client is never left waiting.
-fn write<W: Write>(writer: &mut FrameWriter<W>, message: &Message) -> Result<(), JsonError> {
+/// Writes one message, then `stream`'s bytes if the message went out as it was, and flushes. A result that cannot
+/// be written as strict JSON (too deep, too large) is replaced by `-32603` for the same request, so the client is
+/// never left waiting; the stream it announced is then not sent, since the client never learned of it.
+fn write<W: Write>(
+    writer: &mut FrameWriter<W>,
+    message: &Message,
+    stream: Option<&(StreamId, Vec<u8>)>,
+) -> Result<(), JsonError> {
     let written = match message.to_value() {
         Ok(value) => writer.write_json(&value),
         // The result cannot even be built as a JSON value: treat it like one too deep to write.
         Err(_) => Err(JsonError::TooDeep),
     };
     match written {
-        Ok(()) => {}
+        Ok(()) => {
+            if let Some((id, bytes)) = stream {
+                // The result declared exactly `bytes.len()` bytes on `id`; the end frame closes the stream.
+                writer.write_chunk(*id, bytes)?;
+                writer.write_end(*id)?;
+            }
+        }
         // Nothing was written; the writer is still usable for the fallback.
         Err(JsonError::TooDeep | JsonError::FrameTooLarge { .. }) => {
             let fallback = internal_error(message).to_value().map_err(|_| JsonError::TooDeep)?;
@@ -458,9 +502,11 @@ mod tests {
 
     /// Runs a connection against the phase-1 dispatcher of a working test machine.
     fn run_phase1(input: &[u8]) -> (Closed, Vec<Message>) {
-        let dispatcher =
-            crate::hello::phase1_dispatcher(crate::probe::probe(&crate::probe::tests::Machine::working().probes()))
-                .unwrap();
+        let dispatcher = crate::hello::phase1_dispatcher(
+            crate::probe::probe(&crate::probe::tests::Machine::working().probes()),
+            crate::hello::tests::records(),
+        )
+        .unwrap();
         run_with(&dispatcher, input)
     }
 
@@ -486,7 +532,7 @@ mod tests {
     #[test]
     fn binary_opt_out_switches_to_base64() {
         let bytes_handler: crate::dispatch::Handler =
-            std::sync::Arc::new(|call: &Call<'_>| Ok(call.bytes.inline(b"knsh").unwrap_or(Value::Null)));
+            std::sync::Arc::new(|call: &Call<'_>| Ok(call.bytes.inline(b"knsh").unwrap_or(Value::Null).into()));
         let dispatcher = Dispatcher::from_tables(
             Table::new()
                 .with(HELLO, ok_handler())
@@ -551,7 +597,10 @@ mod tests {
         }
         let deep = std::sync::Arc::new(deep);
         let dispatcher = Dispatcher::from_tables(
-            Table::new().with(HELLO, std::sync::Arc::new(move |_: &Call<'_>| Ok((*deep).clone()))),
+            Table::new().with(
+                HELLO,
+                std::sync::Arc::new(move |_: &Call<'_>| Ok((*deep).clone().into())),
+            ),
             Table::new(),
         );
         let mut output = Vec::new();
