@@ -24,7 +24,7 @@ Delivery rules are in [../03-functional-requirements/events.md](../03-functional
 | Event | Emitted when | Can block |
 | --- | --- | --- |
 | `session.started`, `session.ended` | A session begins or exits | No |
-| `session.state_changed` | Paused, resumed, human control, handed back | No |
+| `session.state_changed` | Paused, resumed, human control, handed back, ended | No |
 | `session.idle` | A human prompt has waited for input for 5 s | No |
 | `command.proposed` | Lifecycle step 3 | Yes, through hooks |
 | `decision.requested` | Policy returned ask; sent to the authority only | Yes, waits for an answer |
