@@ -9,6 +9,7 @@ mod fs;
 mod kqueue;
 mod launchd;
 mod log;
+mod probe;
 mod process;
 mod random;
 
@@ -17,6 +18,7 @@ pub use fs::RealFs;
 pub use kqueue::{Kqueue, Token};
 pub use launchd::{Launchctl, LaunchdSockets, SystemPeerCredentials};
 pub use log::UnifiedLog;
+pub use probe::SystemProbes;
 pub use process::SystemProcesses;
 pub use random::SystemRandom;
 

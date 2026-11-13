@@ -112,7 +112,11 @@ fn connect_and_get_served(socket: &Path) {
     let stream = UnixStream::connect(socket).expect("connect to user.sock");
     stream.set_read_timeout(Some(LAUNCH_TIMEOUT)).unwrap();
     let mut writer = FrameWriter::new(&stream);
-    let hello = knsh_json::parse(br#"{"jsonrpc":"2.0","id":1,"method":"hello"}"#, 1024).unwrap();
+    let hello = knsh_json::parse(
+        br#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"client":"launchd-test","client_version":"0","protocols":[1]}}"#,
+        1024,
+    )
+    .unwrap();
     writer.write_json(&hello).unwrap();
     writer.flush().unwrap();
     let Some(Frame::Json(payload)) = FrameReader::new(&stream)
@@ -121,10 +125,27 @@ fn connect_and_get_served(socket: &Path) {
     else {
         panic!("knshd closed the connection without answering hello");
     };
-    assert!(
-        matches!(knsh_proto::decode(&payload), Ok(Message::Success(_))),
-        "hello failed"
-    );
+    let Ok(Message::Success(success)) = knsh_proto::decode(&payload) else {
+        panic!("hello failed");
+    };
+    // KNSH-014 on the real machine: protocol 1, advisory in phase 1, and every backend reported (never omitted).
+    let result = success.result.as_object().expect("hello result is an object");
+    assert_eq!(result.get("protocol").and_then(knsh_json::Value::as_i64), Some(1));
+    assert_eq!(result.get("advisory").and_then(knsh_json::Value::as_bool), Some(true));
+    let capabilities = result
+        .get("capabilities")
+        .and_then(knsh_json::Value::as_object)
+        .expect("capabilities");
+    for field in [
+        "sandbox",
+        "network_filter",
+        "file_events",
+        "secrets",
+        "checkpoints",
+        "methods",
+    ] {
+        assert!(capabilities.contains_key(field), "{field} missing");
+    }
 }
 
 /// Waits until launchd reports no running `knshd`.

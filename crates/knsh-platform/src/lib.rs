@@ -30,6 +30,13 @@
 //! listeners, cross-thread wake-ups and termination signals (`SIGTERM` as an event, so shutdown is orderly). It is
 //! concrete rather than a trait: the server is tested over real sockets in a temporary directory.
 //!
+//! The [`probe`] module (KNSH-014) holds the capability probes: real checks, each bounded in time on the injected
+//! [`Clock`], that a backend works here (Seatbelt through `sandbox-exec`, `FSEvents`), plus the OS version.
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`SystemProbe`] | OS major version; start and stop a file-event stream | `SystemProbes` | `FakeSystemProbe` |
+//!
 //! Later stories add Keychain, `LocalAuthentication`, XPC, `FSEvents` and APFS clones to the same interface.
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
@@ -56,6 +63,7 @@
 //! - `specs/09-reference/file-locations.md`, NFR-PRIV-04, NFR-SEC-08 (engine directories, KNSH-011)
 //! - `specs/02-architecture/process-model.md`, `specs/02-architecture/endpoints.md`, NFR-REL-03 (launchd agent,
 //!   KNSH-012)
+//! - `specs/05-models/capabilities.md`, NFR-SEC-10, NFR-REL-08 (capability probe, KNSH-014)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
@@ -68,6 +76,7 @@ mod error;
 mod fs;
 pub mod launchd;
 mod log;
+pub mod probe;
 mod process;
 mod random;
 
@@ -90,5 +99,6 @@ pub use error::{Operation, PlatformError, SqliteCode};
 pub use fs::{FileKind, Fs, Metadata};
 pub use launchd::{LaunchAgent, PeerCredentials, ServiceManager, SocketActivation, install_agent, uninstall_agent};
 pub use log::{Field, Level, SystemLog, Value, render};
+pub use probe::{ProbeFailure, SystemProbe};
 pub use process::{ExitStatus, ProcessGroupId, Processes, Signal, SpawnRequest, Stdio};
 pub use random::Random;

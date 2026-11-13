@@ -20,21 +20,23 @@ honest. v1 probes: `sandbox` (presence and a trivial successful run of `sandbox-
 **Acceptance criteria**
 *`hello` handshake and method catalogue*
 
-- [ ] `hello` params: `client`, `client_version`, `protocols`, optional `session_token`, optional binary-frame
+- [x] `hello` params: `client`, `client_version`, `protocols`, optional `session_token`, optional binary-frame
       opt-out; result: `engine_version`, `protocol`, `platform` (e.g. `macos-15-arm64`), `session_id` where
       applicable, `capabilities`.
-- [ ] If none of the client's `protocols` is supported, the call fails and the connection closes.
-- [ ] `capabilities.methods` lists exactly the methods available on that endpoint on this machine.
-- [ ] Missing backends are reported as `none`, never omitted or replaced (NFR-SEC-10).
-- [ ] Deprecated methods are marked in `hello` and keep working for two engine minor releases (catalogue field).
-- [ ] Phase 1 builds report themselves as advisory (see KNSH-024).
+- [x] If none of the client's `protocols` is supported, the call fails and the connection closes.
+- [x] `capabilities.methods` lists exactly the methods available on that endpoint on this machine.
+- [x] Missing backends are reported as `none`, never omitted or replaced (NFR-SEC-10).
+- [x] Deprecated methods are marked in `hello` and keep working for two engine minor releases (catalogue field).
+      (Checked with test catalogues: no engine method is deprecated yet.)
+- [x] Phase 1 builds report themselves as advisory (see KNSH-024). (`hello` reports `advisory: true`; the
+      `knsh --version` and README labels are KNSH-024.)
 
 *Capability probe v1*
 
-- [ ] Each probe runs a real check, not a version guess, and reports `none` on any failure.
-- [ ] Probing is bounded in time; a hanging probe reports `none`.
-- [ ] Results are cached per `knshd` lifetime and re-probed on restart.
-- [ ] Phase 1 reports `network_filter: none`, `secrets: none`, `checkpoints: {}` (or `none`) — no feature is claimed
+- [x] Each probe runs a real check, not a version guess, and reports `none` on any failure.
+- [x] Probing is bounded in time; a hanging probe reports `none`.
+- [x] Results are cached per `knshd` lifetime and re-probed on restart.
+- [x] Phase 1 reports `network_filter: none`, `secrets: none`, `checkpoints: {}` (or `none`) — no feature is claimed
       before it exists.
 
 **Unit tests**

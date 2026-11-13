@@ -27,16 +27,41 @@
 //! - [`ErrorCode`] defines every code with its meaning and `data` fields, checked against `errors.md` by a test.
 //! - [`MethodName`] validates `area.verb` names for the method catalogue (KNSH-014).
 //!
-//! Method parameters, results and the capability model arrive with the stories that implement each method.
+//! # Handshake, method catalogue and capabilities (KNSH-014)
+//!
+//! - [`Catalogue::ENGINE`] declares every client-callable method once: its [`Endpoints`], its [`Availability`] in
+//!   this build, the [`Backend`] it needs and its [`Deprecation`]. [`Catalogue::available`] is the single query
+//!   `knshd` builds both its dispatch tables and `hello`'s `methods` list from.
+//! - [`Capabilities`] models what the probe found; every backend is an enum with an explicit `none`, so a missing
+//!   backend is reported, never omitted (NFR-SEC-10, NFR-REL-08). [`Platform`] writes `macos-<major>-<arch>`.
+//! - [`HelloParams`], [`negotiate`] and [`HelloResult`] are the handshake itself; [`ByteTransport`] records a
+//!   client's opt-out of binary frames (base64 inside JSON instead).
+//!
+//! Parameters and results of the other methods arrive with the stories that implement them.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 #![forbid(unsafe_code)]
 
+mod capability;
+mod catalogue;
 mod envelope;
 mod error;
 mod error_code;
+mod hello;
 mod method;
+
+pub use capability::{
+    Backend, Capabilities, CheckpointBackend, FileEvents, NONE, NetworkFilter, Platform, Sandbox, Secrets,
+};
+pub use catalogue::{
+    Availability, Catalogue, CatalogueError, DEPRECATION_WINDOW, Deprecation, Endpoint, Endpoints, Lookup, MethodSpec,
+    Release,
+};
+pub use hello::{
+    ByteTransport, HelloParams, HelloResult, MAX_CLIENT_FIELD_LEN, MAX_PROTOCOLS, MAX_SESSION_TOKEN_LEN,
+    PROTOCOL_CAPABILITY, SUPPORTED_PROTOCOLS, negotiate,
+};
 
 pub use envelope::{
     ErrorResponse, MAX_ID_LEN, Message, Notification, Rejection, Request, RequestId, RpcError, SuccessResponse, decode,

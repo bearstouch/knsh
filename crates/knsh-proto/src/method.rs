@@ -9,7 +9,7 @@ use crate::error::ProtoError;
 pub const MAX_METHOD_NAME_LEN: usize = 64;
 
 /// The handshake method, the one name without an area (`specs/06-api/handshake.md`).
-const HELLO: &str = "hello";
+pub(crate) const HELLO: &str = "hello";
 
 /// The area JSON-RPC 2.0 reserves for its own extensions ("Method names that begin with rpc.").
 const RESERVED_AREA: &str = "rpc";

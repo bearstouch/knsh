@@ -15,7 +15,7 @@ The API is **JSON-RPC 2.0** on all three endpoints: in length-prefixed frames on
 | [wire-format.md](wire-format.md) | Frame layout, binary streams, strict JSON profile |
 | [handshake.md](handshake.md) | `hello`, versioning and deprecation |
 | [agent-socket.md](agent-socket.md) | `exec.*`, `policy.check`, own records, events and checkpoints |
-| [user-socket.md](user-socket.md) | Session management, observers, approvals, policy edits, `forget` |
+| [user-socket.md](user-socket.md) | Session management, observers, approvals, policy edits, `records.forget` |
 | [control-service.md](control-service.md) | Authority registration, decision protocol, policy, secrets |
 | [errors.md](errors.md) | Error codes |
 | [cli.md](cli.md) | The `knsh` CLI that wraps the API |

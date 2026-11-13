@@ -574,7 +574,7 @@ mod tests {
     use knsh_core::Timestamp;
     use knsh_json::{Frame, FrameReader};
     use knsh_platform::testing::{FakeClock, FixedPeerCredentials, RecordingLog};
-    use knsh_proto::{ErrorCode, Message, Request, decode};
+    use knsh_proto::{ErrorCode, Message, decode};
 
     use super::*;
     use crate::dispatch::tests::ok_handler;
@@ -669,7 +669,7 @@ mod tests {
             let activity = Arc::new(FlagActivity::default());
             let journal = Arc::new(Journal::default());
             let services = Services {
-                dispatcher: Dispatcher::new(user_table, Table::new().with(HELLO, ok_handler())),
+                dispatcher: Dispatcher::from_tables(user_table, Table::new().with(HELLO, ok_handler())),
                 credentials: Arc::new(FixedPeerCredentials::uid(peer_uid)),
                 log: log.clone(),
                 own_uid: OWN_UID,
@@ -782,7 +782,7 @@ mod tests {
         let slot = Arc::clone(journal_slot);
         let table = Table::new().with(HELLO, ok_handler()).with(
             "test.block",
-            Arc::new(move |_: &Request| {
+            Arc::new(move |_: &crate::dispatch::Call<'_>| {
                 let _ = entered_tx.lock().unwrap().send(());
                 let _ = released.lock().unwrap().recv();
                 if let Some(journal) = slot.lock().unwrap().as_ref() {

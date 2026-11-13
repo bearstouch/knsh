@@ -42,6 +42,10 @@ impl Clock for SystemClock {
         let nanos = u32::try_from(now.tv_nsec).unwrap_or(0);
         Monotonic::from_elapsed(Duration::new(secs, nanos))
     }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
 }
 
 #[cfg(test)]

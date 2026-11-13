@@ -13,6 +13,8 @@
 //! - Other envelope faults (`-32600`, `-32601`, `-32602`) are answered and the connection stays open.
 //! - Notifications and responses from the client are ignored: no client notification exists yet, and `knshd` sends
 //!   no requests that a client could answer.
+//! - **Byte transport.** A successful `hello` with `binary_frames: false` switches the connection to base64 inside
+//!   JSON for raw bytes (KNSH-014); every later handler sees the choice in [`Call::bytes`].
 //!
 //! The loop works on any blocking [`Read`] and [`Write`], so tests drive it over a socket pair. It never logs:
 //! [`Closed`] says why the connection ended, without any content.
@@ -21,10 +23,11 @@ use std::io::{Read, Write};
 
 use knsh_json::{Frame, FrameReader, FrameWriter, JsonError};
 use knsh_proto::{
-    ErrorCode, ErrorResponse, Message, ProtoError, Rejection, Request, RequestId, RpcError, SuccessResponse, decode,
+    ByteTransport, ErrorCode, ErrorResponse, HelloParams, Message, ProtoError, Rejection, Request, RequestId, RpcError,
+    SuccessResponse, decode,
 };
 
-use crate::dispatch::{Dispatcher, Endpoint, HELLO};
+use crate::dispatch::{Call, Dispatcher, Endpoint, HELLO, Reply};
 
 /// Why a connection ended. Holds no message content, so it can be logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +98,8 @@ struct Session<'a> {
     dispatcher: &'a Dispatcher,
     /// Whether `hello` has succeeded.
     greeted: bool,
+    /// How raw bytes reach this client: binary frames until a `hello` opts out.
+    bytes: ByteTransport,
 }
 
 impl Session<'_> {
@@ -111,9 +116,10 @@ impl Session<'_> {
     fn handle_first(&mut self, message: Message) -> Step {
         match message {
             Message::Request(request) if request.method.as_str() == HELLO => {
-                match self.dispatcher.call(self.endpoint, &request) {
+                match self.call(&request) {
                     Ok(result) => {
                         self.greeted = true;
+                        self.settle_bytes(&request);
                         Step::reply(success(request.id, result))
                     }
                     // A failed handshake (for example no common protocol, KNSH-014) ends the connection.
@@ -129,18 +135,42 @@ impl Session<'_> {
     }
 
     /// After `hello`: requests are dispatched; client notifications and responses are ignored.
-    fn handle_message(&self, message: Message) -> Step {
+    fn handle_message(&mut self, message: Message) -> Step {
         match message {
             Message::Request(request) => Step::reply(self.dispatch(request)),
             Message::Notification(_) | Message::Success(_) | Message::Error(_) => Step::NOTHING,
         }
     }
 
-    fn dispatch(&self, request: Request) -> Message {
-        match self.dispatcher.call(self.endpoint, &request) {
-            Ok(result) => success(request.id, result),
+    fn dispatch(&mut self, request: Request) -> Message {
+        match self.call(&request) {
+            Ok(result) => {
+                // A repeated `hello` echoes its own `binary_frames` choice, so the connection must follow it too;
+                // otherwise the client would be told one transport and sent the other.
+                if request.method.as_str() == HELLO {
+                    self.settle_bytes(&request);
+                }
+                success(request.id, result)
+            }
             Err(error) => failure(Some(request.id), error),
         }
+    }
+
+    /// Adopts the byte transport of a `hello` that succeeded. The handler accepted these params, so they parse; the
+    /// default (binary frames) only applies to hand-built test handlers that accept anything.
+    fn settle_bytes(&mut self, request: &Request) {
+        self.bytes = request
+            .params::<HelloParams>()
+            .map(|params| params.bytes)
+            .unwrap_or_default();
+    }
+
+    fn call(&self, request: &Request) -> Reply {
+        self.dispatcher.call(&Call {
+            endpoint: self.endpoint,
+            bytes: self.bytes,
+            request,
+        })
     }
 
     /// A message `decode` refused.
@@ -185,6 +215,7 @@ pub(crate) fn serve<R: Read, W: Write>(
         endpoint,
         dispatcher,
         greeted: false,
+        bytes: ByteTransport::BinaryFrames,
     };
     loop {
         let payload = match reader.read_frame() {
@@ -262,7 +293,7 @@ mod tests {
     use crate::dispatch::{Endpoint, Table};
 
     fn dispatcher() -> Dispatcher {
-        Dispatcher::new(
+        Dispatcher::from_tables(
             Table::new()
                 .with(HELLO, ok_handler())
                 .with("records.query", ok_handler()),
@@ -282,16 +313,16 @@ mod tests {
         out
     }
 
-    /// Runs a connection over `input` and returns why it closed and every answer, decoded.
+    /// Runs a `user.sock` connection over `input` with the test tables and returns why it closed and every answer.
     fn run(input: &[u8]) -> (Closed, Vec<Message>) {
+        run_with(&dispatcher(), input)
+    }
+
+    /// Runs a `user.sock` connection over `input` with `dispatcher` and returns why it closed and every answer,
+    /// decoded.
+    fn run_with(dispatcher: &Dispatcher, input: &[u8]) -> (Closed, Vec<Message>) {
         let mut output = Vec::new();
-        let closed = serve(
-            Cursor::new(input),
-            &mut output,
-            Endpoint::User,
-            &dispatcher(),
-            &mut || {},
-        );
+        let closed = serve(Cursor::new(input), &mut output, Endpoint::User, dispatcher, &mut || {});
         let mut reader = FrameReader::new(output.as_slice());
         let mut answers = Vec::new();
         while let Some(Frame::Json(payload)) = reader.read_frame().unwrap() {
@@ -350,7 +381,7 @@ mod tests {
 
     #[test]
     fn failed_hello_closes_the_connection() {
-        let dispatcher = Dispatcher::new(Table::new(), Table::new());
+        let dispatcher = Dispatcher::from_tables(Table::new(), Table::new());
         let mut output = Vec::new();
         let closed = serve(
             Cursor::new(frames(&[HELLO_REQ, HELLO_REQ])),
@@ -425,6 +456,78 @@ mod tests {
         assert_eq!(answers.len(), 1);
     }
 
+    /// Runs a connection against the phase-1 dispatcher of a working test machine.
+    fn run_phase1(input: &[u8]) -> (Closed, Vec<Message>) {
+        let dispatcher =
+            crate::hello::phase1_dispatcher(crate::probe::probe(&crate::probe::tests::Machine::working().probes()))
+                .unwrap();
+        run_with(&dispatcher, input)
+    }
+
+    // KNSH-014: no protocol in common fails `hello` and closes the connection; nothing after it is served.
+    #[test]
+    fn unsupported_protocol_list_is_refused() {
+        let (closed, answers) = run_phase1(
+            &frames(&[
+                br#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"client":"c","client_version":"1","protocols":[2]}}"#,
+                br#"{"jsonrpc":"2.0","id":2,"method":"hello","params":{"client":"c","client_version":"1","protocols":[1]}}"#,
+            ]),
+        );
+        assert_eq!(closed, Closed::Handshake);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(
+            error_code(&answers[0]),
+            (Some(RequestId::from(1u32)), ErrorCode::CapabilityUnavailable)
+        );
+    }
+
+    // KNSH-014: after `hello` with `binary_frames: false`, handlers see the base64 transport and inline raw bytes as
+    // base64 JSON strings; without the opt-out they keep binary frames.
+    #[test]
+    fn binary_opt_out_switches_to_base64() {
+        let bytes_handler: crate::dispatch::Handler =
+            std::sync::Arc::new(|call: &Call<'_>| Ok(call.bytes.inline(b"knsh").unwrap_or(Value::Null)));
+        let dispatcher = Dispatcher::from_tables(
+            Table::new()
+                .with(HELLO, ok_handler())
+                .with("records.output", bytes_handler),
+            Table::new(),
+        );
+        // The result of `records.output` after `hello`.
+        let output_of = |hello: &[u8]| {
+            let (_, answers) = run_with(
+                &dispatcher,
+                &frames(&[hello, br#"{"jsonrpc":"2.0","id":2,"method":"records.output"}"#]),
+            );
+            match answers.last() {
+                Some(Message::Success(success)) => success.result.clone(),
+                other => panic!("records.output was not answered with a result: {other:?}"),
+            }
+        };
+        let opted_out = output_of(
+            br#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"client":"c","client_version":"1","protocols":[1],"binary_frames":false}}"#,
+        );
+        assert_eq!(opted_out, Value::from("a25zaA=="));
+        let default = output_of(
+            br#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"client":"c","client_version":"1","protocols":[1]}}"#,
+        );
+        assert_eq!(default, Value::Null, "bytes go in binary frames by default");
+
+        // A repeated `hello` that opts out switches the transport it reports, so the two never disagree.
+        let (_, answers) = run_with(
+            &dispatcher,
+            &frames(&[
+                br#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"client":"c","client_version":"1","protocols":[1]}}"#,
+                br#"{"jsonrpc":"2.0","id":2,"method":"hello","params":{"client":"c","client_version":"1","protocols":[1],"binary_frames":false}}"#,
+                br#"{"jsonrpc":"2.0","id":3,"method":"records.output"}"#,
+            ]),
+        );
+        match answers.last() {
+            Some(Message::Success(success)) => assert_eq!(success.result, Value::from("a25zaA==")),
+            other => panic!("records.output was not answered with a result: {other:?}"),
+        }
+    }
+
     #[test]
     fn on_greeted_runs_once_after_hello() {
         let mut calls = 0;
@@ -447,8 +550,8 @@ mod tests {
             deep = Value::from(vec![deep]);
         }
         let deep = std::sync::Arc::new(deep);
-        let dispatcher = Dispatcher::new(
-            Table::new().with(HELLO, std::sync::Arc::new(move |_: &Request| Ok((*deep).clone()))),
+        let dispatcher = Dispatcher::from_tables(
+            Table::new().with(HELLO, std::sync::Arc::new(move |_: &Call<'_>| Ok((*deep).clone()))),
             Table::new(),
         );
         let mut output = Vec::new();
