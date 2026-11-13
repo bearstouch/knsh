@@ -29,7 +29,7 @@ const LAYOUT: &[(&str, &[&str])] = &[
     ("knsh-json", &[]),
     ("knsh-toml", &[]),
     ("knsh-proto", &["knsh-json", "knsh-core"]),
-    ("knsh-platform", &["libc"]),
+    ("knsh-platform", &["knsh-core", "libc"]),
     ("knsh-sandbox", &["knsh-core"]),
     ("knsh-proxy", &["knsh-core", "knsh-platform"]),
     ("knsh-store", &["knsh-core", "knsh-platform"]),
