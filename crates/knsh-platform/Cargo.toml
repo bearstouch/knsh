@@ -6,7 +6,14 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Deterministic fakes for every trait (`knsh_platform::testing`). Enabled by other crates only in their
+# `[dev-dependencies]`, so no fake ever reaches a shipped binary (KNSH-007).
+testing = []
+
 [dependencies]
+# `CanonicalPath`, `Timestamp` and `Ulid` (KNSH-002). knsh-core is pure, so this edge points downwards.
+knsh-core = { path = "../knsh-core" }
 libc = { workspace = true }
 
 [lints]

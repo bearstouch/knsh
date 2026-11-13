@@ -47,7 +47,7 @@ Each crate has one concern. Dependencies point downwards only: binaries → serv
 | `knsh-json` | Strict JSON (I-JSON profile) reader and writer, plus the length-prefixed frame codec. | — |
 | `knsh-toml` | Parser for the TOML subset used by policy and configuration. | — |
 | `knsh-proto` | JSON-RPC method params and results, the error codes, the capability model. | `knsh-json`, `knsh-core` |
-| `knsh-platform` | The platform interface (traits) and the macOS backend: XPC, Keychain, LocalAuthentication, FSEvents, APFS clones, unified logging, CommonCrypto, SQLite FFI. | `libc` |
+| `knsh-platform` | The platform interface (traits) and the macOS backend: XPC, Keychain, LocalAuthentication, FSEvents, APFS clones, unified logging, CommonCrypto, SQLite FFI. | `knsh-core`, `libc` |
 | `knsh-sandbox` | Compiles policy into Seatbelt profile text. Pure function: same input, same bytes. | `knsh-core` |
 | `knsh-proxy` | HTTP CONNECT and SOCKS proxy, TLS server-name reader, host and address checks. | `knsh-core`, `knsh-platform` |
 | `knsh-store` | Record store (system SQLite), retention, redaction at write time. | `knsh-core`, `knsh-platform` |
