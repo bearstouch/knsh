@@ -1,0 +1,7 @@
+# Stable rustfmt options only (CLAUDE.md "Code style"). Never hand-format around it.
+edition = "2024"
+style_edition = "2024"
+max_width = 120
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true

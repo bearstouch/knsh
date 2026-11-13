@@ -1,0 +1,44 @@
+# Kinetic Shell workspace. Dependencies point downwards only: binaries -> services
+# -> core and parsers (CLAUDE.md "Workspace layout"). The graph is enforced by
+# `xtask/tests/dependency_policy.rs` (NFR-SUP-01, NFR-SUP-02).
+[workspace]
+resolver = "3"
+members = [
+    "crates/knsh-core",
+    "crates/knsh-bash",
+    "crates/knsh-json",
+    "crates/knsh-toml",
+    "crates/knsh-proto",
+    "crates/knsh-platform",
+    "crates/knsh-sandbox",
+    "crates/knsh-proxy",
+    "crates/knsh-store",
+    "crates/knsh-checkpoint",
+    "crates/knshd",
+    "crates/knsh",
+    "crates/knsh-exec",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+# The only third-party runtime crate (supply-chain.md). Exact pin, vendored in
+# `vendor/`; justification in `vendor/README.md` (NFR-SUP-02).
+[workspace.dependencies]
+libc = { version = "=0.2.191", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Denied outside tests; `clippy.toml` allows them in `#[cfg(test)]` code.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

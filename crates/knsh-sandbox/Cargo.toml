@@ -1,0 +1,13 @@
+[package]
+name = "knsh-sandbox"
+description = "Seatbelt profile compiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+knsh-core = { path = "../knsh-core" }
+
+[lints]
+workspace = true

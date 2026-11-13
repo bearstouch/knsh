@@ -1,0 +1,23 @@
+[package]
+name = "knshd"
+description = "Per-user daemon and supervisor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "knshd"
+path = "src/main.rs"
+
+[dependencies]
+knsh-core = { path = "../knsh-core" }
+knsh-proto = { path = "../knsh-proto" }
+knsh-platform = { path = "../knsh-platform" }
+knsh-sandbox = { path = "../knsh-sandbox" }
+knsh-proxy = { path = "../knsh-proxy" }
+knsh-store = { path = "../knsh-store" }
+knsh-checkpoint = { path = "../knsh-checkpoint" }
+
+[lints]
+workspace = true

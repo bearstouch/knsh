@@ -1,0 +1,7 @@
+# Pinned stable toolchain (edition 2024). Pinning an exact stable release keeps
+# `clippy -D warnings` and rustdoc reproducible: a new stable cannot break CI
+# with new lints until this file is bumped deliberately.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
