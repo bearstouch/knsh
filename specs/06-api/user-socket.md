@@ -48,3 +48,20 @@ Result: `{"records": [...], "next_cursor": "01J…" | null}`. Records are ordere
 Ranges beyond the end are clamped, never refused. Result: `record_id`, `stream`, `recorded` (false when no output was recorded for the stream; all sizes are then `"0"`), `size` (total stored size), `original_size`, `skipped`, `skipped_at`, and the range returned as `offset` and `length`. The bytes follow as a binary stream named in `data`: `{"stream_id": n, "size": "<length>", "content_type": "application/octet-stream"}`. A client that opted out of binary frames in `hello` receives `data_base64` instead, and at most 524288 bytes per call (so the answer fits in one frame); it reads longer ranges in several calls.
 
 A `record_id` that does not exist is `-32602` on `user.sock`; on `agent.sock` a record of another session is indistinguishable from a missing one and is `-32003`.
+
+### `records.forget`
+
+`user.sock` only: on `agent.sock` it is `-32003`, so an agent can never erase records (FR-REC-10, NFR-PRIV-03).
+
+| Param | Type | Meaning |
+| --- | --- | --- |
+| `session_id` | ULID, optional | Delete this session's records |
+| `since` | timestamp, optional | Delete records started at or after this instant |
+| `with_checkpoints` | bool, optional | Delete the matching records' checkpoints too; default `false` |
+
+At least one of `session_id` and `since` is required (`-32602` otherwise); with both, a record must match both. The matching records and their stored output are deleted in one transaction: on error nothing is deleted. Deleted content is overwritten in the database file and the write-ahead log is truncated, so forgotten text does not stay on disk. The session itself (its row: actor, profile, state) is kept.
+
+Result: `{"deleted": n}`, the number of records deleted.
+
+Until checkpoints exist (phase 3), `with_checkpoints: true` is refused with `-32005` and `data.capability` `"checkpoints"`, before anything is deleted: the flag is never silently ignored.
+

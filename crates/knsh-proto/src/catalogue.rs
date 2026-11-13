@@ -255,8 +255,8 @@ pub struct Catalogue {
     methods: &'static [MethodSpec],
 }
 
-/// Every method in the specification. Phase 1 implements `hello`, `records.query` and `records.output` (KNSH-016);
-/// the rest arrive with their stories.
+/// Every method in the specification. Phase 1 implements `hello`, `records.query` and `records.output` (KNSH-016)
+/// and `records.forget` (KNSH-017); the rest arrive with their stories.
 const ENGINE_METHODS: &[MethodSpec] = &[
     // Handshake (specs/06-api/handshake.md).
     MethodSpec::planned("hello", Endpoints::ALL).available(),
@@ -289,7 +289,8 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("policy.edit", Endpoints::USER),
     MethodSpec::planned("profile.use", Endpoints::USER),
     MethodSpec::planned("policy.grant", Endpoints::USER_CONTROL),
-    MethodSpec::planned("records.forget", Endpoints::USER),
+    // Deleting records is for the user only: an agent can never erase its own trail (KNSH-017).
+    MethodSpec::planned("records.forget", Endpoints::USER).available(),
     // Control service (specs/06-api/control-service.md).
     MethodSpec::planned("authority.register", Endpoints::CONTROL),
     MethodSpec::planned("decision.respond", Endpoints::CONTROL),
@@ -492,18 +493,28 @@ mod tests {
         }
     }
 
-    // Phase 1 implements the handshake and the record reads (KNSH-016): no method is claimed before it exists.
+    // Phase 1 implements the handshake, the record reads (KNSH-016) and, on user.sock only, `records.forget`
+    // (KNSH-017): no method is claimed before it exists.
     #[test]
-    fn phase1_lists_hello_and_record_reads_only() {
+    fn phase1_lists_hello_and_record_methods_only() {
         let caps = capabilities(Sandbox::Seatbelt);
         for endpoint in Endpoint::ALL {
+            let expected: &[&str] = match endpoint {
+                Endpoint::User => &["hello", "records.query", "records.output", "records.forget"],
+                Endpoint::Agent | Endpoint::Control => &["hello", "records.query", "records.output"],
+            };
             assert_eq!(
                 names(Catalogue::ENGINE, endpoint, &caps),
-                ["hello", "records.query", "records.output"],
+                expected,
                 "{}",
                 endpoint.name()
             );
         }
+        assert_eq!(
+            Catalogue::ENGINE.lookup(Endpoint::Agent, "records.forget", &caps),
+            Lookup::NotOnEndpoint,
+            "an agent can never erase records"
+        );
     }
 
     const TEST_METHODS: &[MethodSpec] = &[

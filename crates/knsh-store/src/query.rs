@@ -88,6 +88,40 @@ pub struct Page {
     pub next_cursor: Option<RecordId>,
 }
 
+/// Which records `forget` deletes (FR-REC-10): a session's, those started at or after an instant, or both
+/// combined with AND.
+///
+/// At least one selector is always set: there is no way to build a selector that matches every record by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ForgetSelector {
+    session: Option<SessionId>,
+    since: Option<Timestamp>,
+}
+
+impl ForgetSelector {
+    /// A selector, or `None` when neither `session` nor `since` is given.
+    #[must_use]
+    pub const fn new(session: Option<SessionId>, since: Option<Timestamp>) -> Option<Self> {
+        if session.is_none() && since.is_none() {
+            None
+        } else {
+            Some(Self { session, since })
+        }
+    }
+
+    /// Only this session's records.
+    #[must_use]
+    pub const fn session(&self) -> Option<SessionId> {
+        self.session
+    }
+
+    /// Only records started at or after this instant (inclusive).
+    #[must_use]
+    pub const fn since(&self) -> Option<Timestamp> {
+        self.since
+    }
+}
+
 /// A byte range of one record's stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutputRequest {
@@ -130,6 +164,17 @@ mod tests {
         assert_eq!(PageSize::new(MAX_PAGE_SIZE + 1), None);
         assert_eq!(PageSize::new(1).map(PageSize::get), Some(1));
         assert_eq!(PageSize::default().get(), DEFAULT_PAGE_SIZE);
+    }
+
+    // `forget` can never match every record by accident: one selector is required.
+    #[test]
+    fn forget_selector_requires_a_selector() {
+        assert_eq!(ForgetSelector::new(None, None), None);
+        let session = SessionId::from_ulid(knsh_core::Ulid::from_u128(1));
+        let selector = ForgetSelector::new(Some(session), None).unwrap();
+        assert_eq!((selector.session(), selector.since()), (Some(session), None));
+        let since = ForgetSelector::new(None, Some(Timestamp::UNIX_EPOCH)).unwrap();
+        assert_eq!(since.since(), Some(Timestamp::UNIX_EPOCH));
     }
 
     #[test]

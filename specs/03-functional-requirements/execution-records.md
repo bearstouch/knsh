@@ -15,3 +15,14 @@ Each agent command line becomes a structured record. Fields are defined in [../0
 | FR-REC-09 | Human telemetry records, when recording is on, must hold only `command`, `cwd`, times and `exit_code`. |
 | FR-REC-10 | `knsh forget --session <id>` or `--since <date>` must delete records; `--with-checkpoints` deletes their checkpoints too. |
 | FR-REC-11 | Secret values must never be stored in records; `secrets_injected` holds names only. |
+
+## Retention
+
+How FR-REC-07 applies (KNSH-017):
+
+- **Per record, by its session's profile.** One store holds the records of sessions with different profiles. Each record is kept for the `recording.retention_days` of its own session's profile; a profile without the setting, or a record whose session is unknown, uses the default of 30 days. Shortening one profile's retention never removes another profile's records early.
+- **One size limit for the store.** The 2 GB limit is for the whole store, measured as the space of its live database pages (pages less the free list). Over it, the oldest records (by `started_at`) are deleted, with their output, until the store is under the limit. Freed pages are reused by new records, so the file stays bounded without rewriting it.
+- **No special keeping.** Denials and approvals (FR-REC-03) follow the same retention as every other record.
+- **When.** `knshd`'s store thread runs retention when the store opens and then every hour, reading the time from its clock once per pass. It deletes in batches of 500 records, one transaction each, and serves queued reads and writes between batches, so a large clean-up delays a record write by at most one batch. If the clock cannot be read, the pass deletes nothing.
+- **`forget`.** `knsh forget` (FR-REC-10) is the manual counterpart; see [`records.forget`](../06-api/user-socket.md#recordsforget).
+

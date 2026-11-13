@@ -35,6 +35,17 @@ installs and removes it without talking to `knshd`.
 - The property list declares `user.sock` and `agent.sock` (mode `0600`) and the control service, starts `knshd` on
   demand (`RunAtLoad` false) and restarts it after a crash (`KeepAlive` → `Crashed`).
 
+## Forget
+
+`knsh forget` calls [`records.forget`](user-socket.md#recordsforget) and prints the number of records deleted
+(`{"deleted": n}` with `--json`).
+
+- At least one of `--session <id>` and `--since <date>` is required; with both, a record must match both. Without
+  one, or with a malformed value, it is a usage error (status 2) and nothing is sent.
+- `--since` takes a UTC date `YYYY-MM-DD` (from midnight UTC) or an engine timestamp `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`.
+- `--with-checkpoints` is passed on. Until checkpoints exist (phase 3) `knshd` answers `-32005`: `knsh forget` says so,
+  deletes nothing and exits with 1.
+
 ## Shell invocation
 
 | Invocation | Behaviour |

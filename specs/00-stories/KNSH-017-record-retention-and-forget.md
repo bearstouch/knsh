@@ -17,22 +17,22 @@ and becomes effective in phase 3.
 **Acceptance criteria**
 *Record retention*
 
-- [ ] Records older than the retention period are deleted, oldest first, with their output blobs.
-- [ ] When the store exceeds 2 GB, oldest records are deleted until under the limit.
-- [ ] Retention runs periodically and at start, in the writer thread, without blocking record writes for long
+- [x] Records older than the retention period are deleted, oldest first, with their output blobs.
+- [x] When the store exceeds 2 GB, oldest records are deleted until under the limit.
+- [x] Retention runs periodically and at start, in the writer thread, without blocking record writes for long
       (batched deletes).
-- [ ] Denial and approval records follow the same retention (no special keeping beyond the limit).
-- [ ] Time comes from the injected clock.
+- [x] Denial and approval records follow the same retention (no special keeping beyond the limit).
+- [x] Time comes from the injected clock.
 
 *`forget` (API and CLI)*
 
-- [ ] `forget {session_id}` and `forget {since}` on `user.sock` delete matching records and their output blobs in one
+- [x] `forget {session_id}` and `forget {since}` on `user.sock` delete matching records and their output blobs in one
       transaction; on error nothing is deleted.
-- [ ] `knsh forget --session <id>` and `--since <date>` call it and report the count; at least one selector is
+- [x] `knsh forget --session <id>` and `--since <date>` call it and report the count; at least one selector is
       required.
-- [ ] `--with-checkpoints` in phase 1 reports that checkpoints are not available (`-32005`), rather than silently
+- [x] `--with-checkpoints` in phase 1 reports that checkpoints are not available (`-32005`), rather than silently
       ignoring the flag.
-- [ ] Not available on `agent.sock`.
+- [x] Not available on `agent.sock`.
 
 **Unit tests**
 *Record retention*
@@ -53,4 +53,14 @@ and becomes effective in phase 3.
 *Record retention*
 
 — How a per-profile retention applies to a store shared by sessions with different profiles is not
-specified; propose "per record, using the profile of its session" in the spec.
+specified; propose "per record, using the profile of its session" in the spec. *Resolved:* specified in
+[execution records](../03-functional-requirements/execution-records.md#retention) — per record by its session's
+profile, the default for unknown sessions, and one 2 GB limit for the whole store.
+
+*Implementation notes (KNSH-017)*
+
+- The size limit is measured as the store's live pages (`page_count − freelist_count`); freed pages are reused, so
+  the file stays bounded without a `VACUUM`.
+- `records.forget` overwrites deleted content (`secure_delete`) and truncates the write-ahead log afterwards.
+- `knsh forget` uses a minimal `user.sock` client (`knsh::cli::client`) that KNSH-023 extends.
+- Per-profile periods are a store setting; `knshd` passes the defaults until profile files are loaded.

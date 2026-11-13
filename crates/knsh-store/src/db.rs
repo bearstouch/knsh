@@ -20,7 +20,8 @@ use knsh_platform::{FileKind, Fs};
 
 use crate::error::StoreError;
 use crate::output::{Capped, cap_output, len_u64};
-use crate::query::{OutputRange, OutputRequest, Page, RecordQuery, Scope, StoredRecord, clamp};
+use crate::query::{ForgetSelector, OutputRange, OutputRequest, Page, RecordQuery, Scope, StoredRecord, clamp};
+use crate::retention::Cutoffs;
 use crate::schema;
 
 /// A command's output as captured, before capping. Wrapped so it is never printed (NFR-PRIV-02): output may hold
@@ -70,8 +71,15 @@ impl Database {
             return Err(StoreError::UnsafeFile);
         }
         schema::migrate(&mut connection)?;
-        // Per connection, not stored in the file: deleting a record deletes its output.
-        connection.exec("PRAGMA foreign_keys = ON")?;
+        // Per connection, not stored in the file: deleting a record deletes its output (KNSH-017: retention and
+        // `forget` never leave orphaned output). `secure_delete` overwrites deleted content with zeros, so a forgotten
+        // command line does not linger in free pages of the file (NFR-PRIV-03).
+        connection.exec("PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON")?;
+        // The per-profile cutoffs of a retention pass, bound into the expiry delete as rows rather than as SQL text.
+        // A temporary table lives in this connection only and is never written to the file.
+        connection.exec(
+            "CREATE TEMP TABLE IF NOT EXISTS retention_cutoffs (profile TEXT PRIMARY KEY NOT NULL, cutoff INTEGER NOT NULL)",
+        )?;
         Ok(Self { connection, output_cap })
     }
 
@@ -287,6 +295,121 @@ impl Database {
             offset,
             data,
         })
+    }
+}
+
+impl Database {
+    /// Deletes every record matching `selector`, with its output, in one transaction (FR-REC-10, NFR-PRIV-03).
+    /// Returns how many records were deleted.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Platform`] if SQLite fails; the transaction is then rolled back and nothing is deleted.
+    pub(crate) fn forget(&mut self, selector: &ForgetSelector) -> Result<u64, StoreError> {
+        let session = selector.session().map(|id| id.to_string());
+        let since = selector.since().map(micros).transpose()?;
+        let transaction = self.connection.transaction()?;
+        // Outputs go with their records through `ON DELETE CASCADE`, inside the same statement.
+        let deleted = transaction.execute(
+            "DELETE FROM records WHERE (?1 IS NULL OR session_id = ?1) AND (?2 IS NULL OR started_at >= ?2)",
+            &[
+                optional_text(session.as_deref()),
+                since.map_or(Value::Null, Value::Integer),
+            ],
+        )?;
+        transaction.commit()?;
+        if deleted > 0 {
+            // The write-ahead log still holds images of the pages as they were before the delete. Checkpointing and
+            // truncating it removes them, so forgotten text is gone from disk too. Best effort: the records are already
+            // deleted, and a later automatic checkpoint overwrites the log anyway.
+            let _ = self.connection.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        }
+        Ok(deleted)
+    }
+
+    /// Deletes up to `limit` records that are older than their retention period, oldest first, in one transaction
+    /// (FR-REC-07). Each record is judged by its session's profile, falling back to the default cutoff when the
+    /// profile has no override or the session is unknown. Returns how many were deleted; fewer than `limit` means no
+    /// expired record is left.
+    ///
+    /// Denials and approvals are records like any other and expire the same way: no record kind is kept longer.
+    pub(crate) fn expire_batch(&mut self, cutoffs: &Cutoffs, limit: u32) -> Result<u64, StoreError> {
+        let latest = micros(cutoffs.latest())?;
+        let default = micros(cutoffs.default)?;
+        let transaction = self.connection.transaction()?;
+        transaction.exec("DELETE FROM temp.retention_cutoffs")?;
+        for (profile, cutoff) in &cutoffs.per_profile {
+            transaction.execute(
+                "INSERT INTO temp.retention_cutoffs (profile, cutoff) VALUES (?1, ?2)",
+                &[Value::Text(profile.as_str()), Value::Integer(micros(*cutoff)?)],
+            )?;
+        }
+        // `started_at < ?1` (the latest cutoff of all) bounds the scan to the `started_at` index: no record at or after
+        // it can have expired under any profile.
+        let deleted = transaction.execute(
+            "DELETE FROM records WHERE record_id IN (\
+             SELECT r.record_id FROM records AS r LEFT JOIN sessions AS s ON s.session_id = r.session_id \
+             WHERE r.started_at < ?1 AND r.started_at < coalesce(\
+             (SELECT c.cutoff FROM temp.retention_cutoffs AS c WHERE c.profile = s.profile), ?2) \
+             ORDER BY r.started_at, r.record_id LIMIT ?3)",
+            &[
+                Value::Integer(latest),
+                Value::Integer(default),
+                Value::Integer(i64::from(limit)),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(deleted)
+    }
+
+    /// When the store takes more than `max_bytes`, deletes the oldest records (at most `limit`) whose estimated size
+    /// covers the excess, in one transaction (FR-REC-07). Returns how many were deleted: 0 when the store is within
+    /// the limit or holds no record.
+    ///
+    /// The estimate only chooses how many records to delete in this batch; the caller measures again afterwards and
+    /// calls this until it returns 0, so the store ends under the limit even when the estimate is off.
+    pub(crate) fn shrink_batch(&mut self, max_bytes: u64, limit: u32) -> Result<u64, StoreError> {
+        let used = self.used_bytes()?;
+        let Some(excess) = used.checked_sub(max_bytes).filter(|excess| *excess > 0) else {
+            return Ok(0);
+        };
+        // A record's footprint: its output bytes, its two largest text fields, and a fixed allowance for the other
+        // columns and its index entries. `CAST AS BLOB` counts bytes, not characters.
+        let mut statement = self.connection.prepare(
+            "SELECT 256 + length(CAST(r.command AS BLOB)) + length(r.cwd) + \
+             coalesce((SELECT sum(length(o.data)) FROM outputs AS o WHERE o.record_id = r.record_id), 0) \
+             FROM records AS r ORDER BY r.started_at, r.record_id LIMIT ?1",
+        )?;
+        statement.bind_all(&[Value::Integer(i64::from(limit))])?;
+        let mut covered = 0u64;
+        let mut count = 0i64;
+        while covered < excess && statement.step()? == Step::Row {
+            let size = statement.column_i64(0)?.ok_or(StoreError::Corrupt)?;
+            covered = covered.saturating_add(u64::try_from(size).map_err(|_| StoreError::Corrupt)?);
+            count += 1;
+        }
+        drop(statement);
+        if count == 0 {
+            return Ok(0);
+        }
+        let transaction = self.connection.transaction()?;
+        // Same order as the estimate, and no write can come in between: this thread is the only writer.
+        let deleted = transaction.execute(
+            "DELETE FROM records WHERE record_id IN (\
+             SELECT record_id FROM records ORDER BY started_at, record_id LIMIT ?1)",
+            &[Value::Integer(count)],
+        )?;
+        transaction.commit()?;
+        Ok(deleted)
+    }
+
+    /// The bytes the store's live pages take: its pages less those on the free list.
+    pub(crate) fn used_bytes(&self) -> Result<u64, StoreError> {
+        let pragma = |name: &'static str| -> Result<u64, StoreError> {
+            u64::try_from(schema::pragma(&self.connection, name)?).map_err(|_| StoreError::Corrupt)
+        };
+        let pages = pragma("page_count")?.saturating_sub(pragma("freelist_count")?);
+        Ok(pages.saturating_mul(pragma("page_size")?))
     }
 }
 

@@ -1,6 +1,7 @@
 //! Behaviour of the record store against the real system SQLite, each test in its own temporary directory.
 
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 
 use knsh_core::{
     Actor, AgentId, CanonicalPath, CheckpointId, ExecutionRecord, OutputStream, ProfileName, RecordDetails, RecordId,
@@ -8,10 +9,12 @@ use knsh_core::{
 };
 use knsh_platform::macos::{RealFs, effective_uid};
 use knsh_platform::sqlite::{Connection, DEFAULT_BUSY_TIMEOUT, Step, Value};
+use knsh_platform::testing::FakeClock;
 
 use crate::testing::TempDir;
 use crate::{
-    OutputRequest, PageSize, RecordQuery, RecordStore, RecordedOutput, Scope, StoreConfig, StoreError, schema_version,
+    ForgetSelector, OutputRequest, PageSize, RecordQuery, RecordStore, RecordedOutput, Retention, RetentionDays,
+    RetentionReport, Scope, StoreConfig, StoreError, schema_version,
 };
 
 const BASE_MILLIS: u64 = 1_794_506_531_000;
@@ -21,7 +24,22 @@ fn open(dir: &TempDir) -> RecordStore {
 }
 
 fn open_with(dir: &TempDir, config: StoreConfig) -> RecordStore {
-    RecordStore::open(&RealFs::new(), &dir.db(), effective_uid(), config).unwrap()
+    open_at(dir, &clock(), config)
+}
+
+/// A fake clock at the base instant: every test record is younger than any retention period, so the pass that runs
+/// when a store opens deletes nothing unless a test moves the clock.
+fn clock() -> Arc<FakeClock> {
+    Arc::new(FakeClock::new(at(0)))
+}
+
+fn open_at(dir: &TempDir, clock: &Arc<FakeClock>, config: StoreConfig) -> RecordStore {
+    try_open(dir, clock, effective_uid(), config).unwrap()
+}
+
+fn try_open(dir: &TempDir, clock: &Arc<FakeClock>, uid: u32, config: StoreConfig) -> Result<RecordStore, StoreError> {
+    let clock: Arc<dyn knsh_platform::Clock> = clock.clone();
+    RecordStore::open(&RealFs::new(), &dir.db(), uid, clock, config)
 }
 
 fn session_id(n: u128) -> SessionId {
@@ -208,7 +226,7 @@ fn newer_schema_is_not_overwritten() {
     }
     let before = std::fs::read(dir.db()).unwrap();
 
-    let error = RecordStore::open(&RealFs::new(), &dir.db(), effective_uid(), StoreConfig::default()).unwrap_err();
+    let error = try_open(&dir, &clock(), effective_uid(), StoreConfig::default()).unwrap_err();
     assert_eq!(
         error,
         StoreError::NewerSchema {
@@ -233,9 +251,9 @@ fn database_must_be_owner_only() {
     assert_eq!(mode, 0o600, "created owner-only");
 
     std::fs::set_permissions(dir.db(), std::fs::Permissions::from_mode(0o644)).unwrap();
-    let error = RecordStore::open(&RealFs::new(), &dir.db(), effective_uid(), StoreConfig::default()).unwrap_err();
+    let error = try_open(&dir, &clock(), effective_uid(), StoreConfig::default()).unwrap_err();
     assert_eq!(error, StoreError::UnsafeFile);
-    let error = RecordStore::open(&RealFs::new(), &dir.db(), effective_uid() + 1, StoreConfig::default());
+    let error = try_open(&dir, &clock(), effective_uid() + 1, StoreConfig::default());
     assert!(error.is_err());
 }
 
@@ -243,7 +261,13 @@ fn database_must_be_owner_only() {
 #[test]
 fn output_over_cap_keeps_head_and_tail() {
     let dir = TempDir::new("cap");
-    let store = open_with(&dir, StoreConfig { output_cap: 10 });
+    let store = open_with(
+        &dir,
+        StoreConfig {
+            output_cap: 10,
+            ..StoreConfig::default()
+        },
+    );
     let written: Vec<u8> = (b'a'..=b'z').collect();
     store
         .write_record(record(1, session_id(1), agent(), "yes"), output(&written, b"short"))
@@ -564,4 +588,411 @@ fn secret_names_that_could_split_are_refused() {
             Err(StoreError::InvalidRecord("secrets_injected"))
         );
     }
+}
+
+// --- Retention and forget (KNSH-017) ---
+
+const DAY_MICROS: u64 = 86_400 * 1_000_000;
+
+/// Moves the wall clock to `days` days and `seconds` seconds after the base instant. Only the wall clock moves, so no
+/// automatic pass falls due: each test runs its pass explicitly and reads its report.
+fn set_days_after_base(clock: &FakeClock, days: u64, seconds: u64) {
+    clock.set_wall(at(seconds).as_unix_micros() + days * DAY_MICROS);
+}
+
+/// One integer from constant `sql`, read through an independent connection.
+fn count(dir: &TempDir, sql: &str) -> i64 {
+    let raw = Connection::open(&RealFs::new(), &dir.db(), DEFAULT_BUSY_TIMEOUT).unwrap();
+    let mut statement = raw.prepare(sql).unwrap();
+    assert_eq!(statement.step().unwrap(), Step::Row);
+    statement.column_i64(0).unwrap().unwrap()
+}
+
+/// The bytes the store's live pages take, read independently of the store: its pages less those on the free list.
+fn used_bytes(dir: &TempDir) -> i64 {
+    count(
+        dir,
+        "SELECT ((SELECT page_count FROM pragma_page_count) - (SELECT freelist_count FROM pragma_freelist_count)) \
+         * (SELECT page_size FROM pragma_page_size)",
+    )
+}
+
+/// Every record ID left in the store, in order.
+fn all_ids(store: &RecordStore) -> Vec<RecordId> {
+    query(
+        store,
+        Scope::All,
+        RecordQuery {
+            limit: PageSize::new(1_000).unwrap(),
+            ..RecordQuery::default()
+        },
+    )
+}
+
+/// Writes records `ns` of `session`, each with a stdout and stderr row.
+fn write_records(store: &RecordStore, session: SessionId, ns: impl IntoIterator<Item = u64>) {
+    for n in ns {
+        store
+            .write_record(
+                record(n, session, agent(), &format!("cmd-{n}")),
+                output(format!("out-{n}").as_bytes(), b"err"),
+            )
+            .unwrap();
+    }
+}
+
+fn session_with_profile(n: u128, profile: &str) -> Session {
+    Session::new(SessionSpec {
+        session_id: session_id(n),
+        actor: agent(),
+        profile: ProfileName::new(profile).unwrap(),
+        envelope: true,
+        recording: None,
+        parent_session_id: None,
+    })
+    .unwrap()
+}
+
+fn days(n: u32) -> RetentionDays {
+    RetentionDays::new(n).unwrap()
+}
+
+// FR-REC-07: records older than the retention period are deleted, judged by the injected clock; younger ones stay.
+#[test]
+fn deletes_records_older_than_retention() {
+    let dir = TempDir::new("expire");
+    let clock = clock();
+    let store = open_at(&dir, &clock, StoreConfig::default());
+    write_records(&store, session_id(1), 1..=8);
+
+    // At the base instant nothing is 30 days old.
+    assert_eq!(store.run_retention().unwrap(), RetentionReport::default());
+    assert_eq!(all_ids(&store).len(), 8);
+
+    // 30 days and 5 seconds later, records started before second 5 have expired; the one at second 5 is exactly 30
+    // days old and stays (the cutoff is exclusive).
+    set_days_after_base(&clock, 30, 5);
+    let report = store.run_retention().unwrap();
+    assert_eq!(report, RetentionReport { expired: 4, trimmed: 0 });
+    assert_eq!(all_ids(&store), (5..=8).map(record_id).collect::<Vec<_>>());
+
+    // A clock that cannot be read deletes nothing: retention never guesses the time.
+    clock.set_wall(u64::MAX);
+    let error = store.run_retention().unwrap_err();
+    assert!(matches!(error, StoreError::Platform(_)), "{error:?}");
+    assert_eq!(all_ids(&store).len(), 4);
+}
+
+// FR-REC-07: no orphaned output. Deleting a record deletes its stored streams.
+#[test]
+fn retention_deletes_output_blobs_with_records() {
+    let dir = TempDir::new("expire-output");
+    let clock = clock();
+    let store = open_at(&dir, &clock, StoreConfig::default());
+    write_records(&store, session_id(1), 1..=4);
+    assert_eq!(count(&dir, "SELECT count(*) FROM outputs"), 8);
+
+    set_days_after_base(&clock, 30, 3);
+    assert_eq!(store.run_retention().unwrap().expired, 2);
+    assert_eq!(
+        count(&dir, "SELECT count(*) FROM outputs"),
+        4,
+        "two streams per remaining record"
+    );
+    assert_eq!(
+        count(
+            &dir,
+            "SELECT count(*) FROM outputs WHERE record_id NOT IN (SELECT record_id FROM records)"
+        ),
+        0
+    );
+}
+
+// FR-REC-07: denials and approvals are kept no longer than other records.
+#[test]
+fn denials_and_approvals_follow_the_same_retention() {
+    let dir = TempDir::new("expire-decisions");
+    let clock = clock();
+    let store = open_at(&dir, &clock, StoreConfig::default());
+    write_records(&store, session_id(1), 1..=2);
+    {
+        // Phase 1 writes no decisions yet; mark the records as a denial and an approval directly.
+        let raw = Connection::open(&RealFs::new(), &dir.db(), DEFAULT_BUSY_TIMEOUT).unwrap();
+        raw.execute(
+            "UPDATE records SET decision = ?1 WHERE record_id = ?2",
+            &[Value::Text("deny"), Value::Text(&record_id(1).to_string())],
+        )
+        .unwrap();
+        raw.execute(
+            "UPDATE records SET decision = ?1 WHERE record_id = ?2",
+            &[Value::Text("approved"), Value::Text(&record_id(2).to_string())],
+        )
+        .unwrap();
+    }
+    set_days_after_base(&clock, 31, 0);
+    assert_eq!(store.run_retention().unwrap().expired, 2);
+    assert_eq!(count(&dir, "SELECT count(*) FROM records"), 0);
+}
+
+// FR-REC-07, configurability: each record is kept for the period of its own session's profile; profiles without an
+// override, and records whose session is unknown, use the default.
+#[test]
+fn per_profile_retention_overrides_default() {
+    let dir = TempDir::new("profiles");
+    let clock = clock();
+    let mut retention = Retention::default();
+    retention
+        .per_profile
+        .insert(ProfileName::new("short").unwrap(), days(1));
+    retention
+        .per_profile
+        .insert(ProfileName::new("long").unwrap(), days(90));
+    let store = open_at(
+        &dir,
+        &clock,
+        StoreConfig {
+            retention,
+            ..StoreConfig::default()
+        },
+    );
+    for (n, profile) in [(1, "short"), (2, "default"), (3, "long")] {
+        store.write_session(&session_with_profile(n, profile), at(0)).unwrap();
+    }
+    // Record n belongs to session n; record 4's session has no row.
+    for n in 1..=4u64 {
+        write_records(&store, session_id(u128::from(n)), [n]);
+    }
+
+    set_days_after_base(&clock, 10, 0);
+    assert_eq!(store.run_retention().unwrap().expired, 1);
+    assert_eq!(
+        all_ids(&store),
+        [record_id(2), record_id(3), record_id(4)],
+        "only the 1-day profile"
+    );
+
+    set_days_after_base(&clock, 31, 0);
+    assert_eq!(store.run_retention().unwrap().expired, 2);
+    assert_eq!(
+        all_ids(&store),
+        [record_id(3)],
+        "the 90-day profile outlives the default"
+    );
+
+    set_days_after_base(&clock, 91, 0);
+    assert_eq!(store.run_retention().unwrap().expired, 1);
+    assert_eq!(all_ids(&store), Vec::<RecordId>::new());
+}
+
+// FR-REC-07: over the size limit, the oldest records go first, until the store is under the limit.
+#[test]
+fn size_limit_deletes_oldest_first() {
+    let dir = TempDir::new("size");
+    let clock = clock();
+    let blob = |n: u64| -> Vec<u8> { (0..64 * 1024u64).map(|i| ((i * 31 + n) % 251) as u8).collect() };
+    let used_with_all = {
+        let store = open_at(&dir, &clock, StoreConfig::default());
+        for n in 1..=10 {
+            let stdout = Redacted::new(blob(n));
+            let recorded = RecordedOutput {
+                stdout: Some(stdout),
+                stderr: None,
+            };
+            store
+                .write_record(record(n, session_id(1), agent(), "build"), recorded)
+                .unwrap();
+        }
+        store.sync().unwrap();
+        used_bytes(&dir)
+    };
+    // Room for all but about three records.
+    let max_bytes = u64::try_from(used_with_all).unwrap() - 3 * 64 * 1024 - 1024;
+    let store = open_at(
+        &dir,
+        &clock,
+        StoreConfig {
+            retention: Retention {
+                max_bytes,
+                ..Retention::default()
+            },
+            ..StoreConfig::default()
+        },
+    );
+    // The pass that ran at open may already have trimmed; this one finishes it (or joins it) and finds no excess.
+    store.run_retention().unwrap();
+    assert_eq!(
+        store.run_retention().unwrap(),
+        RetentionReport::default(),
+        "already under the limit"
+    );
+
+    let left = all_ids(&store);
+    let first = (1..=10).find(|n| left.first() == Some(&record_id(*n))).unwrap();
+    assert_eq!(
+        left,
+        (first..=10).map(record_id).collect::<Vec<_>>(),
+        "oldest deleted first"
+    );
+    assert!(
+        (4..=6).contains(&first),
+        "about three records deleted, not more: first kept is {first}"
+    );
+    let used = used_bytes(&dir);
+    assert!(u64::try_from(used).unwrap() <= max_bytes, "{used} > {max_bytes}");
+    assert_eq!(
+        count(&dir, "SELECT count(*) FROM outputs"),
+        i64::try_from(left.len()).unwrap(),
+        "no orphaned output"
+    );
+}
+
+// A pass deletes in batches of RETENTION_BATCH and keeps going until nothing expired is left.
+#[test]
+fn retention_runs_in_batches_until_done() {
+    let dir = TempDir::new("batches");
+    let clock = clock();
+    let store = open_at(&dir, &clock, StoreConfig::default());
+    let total = u64::from(crate::RETENTION_BATCH) * 2 + 7;
+    {
+        // Many records quickly: one transaction on a side connection rather than one fsync per record.
+        let mut raw = Connection::open(&RealFs::new(), &dir.db(), DEFAULT_BUSY_TIMEOUT).unwrap();
+        let transaction = raw.transaction().unwrap();
+        let session = session_id(1).to_string();
+        for n in 1..=total {
+            transaction
+                .execute(
+                    "INSERT INTO records (record_id, session_id, actor_kind, command, cwd, started_at) \
+                     VALUES (?1, ?2, 'human', 'ls', X'2F', ?3)",
+                    &[
+                        Value::Text(&record_id(n).to_string()),
+                        Value::Text(&session),
+                        Value::Integer(i64::try_from(at(n).as_unix_micros()).unwrap()),
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+    clock.set_wall(at(0).as_unix_micros() + 40 * DAY_MICROS);
+    assert_eq!(store.run_retention().unwrap().expired, total);
+    assert_eq!(count(&dir, "SELECT count(*) FROM records"), 0);
+}
+
+// FR-REC-10, NFR-PRIV-03: forgetting a session deletes its records and their output, and nothing else.
+#[test]
+fn forget_session_deletes_records_and_blobs() {
+    let dir = TempDir::new("forget");
+    let store = open(&dir);
+    write_records(&store, session_id(1), [1, 3, 5]);
+    write_records(&store, session_id(2), [2, 4]);
+
+    let selector = ForgetSelector::new(Some(session_id(1)), None).unwrap();
+    assert_eq!(store.forget(selector).unwrap(), 3);
+    assert_eq!(all_ids(&store), [record_id(2), record_id(4)]);
+    assert_eq!(
+        count(&dir, "SELECT count(*) FROM outputs"),
+        4,
+        "only session 2's streams remain"
+    );
+    // Nothing matched any more: forgetting again deletes nothing.
+    assert_eq!(store.forget(selector).unwrap(), 0);
+}
+
+// FR-REC-10: `since` is inclusive, and combined with a session both must match.
+#[test]
+fn forget_since_deletes_records_started_from_that_instant() {
+    let dir = TempDir::new("forget-since");
+    let store = open(&dir);
+    write_records(&store, session_id(1), 1..=4);
+    write_records(&store, session_id(2), 5..=6);
+
+    let both = ForgetSelector::new(Some(session_id(1)), Some(at(3))).unwrap();
+    assert_eq!(store.forget(both).unwrap(), 2);
+    assert_eq!(
+        all_ids(&store),
+        [record_id(1), record_id(2), record_id(5), record_id(6)]
+    );
+
+    let since = ForgetSelector::new(None, Some(at(2))).unwrap();
+    assert_eq!(store.forget(since).unwrap(), 3);
+    assert_eq!(all_ids(&store), [record_id(1)]);
+    assert_eq!(count(&dir, "SELECT count(*) FROM outputs"), 2);
+}
+
+// Failure safety: if any delete fails, the whole forget is rolled back and nothing is deleted.
+#[test]
+fn forget_is_atomic_on_error() {
+    let dir = TempDir::new("forget-atomic");
+    let store = open(&dir);
+    write_records(&store, session_id(1), 1..=3);
+    {
+        // Make deleting the second record fail half way through the statement.
+        let raw = Connection::open(&RealFs::new(), &dir.db(), DEFAULT_BUSY_TIMEOUT).unwrap();
+        raw.exec(&format!(
+            "CREATE TRIGGER refuse BEFORE DELETE ON records WHEN old.record_id = '{}' \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+            record_id(2)
+        ))
+        .unwrap();
+    }
+    let error = store
+        .forget(ForgetSelector::new(Some(session_id(1)), None).unwrap())
+        .unwrap_err();
+    assert!(matches!(error, StoreError::Platform(_)), "{error:?}");
+    assert_eq!(all_ids(&store), (1..=3).map(record_id).collect::<Vec<_>>());
+    assert_eq!(count(&dir, "SELECT count(*) FROM outputs"), 6, "every stream kept");
+}
+
+/// Polls `done` for up to five seconds: for passes the store thread starts on its own, which no call waits for.
+fn eventually(mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
+// FR-REC-07: retention runs when the store opens, without being asked.
+#[test]
+fn retention_runs_at_start() {
+    let dir = TempDir::new("at-start");
+    drop({
+        let store = open(&dir);
+        write_records(&store, session_id(1), 1..=3);
+        store.sync().unwrap();
+        store
+    });
+    // Reopened 40 days later: the pass at open deletes every record, with no call to `run_retention`.
+    let clock = clock();
+    set_days_after_base(&clock, 40, 0);
+    let store = open_at(&dir, &clock, StoreConfig::default());
+    assert!(
+        eventually(|| all_ids(&store).is_empty()),
+        "the pass at open did not run"
+    );
+    assert_eq!(count(&dir, "SELECT count(*) FROM outputs"), 0);
+}
+
+// FR-REC-07: retention runs periodically while the store is open, timed by the injected monotonic clock, and writes
+// keep being served.
+#[test]
+fn retention_runs_periodically() {
+    let dir = TempDir::new("periodic");
+    let clock = clock();
+    let store = open_at(&dir, &clock, StoreConfig::default());
+    write_records(&store, session_id(1), 1..=3);
+    set_days_after_base(&clock, 40, 0);
+    store.sync().unwrap();
+    assert_eq!(all_ids(&store).len(), 3, "no pass is due before the interval elapses");
+
+    // One interval later on the monotonic clock: the next time the thread wakes (here, on the next job), a pass is
+    // due and starts by itself.
+    clock.advance(crate::RETENTION_INTERVAL);
+    assert!(eventually(|| all_ids(&store).is_empty()), "no periodic pass ran");
+    // The store still takes writes after its passes.
+    write_records(&store, session_id(1), [100]);
+    assert_eq!(all_ids(&store), [record_id(100)]);
 }

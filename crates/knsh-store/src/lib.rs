@@ -10,12 +10,12 @@
 //!
 //! # Specification
 //!
-//! - `specs/03-functional-requirements/execution-records.md` (FR-REC-02, FR-REC-06, FR-REC-08, FR-REC-09,
-//!   FR-REC-11)
+//! - `specs/03-functional-requirements/execution-records.md` (FR-REC-02, FR-REC-06, FR-REC-07, FR-REC-08,
+//!   FR-REC-09, FR-REC-10, FR-REC-11)
 //! - `specs/05-models/execution-record.md`
-//! - `specs/04-non-functional-requirements/privacy.md`, `specs/04-non-functional-requirements/reliability.md`
+//! - `specs/04-non-functional-requirements/privacy.md` (NFR-PRIV-03), `specs/04-non-functional-requirements/reliability.md`
 //!   (NFR-REL-05)
-//! - `specs/06-api/user-socket.md` (`records.query`, `records.output`)
+//! - `specs/06-api/user-socket.md` (`records.query`, `records.output`, `records.forget`)
 //!
 //! # Record store (KNSH-016)
 //!
@@ -30,6 +30,16 @@
 //!   cursor; [`OutputRequest`] reads a clamped byte range. Every read takes a [`Scope`], applied in SQL, so a
 //!   session-scoped caller never sees another session's records.
 //!
+//! # Retention and `forget` (KNSH-017)
+//!
+//! - **Retention.** Records older than their period, or the oldest while the store is over its size limit, are
+//!   deleted with their output ([`Retention`], FR-REC-07). Each record uses the period of its session's profile. The
+//!   store thread runs a pass at open and every hour, in batches of [`RETENTION_BATCH`] records, serving queued jobs
+//!   between batches; time comes from the injected [`Clock`](knsh_platform::Clock).
+//! - **`forget`.** [`RecordStore::forget`] deletes the records matching a [`ForgetSelector`] and their output in one
+//!   transaction: on error nothing is deleted (FR-REC-10, NFR-PRIV-03). Deleted content is overwritten
+//!   (`secure_delete`) and the write-ahead log truncated, so forgotten text does not stay on disk.
+//!
 //! The store is built on macOS only until the Linux SQLite backend exists.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -41,6 +51,7 @@ mod db;
 mod error;
 mod output;
 mod query;
+mod retention;
 #[cfg(target_os = "macos")]
 mod schema;
 #[cfg(target_os = "macos")]
@@ -58,7 +69,12 @@ pub use db::RecordedOutput;
 pub use error::StoreError;
 pub use output::DEFAULT_OUTPUT_CAP;
 pub use query::{
-    DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, OutputRange, OutputRequest, Page, PageSize, RecordQuery, Scope, StoredRecord,
+    DEFAULT_PAGE_SIZE, ForgetSelector, MAX_PAGE_SIZE, OutputRange, OutputRequest, Page, PageSize, RecordQuery, Scope,
+    StoredRecord,
+};
+pub use retention::{
+    DEFAULT_MAX_BYTES, DEFAULT_RETENTION_DAYS, MAX_RETENTION_DAYS, RETENTION_BATCH, RETENTION_INTERVAL, Retention,
+    RetentionDays, RetentionReport,
 };
 #[cfg(target_os = "macos")]
 pub use schema::current_version as schema_version;

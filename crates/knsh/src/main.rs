@@ -24,6 +24,7 @@ fn main() -> ExitCode {
         Ok(Invocation::Shell(_)) => not_implemented("shell mode"),
         Ok(Invocation::Command(parsed)) => match parsed.path.as_slice() {
             ["daemon", action @ ("install" | "uninstall")] => daemon(action, parsed.json()),
+            ["forget"] => forget(&parsed),
             _ => not_implemented(&format!("'knsh {}'", parsed.path.join(" "))),
         },
         // Usage errors run nothing and exit with 2, like bash (KNSH-009).
@@ -73,6 +74,53 @@ fn daemon(action: &str, json: bool) -> ExitCode {
 #[cfg(not(target_os = "macos"))]
 fn daemon(action: &str, _json: bool) -> ExitCode {
     not_implemented(&format!("'knsh daemon {action}' on this platform"))
+}
+
+/// Runs `knsh forget` (KNSH-017): validates the selectors, calls `records.forget` on `user.sock` and reports the
+/// count. A command line without a selector, or with a malformed one, is a usage error (exit 2) and sends nothing;
+/// a failed call exits with 1 and the reason on stderr.
+#[cfg(unix)]
+fn forget(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    use knsh::cli::{client, forget};
+    use knsh_platform::EnginePaths;
+
+    let params = match forget::params(parsed) {
+        Ok(params) => params,
+        Err(error) => {
+            report(&format!(
+                "knsh: {error}\nTry 'knsh forget --help' for more information.\n"
+            ));
+            return ExitCode::from(ArgsError::EXIT_STATUS);
+        }
+    };
+    let Some(home) = std::env::var_os("HOME") else {
+        report("knsh: HOME is not set\n");
+        return ExitCode::FAILURE;
+    };
+    let paths = match EnginePaths::for_home(std::path::Path::new(&home)) {
+        Ok(paths) => paths,
+        Err(error) => {
+            report(&format!("knsh: unusable HOME: {error}\n"));
+            return ExitCode::FAILURE;
+        }
+    };
+    let outcome = client::connect_user(&paths.user_socket()).and_then(|mut client| forget::run(&mut client, &params));
+    match outcome {
+        Ok(deleted) => {
+            let _ = std::io::stdout().write_all(forget::report(deleted, parsed.json()).as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            report(&forget::failure_message(&error));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `user.sock` is a Unix socket; no other platform has one.
+#[cfg(not(unix))]
+fn forget(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    not_implemented("'knsh forget' on this platform")
 }
 
 /// Reports that a correctly parsed invocation has no behaviour yet.

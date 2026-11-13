@@ -16,6 +16,8 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
+# Session IDs and timestamps, validated before a request is sent (`knsh forget`, KNSH-017).
+knsh-core = { path = "../knsh-core" }
 knsh-proto = { path = "../knsh-proto" }
 knsh-json = { path = "../knsh-json" }
 # Engine paths and the launchd agent for `knsh daemon install` and `uninstall` (KNSH-012). knsh-platform is the

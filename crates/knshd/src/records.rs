@@ -1,8 +1,17 @@
-//! `records.query` and `records.output` (KNSH-016, `specs/06-api/user-socket.md#records`).
+//! `records.query`, `records.output` (KNSH-016) and `records.forget` (KNSH-017),
+//! `specs/06-api/user-socket.md#records`.
 //!
 //! The handlers are thin: parameters are read by `knsh-proto`, records come from the [`RecordStore`], and the
-//! answer is written by `knsh-proto`. Records leave the engine only through these two methods; the SQLite file is
+//! answer is written by `knsh-proto`. Records leave the engine only through the two read methods; the SQLite file is
 //! never an API (FR-REC-08).
+//!
+//! # Forget
+//!
+//! `records.forget` exists on `user.sock` only: the catalogue keeps it off `agent.sock` (`-32003` there), and the
+//! handler checks the endpoint again, so an agent can never erase records. Records matching the selectors are
+//! deleted with their output in one transaction (FR-REC-10, NFR-PRIV-03). `with_checkpoints` is refused with
+//! `-32005` naming `checkpoints` until checkpoints exist (phase 3), before anything is deleted: the user asked for
+//! more than this build can do, so it does nothing rather than half of it.
 //!
 //! # Scope
 //!
@@ -24,12 +33,12 @@ use std::sync::Arc;
 
 use knsh_json::ToJson;
 use knsh_proto::{
-    ByteTransport, ErrorCode, MAX_BASE64_OUTPUT, OutputData, RecordEntry, RecordsOutputParams, RecordsOutputResult,
-    RecordsQueryParams, RecordsQueryResult, RpcError,
+    Backend, ByteTransport, ErrorCode, MAX_BASE64_OUTPUT, OutputData, RecordEntry, RecordsForgetParams,
+    RecordsForgetResult, RecordsOutputParams, RecordsOutputResult, RecordsQueryParams, RecordsQueryResult, RpcError,
 };
-use knsh_store::{OutputRequest, PageSize, RecordQuery, RecordStore, Scope, StoreError};
+use knsh_store::{ForgetSelector, OutputRequest, PageSize, RecordQuery, RecordStore, Scope, StoreError};
 
-use crate::dispatch::{Answer, Call, Endpoint, Handler, Handlers, Reply};
+use crate::dispatch::{Answer, Call, Endpoint, Handler, Handlers, Reply, capability_unavailable};
 use crate::lifetime::{CommitFailed, PendingWrites};
 
 /// The most bytes the records of one `records.query` answer may take as JSON: one frame, less room for the
@@ -59,15 +68,47 @@ impl Records {
         self.store.as_ref().ok_or_else(internal_error)
     }
 
-    /// Both handlers, by method name.
+    /// Every record handler, by method name.
     pub(crate) fn handlers(&self) -> Handlers {
         let query = self.clone();
         let output = self.clone();
+        let forget = self.clone();
         let query: Handler = Arc::new(move |call: &Call<'_>| query.query(scope_of(call)?, call));
         let output: Handler = Arc::new(move |call: &Call<'_>| output.output(scope_of(call)?, call));
-        [("records.query", query), ("records.output", output)]
-            .into_iter()
-            .collect()
+        let forget: Handler = Arc::new(move |call: &Call<'_>| forget.forget(call));
+        [
+            ("records.query", query),
+            ("records.output", output),
+            ("records.forget", forget),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// `records.forget`: deletes the matching records and their output, and answers how many (FR-REC-10).
+    pub(crate) fn forget(&self, call: &Call<'_>) -> Reply {
+        // The dispatcher already keeps this method off agent.sock; checked again so that a routing mistake can never
+        // let an agent erase records.
+        match call.endpoint {
+            Endpoint::User => {}
+            Endpoint::Agent => return Err(RpcError::new(ErrorCode::NotAllowed)),
+        }
+        let params: RecordsForgetParams = call.request.params().map_err(|error| RpcError::from(&error))?;
+        if params.with_checkpoints {
+            // Honest capabilities: phase 1 has no checkpoints to delete. Refused before any record is touched.
+            return Err(capability_unavailable(Backend::Checkpoints.name()));
+        }
+        // The protocol already requires a selector; a mismatch is still refused rather than widened to every record.
+        let selector = ForgetSelector::new(params.session_id, params.since)
+            .ok_or_else(|| RpcError::new(ErrorCode::InvalidParams))?;
+        let deleted = self
+            .store()?
+            .forget(selector)
+            .map_err(|error| store_error(Scope::All, &error))?;
+        let result = RecordsForgetResult { deleted }
+            .to_json()
+            .map_err(|_| internal_error())?;
+        Ok(Answer::from(result))
     }
 
     /// `records.query` within `scope`.
@@ -225,6 +266,7 @@ mod tests {
     };
     use knsh_json::{Frame, FrameReader, StreamId, Value};
     use knsh_platform::macos::{RealFs, effective_uid};
+    use knsh_platform::testing::FakeClock;
     use knsh_proto::{Message, MethodName, Request, RequestId, decode};
     use knsh_store::{RecordedOutput, StoreConfig};
 
@@ -253,6 +295,18 @@ mod tests {
         }
     }
 
+    /// A store in `dir`, on a fake clock at the epoch so the pass at open deletes nothing.
+    fn open_store(dir: &TempDir) -> RecordStore {
+        RecordStore::open(
+            &RealFs::new(),
+            &dir.0.join("records.db"),
+            effective_uid(),
+            Arc::new(FakeClock::new(Timestamp::UNIX_EPOCH)),
+            StoreConfig::default(),
+        )
+        .unwrap()
+    }
+
     fn session(n: u128) -> SessionId {
         SessionId::from_ulid(Ulid::from_u128(n))
     }
@@ -263,13 +317,7 @@ mod tests {
 
     /// A store holding records 1 and 3 of session 1 and record 2 of session 2, each with stdout `out-<n>`.
     fn records(dir: &TempDir) -> Records {
-        let store = RecordStore::open(
-            &RealFs::new(),
-            &dir.0.join("records.db"),
-            effective_uid(),
-            StoreConfig::default(),
-        )
-        .unwrap();
+        let store = open_store(dir);
         for (n, owner) in [(1, session(1)), (2, session(2)), (3, session(1))] {
             let record = ExecutionRecord {
                 record_id: record_id(n),
@@ -424,13 +472,7 @@ mod tests {
     #[test]
     fn query_page_is_cut_to_fit_one_frame() {
         let dir = TempDir::new();
-        let store = RecordStore::open(
-            &RealFs::new(),
-            &dir.0.join("records.db"),
-            effective_uid(),
-            StoreConfig::default(),
-        )
-        .unwrap();
+        let store = open_store(&dir);
         let long = "x".repeat(16 * 1024);
         let total = 100u128;
         for n in 1..=total {
@@ -592,5 +634,88 @@ mod tests {
             .unwrap();
         assert_eq!(field(&answer, "recorded").as_bool(), Some(false));
         assert_eq!(answer.bytes.as_deref(), Some(&b""[..]));
+    }
+
+    fn deleted(answer: &Answer) -> i64 {
+        field(answer, "deleted").as_i64().unwrap()
+    }
+
+    // FR-REC-10: forget on user.sock deletes the matching records and reports the count.
+    #[test]
+    fn forget_deletes_matching_records_and_reports_the_count() {
+        let dir = TempDir::new();
+        let records = records(&dir);
+        let request = rpc("records.forget", &format!(r#"{{"session_id":"{}"}}"#, session(1)));
+        let answer = records.forget(&call(&request, ByteTransport::BinaryFrames)).unwrap();
+        assert_eq!(deleted(&answer), 2);
+
+        let query = rpc("records.query", "{}");
+        let left = records
+            .query(Scope::All, &call(&query, ByteTransport::BinaryFrames))
+            .unwrap();
+        assert_eq!(record_ids(&left), [record_id(2).to_string()]);
+
+        // `since` alone: record 2 started at second 2.
+        let request = rpc("records.forget", r#"{"since":"1970-01-01T00:00:02Z"}"#);
+        let answer = records.forget(&call(&request, ByteTransport::BinaryFrames)).unwrap();
+        assert_eq!(deleted(&answer), 1);
+
+        // No selector: refused, nothing deleted.
+        let request = rpc("records.forget", "{}");
+        let error = records
+            .forget(&call(&request, ByteTransport::BinaryFrames))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidParams);
+    }
+
+    // Honest capabilities: phase 1 has no checkpoints, so --with-checkpoints is -32005 naming them, and nothing is
+    // deleted.
+    #[test]
+    fn with_checkpoints_reports_capability_unavailable() {
+        let dir = TempDir::new();
+        let records = records(&dir);
+        let request = rpc(
+            "records.forget",
+            &format!(r#"{{"session_id":"{}","with_checkpoints":true}}"#, session(1)),
+        );
+        let error = records
+            .forget(&call(&request, ByteTransport::BinaryFrames))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::CapabilityUnavailable);
+        let data = error.data.unwrap();
+        assert_eq!(
+            data.as_object().unwrap().get("capability").and_then(Value::as_str),
+            Some("checkpoints")
+        );
+        let query = rpc("records.query", "{}");
+        let left = records
+            .query(Scope::All, &call(&query, ByteTransport::BinaryFrames))
+            .unwrap();
+        assert_eq!(record_ids(&left).len(), 3, "nothing deleted");
+    }
+
+    // records.forget is not available on agent.sock: the real phase 1 dispatcher refuses it there with -32003, and
+    // the handler refuses it too if ever reached.
+    #[test]
+    fn forget_is_not_available_on_agent_sock() {
+        let dir = TempDir::new();
+        let records = records(&dir);
+        let request = rpc("records.forget", &format!(r#"{{"session_id":"{}"}}"#, session(1)));
+        let agent_call = Call {
+            endpoint: Endpoint::Agent,
+            ..call(&request, ByteTransport::BinaryFrames)
+        };
+        let error = records.forget(&agent_call).unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotAllowed);
+
+        let probed = crate::probe::probe(&crate::probe::tests::Machine::working().probes());
+        let dispatcher = crate::hello::phase1_dispatcher(probed, records.handlers()).unwrap();
+        let error = dispatcher.call(&agent_call).unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotAllowed);
+        let query = rpc("records.query", "{}");
+        let left = records
+            .query(Scope::All, &call(&query, ByteTransport::BinaryFrames))
+            .unwrap();
+        assert_eq!(record_ids(&left).len(), 3, "nothing deleted");
     }
 }
