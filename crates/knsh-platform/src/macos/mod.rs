@@ -15,3 +15,10 @@ pub use fs::RealFs;
 pub use log::UnifiedLog;
 pub use process::SystemProcesses;
 pub use random::SystemRandom;
+
+/// The effective user id of this process: the only owner whose engine paths are used (KNSH-011, NFR-SEC-08).
+#[must_use]
+pub fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions, touches no memory of ours and cannot fail.
+    unsafe { libc::geteuid() }
+}

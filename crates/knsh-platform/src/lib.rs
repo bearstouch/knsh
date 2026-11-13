@@ -14,6 +14,9 @@
 //! The [`sqlite`] module (KNSH-010) is a safe wrapper over the system SQLite library for the record store; it is not
 //! a trait, because the record store always uses the real database (in a temporary directory under test).
 //!
+//! The [`engine_dirs`] module (KNSH-011) is the single source of engine paths ([`EnginePaths`]) and prepares them
+//! owner-only and excluded from Spotlight and Time Machine ([`ensure_engine_dirs`]), through the [`Fs`] trait.
+//!
 //! Later stories add Keychain, `LocalAuthentication`, XPC, `FSEvents` and APFS clones to the same interface.
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
@@ -37,6 +40,7 @@
 //! - `specs/02-architecture/platform-support.md`
 //! - `specs/08-integrations/macos-services.md`
 //! - `specs/04-non-functional-requirements/supply-chain.md` (system SQLite, no crates), FR-REC-08 (KNSH-010)
+//! - `specs/09-reference/file-locations.md`, NFR-PRIV-04, NFR-SEC-08 (engine directories, KNSH-011)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
@@ -44,6 +48,7 @@
 #![warn(clippy::pedantic)]
 
 mod clock;
+pub mod engine_dirs;
 mod error;
 mod fs;
 mod log;
@@ -64,6 +69,7 @@ pub mod sqlite;
 pub mod testing;
 
 pub use clock::{Clock, Monotonic};
+pub use engine_dirs::{EnginePaths, ensure_engine_dirs};
 pub use error::{Operation, PlatformError, SqliteCode};
 pub use fs::{FileKind, Fs, Metadata};
 pub use log::{Field, Level, SystemLog, Value, render};

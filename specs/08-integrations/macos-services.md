@@ -15,7 +15,7 @@ All macOS services sit behind one internal platform interface, called directly f
 | Unified logging | System log subsystem `knsh`; reading tagged sandbox denials | Best effort |
 | CommonCrypto | Hashing and policy signatures | |
 | SQLite (system library) | Record store | |
-| Spotlight, Time Machine | Exclusion of engine paths | |
+| Spotlight, Time Machine | Exclusion of engine paths | Time Machine: extended attribute `com.apple.metadata:com_apple_backup_excludeItem` set to the same binary plist `tmutil addexclusion` writes (sticky item exclusion, no admin rights; `tmutil addexclusion -p` would need them). Spotlight: an empty `.metadata_never_index` file in each engine directory, which macOS 26.6 was observed to ignore below the volume root (claim C11, open). Both read back after writing (KNSH-011) |
 | Audit tokens | Matching `agent.sock` callers without a session token to their envelope | |
 
 Claims about these services that must be verified before phase 2 are listed in [../07-testing/verification-claims.md](../07-testing/verification-claims.md).

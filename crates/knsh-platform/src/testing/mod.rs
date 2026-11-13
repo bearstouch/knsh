@@ -19,7 +19,7 @@ mod process;
 mod random;
 
 pub use clock::FakeClock;
-pub use fs::MemFs;
+pub use fs::{DEFAULT_UID, MemFs};
 pub use log::{Entry, RecordingLog};
 pub use process::{Script, ScriptedProcesses};
 pub use random::SeededRandom;

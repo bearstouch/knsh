@@ -33,6 +33,8 @@ pub struct Metadata {
     pub len: u64,
     /// Permission bits (`0o7777` mask), for example `0o600`.
     pub mode: u32,
+    /// User id of the owner. Engine paths owned by anyone but the engine's user are refused (KNSH-011).
+    pub uid: u32,
 }
 
 /// Filesystem operations. Object safe: hold it as `Arc<dyn Fs>`.
@@ -120,6 +122,36 @@ pub trait Fs: Send + Sync {
     /// is found (`ELOOP`); [`PlatformError::NotCanonical`] if the system returned a path that breaks the
     /// [`CanonicalPath`] invariants.
     fn canonicalise(&self, path: &Path) -> Result<CanonicalPath, PlatformError>;
+
+    /// Sets the permission bits of `path` to exactly `mode` (not reduced by the umask), without following a final
+    /// symlink: if `path` is a symlink, the link itself is changed, never its target. Used to tighten engine paths
+    /// to owner-only (KNSH-011, NFR-SEC-08).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::InvalidPath`]; [`PlatformError::Os`] with [`Operation::SetMode`](crate::Operation::SetMode)
+    /// (`ENOENT` if nothing exists there, `EPERM` if the caller does not own it).
+    fn set_mode(&self, path: &Path, mode: u32) -> Result<(), PlatformError>;
+
+    /// Reads the extended attribute `name` of `path` itself, without following a final symlink. Returns `None` if
+    /// the attribute is not set. Values longer than `limit` bytes are refused before allocating more than `limit`.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::InvalidPath`] for a relative path or a path or name containing a NUL byte;
+    /// [`PlatformError::TooLarge`] if the value is longer than `limit`; [`PlatformError::Os`] with
+    /// [`Operation::ReadAttribute`](crate::Operation::ReadAttribute).
+    fn xattr(&self, path: &Path, name: &str, limit: usize) -> Result<Option<Vec<u8>>, PlatformError>;
+
+    /// Creates or replaces the extended attribute `name` of `path` itself with `value`, without following a final
+    /// symlink. Used for the Time Machine exclusion of engine directories (KNSH-011, NFR-PRIV-04).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::InvalidPath`] for a relative path or a path or name containing a NUL byte;
+    /// [`PlatformError::Os`] with [`Operation::WriteAttribute`](crate::Operation::WriteAttribute) (`ENOTSUP` if the
+    /// filesystem has no extended attributes).
+    fn set_xattr(&self, path: &Path, name: &str, value: &[u8]) -> Result<(), PlatformError>;
 }
 
 /// Refuses relative paths, which every [`Fs`] method rejects.
