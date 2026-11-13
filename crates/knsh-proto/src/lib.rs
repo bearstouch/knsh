@@ -44,6 +44,11 @@
 //! write their answers, with the raw bytes either announced as a binary stream or inlined as base64
 //! ([`OutputData`]).
 //!
+//! # Forget (KNSH-017)
+//!
+//! [`RecordsForgetParams`] reads and writes `records.forget` (`user.sock` only): a session, an instant, or both, and
+//! never neither. [`RecordsForgetResult`] carries the number of records deleted.
+//!
 //! Parameters and results of the other methods arrive with the stories that implement them.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -80,5 +85,6 @@ pub use error_code::ErrorCode;
 pub use method::{MAX_METHOD_NAME_LEN, MethodName};
 pub use records::{
     DEFAULT_RECORDS_PAGE, MAX_BASE64_OUTPUT, MAX_RECORDS_PAGE, MAX_RECORDS_TEXT_LEN, OUTPUT_CONTENT_TYPE, OutputData,
-    RecordEntry, RecordsOutputParams, RecordsOutputResult, RecordsQueryParams, RecordsQueryResult,
+    RecordEntry, RecordsForgetParams, RecordsForgetResult, RecordsOutputParams, RecordsOutputResult,
+    RecordsQueryParams, RecordsQueryResult,
 };

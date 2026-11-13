@@ -19,13 +19,15 @@
 //!   catalogue and capability probe, KNSH-014)
 //! - `specs/06-api/user-socket.md#records`, FR-REC-02, FR-REC-08, NFR-REL-05 (record store, `records.query` and
 //!   `records.output`, KNSH-016)
+//! - FR-REC-07, FR-REC-10, NFR-PRIV-03 (record retention and `records.forget`, KNSH-017)
 //!
 //! On start it prepares the engine directories (KNSH-011) and takes its sockets from launchd ([`endpoints`],
 //! KNSH-012). It then serves them ([`server`], KNSH-013): a kqueue accept loop hands each connection to its own
 //! thread, which reads frames ([`connection`]) and dispatches JSON-RPC methods through per-endpoint tables
 //! ([`dispatch`]), generated from the method catalogue and the capabilities probed once at start ([`probe`],
 //! [`hello`], KNSH-014). It opens the record store in the engine data directory and answers `records.query` and
-//! `records.output` from it ([`records`], KNSH-016). It exits after ten idle minutes ([`lifetime`]) or when launchd
+//! `records.output` from it ([`records`], KNSH-016), and `records.forget` on `user.sock`; the store applies record
+//! retention on its own thread, at start and hourly (KNSH-017). It exits after ten idle minutes ([`lifetime`]) or when launchd
 //! stops it, finishing in-flight requests and committing pending writes first. The supervisor arrives in later
 //! stories.
 
@@ -166,12 +168,15 @@ fn start() -> Result<(), StartError> {
         ensure_engine_dirs(&RealFs::new(), &paths, uid).map_err(StartError::EngineDirs)?;
         // Never a fallback bind: without launchd's sockets, knshd does not run (KNSH-012).
         let listeners = endpoints::activate(&LaunchdSockets::new()).map_err(StartError::NoLaunchdSockets)?;
+        let clock = Arc::new(SystemClock::new());
         // A store that cannot be opened (newer schema, foreign or unsafe file) is reported and left untouched; knshd
         // still serves, so a human session is never blocked by it, and the record methods answer -32603.
+        // Retention uses the defaults (30 days or 2 GB); per-profile periods arrive with profile loading.
         let store = match RecordStore::open(
             &RealFs::new(),
             &paths.data_dir().join(DATABASE_FILE),
             uid,
+            clock.clone(),
             StoreConfig::default(),
         ) {
             Ok(store) => Some(store),
@@ -185,7 +190,6 @@ fn start() -> Result<(), StartError> {
             }
         };
         let records = Records::new(store);
-        let clock = Arc::new(SystemClock::new());
         // Probed once, before serving: every hello of this process reports the same result, and a restarted knshd
         // probes again (KNSH-014).
         let probed = probe(&Probes {

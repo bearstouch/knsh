@@ -10,5 +10,9 @@ publish.workspace = true
 knsh-core = { path = "../knsh-core" }
 knsh-platform = { path = "../knsh-platform" }
 
+[dev-dependencies]
+# Deterministic clock for retention tests (KNSH-017).
+knsh-platform = { path = "../knsh-platform", features = ["testing"] }
+
 [lints]
 workspace = true

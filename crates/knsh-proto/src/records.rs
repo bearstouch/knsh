@@ -1,4 +1,5 @@
-//! `records.query` and `records.output`: parameters and results (`specs/06-api/user-socket.md#records`, KNSH-016).
+//! `records.query`, `records.output` and `records.forget`: parameters and results
+//! (`specs/06-api/user-socket.md#records`, KNSH-016, KNSH-017).
 //!
 //! Parameters come from untrusted clients, so each is bounded and parsed strictly before it is used: IDs must be
 //! canonical ULIDs, times the engine's RFC 3339 form, byte counts canonical decimal strings. Anything else is
@@ -99,6 +100,78 @@ impl FromJson for RecordsOutputParams {
             offset,
             length,
         })
+    }
+}
+
+/// The parameters of `records.forget` (`user.sock` only, FR-REC-10).
+///
+/// At least one of `session_id` and `since` is required; when both are given a record must match both. A call with
+/// neither is `-32602`, so no client can delete every record by omitting a field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordsForgetParams {
+    /// Only this session's records.
+    pub session_id: Option<SessionId>,
+    /// Only records started at or after this instant.
+    pub since: Option<Timestamp>,
+    /// Delete the matching records' checkpoints too. Phase 1 has no checkpoints: `knshd` answers `-32005` and deletes
+    /// nothing, rather than ignoring the flag (KNSH-017).
+    pub with_checkpoints: bool,
+}
+
+impl FromJson for RecordsForgetParams {
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let mut fields = Fields::new(value)?;
+        let session_id = parsed(fields.optional::<String>("session_id")?, "session_id")?;
+        let since = parsed(fields.optional::<String>("since")?, "since")?;
+        let with_checkpoints = fields.optional::<bool>("with_checkpoints")?.unwrap_or(false);
+        fields.finish()?;
+        if session_id.is_none() && since.is_none() {
+            return Err(JsonError::MissingField("session_id"));
+        }
+        Ok(Self {
+            session_id,
+            since,
+            with_checkpoints,
+        })
+    }
+}
+
+impl ToJson for RecordsForgetParams {
+    /// Absent selectors are left out; `with_checkpoints` is written only when set.
+    fn to_json(&self) -> Result<Value, JsonError> {
+        let mut object = Object::new();
+        if let Some(session_id) = self.session_id {
+            object.insert("session_id", Value::from(session_id.to_string()))?;
+        }
+        if let Some(since) = self.since {
+            object.insert("since", Value::from(since.to_string()))?;
+        }
+        if self.with_checkpoints {
+            object.insert("with_checkpoints", Value::from(true))?;
+        }
+        Ok(Value::Object(object))
+    }
+}
+
+/// The result of `records.forget`: how many records were deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordsForgetResult {
+    /// The number of records deleted, with their output.
+    pub deleted: u64,
+}
+
+impl ToJson for RecordsForgetResult {
+    fn to_json(&self) -> Result<Value, JsonError> {
+        Ok(Value::Object(Object::new().with("deleted", self.deleted.to_json()?)?))
+    }
+}
+
+impl FromJson for RecordsForgetResult {
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let mut fields = Fields::new(value)?;
+        let deleted = fields.required("deleted")?;
+        fields.finish()?;
+        Ok(Self { deleted })
     }
 }
 
@@ -349,6 +422,44 @@ mod tests {
         ] {
             assert!(params::<RecordsOutputParams>(&bad).is_err(), "{bad}");
         }
+    }
+
+    // FR-REC-10: forget needs a selector; both selectors and the flag round-trip; malformed values are refused.
+    #[test]
+    fn forget_params_require_a_selector() {
+        assert_eq!(
+            params::<RecordsForgetParams>("{}").unwrap_err(),
+            JsonError::MissingField("session_id")
+        );
+        assert!(params::<RecordsForgetParams>(r#"{"with_checkpoints":true}"#).is_err());
+        let full: RecordsForgetParams = params(&format!(
+            r#"{{"session_id":"{SESSION}","since":"2026-11-12T00:00:00Z","with_checkpoints":true}}"#
+        ))
+        .unwrap();
+        assert_eq!(full.session_id, Some(SESSION.parse().unwrap()));
+        assert!(full.with_checkpoints);
+        assert_eq!(
+            json(&full),
+            format!(r#"{{"session_id":"{SESSION}","since":"2026-11-12T00:00:00.000000Z","with_checkpoints":true}}"#)
+        );
+        let since_only: RecordsForgetParams = params(r#"{"since":"2026-11-12T00:00:00Z"}"#).unwrap();
+        assert_eq!((since_only.session_id, since_only.with_checkpoints), (None, false));
+        assert_eq!(json(&since_only), r#"{"since":"2026-11-12T00:00:00.000000Z"}"#);
+        for bad in [
+            r#"{"session_id":"nope"}"#,
+            r#"{"since":"2026-11-12"}"#,
+            r#"{"since":"2026-11-12T00:00:00Z","with_checkpoints":"yes"}"#,
+        ] {
+            assert!(params::<RecordsForgetParams>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn forget_result_round_trips() {
+        let result = RecordsForgetResult { deleted: 42 };
+        assert_eq!(json(&result), r#"{"deleted":42}"#);
+        assert_eq!(params::<RecordsForgetResult>(r#"{"deleted":42}"#).unwrap(), result);
+        assert!(params::<RecordsForgetResult>(r#"{"deleted":-1}"#).is_err());
     }
 
     fn record(actor: Actor) -> ExecutionRecord {

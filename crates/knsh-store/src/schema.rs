@@ -105,8 +105,8 @@ fn single_integer(connection: &Connection, sql: &str) -> Result<i64, StoreError>
     }
 }
 
-/// Reads one integer pragma, such as `user_version`. `name` is a constant of this module.
-fn pragma(connection: &Connection, name: &'static str) -> Result<i64, StoreError> {
+/// Reads one integer pragma, such as `user_version`. `name` is a constant of this crate.
+pub(crate) fn pragma(connection: &Connection, name: &'static str) -> Result<i64, StoreError> {
     single_integer(connection, &format!("PRAGMA {name}"))
 }
 
