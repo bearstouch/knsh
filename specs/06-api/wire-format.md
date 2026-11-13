@@ -12,8 +12,10 @@ Messages are JSON; raw bytes travel in binary frames beside them. JSON keeps the
 | Payload | Up to 1 MB | UTF-8 JSON, or raw bytes |
 
 - The receiver reads the length first and closes the connection on any frame over the limit, before allocating memory for it.
+- Any other framing violation also closes the connection, and nothing after it is read: a length smaller than the type and stream ID, an unknown type, a JSON message on a stream other than 0, a binary chunk or end-of-stream frame on stream 0 or on a stream that is not open (never opened, or already ended), an end-of-stream frame with a payload, a stream that carries more or fewer bytes than the size its opening message declared, more than 256 streams open at once, and input that ends inside a frame or while a stream is still open. A JSON message that is well framed but not strict JSON is only a parse error (`-32700`); the connection stays open.
+- Stream 0 is reserved for JSON messages, so a stream ID is never 0. An ID may be reused once its stream has ended.
 - **Raw bytes** (command output through `records.output` and `command.output`, file contents in `checkpoint.diff`) go in binary chunks. A JSON message opens the stream with its ID, size and content type, and an end-of-stream frame closes it.
-- A client that cannot handle binary frames says so in `hello` and receives the bytes base64-encoded inside JSON instead.
+- A client that cannot handle binary frames says so in `hello` and receives the bytes base64-encoded inside JSON instead: the standard alphabet with padding (RFC 4648 section 4), and only the canonical encoding is accepted (no whitespace, no URL-safe alphabet, unused bits zero).
 - Output from `knsh -c` never crosses the API: the client hands its stdio descriptors to the supervisor, which attaches them to the command directly.
 
 ## Control service (XPC)
