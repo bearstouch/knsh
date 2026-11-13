@@ -66,6 +66,17 @@ pub trait Fs: Send + Sync {
     /// [`PlatformError::InvalidPath`]; [`PlatformError::Os`] with [`Operation::Write`](crate::Operation::Write).
     fn write(&self, path: &Path, data: &[u8], mode: u32) -> Result<(), PlatformError>;
 
+    /// Creates a new, empty regular file with permission bits exactly `mode` (not reduced by the umask). Fails if
+    /// anything already exists at `path`, including a symlink, so it never truncates or follows an existing entry
+    /// (`O_CREAT | O_EXCL`). Used to create owner-only files that another component then opens, such as the
+    /// record database (KNSH-010).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::InvalidPath`]; [`PlatformError::Os`] with [`Operation::Write`](crate::Operation::Write),
+    /// including `EEXIST` if anything already exists at `path`.
+    fn create_new(&self, path: &Path, mode: u32) -> Result<(), PlatformError>;
+
     /// Replaces the file at `path` with `data` and permission bits exactly `mode`, atomically and durably.
     ///
     /// Steps: create a new temporary file in the same directory (so the rename stays on one volume), write it,

@@ -11,6 +11,9 @@
 //! | [`Processes`] | Spawn in a new process group, signal the group, wait | `SystemProcesses` | `ScriptedProcesses` |
 //! | [`SystemLog`] | Unified logging, subsystem `knsh` | `UnifiedLog` | `RecordingLog` |
 //!
+//! The [`sqlite`] module (KNSH-010) is a safe wrapper over the system SQLite library for the record store; it is not
+//! a trait, because the record store always uses the real database (in a temporary directory under test).
+//!
 //! Later stories add Keychain, `LocalAuthentication`, XPC, `FSEvents` and APFS clones to the same interface.
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
@@ -19,8 +22,8 @@
 //!
 //! # Boundaries
 //!
-//! One of only two crates allowed to use `unsafe` (with `knsh-exec`), and within it only the `macos` backend
-//! module: the crate root denies `unsafe_code` and that module alone allows it. Every `unsafe` block needs a
+//! One of only two crates allowed to use `unsafe` (with `knsh-exec`), and within it only the `macos` backend and
+//! `sqlite` modules: the crate root denies `unsafe_code` and those modules alone allow it. Every `unsafe` block needs a
 //! `// SAFETY:` comment and every `unsafe fn` a `# Safety` doc section. The only third-party dependency is `libc`,
 //! and no other crate may depend on it (NFR-SUP-02). The only workspace dependency is `knsh-core`, for
 //! [`knsh_core::CanonicalPath`], [`knsh_core::Timestamp`] and [`knsh_core::Ulid`].
@@ -33,6 +36,7 @@
 //! - `specs/02-architecture/implementation.md` (platform interface)
 //! - `specs/02-architecture/platform-support.md`
 //! - `specs/08-integrations/macos-services.md`
+//! - `specs/04-non-functional-requirements/supply-chain.md` (system SQLite, no crates), FR-REC-08 (KNSH-010)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
@@ -50,12 +54,17 @@ mod random;
 #[allow(unsafe_code)]
 pub mod macos;
 
+// Linked against the system `libsqlite3`; built on macOS only until the Linux backend exists.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub mod sqlite;
+
 // Also built for `cargo doc`, so the fakes are documented and intra-doc links to them resolve.
 #[cfg(any(test, doc, feature = "testing"))]
 pub mod testing;
 
 pub use clock::{Clock, Monotonic};
-pub use error::{Operation, PlatformError};
+pub use error::{Operation, PlatformError, SqliteCode};
 pub use fs::{FileKind, Fs, Metadata};
 pub use log::{Field, Level, SystemLog, Value, render};
 pub use process::{ExitStatus, ProcessGroupId, Processes, Signal, SpawnRequest, Stdio};

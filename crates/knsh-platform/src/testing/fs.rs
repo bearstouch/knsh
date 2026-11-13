@@ -254,6 +254,25 @@ impl Fs for MemFs {
         Ok(())
     }
 
+    fn create_new(&self, path: &Path, mode: u32) -> Result<(), PlatformError> {
+        let mut state = lock(&self.state);
+        require_absolute(path)?;
+        state.check_fault(Operation::Write)?;
+        let resolved = resolve(&state.nodes, path, false, Operation::Write)?;
+        // Like `O_EXCL`: any existing node, a symlink included, is refused rather than followed or truncated.
+        if state.nodes.contains_key(&resolved) {
+            return Err(os(Operation::Write, libc::EEXIST));
+        }
+        state.nodes.insert(
+            resolved,
+            Node::File {
+                data: Vec::new(),
+                mode: mode & 0o7777,
+            },
+        );
+        Ok(())
+    }
+
     fn atomic_replace(&self, path: &Path, data: &[u8], mode: u32) -> Result<(), PlatformError> {
         split_target(path)?;
         let mut state = lock(&self.state);
@@ -449,5 +468,23 @@ mod tests {
         );
         fs.inject_fault(Operation::Read, libc::EIO);
         assert_eq!(fs.read(file, 10).unwrap_err().errno(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn create_new_refuses_existing_entries() {
+        let fs = MemFs::new();
+        fs.add_dir_all(Path::new("/state")).unwrap();
+        let file = Path::new("/state/records.db");
+        fs.create_new(file, 0o600).unwrap();
+        assert_eq!(fs.contents(file).unwrap(), b"");
+        assert_eq!(fs.metadata(file).unwrap().mode, 0o600);
+        assert_eq!(fs.create_new(file, 0o600).unwrap_err().errno(), Some(libc::EEXIST));
+        fs.add_symlink(Path::new("/state/link"), Path::new("/state/target"))
+            .unwrap();
+        assert_eq!(
+            fs.create_new(Path::new("/state/link"), 0o600).unwrap_err().errno(),
+            Some(libc::EEXIST)
+        );
+        assert!(fs.contents(Path::new("/state/target")).is_none());
     }
 }
