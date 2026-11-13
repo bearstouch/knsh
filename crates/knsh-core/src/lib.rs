@@ -25,6 +25,14 @@
 //! - [`Redacted`], which never prints its inner value (NFR-PRIV-02).
 //! - [`Timestamp`], UTC microseconds formatted as RFC 3339.
 //!
+//! # Sessions (KNSH-015)
+//!
+//! - [`Session`]: one actor fixed at creation (FR-SES-01), recording defaults per actor (FR-SES-04), and the state
+//!   machine of `specs/03-functional-requirements/sessions.md#states`, where every change yields a
+//!   [`StateChanged`] value (FR-SES-14) and a refused transition leaves the state unchanged.
+//! - [`SessionRegistry`]: the live sessions, unique IDs, parent links (FR-SES-03) with the [`ProfileOrder`] hook
+//!   for agent children, and "not found or ended" for sessions that have ended (`-32006`).
+//!
 //! All failures are reported through the single crate error, [`CoreError`].
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -35,6 +43,8 @@ mod error;
 mod id;
 mod path;
 mod redacted;
+mod registry;
+mod session;
 mod time;
 mod ulid;
 
@@ -42,5 +52,10 @@ pub use error::CoreError;
 pub use id::{CheckpointId, EventId, GrantId, RecordId, RequestId, SessionId};
 pub use path::CanonicalPath;
 pub use redacted::{REDACTED_MARKER, Redacted};
+pub use registry::{EqualProfileOnly, ProfileOrder, SessionRegistry};
+pub use session::{
+    Actor, ActorKind, AgentId, MAX_NAME_LEN, ProfileName, STATE_CHANGED_EVENT, Session, SessionSpec, SessionState,
+    StateChanged, Transition, default_recording,
+};
 pub use time::Timestamp;
 pub use ulid::{MAX_MILLIS, Ulid};
