@@ -1,6 +1,6 @@
 # Policy profile
 
-Profiles are TOML files in `~/.config/knsh/policies/` (signed by `knshd`), or snapshots pushed by the authority with `policy.set`. They are parsed by a hand-written parser for the TOML subset shown here. Evaluation rules are in [../functional-requirements/policy.md](../functional-requirements/policy.md).
+Profiles are TOML files in `~/.config/knsh/policies/` (signed by `knshd`), or snapshots pushed by the authority with `policy.set`. They are parsed by a hand-written parser for the TOML subset shown here. Evaluation rules are in [../03-functional-requirements/policy.md](../03-functional-requirements/policy.md).
 
 ## Example
 

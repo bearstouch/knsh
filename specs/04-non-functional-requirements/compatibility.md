@@ -21,8 +21,8 @@ Humans keep their own zsh or bash; agent lines run in stock bash under the super
 | NFR-COMPAT-04 | Agent lines must use `/bin/bash` (bash 3.2 on macOS) unless the profile names another (for example Homebrew bash 5), so agents see the same bash a plain `bash -c` would give them. |
 | NFR-COMPAT-05 | Differences between bash 3.2 and 5.2 that agents rely on must be covered by the corpus tests. |
 | NFR-COMPAT-06 | Interactive zsh users must be able to stay in integration mode permanently. |
-| NFR-COMPAT-07 | Conformance must be measured in CI on every release ([conformance](../testing/conformance.md)). |
+| NFR-COMPAT-07 | Conformance must be measured in CI on every release ([conformance](../07-testing/conformance.md)). |
 | NFR-COMPAT-08 | `knsh` must be addable to `/etc/shells`, with the user's permission, so it works as a login shell with `chsh`. Login and startup-file behaviour follow the hosted shell. |
-| NFR-COMPAT-09 | Exit status must follow bash: 127 for command not found, 128 plus the signal number for signals. A policy denial uses 126, with the reason always printed on stderr and kept in the record ([exit codes](../reference/exit-codes.md)). |
+| NFR-COMPAT-09 | Exit status must follow bash: 127 for command not found, 128 plus the signal number for signals. A policy denial uses 126, with the reason always printed on stderr and kept in the record ([exit codes](../09-reference/exit-codes.md)). |
 | NFR-COMPAT-10 | In every mode the engine must emit OSC 7 (working directory) and OSC 133 (prompt, command, output and exit code). |
 | NFR-COMPAT-11 | Native mode must reach at least 99% of the agent-command corpus behaving as in bash 5.2. |

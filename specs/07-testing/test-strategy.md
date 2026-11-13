@@ -8,8 +8,8 @@
 | Untrusted-input parsers | Continuous fuzzing | [fuzzing.md](fuzzing.md) |
 | Performance | Benchmarks against the targets on Apple silicon | [performance-validation.md](performance-validation.md) |
 | Sandbox rules | One test per rule (process information, signals, Unix sockets, fixed write denies, system services) | [verification-claims.md](verification-claims.md) |
-| Agent CLI presets | Run each supported CLI (Claude Code, Codex CLI) per release; verify how it chooses its shell | [../integrations/agent-clis.md](../integrations/agent-clis.md) |
-| Dependencies | Licence, advisory and duplicate-version checks | [../nonfunctional-requirements/supply-chain.md](../nonfunctional-requirements/supply-chain.md) |
+| Agent CLI presets | Run each supported CLI (Claude Code, Codex CLI) per release; verify how it chooses its shell | [../08-integrations/agent-clis.md](../08-integrations/agent-clis.md) |
+| Dependencies | Licence, advisory and duplicate-version checks | [../04-non-functional-requirements/supply-chain.md](../04-non-functional-requirements/supply-chain.md) |
 
 ## CI gates per release
 
@@ -21,7 +21,7 @@
 
 ## Security test focus
 
-Each row of the threat model ([security](../nonfunctional-requirements/security.md)) should have at least one end-to-end test showing the mitigation holds, for example:
+Each row of the threat model ([security](../04-non-functional-requirements/security.md)) should have at least one end-to-end test showing the mitigation holds, for example:
 
 - An envelope process cannot connect to `user.sock` or look up the control service.
 - `python3 -c "subprocess.run(['git','push'])"` cannot reach an `approval_hosts` host.

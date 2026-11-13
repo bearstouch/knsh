@@ -19,4 +19,4 @@ Each document groups requirements for one area. IDs have the form `FR-<AREA>-NN`
 | `FR-CKP` | Checkpoints, undo and redo | [checkpoints.md](checkpoints.md) | 3 |
 | `FR-IRR` | Irreversible actions | [irreversible-actions.md](irreversible-actions.md) | 3 |
 
-Standalone (degraded) behaviour is specified with the reliability requirements in [../nonfunctional-requirements/reliability.md](../nonfunctional-requirements/reliability.md).
+Standalone (degraded) behaviour is specified with the reliability requirements in [../04-non-functional-requirements/reliability.md](../04-non-functional-requirements/reliability.md).

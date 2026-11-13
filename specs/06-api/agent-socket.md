@@ -21,7 +21,7 @@ Reachable by processes inside envelopes. Every method is scoped to the caller's 
 | `command` | string | The line to run |
 | `cwd` | path | Working directory |
 | `timeout_s` | int | The line is killed after this, with `-32008` |
-| `output.mode` | string | `full`, `truncate`, `head_tail`, `errors_only` or `ref` ([output modes](../functional-requirements/output-modes.md)); default from the profile |
+| `output.mode` | string | `full`, `truncate`, `head_tail`, `errors_only` or `ref` ([output modes](../03-functional-requirements/output-modes.md)); default from the profile |
 | `output.max_bytes` | int | For `truncate` |
 | `output.lines` | int | For `head_tail` |
 

@@ -13,7 +13,7 @@ knsh agent --profile web-app -- claude
 | FR-AGT-01 | `knsh agent` must ask `knshd` over `user.sock` to create an agent session. |
 | FR-AGT-02 | The actor must be the name given with `--agent`, or derived from the command (`claude` becomes `claude-code`). |
 | FR-AGT-03 | `knshd` must compile the envelope profile and start the agent CLI through `knsh-exec`, with `SHELL` set to `knsh`, the shim directory first in `PATH`, a session token in the environment, and network routed through the proxy. |
-| FR-AGT-04 | The envelope must allow what the CLI itself needs: its model API host (for example `api.anthropic.com`), its own configuration and credential folder (for example `~/.claude`), and the project. Profiles ship presets for supported CLIs ([agent CLIs](../integrations/agent-clis.md)). |
+| FR-AGT-04 | The envelope must allow what the CLI itself needs: its model API host (for example `api.anthropic.com`), its own configuration and credential folder (for example `~/.claude`), and the project. Profiles ship presets for supported CLIs ([agent CLIs](../08-integrations/agent-clis.md)). |
 | FR-AGT-05 | The agent CLI's own sandbox must be turned off inside an envelope, because macOS cannot apply a second sandbox inside a sandboxed process. The envelope replaces it. |
 | FR-AGT-06 | Agent sessions must refuse to start when the capability probe reports `sandbox: none`. |
 

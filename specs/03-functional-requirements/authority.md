@@ -1,6 +1,6 @@
 # The authority and approvals
 
-The **authority** is the one client trusted to make decisions: approve or deny, push policy, grant, pause and take over sessions, and supply secrets. The engine works fully without one. Integration guidance is in [../integrations/authority-apps.md](../integrations/authority-apps.md); message formats are in [../api/control-service.md](../api/control-service.md).
+The **authority** is the one client trusted to make decisions: approve or deny, push policy, grant, pause and take over sessions, and supply secrets. The engine works fully without one. Integration guidance is in [../08-integrations/authority-apps.md](../08-integrations/authority-apps.md); message formats are in [../06-api/control-service.md](../06-api/control-service.md).
 
 ## Registration
 

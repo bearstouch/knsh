@@ -28,7 +28,7 @@ flowchart LR
 
 - `agent.sock` is scoped to the caller's session. A request without a valid session token is matched to its envelope through the caller's audit token; if that fails, it is refused.
 - `user.sock` actions that change security state (approvals, policy edits, grants, profile selection) require Touch ID or the user's password, checked by `knshd` itself. The CLI cannot claim the user is present.
-- The control service accepts only the trusted authority, verified by code signature in both directions ([authority](../functional-requirements/authority.md)).
+- The control service accepts only the trusted authority, verified by code signature in both directions ([authority](../03-functional-requirements/authority.md)).
 - Engine paths, `user.sock` and the control service lookup are fixed denies in every envelope and command profile; no profile can change that.
 
-Method lists for each endpoint are in [../api/](../api/README.md).
+Method lists for each endpoint are in [../06-api/](../06-api/README.md).

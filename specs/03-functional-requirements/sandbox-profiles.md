@@ -1,6 +1,6 @@
 # Sandbox profiles
 
-Two kinds of profile confine every agent: the envelope profile and a per-command profile for each supervised line. How they are applied is in [../architecture/enforcement-model.md](../architecture/enforcement-model.md).
+Two kinds of profile confine every agent: the envelope profile and a per-command profile for each supervised line. How they are applied is in [../02-architecture/enforcement-model.md](../02-architecture/enforcement-model.md).
 
 ## Profile contents (macOS)
 

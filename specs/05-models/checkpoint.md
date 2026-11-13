@@ -1,6 +1,6 @@
 # Checkpoint
 
-Behaviour is in [../functional-requirements/checkpoints.md](../functional-requirements/checkpoints.md).
+Behaviour is in [../03-functional-requirements/checkpoints.md](../03-functional-requirements/checkpoints.md).
 
 ## Concepts
 

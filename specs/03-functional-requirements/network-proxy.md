@@ -15,7 +15,7 @@
 | FR-NET-09 | Every refused connection must emit `proxy.denied`; hosts contacted or refused must be listed in the record's `network` field. Proxy refusals are authoritative. |
 | FR-NET-10 | A line that receives a secret must have its network narrowed to that secret's `hosts` ([secrets](secrets.md)). |
 | FR-NET-11 | Dynamic code must be limited to `network.hosts` and can never reach `approval_hosts` ([policy](policy.md#dynamic-code)). |
-| FR-NET-12 | Presets should set tool-specific proxy settings where tools have them ([developer tools](../integrations/developer-tools.md)). |
+| FR-NET-12 | Presets should set tool-specific proxy settings where tools have them ([developer tools](../08-integrations/developer-tools.md)). |
 | FR-NET-13 | The proxy must make no requests of its own; it only forwards traffic for sessions. |
 
 ## Known limits

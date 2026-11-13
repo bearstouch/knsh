@@ -14,4 +14,4 @@ macOS 14 and later ships first. Linux follows once the macOS engine is stable (p
 | Daemon | launchd user agent | systemd user unit |
 | System log | Unified logging | journald |
 
-The API, records, events, policy format and checkpoint rules are the same on both. Only the backends differ, and `hello` reports which are active ([capabilities](../models/capabilities.md)).
+The API, records, events, policy format and checkpoint rules are the same on both. Only the backends differ, and `hello` reports which are active ([capabilities](../05-models/capabilities.md)).

@@ -17,4 +17,4 @@
 1. Apple grants the Endpoint Security entitlement case by case. Whether it is granted for a broadly distributed developer tool is not yet known; the application should go in now.
 2. Which events the descendant client can authorise beyond exec (file opens, network), and what happens to pending and later operations if `knshd` exits. Verify on macOS 27 before relying on it.
 
-Platform claims to verify before phase 2 are in [../testing/verification-claims.md](../testing/verification-claims.md).
+Platform claims to verify before phase 2 are in [../07-testing/verification-claims.md](../07-testing/verification-claims.md).

@@ -1,6 +1,6 @@
 # Checkpoints: best-effort undo and redo
 
-Checkpoints make most agent file changes reversible. They are best-effort: the engine detects when it cannot be sure what a file should be, and then refuses to restore rather than overwrite something it did not record. Data structures are in [../models/checkpoint.md](../models/checkpoint.md).
+Checkpoints make most agent file changes reversible. They are best-effort: the engine detects when it cannot be sure what a file should be, and then refuses to restore rather than overwrite something it did not record. Data structures are in [../05-models/checkpoint.md](../05-models/checkpoint.md).
 
 ## Taking checkpoints
 

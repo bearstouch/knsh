@@ -10,4 +10,4 @@ Exit status of `knsh -c` and supervised lines follows bash.
 | 127 | Command not found |
 | 128 + n | Killed by signal n |
 
-API error codes are in [../api/errors.md](../api/errors.md).
+API error codes are in [../06-api/errors.md](../06-api/errors.md).

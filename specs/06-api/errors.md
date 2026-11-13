@@ -16,4 +16,4 @@ Standard JSON-RPC errors apply (for example `-32700` parse error for input that 
 | -32010 | Checkpoint not ready: the root's shadow is still being built | `root`, progress |
 | -32011 | Request cancelled | `request_id` |
 
-Process exit codes seen by `knsh -c` callers are in [../reference/exit-codes.md](../reference/exit-codes.md).
+Process exit codes seen by `knsh -c` callers are in [../09-reference/exit-codes.md](../09-reference/exit-codes.md).

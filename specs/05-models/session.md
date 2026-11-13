@@ -1,6 +1,6 @@
 # Session
 
-A session has exactly one actor, fixed at start. Behaviour is specified in [../functional-requirements/sessions.md](../functional-requirements/sessions.md).
+A session has exactly one actor, fixed at start. Behaviour is specified in [../03-functional-requirements/sessions.md](../03-functional-requirements/sessions.md).
 
 | Field | Type | Notes |
 | --- | --- | --- |

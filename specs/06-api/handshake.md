@@ -33,7 +33,7 @@ Every client starts with `hello`, which settles the protocol version and reports
 | `protocol` | int | The chosen protocol version |
 | `platform` | string | e.g. `macos-15-arm64` |
 | `session_id` | ULID | On `agent.sock`, the caller's session |
-| `capabilities` | object | See [../models/capabilities.md](../models/capabilities.md) |
+| `capabilities` | object | See [../05-models/capabilities.md](../05-models/capabilities.md) |
 
 ## Rules
 

@@ -1,6 +1,6 @@
 # Design principles
 
-Every other document follows these principles. When a design choice conflicts with one of them, the principle wins unless a decision in [../reference/decisions.md](../reference/decisions.md) says otherwise.
+Every other document follows these principles. When a design choice conflicts with one of them, the principle wins unless a decision in [../09-reference/decisions.md](../09-reference/decisions.md) says otherwise.
 
 | Principle | Meaning |
 | --- | --- |

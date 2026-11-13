@@ -1,6 +1,6 @@
 # Events
 
-Events tell subscribers what happened; hooks ([hooks.md](hooks.md)) help decide what may happen. Every event is observe-only. The envelope format and catalog are in [../models/event.md](../models/event.md).
+Events tell subscribers what happened; hooks ([hooks.md](hooks.md)) help decide what may happen. Every event is observe-only. The envelope format and catalog are in [../05-models/event.md](../05-models/event.md).
 
 | ID | Requirement |
 | --- | --- |

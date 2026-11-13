@@ -21,8 +21,8 @@ An agent CLI (for example Claude Code) runs inside an **envelope**: a sandboxed 
 | If you want to know… | Read |
 | --- | --- |
 | Why the system exists and what it will not do | [goals-and-non-goals.md](goals-and-non-goals.md), [design-principles.md](design-principles.md) |
-| How the pieces fit | [../architecture/system-overview.md](../architecture/system-overview.md) |
-| What happens when an agent runs a command | [../functional-requirements/command-lifecycle.md](../functional-requirements/command-lifecycle.md) |
-| How to build a client or authority | [../api/README.md](../api/README.md), [../integrations/authority-apps.md](../integrations/authority-apps.md) |
-| What the engine protects against | [../nonfunctional-requirements/security.md](../nonfunctional-requirements/security.md) |
+| How the pieces fit | [../02-architecture/system-overview.md](../02-architecture/system-overview.md) |
+| What happens when an agent runs a command | [../03-functional-requirements/command-lifecycle.md](../03-functional-requirements/command-lifecycle.md) |
+| How to build a client or authority | [../06-api/README.md](../06-api/README.md), [../08-integrations/authority-apps.md](../08-integrations/authority-apps.md) |
+| What the engine protects against | [../04-non-functional-requirements/security.md](../04-non-functional-requirements/security.md) |
 | When each piece ships | [roadmap.md](roadmap.md) |

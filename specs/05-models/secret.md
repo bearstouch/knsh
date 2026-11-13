@@ -1,6 +1,6 @@
 # Secret
 
-A secret is a named value stored in the Keychain (service `knsh`), or supplied by the authority with `secrets.provide` for a limited time and held only in memory. Behaviour is in [../functional-requirements/secrets.md](../functional-requirements/secrets.md).
+A secret is a named value stored in the Keychain (service `knsh`), or supplied by the authority with `secrets.provide` for a limited time and held only in memory. Behaviour is in [../03-functional-requirements/secrets.md](../03-functional-requirements/secrets.md).
 
 ## Profile definition
 

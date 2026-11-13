@@ -33,9 +33,9 @@ The engine protects the user from agents running as the same macOS user, not fro
 | NFR-SEC-02 | Every agent shell command must be spawned by the supervisor; nothing inside an envelope may grant itself more than the envelope allows. |
 | NFR-SEC-03 | All hard limits must be enforced by the operating system (sandbox, executable rules), the proxy or credential scoping, never by command rules alone. |
 | NFR-SEC-04 | Every security-changing action from a user process (approval, grant, policy edit, profile selection, authority trust) must require Touch ID or the user's password, checked inside `knshd`. |
-| NFR-SEC-05 | Code that parses agent-controlled input must be memory-safe (Rust), and hand-written parsers for untrusted input must be fuzzed continuously ([fuzzing](../testing/fuzzing.md)). |
-| NFR-SEC-06 | The JSON parser must enforce the strict JSON profile, including rejecting duplicate keys ([wire format](../api/wire-format.md)). |
+| NFR-SEC-05 | Code that parses agent-controlled input must be memory-safe (Rust), and hand-written parsers for untrusted input must be fuzzed continuously ([fuzzing](../07-testing/fuzzing.md)). |
+| NFR-SEC-06 | The JSON parser must enforce the strict JSON profile, including rejecting duplicate keys ([wire format](../06-api/wire-format.md)). |
 | NFR-SEC-07 | Frames over the size limit must be rejected before memory is allocated for them. |
 | NFR-SEC-08 | Engine files must be readable by the user only. |
-| NFR-SEC-09 | Hooks are a trusted extension point: hook input contains agent-controlled text and hooks must never pass it to a shell ([hooks integration](../integrations/hooks.md)). |
+| NFR-SEC-09 | Hooks are a trusted extension point: hook input contains agent-controlled text and hooks must never pass it to a shell ([hooks integration](../08-integrations/hooks.md)). |
 | NFR-SEC-10 | The engine must report what it can guarantee on this machine (`hello` capabilities) instead of silently degrading. |

@@ -1,6 +1,6 @@
 # Sessions
 
-Every command runs in a session with exactly one actor, fixed at start. Agent commands are decided on as a whole line before any part of it runs; human commands are only observed. Session fields are defined in [../models/session.md](../models/session.md).
+Every command runs in a session with exactly one actor, fixed at start. Agent commands are decided on as a whole line before any part of it runs; human commands are only observed. Session fields are defined in [../05-models/session.md](../05-models/session.md).
 
 ## Creation
 
@@ -9,7 +9,7 @@ Every command runs in a session with exactly one actor, fixed at start. Agent co
 | FR-SES-01 | Every session must have exactly one actor (`human` or `agent`), fixed at start. |
 | FR-SES-02 | Agent sessions must be created only over `user.sock` (`knsh agent`) or by the authority. A process inside an envelope cannot create sessions. |
 | FR-SES-03 | A session started from inside another one must record `parent_session_id` and inherit its profile or a stricter one. |
-| FR-SES-04 | Recording must be off by default for human sessions and on by default for agent sessions ([privacy](../nonfunctional-requirements/privacy.md)). |
+| FR-SES-04 | Recording must be off by default for human sessions and on by default for agent sessions ([privacy](../04-non-functional-requirements/privacy.md)). |
 
 ## States
 
@@ -37,7 +37,7 @@ stateDiagram-v2
 
 | ID | Requirement |
 | --- | --- |
-| FR-SES-20 | Human sessions must run stock zsh or bash in integration mode ([terminals and shells](../integrations/terminals-and-shells.md)). |
+| FR-SES-20 | Human sessions must run stock zsh or bash in integration mode ([terminals and shells](../08-integrations/terminals-and-shells.md)). |
 | FR-SES-21 | When recording is on, `preexec` and `precmd` hooks must record commands as telemetry. |
 | FR-SES-22 | Nothing in a human session may be decided, rewritten or blocked, and these hooks are never relied on for security. |
 | FR-SES-23 | Human sessions with recording off must not start `knshd`. |

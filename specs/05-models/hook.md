@@ -1,6 +1,6 @@
 # Hook
 
-Hooks are registered in the user's configuration (`~/.config/knsh/`, which envelopes cannot read or write). Behaviour is in [../functional-requirements/hooks.md](../functional-requirements/hooks.md).
+Hooks are registered in the user's configuration (`~/.config/knsh/`, which envelopes cannot read or write). Behaviour is in [../03-functional-requirements/hooks.md](../03-functional-requirements/hooks.md).
 
 ```toml
 [[hooks]]

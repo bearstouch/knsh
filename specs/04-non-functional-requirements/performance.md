@@ -1,6 +1,6 @@
 # Performance
 
-Targets to validate on an Apple silicon laptop; the shadow figure especially is unproven. How they are measured is in [../testing/performance-validation.md](../testing/performance-validation.md).
+Targets to validate on an Apple silicon laptop; the shadow figure especially is unproven. How they are measured is in [../07-testing/performance-validation.md](../07-testing/performance-validation.md).
 
 | ID | Measure | Target |
 | --- | --- | --- |

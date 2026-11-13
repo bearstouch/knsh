@@ -33,7 +33,7 @@ flowchart TD
 | 3. Emit | FR-LC-07 | The supervisor must emit `command.proposed`. |
 | 4. Hooks | FR-LC-08 | The supervisor must run matching hooks ([hooks](hooks.md)). |
 | 5. Policy | FR-LC-09 | Policy must be evaluated for the whole line before anything runs: deny if any part is denied, ask if any part asks ([policy](policy.md)). |
-| 6. Ask | FR-LC-10 | If the verdict is ask, the supervisor must ask the authority, or apply standalone rules when none is connected ([reliability](../nonfunctional-requirements/reliability.md)). |
+| 6. Ask | FR-LC-10 | If the verdict is ask, the supervisor must ask the authority, or apply standalone rules when none is connected ([reliability](../04-non-functional-requirements/reliability.md)). |
 | 7. Rewrite | FR-LC-11 | If a rewrite was returned, the supervisor must apply it and repeat steps 2 to 5 once on the new line ([authority](authority.md#rewrites)). |
 | 8. Profile | FR-LC-12 | The line's profile must be the session's per-command baseline plus whatever its classes, grants and approvals add ([sandbox profiles](sandbox-profiles.md)). |
 | 9. Spawn | FR-LC-13 | The supervisor must re-serialise the line with every command's resolved absolute path and run it through `knsh-exec`, attached to the caller's stdio descriptors. |

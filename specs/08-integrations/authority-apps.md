@@ -1,6 +1,6 @@
 # Authority applications
 
-An authority is a trusted client application that decides and presents: it approves or denies agent commands, pushes policy, creates grants, pauses and takes over sessions, and supplies secrets. The engine accepts one authority at a time and works fully without one. Requirements are in [../functional-requirements/authority.md](../functional-requirements/authority.md).
+An authority is a trusted client application that decides and presents: it approves or denies agent commands, pushes policy, creates grants, pauses and takes over sessions, and supplies secrets. The engine accepts one authority at a time and works fully without one. Requirements are in [../03-functional-requirements/authority.md](../03-functional-requirements/authority.md).
 
 ## Prerequisites
 

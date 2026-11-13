@@ -1,6 +1,6 @@
 # Policy
 
-A policy profile says what an agent may read, write, run and reach, and what needs approval. Command rules are intent filters that make approvals specific and stop honest mistakes; the hard limits are the sandbox, its executable rules, the proxy and credential scoping ([enforcement model](../architecture/enforcement-model.md)). The file format is in [../models/policy-profile.md](../models/policy-profile.md).
+A policy profile says what an agent may read, write, run and reach, and what needs approval. Command rules are intent filters that make approvals specific and stop honest mistakes; the hard limits are the sandbox, its executable rules, the proxy and credential scoping ([enforcement model](../02-architecture/enforcement-model.md)). The file format is in [../05-models/policy-profile.md](../05-models/policy-profile.md).
 
 ## Sources
 
@@ -56,7 +56,7 @@ A policy profile says what an agent may read, write, run and reach, and what nee
 
 ## Grants
 
-A grant is a time-limited rule added on top of a profile, usually after an approval: "allow `git push` in this session for one hour". See [../models/grant.md](../models/grant.md).
+A grant is a time-limited rule added on top of a profile, usually after an approval: "allow `git push` in this session for one hour". See [../05-models/grant.md](../05-models/grant.md).
 
 | ID | Requirement |
 | --- | --- |

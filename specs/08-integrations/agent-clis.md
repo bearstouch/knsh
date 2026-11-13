@@ -1,6 +1,6 @@
 # Agent CLIs
 
-How agent CLIs such as Claude Code and Codex CLI run under Kinetic Shell. Requirements are in [../functional-requirements/agent-integration.md](../functional-requirements/agent-integration.md).
+How agent CLIs such as Claude Code and Codex CLI run under Kinetic Shell. Requirements are in [../03-functional-requirements/agent-integration.md](../03-functional-requirements/agent-integration.md).
 
 ## Starting
 
@@ -48,4 +48,4 @@ How each CLI chooses its shell is verified per release.
 
 ## Using the API directly
 
-Agents that integrate natively can call `exec.run` on `agent.sock` instead of `knsh -c`, to choose an output mode and receive structured results ([agent socket](../api/agent-socket.md)).
+Agents that integrate natively can call `exec.run` on `agent.sock` instead of `knsh -c`, to choose an output mode and receive structured results ([agent socket](../06-api/agent-socket.md)).

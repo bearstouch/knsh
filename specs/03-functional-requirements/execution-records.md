@@ -1,6 +1,6 @@
 # Execution records
 
-Each agent command line becomes a structured record. Fields are defined in [../models/execution-record.md](../models/execution-record.md).
+Each agent command line becomes a structured record. Fields are defined in [../05-models/execution-record.md](../05-models/execution-record.md).
 
 | ID | Requirement |
 | --- | --- |

@@ -1,6 +1,6 @@
 # Secrets
 
-A **secret** is a named value stored in the Keychain (service `knsh`), or supplied by the authority with `secrets.provide` for a limited time and held only in memory. The definition format is in [../models/secret.md](../models/secret.md).
+A **secret** is a named value stored in the Keychain (service `knsh`), or supplied by the authority with `secrets.provide` for a limited time and held only in memory. The definition format is in [../05-models/secret.md](../05-models/secret.md).
 
 ## Injection
 

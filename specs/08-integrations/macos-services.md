@@ -1,6 +1,6 @@
 # macOS services
 
-All macOS services sit behind one internal platform interface, called directly from Rust ([implementation](../architecture/implementation.md)). A small Swift helper may be used only where Rust is impractical, never on the decision or enforcement path.
+All macOS services sit behind one internal platform interface, called directly from Rust ([implementation](../02-architecture/implementation.md)). A small Swift helper may be used only where Rust is impractical, never on the decision or enforcement path.
 
 | Service | Used for | Notes |
 | --- | --- | --- |
@@ -18,4 +18,4 @@ All macOS services sit behind one internal platform interface, called directly f
 | Spotlight, Time Machine | Exclusion of engine paths | |
 | Audit tokens | Matching `agent.sock` callers without a session token to their envelope | |
 
-Claims about these services that must be verified before phase 2 are listed in [../testing/verification-claims.md](../testing/verification-claims.md).
+Claims about these services that must be verified before phase 2 are listed in [../07-testing/verification-claims.md](../07-testing/verification-claims.md).

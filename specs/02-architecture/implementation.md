@@ -19,11 +19,11 @@ Kinetic Shell is written in **Rust** wherever possible, because the engine parse
 
 - The bash parser is written in-house.
 - Existing Rust shells such as brush serve as references and test oracles, not dependencies.
-- Anything the parser cannot read with confidence is classified as **dynamic code**, so gaps in the parser fail closed. Parser scope is defined in decision 6 ([decisions](../reference/decisions.md)) and its exit criterion in [conformance](../testing/conformance.md).
+- Anything the parser cannot read with confidence is classified as **dynamic code**, so gaps in the parser fail closed. Parser scope is defined in decision 6 ([decisions](../09-reference/decisions.md)) and its exit criterion in [conformance](../07-testing/conformance.md).
 
 ## Hand-written components
 
-Because of the [dependency policy](../nonfunctional-requirements/supply-chain.md), the following are written in-house and fuzzed continuously ([fuzzing](../testing/fuzzing.md)):
+Because of the [dependency policy](../04-non-functional-requirements/supply-chain.md), the following are written in-house and fuzzed continuously ([fuzzing](../07-testing/fuzzing.md)):
 
 - JSON-RPC reader and writer for the strict JSON profile and frame format
 - Parser for the TOML subset used by policy and configuration files

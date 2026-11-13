@@ -1,6 +1,6 @@
 # Performance validation
 
-Targets ([performance](../nonfunctional-requirements/performance.md)) are validated on an Apple silicon laptop. The shadow figure especially is unproven.
+Targets ([performance](../04-non-functional-requirements/performance.md)) are validated on an Apple silicon laptop. The shadow figure especially is unproven.
 
 | Target | Measurement |
 | --- | --- |

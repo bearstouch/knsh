@@ -1,6 +1,6 @@
 # Writing hooks
 
-Hooks let the user add their own checks to agent commands. They run in the supervisor, before policy, for `command.proposed`. Format: [../models/hook.md](../models/hook.md). Behaviour: [../functional-requirements/hooks.md](../functional-requirements/hooks.md).
+Hooks let the user add their own checks to agent commands. They run in the supervisor, before policy, for `command.proposed`. Format: [../05-models/hook.md](../05-models/hook.md). Behaviour: [../03-functional-requirements/hooks.md](../03-functional-requirements/hooks.md).
 
 ## Example registration
 

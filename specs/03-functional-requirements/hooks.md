@@ -1,6 +1,6 @@
 # Hooks
 
-A hook is an executable registered in the user's configuration for `command.proposed`, with an optional match. Hooks run only for supervised agent commands, in the supervisor, before policy. The registration format is in [../models/hook.md](../models/hook.md); authoring guidance is in [../integrations/hooks.md](../integrations/hooks.md).
+A hook is an executable registered in the user's configuration for `command.proposed`, with an optional match. Hooks run only for supervised agent commands, in the supervisor, before policy. The registration format is in [../05-models/hook.md](../05-models/hook.md); authoring guidance is in [../08-integrations/hooks.md](../08-integrations/hooks.md).
 
 ## Execution
 

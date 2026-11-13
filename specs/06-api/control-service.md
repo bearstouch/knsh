@@ -1,6 +1,6 @@
 # Control service
 
-An XPC Mach service (`knsh.control`, final name tied to the signing identity) reachable only by the trusted, code-signed authority. Messages carry the same JSON-RPC payloads as the sockets; raw bytes are XPC data values. Trust and verification are specified in [../functional-requirements/authority.md](../functional-requirements/authority.md).
+An XPC Mach service (`knsh.control`, final name tied to the signing identity) reachable only by the trusted, code-signed authority. Messages carry the same JSON-RPC payloads as the sockets; raw bytes are XPC data values. Trust and verification are specified in [../03-functional-requirements/authority.md](../03-functional-requirements/authority.md).
 
 | Method | Purpose |
 | --- | --- |
@@ -58,7 +58,7 @@ An XPC Mach service (`knsh.control`, final name tied to the signing identity) re
 
 ## `policy.set`
 
-Pushes a policy snapshot. A snapshot must carry `expires_at`; on expiry, sessions using it are paused ([policy](../functional-requirements/policy.md#lifetime-of-pushed-policy)).
+Pushes a policy snapshot. A snapshot must carry `expires_at`; on expiry, sessions using it are paused ([policy](../03-functional-requirements/policy.md#lifetime-of-pushed-policy)).
 
 ## `secrets.provide`
 

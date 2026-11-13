@@ -12,4 +12,4 @@ Replacing well-tested crates with hand-written parsers moves the risk into our o
 | TLS ClientHello reader | Proxy connections | Server name extracted correctly or connection refused; no panics |
 | HTTP CONNECT and SOCKS handling | Proxy connections | No panics; malformed requests refused |
 
-Test-only crates (fuzzers, property testing) are allowed under the [dependency policy](../nonfunctional-requirements/supply-chain.md).
+Test-only crates (fuzzers, property testing) are allowed under the [dependency policy](../04-non-functional-requirements/supply-chain.md).

@@ -1,6 +1,6 @@
 # Event
 
-Delivery rules are in [../functional-requirements/events.md](../functional-requirements/events.md).
+Delivery rules are in [../03-functional-requirements/events.md](../03-functional-requirements/events.md).
 
 ## Envelope
 
