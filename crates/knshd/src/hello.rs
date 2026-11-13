@@ -102,9 +102,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// The record handlers without a store.
-    pub(crate) fn records() -> Handlers {
-        crate::records::Records::unavailable().handlers()
+    /// Every phase 1 handler besides `hello`: records without a store, and events on an empty bus.
+    pub(crate) fn handlers() -> Handlers {
+        let mut handlers = crate::records::Records::unavailable().handlers();
+        handlers.extend(crate::events::tests::hub().handlers());
+        handlers
     }
 
     const PARAMS: &str = r#"{"client":"test","client_version":"1.0","protocols":[1]}"#;
@@ -117,6 +119,7 @@ pub(crate) mod tests {
                 bytes: ByteTransport::BinaryFrames,
                 stream: crate::dispatch::tests::stream(),
                 request: &request,
+                subscriber: crate::dispatch::tests::subscriber(),
             })
             .map(|answer| answer.result.as_object().cloned().unwrap())
     }
@@ -137,7 +140,7 @@ pub(crate) mod tests {
 
     #[test]
     fn hello_reports_version_protocol_platform_and_advisory() {
-        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes()), records()).unwrap();
+        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes()), handlers()).unwrap();
         let result = hello(&dispatcher, Endpoint::User, PARAMS).unwrap();
         assert_eq!(
             result.get("engine_version").and_then(Value::as_str),
@@ -166,7 +169,7 @@ pub(crate) mod tests {
         for machine in [Machine::working(), Machine::failing()] {
             let probed = probe(&machine.probes());
             let capabilities = Arc::clone(&probed.capabilities);
-            let dispatcher = phase1_dispatcher(probed, records()).unwrap();
+            let dispatcher = phase1_dispatcher(probed, handlers()).unwrap();
             for endpoint in Endpoint::ALL {
                 let result = hello(&dispatcher, endpoint, PARAMS).unwrap();
                 let mut listed = methods(&result);
@@ -184,7 +187,7 @@ pub(crate) mod tests {
     // KNSH-014: version negotiation. No shared protocol is refused with -32005 naming `protocol`.
     #[test]
     fn unsupported_protocol_list_is_refused() {
-        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes()), records()).unwrap();
+        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes()), handlers()).unwrap();
         let error = hello(
             &dispatcher,
             Endpoint::User,
@@ -213,7 +216,7 @@ pub(crate) mod tests {
 
     #[test]
     fn malformed_hello_params_are_invalid_params() {
-        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes()), records()).unwrap();
+        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes()), handlers()).unwrap();
         for params in ["{}", r#"{"client":"c","client_version":"1","protocols":"1"}"#] {
             let error = hello(&dispatcher, Endpoint::User, params).unwrap_err();
             assert_eq!(error.code, ErrorCode::InvalidParams, "{params}");
@@ -223,7 +226,7 @@ pub(crate) mod tests {
     // KNSH-014, NFR-SEC-10: missing backends are reported as `none`, never omitted.
     #[test]
     fn missing_backend_reported_as_none() {
-        let dispatcher = phase1_dispatcher(probe(&Machine::failing().probes()), records()).unwrap();
+        let dispatcher = phase1_dispatcher(probe(&Machine::failing().probes()), handlers()).unwrap();
         let result = hello(&dispatcher, Endpoint::User, PARAMS).unwrap();
         let capabilities = capabilities(&result);
         for field in ["sandbox", "network_filter", "file_events", "secrets"] {
@@ -242,7 +245,7 @@ pub(crate) mod tests {
 
     #[test]
     fn binary_opt_out_is_echoed() {
-        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes()), records()).unwrap();
+        let dispatcher = phase1_dispatcher(probe(&Machine::working().probes()), handlers()).unwrap();
         let result = hello(
             &dispatcher,
             Endpoint::User,
@@ -257,7 +260,7 @@ pub(crate) mod tests {
     fn probe_runs_once_per_lifetime() {
         let system = Arc::new(knsh_platform::testing::FakeSystemProbe::working(15));
         let machine = Machine::new(knsh_platform::testing::Script::Exits(0), system.clone());
-        let dispatcher = phase1_dispatcher(probe(&machine.probes()), records()).unwrap();
+        let dispatcher = phase1_dispatcher(probe(&machine.probes()), handlers()).unwrap();
         let after_probe = system.calls();
         for _ in 0..3 {
             hello(&dispatcher, Endpoint::User, PARAMS).unwrap();

@@ -356,6 +356,7 @@ mod tests {
             bytes,
             stream: stream(),
             request,
+            subscriber: crate::dispatch::tests::subscriber(),
         }
     }
 
@@ -557,7 +558,14 @@ mod tests {
             ),
         ]);
         let mut output = Vec::new();
-        serve(Cursor::new(input), &mut output, Endpoint::User, &dispatcher, &mut || {});
+        serve(
+            Cursor::new(input),
+            &mut output,
+            Endpoint::User,
+            &dispatcher,
+            &mut || {},
+            &|| {},
+        );
 
         let mut reader = FrameReader::new(output.as_slice());
         let Some(Frame::Json(_hello)) = reader.read_frame().unwrap() else {
@@ -709,7 +717,9 @@ mod tests {
         assert_eq!(error.code, ErrorCode::NotAllowed);
 
         let probed = crate::probe::probe(&crate::probe::tests::Machine::working().probes());
-        let dispatcher = crate::hello::phase1_dispatcher(probed, records.handlers()).unwrap();
+        let mut handlers = records.handlers();
+        handlers.extend(crate::events::tests::hub().handlers());
+        let dispatcher = crate::hello::phase1_dispatcher(probed, handlers).unwrap();
         let error = dispatcher.call(&agent_call).unwrap_err();
         assert_eq!(error.code, ErrorCode::NotAllowed);
         let query = rpc("records.query", "{}");

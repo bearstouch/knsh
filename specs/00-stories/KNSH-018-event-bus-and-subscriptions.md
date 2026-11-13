@@ -18,23 +18,25 @@ clients can watch live and resume after reconnecting.
 **Acceptance criteria**
 *Event bus*
 
-- [ ] `seq` increases by one per session with no gaps.
-- [ ] The last 10,000 events per session are buffered; older ones are dropped.
-- [ ] Publishing never blocks on a slow subscriber; a subscriber that falls behind beyond the buffer is told it lost
+- [x] `seq` increases by one per session with no gaps.
+- [x] The last 10,000 events per session are buffered; older ones are dropped.
+- [x] Publishing never blocks on a slow subscriber; a subscriber that falls behind beyond the buffer is told it lost
       events (and resumes from the record store).
-- [ ] Events are scoped: a subscription with a session scope never receives other sessions' events.
-- [ ] Event payloads take redacted types only (FR-EVT-07).
+- [x] Events are scoped: a subscription with a session scope never receives other sessions' events.
+- [x] Event payloads take redacted types only (FR-EVT-07).
 - [ ] Phase 1 emits `session.started`, `session.ended`, `session.state_changed`, `session.idle`, `command.finished`
-      (telemetry), `cwd.changed`.
+      (telemetry), `cwd.changed`. *Pending: the payload types and the session start/transition helpers exist and
+      are tested; the emitters are wired by KNSH-021 (human telemetry) and KNSH-056 (`knsh agent`).*
 
 *`events.subscribe` and `events.unsubscribe`*
 
-- [ ] `events.subscribe {session_id?, since_seq?}` returns a subscription ID, then sends events as notifications in
+- [x] `events.subscribe {session_id?, since_seq?}` returns a subscription ID, then sends events as notifications in
       `seq` order.
-- [ ] With `since_seq` inside the buffer, delivery resumes exactly after it; outside the buffer, the reply says how
+- [x] With `since_seq` inside the buffer, delivery resumes exactly after it; outside the buffer, the reply says how
       far back the buffer reaches.
-- [ ] `events.unsubscribe` stops delivery; closing the connection ends all its subscriptions.
-- [ ] Output chunk events carry bytes as binary stream frames (when they exist in later phases).
+- [x] `events.unsubscribe` stops delivery; closing the connection ends all its subscriptions.
+- [ ] Output chunk events carry bytes as binary stream frames (when they exist in later phases). *Pending: no
+      output chunk event exists in phase 1 (KNSH-053).*
 
 **Unit tests**
 *Event bus*

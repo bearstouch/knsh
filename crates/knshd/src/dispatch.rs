@@ -21,6 +21,8 @@ use knsh_proto::{
     Release, Request, RpcError,
 };
 
+use crate::events::Subscriber;
+
 /// The name of the handshake method, which every connection must call first.
 pub(crate) const HELLO: &str = "hello";
 
@@ -66,6 +68,8 @@ pub(crate) struct Call<'a> {
     pub(crate) stream: StreamId,
     /// The request.
     pub(crate) request: &'a Request,
+    /// The connection's event subscriptions (`events.subscribe`, KNSH-018). Closed with the connection.
+    pub(crate) subscriber: &'a Subscriber,
 }
 
 /// A successful answer: the `result`, and raw bytes to send after it on [`Call::stream`]
@@ -296,6 +300,12 @@ pub(crate) mod tests {
         }
     }
 
+    /// A connection subscriber for test calls that do not subscribe.
+    pub(crate) fn subscriber() -> &'static Subscriber {
+        static SUBSCRIBER: std::sync::LazyLock<Subscriber> = std::sync::LazyLock::new(Subscriber::new);
+        &SUBSCRIBER
+    }
+
     /// The stream ID test calls use.
     pub(crate) fn stream() -> StreamId {
         StreamId::new(1).unwrap()
@@ -308,6 +318,7 @@ pub(crate) mod tests {
             bytes: ByteTransport::BinaryFrames,
             stream: stream(),
             request: &request(method),
+            subscriber: subscriber(),
         })
     }
 

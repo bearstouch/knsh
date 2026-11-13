@@ -13,6 +13,9 @@
 | `command.long_running` | 30 s | Yes | [command lifecycle](../03-functional-requirements/command-lifecycle.md) |
 | `session.idle` | 5 s at a human prompt | — | [sessions](../03-functional-requirements/sessions.md) |
 | Event buffer | Last 10,000 events per session | — | [events](../03-functional-requirements/events.md) |
+| Ended sessions' event buffers | The 64 most recently ended sessions | — | [user socket](../06-api/user-socket.md#events) |
+| Events queued per subscription | 10,000, then the oldest are dropped and reported (`events.lost`) | — | [user socket](../06-api/user-socket.md#events) |
+| Subscriptions per connection | 16 | — | [user socket](../06-api/user-socket.md#events) |
 | Record retention | 30 days or 2 GB, first reached; days per record by its session's profile, 2 GB for the whole store | Days per profile (`recording.retention_days`, 1 to 36500) | [execution records](../03-functional-requirements/execution-records.md#retention) |
 | Retention runs | At store open, then hourly; batches of 500 records | — | [execution records](../03-functional-requirements/execution-records.md#retention) |
 | Recorded output per stream | 1 MB, then head and tail | Yes | [execution records](../03-functional-requirements/execution-records.md) |
