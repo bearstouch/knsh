@@ -28,6 +28,15 @@
 //! an approval host on the strength of `git fetch`. Builtins, function calls (whose bodies are entries of their own),
 //! names not found and wrappers (whose commands are entries of their own) are skipped.
 //!
+//! # Grants
+//!
+//! [`evaluate_line_with_grants`] also applies the live grants of the line's session and profile (KNSH-042, the
+//! [`grant`](super::grant) module): a line the rules ask about is allowed, with source [`DecisionSource::Grant`] and
+//! [`LineDecision::grant`] naming the grant, when every part that asks is a command a grant covers. A grant never
+//! changes a deny, and never changes the capabilities: they are computed from the classification alone, so dynamic
+//! code stays clamped. The `unattended` step below runs after grants, so a granted line holding dynamic code is still
+//! denied there.
+//!
 //! # `unattended`
 //!
 //! Under the built-in [`unattended`](super::unattended) profile no one can answer an ask (FR-AGT-21): an `ask` verdict
@@ -49,10 +58,13 @@ use knsh_bash::{
     SUBCOMMAND_TABLE, Span, normalise,
 };
 
+use super::grant::GrantSet;
 use super::model::{NetworkMode, Profile, RuleAction};
 use super::rules::{RuleId, evaluate_command, matches_certainly};
 use super::unattended::UNATTENDED_PROFILE;
+use crate::id::{GrantId, SessionId};
 use crate::session::ProfileName;
+use crate::time::Timestamp;
 
 /// Who made a line's final decision: the record's `decision.source`
 /// (`specs/05-models/execution-record.md#decision`).
@@ -70,10 +82,12 @@ pub enum DecisionSource {
     Standalone,
     /// Rate limiting of repeated denials.
     RateLimit,
+    /// A live grant answered the rules' ask (KNSH-042).
+    Grant,
 }
 
 impl DecisionSource {
-    /// The record spelling: `rule`, `hook`, `authority`, `user`, `standalone` or `rate_limit`.
+    /// The record spelling: `rule`, `hook`, `authority`, `user`, `standalone`, `rate_limit` or `grant`.
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
@@ -83,6 +97,7 @@ impl DecisionSource {
             Self::User => "user",
             Self::Standalone => "standalone",
             Self::RateLimit => "rate_limit",
+            Self::Grant => "grant",
         }
     }
 }
@@ -153,13 +168,17 @@ pub struct LineCapabilities {
 pub struct LineDecision {
     /// Run it, ask, or refuse it.
     pub verdict: RuleAction,
-    /// Who decided: [`DecisionSource::Rule`], or [`DecisionSource::Standalone`] for an ask the `unattended` profile
-    /// denied.
+    /// Who decided: [`DecisionSource::Rule`], [`DecisionSource::Grant`] for an ask a grant answered, or
+    /// [`DecisionSource::Standalone`] for an ask (or granted dynamic code) the `unattended` profile denied.
     pub source: DecisionSource,
     /// The rule or setting that decided the line: the first part with the line's verdict (before an `unattended`
     /// ask is turned into a deny), or for an allowed line holding dynamic code that `unattended` denies, its first
-    /// dynamic part's. `None` for a line with no parts, and for a failed evaluation.
+    /// dynamic part's. For a line a grant allowed, the first rule that asked, which the grant answered. `None` for a
+    /// line with no parts, and for a failed evaluation.
     pub rule_id: Option<RuleId>,
+    /// The grant that allowed the line, when [`source`](Self::source) is [`DecisionSource::Grant`]: the one covering
+    /// the first part that asked. `None` otherwise.
+    pub grant: Option<GrantId>,
     /// Why, when the rule alone does not say: an `unattended` deny or a failed evaluation.
     pub reason: Option<LineReason>,
     /// The decision of every part of the line, entries in source order, then any dynamic part without an entry.
@@ -175,6 +194,7 @@ impl LineDecision {
             verdict: RuleAction::Deny,
             source: DecisionSource::Rule,
             rule_id: None,
+            grant: None,
             reason: Some(LineReason::EvaluationFailed),
             matched_rules: Vec::new(),
             capabilities: LineCapabilities::default(),
@@ -196,7 +216,32 @@ enum EvaluationError {
 /// any failure inside is a deny with [`LineReason::EvaluationFailed`].
 #[must_use]
 pub fn evaluate_line(profile: &Profile, classification: &Classification) -> LineDecision {
-    fail_closed(|| decide(profile, classification))
+    fail_closed(|| decide(profile, classification, None))
+}
+
+/// The live grants a line is evaluated with: those of its session and profile at one instant.
+#[derive(Clone, Copy)]
+struct GrantContext<'a> {
+    grants: &'a GrantSet,
+    session: SessionId,
+    now: Timestamp,
+}
+
+/// Decides a whole classified line of `session` against `profile` and the grants in `grants` live at `now`
+/// (module documentation, "Grants"). `profile` must be the session's own: profile-scoped grants match its name.
+///
+/// `now` comes from the injected clock; a caller that cannot read the clock must call [`evaluate_line`] instead, so
+/// no grant applies (fail closed). Pure and total, like [`evaluate_line`].
+#[must_use]
+pub fn evaluate_line_with_grants(
+    profile: &Profile,
+    classification: &Classification,
+    grants: &GrantSet,
+    session: SessionId,
+    now: Timestamp,
+) -> LineDecision {
+    let context = GrantContext { grants, session, now };
+    fail_closed(|| decide(profile, classification, Some(context)))
 }
 
 /// Runs `evaluate`, turning an error or a panic into [`LineDecision::failed`] (fail closed).
@@ -209,7 +254,11 @@ fn fail_closed(evaluate: impl FnOnce() -> Result<LineDecision, EvaluationError>)
 }
 
 /// The evaluation proper; see the module documentation.
-fn decide(profile: &Profile, classification: &Classification) -> Result<LineDecision, EvaluationError> {
+fn decide(
+    profile: &Profile,
+    classification: &Classification,
+    grants: Option<GrantContext<'_>>,
+) -> Result<LineDecision, EvaluationError> {
     let commands = classification.commands();
     let mut matched_rules = Vec::with_capacity(commands.len() + 1);
     for (index, command) in commands.iter().enumerate() {
@@ -244,6 +293,16 @@ fn decide(profile: &Profile, classification: &Classification) -> Result<LineDeci
         .find(|part| part.verdict == verdict)
         .map(|part| part.rule_id);
 
+    // KNSH-042: a grant only answers an ask, and only when it covers every part that asks; a deny is never touched.
+    let grant = match (verdict, grants) {
+        (RuleAction::Ask, Some(context)) => covering_grant(profile, commands, &matched_rules, context),
+        (RuleAction::Allow | RuleAction::Ask | RuleAction::Deny, _) => None,
+    };
+    let (verdict, source) = match grant {
+        Some(_) => (RuleAction::Allow, DecisionSource::Grant),
+        None => (verdict, DecisionSource::Rule),
+    };
+
     // FR-AGT-21: under `unattended` no one can answer, so an ask is a deny made by the standalone rules. Dynamic code
     // is too: an allowed tool given a code variable (`GIT_EXTERNAL_DIFF=./x git diff`) runs any program, which only
     // an approval could allow, so it is never a plain read-only command.
@@ -255,17 +314,19 @@ fn decide(profile: &Profile, classification: &Classification) -> Result<LineDeci
                 .is_none_or(|index| commands.get(index).is_none_or(|command| command.class.is_dynamic()))
         })
         .map(|part| part.rule_id);
-    let (verdict, rule_id, source, reason) = match (verdict, rule_id, dynamic_rule) {
+    // A granted line holding dynamic code is denied here too: a grant never relaxes the dynamic-code limits.
+    let (verdict, rule_id, source, grant, reason) = match (verdict, rule_id, dynamic_rule) {
         (RuleAction::Ask, Some(rule_id), _) | (RuleAction::Allow, _, Some(rule_id)) if unattended => (
             RuleAction::Deny,
             Some(rule_id),
             DecisionSource::Standalone,
+            None,
             Some(LineReason::Unattended {
                 profile: profile.name.clone(),
                 rule_id,
             }),
         ),
-        (verdict, rule_id, _) => (verdict, rule_id, DecisionSource::Rule, None),
+        (verdict, rule_id, _) => (verdict, rule_id, source, grant, None),
     };
 
     let capabilities = match verdict {
@@ -276,10 +337,31 @@ fn decide(profile: &Profile, classification: &Classification) -> Result<LineDeci
         verdict,
         source,
         rule_id,
+        grant,
         reason,
         matched_rules,
         capabilities,
     })
+}
+
+/// The grant covering the first part that asks, if a live grant covers **every** part that asks; `None` as soon as
+/// one asking part is not covered. A part with no entry of its own has no command for a grant rule to match, so it is
+/// never covered.
+fn covering_grant(
+    profile: &Profile,
+    commands: &[ClassifiedCommand],
+    matched_rules: &[MatchedRule],
+    context: GrantContext<'_>,
+) -> Option<GrantId> {
+    let mut first = None;
+    for part in matched_rules.iter().filter(|part| part.verdict == RuleAction::Ask) {
+        let command = commands.get(part.command?)?;
+        let grant = context
+            .grants
+            .covering(context.session, &profile.name, command, context.now)?;
+        first.get_or_insert(grant.id());
+    }
+    first
 }
 
 /// Whether the line has a dynamic part that no dynamic entry covers, so no rule decided it: a line the parser could

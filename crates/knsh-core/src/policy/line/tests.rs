@@ -240,6 +240,7 @@ fn evaluation_error_denies() {
         verdict: RuleAction::Deny,
         source: DecisionSource::Rule,
         rule_id: None,
+        grant: None,
         reason: Some(LineReason::EvaluationFailed),
         matched_rules: Vec::new(),
         capabilities: LineCapabilities::default(),
@@ -250,7 +251,7 @@ fn evaluation_error_denies() {
     // A successful evaluation passes through unchanged.
     let p = profile("[exec]\nallow = [\"ls\"]");
     let classification = classify(&parse_line("ls"), "ls", &Session, &Interpreters::defaults());
-    let decision = decide(&p, &classification).unwrap();
+    let decision = decide(&p, &classification, None).unwrap();
     assert_eq!(fail_closed(|| Ok(decision.clone())), decision);
 }
 
@@ -352,9 +353,13 @@ fn decision_sources_use_record_spellings() {
         DecisionSource::User,
         DecisionSource::Standalone,
         DecisionSource::RateLimit,
+        DecisionSource::Grant,
     ]
     .iter()
     .map(|source| source.code())
     .collect();
-    assert_eq!(codes, ["rule", "hook", "authority", "user", "standalone", "rate_limit"]);
+    assert_eq!(
+        codes,
+        ["rule", "hook", "authority", "user", "standalone", "rate_limit", "grant"]
+    );
 }

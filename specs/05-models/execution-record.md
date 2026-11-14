@@ -32,7 +32,7 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 | Field | Values |
 | --- | --- |
 | `verdict` | `allow`, `deny`, `rewrite` (final effective verdict) |
-| `source` | `rule`, `hook`, `authority`, `user`, `standalone`, `rate_limit` |
+| `source` | `rule`, `hook`, `authority`, `user`, `standalone`, `rate_limit`, `grant` (a grant answered the rules' ask, KNSH-042) |
 | `rule_id` | e.g. `exec.allow[1]`, `exec.ask[0]` |
 | `decided_by` | Who decided (hook, authority, user) |
 | `latency_ms` | Time to decide |

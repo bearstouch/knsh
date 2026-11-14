@@ -70,6 +70,17 @@ pub enum CoreError {
     EventActorMismatch,
     /// `since_seq` was given without a session, or is newer than the session's latest event (KNSH-018).
     InvalidSinceSeq,
+    /// A grant's rule is not a command pattern: blank, too long, holding a control character, or naming a path
+    /// rather than a program (KNSH-042).
+    InvalidGrantRule,
+    /// A grant was created already expired, so it could never apply (KNSH-042).
+    GrantExpired,
+    /// A live grant already has this identifier (KNSH-042).
+    GrantExists,
+    /// No live grant has this identifier: it never existed, was revoked, or has expired (`policy.revoke`, FR-POL-61).
+    GrantNotFound,
+    /// The grant set already holds its maximum number of live grants (KNSH-042).
+    TooManyGrants,
 }
 
 impl fmt::Display for CoreError {
@@ -106,6 +117,13 @@ impl fmt::Display for CoreError {
             Self::InvalidSinceSeq => {
                 f.write_str("since_seq needs a session and must not be newer than its latest event")
             }
+            Self::InvalidGrantRule => {
+                f.write_str("a grant rule must be a command pattern: a program name without '/', then its arguments")
+            }
+            Self::GrantExpired => f.write_str("the grant has already expired"),
+            Self::GrantExists => f.write_str("a grant with this id already exists"),
+            Self::GrantNotFound => f.write_str("grant not found, revoked or expired"),
+            Self::TooManyGrants => f.write_str("too many live grants"),
         }
     }
 }
