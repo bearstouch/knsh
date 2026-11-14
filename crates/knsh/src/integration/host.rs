@@ -1,21 +1,22 @@
-//! Installing the zsh startup directory and starting the hosted shell (KNSH-019, FR-SES-20, FR-SES-22).
+//! Installing the startup wrappers and starting the hosted shell (KNSH-019 zsh, KNSH-020 bash, FR-SES-20,
+//! FR-SES-22).
 //!
 //! Two ways to start it, chosen by whether recording is on:
 //!
-//! - **Recording off** ([`exec`]): `knsh` replaces itself with zsh. No telemetry descriptor exists, no hook is
-//!   installed, and `knshd` is never contacted (FR-SES-23). Exit status, signals, job control and terminal
-//!   ownership are zsh's own, because no `knsh` process is left in between.
-//! - **Recording on** ([`run_recorded`]): zsh runs as a child that inherits the write end of a
+//! - **Recording off** ([`exec`]): `knsh` replaces itself with the shell. No telemetry descriptor exists, no hook
+//!   is installed, and `knshd` is never contacted (FR-SES-23). Exit status, signals, job control and terminal
+//!   ownership are the shell's own, because no `knsh` process is left in between.
+//! - **Recording on** ([`run_recorded`]): the shell runs as a child that inherits the write end of a
 //!   [`TelemetryPipe`]; a forwarder thread decodes the lines and hands them to a [`TelemetrySink`] (KNSH-021
-//!   provides the one that talks to `knshd`). `knsh` never touches the terminal: interactive zsh puts itself in its
-//!   own process group and takes the terminal, as under any parent, and gives it back on exit. While it runs, `knsh`
-//!   ignores the terminal's job-control signals ([`JobSignalsIgnored`]) so that only zsh receives them, then
-//!   returns zsh's exit status for the caller to pass on.
+//!   provides the one that talks to `knshd`). `knsh` never touches the terminal: an interactive shell puts itself in
+//!   its own process group and takes the terminal, as under any parent, and gives it back on exit. While it runs,
+//!   `knsh` ignores the terminal's job-control signals ([`JobSignalsIgnored`]) so that only the shell receives them,
+//!   then returns the shell's exit status for the caller to pass on.
 
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufReader};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -28,8 +29,9 @@ use knsh_platform::{EnginePaths, FileKind, Fs, PlatformError, ensure_engine_dirs
 #[cfg(target_os = "macos")]
 use knsh_platform::macos::{JobSignalsIgnored, TelemetryPipe, reraise_default};
 
-use super::telemetry::{LineReader, TelemetryLine};
-use super::zsh::{LaunchPlan, STARTUP_FILE, ZSHENV, ZshLaunch};
+use super::bash::{self, BASHRC, BashLaunch, BashTelemetry};
+use super::telemetry::{LineReader, PromptCycle, TelemetryLine};
+use super::zsh::{self, LaunchPlan, ZSHENV, ZshLaunch};
 
 /// How long `knsh` waits, after zsh has exited, for the forwarder to deliver the lines still in the pipe.
 const FORWARDER_DRAIN: Duration = Duration::from_millis(200);
@@ -37,7 +39,7 @@ const FORWARDER_DRAIN: Duration = Duration::from_millis(200);
 /// How often the drain wait checks whether the forwarder has finished.
 const DRAIN_POLL: Duration = Duration::from_millis(5);
 
-/// The largest startup file read back for comparison; anything longer differs from [`ZSHENV`] anyway.
+/// The largest startup file read back for comparison; anything longer differs from [`ZSHENV`] and [`BASHRC`] anyway.
 const STARTUP_FILE_READ_LIMIT: u64 = 64 * 1024;
 
 /// Whether the forwarder keeps reading after a line.
@@ -51,7 +53,8 @@ pub enum Flow {
 
 /// Receives the telemetry lines of a recorded session, in order, on the forwarder thread.
 ///
-/// Rejected lines are never delivered. A sink must not block for long: while it does, the pipe fills and the
+/// Rejected lines are never delivered, and neither are lines out of the started/finished order of one command line
+/// ([`PromptCycle`]). A sink must not block for long: while it does, the pipe fills and the
 /// hooks drop lines (they never wait).
 pub trait TelemetrySink: Send {
     /// Handles one line.
@@ -63,9 +66,9 @@ pub trait TelemetrySink: Send {
 pub enum HostError {
     /// The telemetry pipe could not be created.
     Telemetry(PlatformError),
-    /// zsh could not be started (for example it does not exist).
+    /// The shell could not be started (for example it does not exist).
     Start(io::Error),
-    /// Waiting for zsh failed.
+    /// Waiting for the shell failed.
     Wait(io::Error),
 }
 
@@ -73,8 +76,8 @@ impl std::fmt::Display for HostError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Telemetry(error) => write!(f, "cannot set up telemetry: {error}"),
-            Self::Start(error) => write!(f, "cannot start zsh: {error}"),
-            Self::Wait(error) => write!(f, "cannot wait for zsh: {error}"),
+            Self::Start(error) => write!(f, "cannot start the shell: {error}"),
+            Self::Wait(error) => write!(f, "cannot wait for the shell: {error}"),
         }
     }
 }
@@ -101,23 +104,44 @@ impl std::error::Error for HostError {
 /// [`PlatformError::UnexpectedKind`] or [`PlatformError::ForeignOwner`] when something other than this user's
 /// directory sits where one belongs. The caller then starts plain zsh: a human shell is never refused.
 pub fn install_zsh_startup_dir(fs: &dyn Fs, paths: &EnginePaths, uid: u32) -> Result<PathBuf, PlatformError> {
-    let dir = paths.zsh_startup_dir();
-    let file = dir.join(STARTUP_FILE);
-    if private_dir_exists(fs, &dir, uid)?
+    install_startup_dir(fs, paths, uid, &paths.zsh_startup_dir(), zsh::STARTUP_FILE, ZSHENV)
+}
+
+/// Makes sure `bashrc` in [`EnginePaths::bash_startup_dir`] holds this build's [`BASHRC`] and returns the
+/// directory (KNSH-020). Needed only while recording: plain bash reads no file of `knsh`'s.
+///
+/// # Errors
+///
+/// As [`install_zsh_startup_dir`]. The caller then starts plain bash, without hooks.
+pub fn install_bash_startup_dir(fs: &dyn Fs, paths: &EnginePaths, uid: u32) -> Result<PathBuf, PlatformError> {
+    install_startup_dir(fs, paths, uid, &paths.bash_startup_dir(), bash::STARTUP_FILE, BASHRC)
+}
+
+/// Makes sure `dir/name` holds `contents`, creating `dir` and its parent owner-only when missing, and returns `dir`.
+fn install_startup_dir(
+    fs: &dyn Fs,
+    paths: &EnginePaths,
+    uid: u32,
+    dir: &Path,
+    name: &str,
+    contents: &str,
+) -> Result<PathBuf, PlatformError> {
+    let file = dir.join(name);
+    if private_dir_exists(fs, dir, uid)?
         && fs
             .read(&file, STARTUP_FILE_READ_LIMIT)
-            .is_ok_and(|text| text == ZSHENV.as_bytes())
+            .is_ok_and(|text| text == contents.as_bytes())
     {
-        return Ok(dir);
+        return Ok(dir.to_path_buf());
     }
     ensure_engine_dirs(fs, paths, uid)?;
-    // `shell/` then `shell/zsh/`, both below the data directory just prepared.
+    // `shell/` then `shell/<shell>/`, both below the data directory just prepared.
     if let Some(parent) = dir.parent() {
         ensure_private_dir(fs, parent, uid)?;
     }
-    ensure_private_dir(fs, &dir, uid)?;
-    fs.atomic_replace(&file, ZSHENV.as_bytes(), FILE_MODE)?;
-    Ok(dir)
+    ensure_private_dir(fs, dir, uid)?;
+    fs.atomic_replace(&file, contents.as_bytes(), FILE_MODE)?;
+    Ok(dir.to_path_buf())
 }
 
 /// Whether `dir` exists as this user's directory. Anything else in its place is refused rather than followed.
@@ -169,13 +193,13 @@ fn apply(plan: &LaunchPlan, mut command: Command) -> Command {
     command
 }
 
-/// Replaces this process with zsh as `plan` describes (recording off). Returns only on failure.
+/// Replaces this process with the shell as `plan` describes (recording off). Returns only on failure.
 #[must_use]
 pub fn exec(plan: &LaunchPlan) -> io::Error {
     command(plan).exec()
 }
 
-/// What the hosted shell starts with when it is not simply `knsh`'s own: tests use it to run zsh in isolation.
+/// What the hosted shell starts with when it is not simply `knsh`'s own: tests use it to run the shell in isolation.
 #[derive(Debug)]
 pub struct Isolation {
     /// Standard input.
@@ -188,35 +212,106 @@ pub struct Isolation {
     pub env: Vec<(OsString, OsString)>,
 }
 
-/// Runs zsh as a child with the telemetry descriptor (recording on), forwarding each decoded line to `sink`, and
-/// returns zsh's exit status. `launch.telemetry_fd` is ignored: the descriptor is created here. `isolation` is `None`
-/// in a real session: zsh inherits `knsh`'s terminal and environment.
+/// The shell to host, with everything that varies when starting it.
+#[derive(Debug, Clone, Copy)]
+pub enum HostedLaunch<'a> {
+    /// zsh (KNSH-019).
+    Zsh(ZshLaunch<'a>),
+    /// bash (KNSH-020).
+    Bash(BashLaunch<'a>),
+}
+
+impl<'a> From<ZshLaunch<'a>> for HostedLaunch<'a> {
+    fn from(launch: ZshLaunch<'a>) -> Self {
+        Self::Zsh(launch)
+    }
+}
+
+impl<'a> From<BashLaunch<'a>> for HostedLaunch<'a> {
+    fn from(launch: BashLaunch<'a>) -> Self {
+        Self::Bash(launch)
+    }
+}
+
+impl HostedLaunch<'_> {
+    /// Whether the startup wrapper, the only thing that takes the telemetry descriptor over, is installed.
+    fn has_startup_dir(&self) -> bool {
+        match self {
+            Self::Zsh(launch) => launch.startup_dir.is_some(),
+            Self::Bash(launch) => launch.startup_dir.is_some(),
+        }
+    }
+
+    /// Whether the shell must hold a read end of the pipe too: bash cannot ignore `SIGPIPE` for one write (see
+    /// [`TelemetryPipe::inheritable_reader`]); zsh does, inside its hooks.
+    fn shell_holds_a_read_end(&self) -> bool {
+        match self {
+            Self::Zsh(_) => false,
+            Self::Bash(_) => true,
+        }
+    }
+
+    /// The lowest descriptor number the shell keeps when it inherits it.
+    fn lowest_kept_fd(&self) -> RawFd {
+        match self {
+            Self::Zsh(_) => 3,
+            Self::Bash(_) => bash::LOWEST_KEPT_FD,
+        }
+    }
+
+    /// The plan with `telemetry_fd` as the inherited descriptor (`None`: recording off).
+    fn plan(&self, telemetry_fd: Option<RawFd>) -> LaunchPlan {
+        match *self {
+            Self::Zsh(launch) => ZshLaunch { telemetry_fd, ..launch }.plan(),
+            Self::Bash(launch) => BashLaunch {
+                // The shell is started by this process, so this is its parent.
+                telemetry: telemetry_fd.map(|fd| BashTelemetry {
+                    fd,
+                    parent_pid: std::process::id(),
+                }),
+                ..launch
+            }
+            .plan(),
+        }
+    }
+}
+
+/// Runs the shell as a child with the telemetry descriptor (recording on), forwarding each decoded line to `sink`,
+/// and returns its exit status. The descriptor in `launch` is ignored: it is created here. `isolation` is `None` in
+/// a real session: the shell inherits `knsh`'s terminal and environment.
 ///
-/// Without a startup directory (`launch.startup_dir` is `None`) no hook could take the descriptor over and close it,
-/// so no pipe is created at all: every command the user runs would otherwise inherit its write end. zsh runs plain
-/// and `sink` receives nothing.
+/// Without a startup directory no hook could take the descriptor over, so no pipe is created at all: every command
+/// the user runs would otherwise inherit its write end. The shell runs plain and `sink` receives nothing.
 ///
 /// # Errors
 ///
-/// [`HostError::Telemetry`] if the pipe cannot be created, [`HostError::Start`] if zsh cannot be started, and
+/// [`HostError::Telemetry`] if the pipe cannot be created, [`HostError::Start`] if the shell cannot be started, and
 /// [`HostError::Wait`] if waiting for it fails. Nothing has been started in the first two cases.
 #[cfg(target_os = "macos")]
-pub fn run_recorded(
-    launch: ZshLaunch<'_>,
+pub fn run_recorded<'a>(
+    launch: impl Into<HostedLaunch<'a>>,
     sink: Box<dyn TelemetrySink>,
     isolation: Option<Isolation>,
 ) -> Result<ExitStatus, HostError> {
-    let (reader, writer) = if launch.startup_dir.is_some() {
-        let (reader, writer) = TelemetryPipe::new().map_err(HostError::Telemetry)?.into_parts();
-        (Some(reader), Some(writer))
+    let launch = launch.into();
+    let pipe = if launch.has_startup_dir() {
+        Some(TelemetryPipe::new_at_or_above(launch.lowest_kept_fd()).map_err(HostError::Telemetry)?)
     } else {
-        (None, None)
+        None
     };
-    let plan = ZshLaunch {
-        telemetry_fd: writer.as_ref().map(AsRawFd::as_raw_fd),
-        ..launch
-    }
-    .plan();
+    // Held only until the shell has started, like the write end.
+    let read_end_for_shell = match &pipe {
+        Some(pipe) if launch.shell_holds_a_read_end() => Some(
+            pipe.inheritable_reader(launch.lowest_kept_fd())
+                .map_err(HostError::Telemetry)?,
+        ),
+        _ => None,
+    };
+    let (reader, writer) = match pipe.map(TelemetryPipe::into_parts) {
+        Some((reader, writer)) => (Some(reader), Some(writer)),
+        None => (None, None),
+    };
+    let plan = launch.plan(writer.as_ref().map(AsRawFd::as_raw_fd));
     let mut command = match isolation {
         None => command(&plan),
         Some(isolation) => {
@@ -230,19 +325,20 @@ pub fn run_recorded(
         }
     };
     let mut child = command.spawn().map_err(HostError::Start)?;
-    // Only zsh may hold the write end, or the forwarder would never see end of file.
+    // Only the shell may hold the write end, or the forwarder would never see end of file.
     drop(writer);
+    drop(read_end_for_shell);
     let forwarder = reader.map(|reader| thread::spawn(move || forward(reader, sink)));
 
-    // Installed after the spawn, so zsh starts with the dispositions knsh was given. Failing to install it is
+    // Installed after the spawn, so the shell starts with the dispositions knsh was given. Failing to install it is
     // tolerated: a human session must not be refused for it (FR-SES-22).
     let ignored = JobSignalsIgnored::install().ok();
     let status = child.wait().map_err(HostError::Wait);
     drop(ignored);
 
-    // zsh has exited and its close-on-exec copy of the descriptor with it: the forwarder sees end of file once the
-    // remaining lines are read. Bounded, in case a process zsh started before the hooks took the descriptor over
-    // still holds it; the thread is then left to finish on its own.
+    // The shell has exited and its copy of the descriptor with it: the forwarder sees end of file once the
+    // remaining lines are read. Bounded, because a process the shell started may still hold the write end (always
+    // possible with bash, which cannot make it close-on-exec); the thread is then left to finish on its own.
     if let Some(forwarder) = forwarder {
         let deadline = Instant::now() + FORWARDER_DRAIN;
         while !forwarder.is_finished() && Instant::now() < deadline {
@@ -256,9 +352,9 @@ pub fn run_recorded(
     status
 }
 
-/// The status `knsh` exits with after a recorded session, so its parent sees what plain zsh would have shown: zsh's
-/// exit code; or, when a signal ended zsh, `knsh` ends by the same signal and returns only if that signal does not
-/// terminate it, in which case the shell convention `128 + n` is returned.
+/// The status `knsh` exits with after a recorded session, so its parent sees what the plain shell would have shown:
+/// its exit code; or, when a signal ended the shell, `knsh` ends by the same signal and returns only if that signal
+/// does not terminate it, in which case the shell convention `128 + n` is returned.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn finish(status: ExitStatus) -> u8 {
@@ -276,11 +372,14 @@ pub fn finish(status: ExitStatus) -> u8 {
 }
 
 /// The forwarder: decodes lines from `reader` and delivers them until end of file, a read error, or
-/// [`Flow::Stop`]. Rejected lines are dropped. Returning drops `reader`, which closes the read end.
+/// [`Flow::Stop`]. Rejected lines, and lines out of order ([`PromptCycle`]), are dropped. Returning drops `reader`,
+/// which closes the read end.
 fn forward(reader: File, mut sink: Box<dyn TelemetrySink>) {
     let mut lines = LineReader::new(BufReader::new(reader));
+    let mut cycle = PromptCycle::default();
     while let Ok(Some(line)) = lines.next_line() {
         if let Ok(line) = line
+            && cycle.accept(&line)
             && sink.deliver(line) == Flow::Stop
         {
             return;
@@ -315,7 +414,7 @@ mod tests {
     }
 
     fn startup_file(paths: &EnginePaths) -> PathBuf {
-        paths.zsh_startup_dir().join(STARTUP_FILE)
+        paths.zsh_startup_dir().join(zsh::STARTUP_FILE)
     }
 
     #[test]
@@ -348,6 +447,24 @@ mod tests {
             .expect("edit");
         install_zsh_startup_dir(&fs, &paths, UID).expect("reinstall");
         assert_eq!(fs.contents(&startup_file(&paths)).as_deref(), Some(ZSHENV.as_bytes()));
+    }
+
+    // KNSH-020: the bash wrapper lives beside the zsh one, owner-only, and is replaced when outdated.
+    #[test]
+    fn installs_the_bash_wrapper_owner_only() {
+        let (fs, paths) = setup();
+        let dir = install_bash_startup_dir(&fs, &paths, UID).expect("install");
+        assert_eq!(dir, paths.bash_startup_dir());
+        let file = dir.join(bash::STARTUP_FILE);
+        assert_eq!(fs.contents(&file).as_deref(), Some(BASHRC.as_bytes()));
+        assert_eq!(fs.metadata(&file).expect("file").mode, FILE_MODE);
+        assert_eq!(fs.metadata(&dir).expect("dir").mode, DIR_MODE);
+        fs.atomic_replace(&file, b"echo old\n", FILE_MODE).expect("edit");
+        install_bash_startup_dir(&fs, &paths, UID).expect("reinstall");
+        assert_eq!(fs.contents(&file).as_deref(), Some(BASHRC.as_bytes()));
+        // Both shells' wrappers can live side by side.
+        install_zsh_startup_dir(&fs, &paths, UID).expect("zsh");
+        assert_eq!(fs.contents(&file).as_deref(), Some(BASHRC.as_bytes()));
     }
 
     // A symlink or another user's directory where the startup directory belongs is refused, not followed.

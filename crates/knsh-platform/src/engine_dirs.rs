@@ -64,6 +64,8 @@ const CHECKPOINTS_DIR: &str = "checkpoints";
 const POLICIES_DIR: &str = "policies";
 /// The zsh startup directory of integration mode, below the data directory (KNSH-019).
 const ZSH_STARTUP_DIR: [&str; 2] = ["shell", "zsh"];
+/// The bash startup directory of integration mode, below the data directory (KNSH-020).
+const BASH_STARTUP_DIR: [&str; 2] = ["shell", "bash"];
 /// Agent socket, inside the run directory.
 const AGENT_SOCKET: &str = "agent.sock";
 /// User socket, inside the run directory.
@@ -157,6 +159,13 @@ impl EnginePaths {
     #[must_use]
     pub fn zsh_startup_dir(&self) -> PathBuf {
         join_all(&self.data, &ZSH_STARTUP_DIR)
+    }
+
+    /// `~/Library/Application Support/knsh/shell/bash/`: the directory holding the bash startup wrapper of
+    /// integration mode, used only while recording (KNSH-020). Created by `knsh`, not by [`ensure_engine_dirs`].
+    #[must_use]
+    pub fn bash_startup_dir(&self) -> PathBuf {
+        join_all(&self.data, &BASH_STARTUP_DIR)
     }
 
     /// The directories [`ensure_engine_dirs`] creates, each listed after its parent.
@@ -543,6 +552,7 @@ mod tests {
             paths.config_dir().to_path_buf(),
             paths.policies_dir(),
             paths.zsh_startup_dir(),
+            paths.bash_startup_dir(),
         ];
         for path in every_path.iter().chain(&paths.private_dirs()) {
             assert!(
@@ -559,6 +569,10 @@ mod tests {
         assert_eq!(
             paths.zsh_startup_dir(),
             Path::new("/Users/u/Library/Application Support/knsh/shell/zsh")
+        );
+        assert_eq!(
+            paths.bash_startup_dir(),
+            Path::new("/Users/u/Library/Application Support/knsh/shell/bash")
         );
     }
 
