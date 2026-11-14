@@ -28,6 +28,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.99"
 publish = false
+license = "MIT"
 
 # The only third-party runtime crate (supply-chain.md). Exact pin, vendored in
 # `vendor/`; justification in `vendor/README.md` (NFR-SUP-02).

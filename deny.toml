@@ -15,7 +15,7 @@ ignore = []
 # Licences of the vendored runtime crates. Adding one needs the same review as a new crate.
 allow = ["MIT", "Apache-2.0"]
 confidence-threshold = 0.93
-# Workspace crates are `publish = false` and carry no licence field yet.
+# Workspace crates are MIT (`license.workspace = true`) and `publish = false`, so they are not checked here.
 private = { ignore = true }
 
 [bans]

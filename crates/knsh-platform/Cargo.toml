@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [features]
 # Deterministic fakes for every trait (`knsh_platform::testing`). Enabled by other crates only in their
