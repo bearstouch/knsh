@@ -120,6 +120,28 @@ fn knsh_binary(home: Option<&Path>, zdotdir: Option<&Path>, login: bool, script:
     run_with_script(command, script)
 }
 
+/// Pipes in a `/bin/ls -l /dev/fd/` listing that knsh did not open: the descriptor names of pipes that any child of
+/// this test process inherits. CI runners (GitHub Actions) pass their own pipes down to every process, so a pipe
+/// seen by a command is a telemetry leak only if a plain child does not see it too.
+fn leaked_pipes(listing: &str) -> Vec<String> {
+    let pipes = |listing: &str| -> Vec<String> {
+        listing
+            .lines()
+            .filter(|line| line.starts_with('p'))
+            .filter_map(|line| line.split_whitespace().last().map(str::to_owned))
+            .collect()
+    };
+    let baseline = Command::new("/bin/ls")
+        .args(["-l", "/dev/fd/"])
+        .output()
+        .expect("list inherited descriptors");
+    let inherited = pipes(&String::from_utf8_lossy(&baseline.stdout));
+    pipes(listing)
+        .into_iter()
+        .filter(|fd| !inherited.contains(fd))
+        .collect()
+}
+
 fn read_trace(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
@@ -433,12 +455,12 @@ fn recorded_session_reports_commands_and_keeps_user_hooks() {
     assert!(trace_text.contains("user precmd 1\n"), "{trace_text}");
     assert!(trace_text.contains("user precmd function 1\n"), "{trace_text}");
     assert!(trace_text.contains("tab\there unset 00\n"), "{trace_text}");
-    // Every standard stream here is a file, so a pipe visible to a command could only be the telemetry
-    // descriptor leaking (`ls` itself opens directories, never pipes).
+    // Every standard stream here is a file, so a pipe visible to a command that a plain child of the test does not
+    // inherit could only be the telemetry descriptor leaking (`ls` itself opens directories, never pipes).
     let listing = read_trace(&fds);
     assert!(listing.lines().any(|line| line.ends_with(" 0")), "{listing}");
     assert!(
-        !listing.lines().any(|line| line.starts_with('p')),
+        leaked_pipes(&listing).is_empty(),
         "telemetry pipe leaked to a command: {listing}"
     );
 }
@@ -464,7 +486,7 @@ fn recorded_run_without_startup_dir_leaks_no_descriptor() {
     let listing = read_trace(&fds);
     assert!(listing.ends_with("\n0\n"), "{listing}");
     assert!(
-        !listing.lines().any(|line| line.starts_with('p')),
+        leaked_pipes(&listing).is_empty(),
         "telemetry pipe leaked to a command: {listing}"
     );
 }

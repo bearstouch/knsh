@@ -1,7 +1,9 @@
-target/
+# Build output of the workspace only: an unanchored `target/` also hid vendored sources such as
+# vendor/cc-1.11.2/src/target/, which broke the offline fuzz build in CI.
+/target/
 # Fuzzing output (KNSH-005): build products, crash artefacts and coverage. Saved crashes
 # worth keeping are copied into fuzz/regressions/ by hand.
-fuzz/target/
+/fuzz/target/
 fuzz/artifacts/
 fuzz/coverage/
 # Temporary home directories of engine-directory integration tests (KNSH-011), removed when the tests end.

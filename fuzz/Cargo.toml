@@ -23,6 +23,7 @@ cargo-fuzz = true
 libfuzzer-sys = "=0.4.13"
 knsh-json = { path = "../crates/knsh-json" }
 knsh-toml = { path = "../crates/knsh-toml" }
+knsh-bash = { path = "../crates/knsh-bash" }
 
 [[bin]]
 name = "json_reader"
@@ -48,6 +49,13 @@ bench = false
 [[bin]]
 name = "toml_parser"
 path = "fuzz_targets/toml_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bash_lex"
+path = "fuzz_targets/bash_lex.rs"
 test = false
 doc = false
 bench = false
