@@ -29,6 +29,8 @@ fn main() -> ExitCode {
         Ok(Invocation::Command(parsed)) => match parsed.path.as_slice() {
             ["daemon", action @ ("install" | "uninstall")] => daemon(action, parsed.json()),
             ["forget"] => forget(&parsed),
+            ["history"] => history(&parsed),
+            ["events"] => events(&parsed),
             ["shell", "install"] => shell_install(parsed.json()),
             _ => not_implemented(&format!("'knsh {}'", parsed.path.join(" "))),
         },
@@ -87,29 +89,16 @@ fn daemon(action: &str, _json: bool) -> ExitCode {
 #[cfg(unix)]
 fn forget(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
     use knsh::cli::{client, forget};
-    use knsh_platform::EnginePaths;
 
     let params = match forget::params(parsed) {
         Ok(params) => params,
-        Err(error) => {
-            report(&format!(
-                "knsh: {error}\nTry 'knsh forget --help' for more information.\n"
-            ));
-            return ExitCode::from(ArgsError::EXIT_STATUS);
-        }
+        Err(error) => return usage(&error, "forget"),
     };
-    let Some(home) = std::env::var_os("HOME") else {
-        report("knsh: HOME is not set\n");
-        return ExitCode::FAILURE;
+    let socket = match user_socket() {
+        Ok(socket) => socket,
+        Err(code) => return code,
     };
-    let paths = match EnginePaths::for_home(std::path::Path::new(&home)) {
-        Ok(paths) => paths,
-        Err(error) => {
-            report(&format!("knsh: unusable HOME: {error}\n"));
-            return ExitCode::FAILURE;
-        }
-    };
-    let outcome = client::connect_user(&paths.user_socket()).and_then(|mut client| forget::run(&mut client, &params));
+    let outcome = client::connect_user(&socket).and_then(|mut client| forget::run(&mut client, &params));
     match outcome {
         Ok(deleted) => {
             let _ = std::io::stdout().write_all(forget::report(deleted, parsed.json()).as_bytes());
@@ -126,6 +115,130 @@ fn forget(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
 #[cfg(not(unix))]
 fn forget(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
     not_implemented("'knsh forget' on this platform")
+}
+
+/// The path of `user.sock` under `HOME`. On failure the reason is already on stderr and the exit code (1) is returned.
+#[cfg(unix)]
+fn user_socket() -> Result<std::path::PathBuf, ExitCode> {
+    use knsh_platform::EnginePaths;
+
+    let Some(home) = std::env::var_os("HOME") else {
+        report("knsh: HOME is not set\n");
+        return Err(ExitCode::FAILURE);
+    };
+    match EnginePaths::for_home(std::path::Path::new(&home)) {
+        Ok(paths) => Ok(paths.user_socket()),
+        Err(error) => {
+            report(&format!("knsh: unusable HOME: {error}\n"));
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// Runs `knsh history` (KNSH-023): validates the filters, reads every matching page of `records.query` on
+/// `user.sock`, and prints the newest records first, terminal-safe. Malformed values are a usage error (exit 2) and
+/// send nothing; an unreachable `knshd` or a failed query exits with 1 and the reason on stderr.
+#[cfg(unix)]
+fn history(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    use knsh::cli::{client, history};
+
+    let query = match history::query(parsed) {
+        Ok(query) => query,
+        Err(error) => return usage(&error, "history"),
+    };
+    let socket = match user_socket() {
+        Ok(socket) => socket,
+        Err(code) => return code,
+    };
+    let records = match client::connect_user(&socket).and_then(|mut client| history::run(&mut client, &query)) {
+        Ok(records) => records,
+        Err(error) => {
+            report(&history::failure_message(&error));
+            return ExitCode::FAILURE;
+        }
+    };
+    match history::report(&records, parsed.json()) {
+        Ok(text) => {
+            // A closed stdout (`knsh history | head`) is not an error worth reporting.
+            let _ = std::io::stdout().write_all(text.as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            report(&format!("knsh: history failed: {error}\n"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs `knsh events` (KNSH-023): validates the options, subscribes on `user.sock` and prints each event as it
+/// arrives until interrupted. Malformed options are a usage error (exit 2) and send nothing. An unreachable `knshd`,
+/// a refused subscription or a connection that ends exits with 1 and the reason on stderr; a reader that goes away
+/// (`knsh events | head`) ends the command quietly with 0.
+#[cfg(unix)]
+fn events(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    use knsh::cli::client::{self, ClientError};
+    use knsh::cli::events::{self, FollowError};
+
+    let params = match events::params(parsed) {
+        Ok(params) => params,
+        Err(error) => return usage(&error, "events"),
+    };
+    let socket = match user_socket() {
+        Ok(socket) => socket,
+        Err(code) => return code,
+    };
+    let subscribed = client::connect_user_with_handle(&socket).and_then(|(mut client, handle)| {
+        // Once subscribed, silence is normal (no events for hours), so reads wait without a deadline; interrupting the
+        // command (Ctrl-C) is how it ends. The deadline is lifted before subscribing, while `knshd` has just answered
+        // `hello`: macOS refuses to change a socket option once the peer has closed, which `knshd` may do right after
+        // the first events, and that must read as the end of the stream, not as a failure to subscribe.
+        handle.set_read_timeout(None).map_err(ClientError::Io)?;
+        let result = events::subscribe(&mut client, &params)?;
+        Ok((client, result))
+    });
+    let (mut client, result) = match subscribed {
+        Ok(subscribed) => subscribed,
+        Err(error) => {
+            report(&events::failure_message(&error));
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(notice) = events::gap_notice(&params, &result) {
+        report(&notice);
+    }
+    let Err(error) = events::follow(&mut client, parsed.json(), &mut std::io::stdout().lock());
+    match error {
+        FollowError::Output(error) if error.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        FollowError::Client(ClientError::Closed) => {
+            report("knsh: events: knshd closed the connection\n");
+            ExitCode::FAILURE
+        }
+        other => {
+            report(&format!("knsh: events failed: {other}\n"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `user.sock` is a Unix socket; no other platform has one.
+#[cfg(not(unix))]
+fn history(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    not_implemented("'knsh history' on this platform")
+}
+
+/// `user.sock` is a Unix socket; no other platform has one.
+#[cfg(not(unix))]
+fn events(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    not_implemented("'knsh events' on this platform")
+}
+
+/// Reports a command's usage error the way the argument parser does, and returns its exit status (2).
+#[cfg(unix)]
+fn usage(error: &dyn std::fmt::Display, command: &str) -> ExitCode {
+    report(&format!(
+        "knsh: {error}\nTry 'knsh {command} --help' for more information.\n"
+    ));
+    ExitCode::from(ArgsError::EXIT_STATUS)
 }
 
 /// Runs `knsh shell install` (KNSH-022): adds the running `knsh` to `/etc/shells` after an explicit yes on the

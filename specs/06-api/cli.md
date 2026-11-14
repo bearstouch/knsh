@@ -47,6 +47,56 @@ installs and removes it without talking to `knshd`.
 - `--with-checkpoints` is passed on. Until checkpoints exist (phase 3) `knshd` answers `-32005`: `knsh forget` says so,
   deletes nothing and exits with 1.
 
+## History
+
+`knsh history [--session <id>] [--since <date>] [--until <date>] [--text <text>] [--limit <n>]` (KNSH-023) reads
+records with [`records.query`](user-socket.md#recordsquery) and prints the newest `n` matching records (default 100,
+at most 100,000), **newest first**.
+
+- The filters are the API's: `--session` one session; `--since` records started at or after, `--until` records started
+  before, each a UTC date `YYYY-MM-DD` (midnight UTC) or an engine timestamp; `--text` a case-sensitive substring of
+  the command (at most 4096 bytes). They combine with AND. A malformed value is a usage error (status 2) and nothing
+  is sent.
+- The API pages oldest first, so the command reads every matching page (1000 records per call) and keeps only the
+  newest `n` in memory. A page whose `next_cursor` does not advance is a protocol error (status 1), never a loop.
+- Text output is one line per record: `started_at  session_id  actor  status  command`, where `actor` is `human` or
+  `agent:<agent_id>` and `status` is `exit <n>`, `signal <n>` or `-`. `--json` prints each record object exactly as
+  the API returns it (same field names), one object per line.
+
+## Events
+
+`knsh events [--session <id>] [--since <seq>]` (KNSH-023) subscribes with
+[`events.subscribe`](user-socket.md#eventssubscribe) and prints each event as it arrives, until interrupted.
+
+- `--since <seq>` replays the session's buffered events after `seq` first and needs `--session` (sequence numbers
+  count one session's events); without it, or with a value that is not a whole number, it is a usage error (status 2).
+- Text output is one line per event: `ts  session_id  #seq  event  summary` (the exit status and command for
+  `command.finished`, the directory for `cwd.changed`, `from -> to` for `session.state_changed`, the profile for
+  `session.started`, otherwise the `data` object). `--json` prints each notification's `params` (the event envelope
+  plus `subscription_id`) as one JSON object per line, and flushes after each.
+- Events the subscription loses ([`events.lost`](user-socket.md#eventssubscribe)) are reported in the stream, in
+  order: `{"event": "events.lost", "subscription_id", "session_id", "from_seq", "to_seq"}` with `--json`, a `lost`
+  line otherwise. A resume older than the buffer (`gap: true`) is reported once on stderr.
+- Once subscribed, reads have no deadline: an idle engine may send nothing for hours. `knshd` closing the connection
+  exits with 1; a reader that goes away (`knsh events | head`) ends the command with 0.
+
+## Reading commands and the daemon
+
+`knsh history` and `knsh events` only connect to `user.sock`: launchd may start `knshd` on demand for the socket, but
+the commands never start or install it. When the socket cannot be reached they exit with 1 and say so (`cannot reach
+knshd …; see 'knsh daemon install'`), printing nothing on stdout.
+
+## Terminal safety
+
+Records and events carry text the engine did not author (commands, directories, event data). `knsh history` and
+`knsh events` never print it raw (KNSH-023):
+
+- Text output shows every control character (C0, DEL, C1) and every bidirectional control (U+061C, U+200E, U+200F,
+  U+202A–U+202E, U+2066–U+2069) as a visible escape: `\n`, `\t`, `\r`, `\e`, `\xHH` or `\u{H…}`; a backslash is
+  doubled. A record or event is therefore always one line.
+- `--json` output escapes the same characters as `\uXXXX`. Each line is valid JSON and parses back to the API's value
+  unchanged.
+
 ## Login shell
 
 `knsh shell install` (KNSH-022, NFR-COMPAT-08) adds the running `knsh`, by its resolved absolute path, to

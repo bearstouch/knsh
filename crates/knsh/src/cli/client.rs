@@ -11,7 +11,9 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 use knsh_json::{Frame, FrameReader, FrameWriter, JsonError, Object, ToJson, Value};
-use knsh_proto::{Message, MethodName, ProtoError, Request, RequestId, RpcError, SUPPORTED_PROTOCOLS, decode};
+use knsh_proto::{
+    Message, MethodName, Notification, ProtoError, Request, RequestId, RpcError, SUPPORTED_PROTOCOLS, decode,
+};
 
 /// The name this client gives in `hello`.
 pub const CLIENT_NAME: &str = "knsh";
@@ -136,7 +138,33 @@ impl<R: Read, W: Write> Client<R, W> {
             }
         }
     }
+
+    /// Waits for the next notification: how a subscriber receives events (`knsh events`, KNSH-023).
+    ///
+    /// Only valid once every call on the connection has been answered: an answer arriving here is a protocol error,
+    /// as is any frame that is not a valid message.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Closed`] when `knshd` ends the connection; [`ClientError::Io`] or [`ClientError::Protocol`]
+    /// otherwise.
+    pub fn next_notification(&mut self) -> Result<Notification, ClientError> {
+        let Some(frame) = self.reader.read_frame()? else {
+            return Err(ClientError::Closed);
+        };
+        let Frame::Json(payload) = frame else {
+            return Err(ClientError::Protocol);
+        };
+        match decode(&payload).map_err(|_| ClientError::Protocol)? {
+            Message::Notification(notification) => Ok(notification),
+            Message::Request(_) | Message::Success(_) | Message::Error(_) => Err(ClientError::Protocol),
+        }
+    }
 }
+
+/// A connection to `user.sock`.
+#[cfg(unix)]
+pub type UserClient = Client<std::os::unix::net::UnixStream, std::os::unix::net::UnixStream>;
 
 /// Connects to `user.sock` at `path` and runs the handshake.
 ///
@@ -144,9 +172,22 @@ impl<R: Read, W: Write> Client<R, W> {
 ///
 /// [`ClientError::Connect`] if the socket cannot be reached; any error of [`Client::hello`].
 #[cfg(unix)]
-pub fn connect_user(
+pub fn connect_user(path: &std::path::Path) -> Result<UserClient, ClientError> {
+    connect_user_with_handle(path).map(|(client, _)| client)
+}
+
+/// Like [`connect_user`], and also returns a handle to the same socket, so the caller can change its timeouts later.
+///
+/// Calls are bounded by a read timeout. `knsh events` lifts it with the handle before it subscribes, because a quiet
+/// engine may legitimately send nothing for hours; the timeout is a socket option, so it applies to every handle.
+///
+/// # Errors
+///
+/// As [`connect_user`].
+#[cfg(unix)]
+pub fn connect_user_with_handle(
     path: &std::path::Path,
-) -> Result<Client<std::os::unix::net::UnixStream, std::os::unix::net::UnixStream>, ClientError> {
+) -> Result<(UserClient, std::os::unix::net::UnixStream), ClientError> {
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
@@ -155,13 +196,16 @@ pub fn connect_user(
     const READ_TIMEOUT: Duration = Duration::from_secs(300);
     const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+    // Connecting is all `knsh` does to reach `knshd`: launchd may start it on demand for this socket, but `knsh` never
+    // starts or installs it itself (KNSH-023). A missing or refused socket is `ClientError::Connect`.
     let stream = UnixStream::connect(path).map_err(ClientError::Connect)?;
     stream.set_read_timeout(Some(READ_TIMEOUT)).map_err(ClientError::Io)?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT)).map_err(ClientError::Io)?;
     let writer = stream.try_clone().map_err(ClientError::Io)?;
+    let handle = stream.try_clone().map_err(ClientError::Io)?;
     let mut client = Client::new(stream, writer);
     client.hello()?;
-    Ok(client)
+    Ok((client, handle))
 }
 
 #[cfg(test)]
