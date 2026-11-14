@@ -164,8 +164,10 @@ pub enum ParseError {
         /// Where it is.
         span: Span,
     },
-    /// Valid bash that this parser does not read yet. The line is refused rather than read partly (decision 6:
-    /// anything the parser cannot read is dynamic).
+    /// Valid bash that this parser does not read yet and whose extent it cannot find with confidence. The line is
+    /// refused rather than read partly (decision 6: anything the parser cannot read is dynamic). Constructs outside
+    /// decision 6 whose extent is certain (`select`, `[[ … ]]`, `(( … ))`) are not errors but
+    /// [`Command::Unsupported`](crate::Command::Unsupported) nodes, so the rest of the line is still read.
     Unsupported {
         /// The construct.
         construct: UnsupportedConstruct,
@@ -180,6 +182,12 @@ pub enum ParseError {
         /// The limit.
         limit: usize,
     },
+    /// The line ends inside a compound command or function definition (`if a; then b`, `{ a;`, `for x in a`), so
+    /// the word or operator that closes it never comes. Bash reports an unexpected end of file.
+    Unclosed {
+        /// The reserved word or operator that opened the construct left open.
+        span: Span,
+    },
 }
 
 impl ParseError {
@@ -192,7 +200,8 @@ impl ParseError {
             | Self::MissingRedirectionTarget { span }
             | Self::UnexpectedToken { span, .. }
             | Self::Unsupported { span, .. }
-            | Self::NestingTooDeep { span, .. } => Some(*span),
+            | Self::NestingTooDeep { span, .. }
+            | Self::Unclosed { span } => Some(*span),
         }
     }
 }
@@ -221,6 +230,9 @@ impl fmt::Display for ParseError {
             }
             Self::NestingTooDeep { span, limit } => {
                 write!(f, "commands nested deeper than {limit} levels at byte {}", span.start)
+            }
+            Self::Unclosed { span } => {
+                write!(f, "compound command opened at byte {} is not closed", span.start)
             }
         }
     }
@@ -252,14 +264,15 @@ impl fmt::Display for Unexpected {
     }
 }
 
-/// Valid bash constructs [`parse`](crate::parse) refuses until a later story reads them exactly.
+/// Valid bash constructs [`parse`](crate::parse) does not read exactly: either refused with
+/// [`ParseError::Unsupported`] or kept whole as a [`Command::Unsupported`](crate::Command::Unsupported) node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnsupportedConstruct {
-    /// A compound command or other reserved-word construct in command position: `{`, `(`, `if`, `for`, `while`,
-    /// `until`, `case`, `select`, `[[`, `function` (KNSH-030), `coproc` (dynamic by decision 6), or `time`.
+    /// A command outside decision 6's exact list. As a [`Command::Unsupported`](crate::Command::Unsupported) node:
+    /// `select`, `[[ … ]]`, `(( … ))` and `for (( … ))`, alone or as a function body. As a [`ParseError::Unsupported`]:
+    /// `coproc` (dynamic by decision 6) and `time`, which prefix a pipeline rather than form a command, and a `(( … ))`
+    /// that holds a comment, which bash and this parser could close at different places.
     Compound(CompoundStart),
-    /// `name() …`, a function definition (KNSH-030).
-    FunctionDefinition,
     /// `<<` or `<<-`, a here-document (KNSH-031).
     HereDocument,
     /// `name=(…)`, an array assignment.
@@ -275,11 +288,11 @@ pub enum UnsupportedConstruct {
 impl fmt::Display for UnsupportedConstruct {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Compound(CompoundStart::Subshell) => f.write_str("subshell `(`"),
+            Self::Compound(CompoundStart::Arithmetic) => f.write_str("arithmetic command `((`"),
+            Self::Compound(CompoundStart::ArithmeticFor) => f.write_str("arithmetic loop `for ((`"),
             Self::Compound(CompoundStart::ReservedWord(word)) => {
                 write!(f, "compound command `{}`", reserved_word_text(*word))
             }
-            Self::FunctionDefinition => f.write_str("function definition"),
             Self::HereDocument => f.write_str("here-document"),
             Self::ArrayAssignment => f.write_str("array assignment"),
             Self::SubscriptAssignment => f.write_str("array element assignment"),
@@ -288,12 +301,14 @@ impl fmt::Display for UnsupportedConstruct {
     }
 }
 
-/// The token that starts a construct reported as [`UnsupportedConstruct::Compound`].
+/// What starts a construct reported as [`UnsupportedConstruct::Compound`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompoundStart {
-    /// `(`, a subshell.
-    Subshell,
-    /// A reserved word that starts a compound command or a timed or coprocess pipeline.
+    /// `((`, an arithmetic command.
+    Arithmetic,
+    /// `for ((`, an arithmetic `for` loop.
+    ArithmeticFor,
+    /// A reserved word: `select`, `[[`, `coproc` or `time`.
     ReservedWord(ReservedWord),
 }
 

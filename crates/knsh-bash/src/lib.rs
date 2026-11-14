@@ -14,8 +14,13 @@
 //! and-or lists (`&&`, `||`), pipelines (`|`, `|&`, `!`) and simple commands, with the assignments before each
 //! command separated from its words and redirections attached wherever they were written. Every node keeps its span,
 //! and [`Script::simple_commands`] yields every simple command of the line in source order, so policy sees each part
-//! of the line (FR-LC-09). Valid bash that later stories read (compound commands, function definitions,
-//! here-documents) is refused with [`ParseError::Unsupported`] rather than read partly.
+//! of the line (FR-LC-09). It also reads the compound commands decision 6 makes exact (subshells, `{ }` groups, `if`,
+//! `for`, `while`, `until`, `case`) and function definitions (KNSH-030). `simple_commands` descends into every
+//! condition, body, case arm and function body, and a call that certainly reaches a function defined earlier in the
+//! line is marked ([`SimpleCommand::function_call`]), so it is not resolved as a program. Constructs outside decision
+//! 6 whose extent is certain (`select`, `[[ … ]]`, `(( … ))`) are kept whole as [`Command::Unsupported`] nodes; other
+//! valid bash that later stories read (here-documents, `coproc`, `time`) is refused with [`ParseError::Unsupported`]
+//! rather than read partly.
 //!
 //! # Boundaries
 //!
@@ -40,18 +45,21 @@
 
 mod ast;
 mod error;
+mod functions;
 mod lex;
 mod limits;
 mod parse;
 mod token;
 
 pub use ast::{
-    AndOr, AndOrOperator, AndOrPart, Assignment, Command, CommandWord, ListItem, PipeOperator, Pipeline, PipelinePart,
-    Redirect, Script, Separator, SeparatorKind, SimpleCommand,
+    AndOr, AndOrOperator, AndOrPart, Assignment, CaseClause, CaseCommand, CaseTerminator, CaseTerminatorKind, Command,
+    CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems, FunctionCall, FunctionDefinition,
+    Group, IfClause, IfCommand, ListItem, LoopBody, LoopCommand, PipeOperator, Pipeline, PipelinePart, Redirect,
+    Script, Separator, SeparatorKind, SimpleCommand, Subshell, UnsupportedCommand,
 };
 pub use error::{CompoundStart, Construct, LexError, ParseError, Unexpected, UnsupportedConstruct};
 pub use lex::lex;
-pub use limits::{MAX_INPUT_LEN, MAX_NESTING_DEPTH};
+pub use limits::{MAX_FUNCTION_DEFINITIONS, MAX_INPUT_LEN, MAX_NESTING_DEPTH};
 pub use parse::parse;
 pub use token::{
     IoNumber, Operator, Redirection, RedirectionOperator, ReservedWord, Segment, SegmentKind, Span, Token, TokenKind,
