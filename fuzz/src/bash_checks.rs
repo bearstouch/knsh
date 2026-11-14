@@ -1,9 +1,13 @@
-//! The properties of the `bash_lex` fuzz target (KNSH-028; `specs/07-testing/fuzzing.md`, NFR-SEC-05).
+//! The properties of the `bash_lex` (KNSH-028) and `bash_parse` (KNSH-029) fuzz targets
+//! (`specs/07-testing/fuzzing.md`, NFR-SEC-05).
 //!
 //! Also compiled on stable by `crates/knsh-bash/tests/fuzz_regressions.rs`, which includes this file by path, so it
 //! depends on nothing but `knsh-bash` and `std`. A failed property panics, which libFuzzer records as a crash.
 
-use knsh_bash::{LexError, MAX_INPUT_LEN, Operator, RedirectionOperator, Segment, SegmentKind, Span, TokenKind, lex};
+use knsh_bash::{
+    LexError, MAX_INPUT_LEN, Operator, ParseError, RedirectionOperator, Segment, SegmentKind, SimpleCommand, Span,
+    TokenKind, lex, parse,
+};
 
 /// `bash_lex`: the lexer never panics and is deterministic. An accepted line is tiled exactly by its token spans
 /// (FR-LC-02: nothing hides between tokens), each word by its segments and each double-quoted body by its inner
@@ -154,5 +158,122 @@ fn redirection_text(operator: RedirectionOperator) -> &'static str {
         RedirectionOperator::DuplicateOutput => ">&",
         RedirectionOperator::OutputAll => "&>",
         RedirectionOperator::AppendAll => "&>>",
+    }
+}
+
+/// `bash_parse`: the parser never panics and is deterministic, and it fails exactly when the lexer does with the same
+/// error. A rejection points inside the input. An accepted line loses nothing (FR-LC-02, FR-LC-09): every word token
+/// of the line is exactly one assignment, command word or redirection target of exactly one simple command, every
+/// redirection token is one redirection, the simple commands come in source order without overlapping, and each one's
+/// parts lie inside its span.
+pub fn bash_parse(data: &[u8]) {
+    let input = String::from_utf8_lossy(data);
+    let input = input.as_ref();
+    let result = parse(input);
+    assert_eq!(result, parse(input), "parsing is not deterministic");
+    match (result, lex(input)) {
+        (Err(ParseError::Lex(error)), Err(lex_error)) => {
+            assert_eq!(error, lex_error, "parser reports a different lexer error");
+        }
+        (Err(ParseError::Lex(_)), Ok(_)) => panic!("lexer error reported for a line that lexes"),
+        (Ok(_) | Err(_), Err(_)) => panic!("line parsed past a lexer error"),
+        (Err(error), Ok(_)) => {
+            let span = error
+                .span()
+                .unwrap_or_else(|| panic!("parser error without a span: {error:?}"));
+            span_text(input, span);
+        }
+        (Ok(script), Ok(tokens)) => {
+            assert_eq!(script.span, Span::new(0, input.len()), "script span");
+            let mut words = Vec::new();
+            let mut redirections = Vec::new();
+            for token in &tokens {
+                match token.kind {
+                    TokenKind::Word(_) => words.push(token.span),
+                    TokenKind::Redirection(_) => redirections.push(token.span),
+                    TokenKind::Operator(_) | TokenKind::Newline | TokenKind::Blank | TokenKind::Comment => {}
+                }
+            }
+            // A `!` that negates a pipeline is a word token too; it belongs to the pipeline, not to a command.
+            let negations: Vec<Span> = script
+                .items
+                .iter()
+                .flat_map(|item| item.and_or.pipelines())
+                .filter_map(|pipeline| pipeline.negation)
+                .collect();
+            for bang in &negations {
+                assert_eq!(span_text(input, *bang).replace("\\\n", ""), "!", "negation is not `!`");
+            }
+            let commands: Vec<&SimpleCommand> = script.simple_commands().collect();
+            check_commands(input, &commands, negations, &words, &redirections);
+        }
+    }
+}
+
+/// The `bash_parse` properties of an accepted line's simple commands. `negations` are the word tokens the pipelines
+/// claimed for `!`; together with every command's words they must be exactly the line's word tokens, in order.
+fn check_commands(
+    input: &str,
+    commands: &[&SimpleCommand],
+    negations: Vec<Span>,
+    words: &[Span],
+    redirections: &[Span],
+) {
+    let mut seen_words = negations;
+    let mut seen_redirections: Vec<Span> = Vec::new();
+    let mut previous_end = 0;
+    for command in commands {
+        span_text(input, command.span);
+        assert!(
+            command.span.start >= previous_end,
+            "simple commands overlap or are out of order"
+        );
+        assert!(!command.span.is_empty(), "empty simple command");
+        previous_end = command.span.end;
+        let inside = |span: Span| {
+            assert!(
+                span.start >= command.span.start && span.end <= command.span.end,
+                "part outside its simple command"
+            );
+        };
+        for assignment in &command.assignments {
+            inside(assignment.span);
+            assert!(assignment.value.start > assignment.span.start && assignment.value.end == assignment.span.end);
+            let mut name = assignment.name.bytes();
+            assert!(
+                name.next()
+                    .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic()),
+                "assignment name"
+            );
+            assert!(
+                name.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric()),
+                "assignment name"
+            );
+            seen_words.push(assignment.span);
+        }
+        for word in &command.words {
+            inside(word.span);
+            seen_words.push(word.span);
+        }
+        for redirect in &command.redirections {
+            inside(redirect.span);
+            assert_eq!(
+                redirect.span.end, redirect.target.span.end,
+                "redirection ends at its target"
+            );
+            seen_words.push(redirect.target.span);
+            // The redirection token runs from the redirection's start to just before its target.
+            seen_redirections.push(redirect.span);
+        }
+    }
+    seen_words.sort_by_key(|span| span.start);
+    assert_eq!(seen_words, words, "word tokens dropped, duplicated or invented");
+    assert_eq!(
+        seen_redirections.len(),
+        redirections.len(),
+        "redirection tokens dropped or invented"
+    );
+    for (redirect, token) in seen_redirections.iter().zip(redirections) {
+        assert_eq!(redirect.start, token.start, "redirection out of place");
     }
 }

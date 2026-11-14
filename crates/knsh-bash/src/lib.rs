@@ -10,16 +10,25 @@
 //! substitution (`$( … )`, backticks, `${ … }`, `$(( … ))`, `<( … )`) without expanding anything. Reserved words
 //! are only marked as candidates; whether they act as such depends on position, which the parser decides.
 //!
+//! The second stage is the parser, [`parse`] (KNSH-029): it builds a [`Script`] of lists (`;`, `&`, newlines),
+//! and-or lists (`&&`, `||`), pipelines (`|`, `|&`, `!`) and simple commands, with the assignments before each
+//! command separated from its words and redirections attached wherever they were written. Every node keeps its span,
+//! and [`Script::simple_commands`] yields every simple command of the line in source order, so policy sees each part
+//! of the line (FR-LC-09). Valid bash that later stories read (compound commands, function definitions,
+//! here-documents) is refused with [`ParseError::Unsupported`] rather than read partly.
+//!
 //! # Boundaries
 //!
 //! No workspace or third-party dependencies, no I/O, no global state, no `unsafe`. Input is untrusted (NFR-SEC-05):
 //! its size is checked before it is read ([`MAX_INPUT_LEN`]), recursion is bounded ([`MAX_NESTING_DEPTH`]), the first
-//! problem ends the lex with a [`LexError`] (never a guess), and the lexer is fuzzed (`fuzz/`, target `bash_lex`). A
-//! parser result is an intent filter, never a security boundary.
+//! problem ends the lex or parse with a [`LexError`] or [`ParseError`] (never a guess), and both stages are fuzzed
+//! (`fuzz/`, targets `bash_lex` and `bash_parse`). Callers treat every error as dynamic code, never as an allow
+//! (decision 6, KNSH-032). A parser result is an intent filter, never a security boundary.
 //!
 //! # Specification
 //!
-//! - `specs/03-functional-requirements/command-lifecycle.md` (FR-LC-02: parse the whole line with a bash grammar)
+//! - `specs/03-functional-requirements/command-lifecycle.md` (FR-LC-02: parse the whole line with a bash grammar;
+//!   FR-LC-09: policy is evaluated for every part of the line)
 //! - `specs/09-reference/decisions.md` (decision 6: parser scope for phase 2)
 //! - `specs/04-non-functional-requirements/security.md` (NFR-SEC-05: memory-safe, fuzzed parsers)
 //! - `specs/02-architecture/implementation.md`
@@ -29,14 +38,21 @@
 #![warn(clippy::pedantic)]
 #![forbid(unsafe_code)]
 
+mod ast;
 mod error;
 mod lex;
 mod limits;
+mod parse;
 mod token;
 
-pub use error::{Construct, LexError};
+pub use ast::{
+    AndOr, AndOrOperator, AndOrPart, Assignment, Command, CommandWord, ListItem, PipeOperator, Pipeline, PipelinePart,
+    Redirect, Script, Separator, SeparatorKind, SimpleCommand,
+};
+pub use error::{CompoundStart, Construct, LexError, ParseError, Unexpected, UnsupportedConstruct};
 pub use lex::lex;
 pub use limits::{MAX_INPUT_LEN, MAX_NESTING_DEPTH};
+pub use parse::parse;
 pub use token::{
     IoNumber, Operator, Redirection, RedirectionOperator, ReservedWord, Segment, SegmentKind, Span, Token, TokenKind,
     Word,

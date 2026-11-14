@@ -10,6 +10,7 @@ Replacing well-tested crates with hand-written parsers moves the risk into our o
 | TOML subset parser | Policy and configuration files | No panics; rejects anything outside the subset |
 | Bash parser | Agent command lines | No panics; unparseable input classified as dynamic; differential checks against bash |
 | Bash lexer (`bash_lex`) | Agent command lines | No panics; deterministic; token spans tile the line, segments tile each word; rejections point inside the input |
+| Bash parser, simple commands and lists (`bash_parse`) | Agent command lines | No panics; deterministic; fails exactly when the lexer fails, with the same error; rejections point inside the input; on success every word token is exactly one assignment, command word, redirection target or `!` of the tree, every redirection token one redirection, and simple commands come in source order without overlapping |
 | TLS ClientHello reader | Proxy connections | Server name extracted correctly or connection refused; no panics |
 | HTTP CONNECT and SOCKS handling | Proxy connections | No panics; malformed requests refused |
 
@@ -17,7 +18,7 @@ Test-only crates (fuzzers, property testing) are allowed under the [dependency p
 
 ## Harness
 
-The targets live in `fuzz/`, a test-only workspace outside the shipped one (NFR-SUP-05); its crates are vendored like every other dependency. Each target's properties are a plain function in `fuzz/src/checks.rs` (JSON), `fuzz/src/toml_checks.rs` (TOML) or `fuzz/src/bash_checks.rs` (bash lexer), which the stable test suite also runs over every seed and every saved crash (`fuzz/regressions/<target>/`), so a crash found once stays a failing test until it is fixed.
+The targets live in `fuzz/`, a test-only workspace outside the shipped one (NFR-SUP-05); its crates are vendored like every other dependency. Each target's properties are a plain function in `fuzz/src/checks.rs` (JSON), `fuzz/src/toml_checks.rs` (TOML) or `fuzz/src/bash_checks.rs` (bash lexer and parser), which the stable test suite also runs over every seed and every saved crash (`fuzz/regressions/<target>/`), so a crash found once stays a failing test until it is fixed.
 
 - **CI:** every push runs each target for 60 seconds (`scripts/fuzz.sh`) on a pinned nightly. A crash, a hang (over 10 seconds on one input) or a property failure fails the pipeline, and the crashing inputs are uploaded as an artefact.
 - **Local:** `cargo +nightly fuzz run <target>` runs open-ended and grows the checked-in corpus; `scripts/fuzz.sh <seconds> <target>` runs time-boxed.
