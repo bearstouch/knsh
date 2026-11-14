@@ -1,0 +1,90 @@
+  13 Google Chrome Helper (Aperitif) deny(1) network-outbound /private/var/run/syslog	knsh:c1-google-chrome+ls-own-on:env:default
+   6 swift-driver deny(1) mach-lookup com.apple.CoreServices.coreservicesd	knsh:c1-swift-build-own-off:env:launchservices
+   6 chrome-headless-shell deny(1) network-outbound /private/var/run/syslog	knsh:c1-playwright-own-on:env:default
+   6 chrome-headless-shell deny(1) network-outbound /private/var/run/syslog	knsh:c1-chromium-headless-shell-own-on:env:default
+   4 swift-driver deny(1) mach-lookup com.apple.CoreServices.coreservicesd	knsh:c1-swift-build-own-on:env:launchservices
+   4 chrome-headless-shell deny(1) mach-lookup com.apple.lsd.modifydb	knsh:c1-playwright-own-off:env:launchservices
+   4 Google Chrome deny(1) file-write-data /Users/USER/Library/Application Support/Google/Chrome/Crashpad/settings.dat	knsh:c1-google-chrome+ls-own-on:env:default
+   3 swift-package deny(1) system-fsctl (_IO "h" 47)	knsh:c1-swift-build-own-off:env:default
+   3 chrome-headless-shell deny(1) mach-lookup com.apple.lsd.modifydb	knsh:c1-chromium-headless-shell-own-on:env:launchservices
+   3 chrome-headless-shell deny(1) mach-lookup com.apple.lsd.modifydb	knsh:c1-chromium-headless-shell-own-off:env:launchservices
+   3 chrome-headless-shell deny(1) mach-lookup com.apple.CoreServices.coreservicesd	knsh:c1-playwright-own-off:env:launchservices
+   3 Google Chrome deny(1) file-write-data /Users/USER/Library/Application Support/Google/RLZ/flockfile	knsh:c1-google-chrome+ls-own-on:env:default
+   3 Google Chrome deny(1) file-write-data /Users/USER/Library/Application Support/Google/Chrome/Crashpad/settings.dat	knsh:c1-google-chrome+ls-own-off:env:default
+   2 who deny(1) file-write-data /private/var/run/utmpx	knsh:c1-claude-code-own-on:env:default
+   2 who deny(1) file-write-data /private/var/run/utmpx	knsh:c1-claude-code-own-off:env:default
+   2 node deny(1) mach-lookup com.apple.coreservices.launchservicesd	knsh:c1-claude-code-own-on:env:launchservices
+   2 chrome_crashpad_handler deny(1) file-write-data /Users/USER/Library/Application Support/Google/Chrome/Crashpad/settings.dat	knsh:c1-google-chrome+ls-own-on:env:default
+   2 chrome-headless-shell deny(1) mach-lookup com.apple.lsd.modifydb	knsh:c1-playwright-own-on:env:launchservices
+   2 chrome-headless-shell deny(1) mach-lookup com.apple.CoreServices.coreservicesd	knsh:c1-playwright-own-on:env:launchservices
+   2 chrome-headless-shell deny(1) mach-lookup com.apple.CoreServices.coreservicesd	knsh:c1-chromium-headless-shell-own-off:env:launchservices
+   2 Google Chrome Helper (Aperitif) deny(1) network-outbound	knsh:c1-google-chrome+ls-own-off:env:default
+   1 zsh deny(1) system-sched self	knsh:c1-claude-code-own-on:env:default
+   1 zsh deny(1) system-sched self	knsh:c1-claude-code-own-off:env:default
+   1 tee deny(1) file-write-data /Users/USER/.zcompdump-HOST-5.9	knsh:c1-claude-code-own-on:env:default
+   1 tee deny(1) file-write-data /Users/USER/.zcompdump-HOST-5.9	knsh:c1-claude-code-own-off:env:default
+   1 swift-package deny(1) mach-lookup com.apple.CoreServices.coreservicesd	knsh:c1-swift-build-own-on:env:launchservices
+   1 swift-package deny(1) mach-lookup com.apple.CoreServices.coreservicesd	knsh:c1-swift-build-own-off:env:launchservices
+   1 swift-package deny(1) file-write-unlink /Users/USER/.swiftpm/security	knsh:c1-swift-build-own-on:env:default
+   1 swift-package deny(1) file-write-unlink /Users/USER/.swiftpm/security	knsh:c1-swift-build-own-off:env:default
+   1 rm deny(1) file-write-unlink /Users/USER/.zcompdump-HOST-5.9	knsh:c1-claude-code-own-on:env:default
+   1 rm deny(1) file-write-unlink /Users/USER/.zcompdump-HOST-5.9	knsh:c1-claude-code-own-off:env:default
+   1 node deny(1) mach-lookup com.apple.coreservices.launchservicesd	knsh:c1-claude-code-own-off:env:launchservices
+   1 codesign deny(1) system-fsctl (_IO "A" 20)	knsh:c1-swift-build-own-off:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/fa52c717-d139-4be5-9d59-fb9e80a8c220.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/f8e43fb2-d374-484a-8451-252ffd028e3e.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/eaeda138-2792-4955-819f-b111b54efc12.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/e1119185-187a-422d-9a1e-1e3be07dff15.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/dbc24729-83b6-4b8d-8bad-ec84435c761e.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/d4df5293-6f6e-490d-be71-0282ca4b6744.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/b2f53a03-83d9-4b70-89f5-604ba06518c2.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/aec98e59-11c7-4291-a5d7-0fe73e54c934.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/a3632e4e-7de6-4579-87c3-b4d1f9ca3817.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/9e7e5987-b943-4982-9ad7-c70dd5aff7bf.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/995e15e4-846e-43ae-9d92-8f1e16976042.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/993734f2-2783-47a1-891f-8a512d7bde65.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/95af8fc3-aecc-4988-bdba-6e4b5886e265.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/9392dd46-40c8-47b2-a446-8c238ba84f1c.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/86f8a12d-dddc-4eaf-8a94-28463ccfa34a.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/703418b3-093a-445b-a8cd-16fe34eefb74.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/46b96f38-b0ad-4d03-9d79-b5d8ca7a4303.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/3f5a1f34-00ba-4036-a677-4224bd539f4f.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/3a024cdf-5e20-474f-a997-a68ca878e585.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/3447975b-23e8-4748-911c-bca56f3513b0.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/3408775c-d900-4ce6-923b-3285f4844126.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/2fa026b2-8f13-49f2-ac3e-c4e3bd824f26.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/21ec7f36-80b3-455a-a9f4-562ddcd91a29.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/13ef8433-4245-4dd9-b134-7937c3bc9e31.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/0942e80b-be70-4fde-8527-2dbb3b9464eb.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/04cc8bd3-1a09-4d3e-87f3-d562c30cb0f3.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome_crashpad_handler deny(1) file-write-create /Users/USER/Library/Application Support/Google/Chrome/Crashpad/new/0336ade1-2c6f-4a7a-9c8f-0451a15b144b.dmp	knsh:c1-google-chrome+ls-own-on:env:default
+   1 chrome-headless-shell deny(1) mach-lookup com.apple.lsd.mapdb	knsh:c1-playwright-own-on:env:launchservices
+   1 chrome-headless-shell deny(1) mach-lookup com.apple.lsd.mapdb	knsh:c1-playwright-own-off:env:launchservices
+   1 chrome-headless-shell deny(1) mach-lookup com.apple.lsd.mapdb	knsh:c1-chromium-headless-shell-own-off:env:launchservices
+   1 chrome-headless-shell deny(1) mach-lookup com.apple.coreservices.launchservicesd	knsh:c1-playwright-own-on:env:launchservices
+   1 chrome-headless-shell deny(1) mach-lookup com.apple.coreservices.launchservicesd	knsh:c1-playwright-own-off:env:launchservices
+   1 chrome-headless-shell deny(1) mach-lookup com.apple.coreservices.launchservicesd	knsh:c1-chromium-headless-shell-own-off:env:launchservices
+   1 chrome-headless-shell deny(1) mach-lookup com.apple.coreservices.appleevents	knsh:c1-playwright-own-on:env:appleevents
+   1 chrome-headless-shell deny(1) mach-lookup com.apple.coreservices.appleevents	knsh:c1-playwright-own-off:env:appleevents
+   1 chrome-headless-shell deny(1) mach-lookup com.apple.coreservices.appleevents	knsh:c1-chromium-headless-shell-own-off:env:appleevents
+   1 cat deny(1) file-read-data /private/var/folders/XX/XXXXXXXX/T/tmp.LBBJpnDPns/canary	knsh:c1-:canary
+   1 Google Chrome deny(1) network-outbound /private/var/run/syslog	knsh:c1-google-chrome+ls-own-off:env:default
+   1 Google Chrome deny(1) mach-lookup com.apple.coreservices.launchservicesd	knsh:c1-google-chrome-own-on:env:launchservices
+   1 Google Chrome deny(1) mach-lookup com.apple.coreservices.launchservicesd	knsh:c1-google-chrome-own-off:env:launchservices
+   1 Google Chrome deny(1) mach-lookup com.apple.coreservices.appleevents	knsh:c1-google-chrome+ls-own-on:env:appleevents
+   1 Google Chrome deny(1) mach-lookup com.apple.coreservices.appleevents	knsh:c1-google-chrome+ls-own-off:env:appleevents
+   1 Google Chrome deny(1) file-write-xattr /private/var/folders/XX/XXXXXXXX/X/com.google.Chrome.code_sign_clone	knsh:c1-google-chrome+ls-own-on:env:default
+   1 Google Chrome deny(1) file-write-xattr /private/var/folders/XX/XXXXXXXX/X/com.google.Chrome.code_sign_clone	knsh:c1-google-chrome+ls-own-off:env:default
+   1 Google Chrome deny(1) file-write-create /private/var/folders/XX/XXXXXXXX/X/com.google.Chrome.code_sign_clone/code_sign_clone.WHm5KX	knsh:c1-google-chrome+ls-own-on:env:default
+   1 Google Chrome deny(1) file-write-create /private/var/folders/XX/XXXXXXXX/X/com.google.Chrome.code_sign_clone/code_sign_clone.QLqFRf	knsh:c1-google-chrome+ls-own-off:env:default
+   1 Google Chrome deny(1) file-issue-extension target:/Applications/Google Chrome.app extension-class:com.apple.app-sandbox.read	knsh:c1-google-chrome-own-on:env:default
+   1 Google Chrome deny(1) file-issue-extension target:/Applications/Google Chrome.app extension-class:com.apple.app-sandbox.read	knsh:c1-google-chrome-own-off:env:default
+   1 Google Chrome deny(1) file-issue-extension target:/Applications/Google Chrome.app extension-class:com.apple.app-sandbox.read	knsh:c1-google-chrome+ls-own-on:env:default
+   1 Google Chrome Helper (Aperitif A deny(1) mach-lookup com.apple.coreservices.appleevents	knsh:c1-google-chrome+ls-own-on:env:appleevents
+   1 Google Chrome Helper (Aperitif A deny(1) mach-lookup com.apple.coreservices.appleevents	knsh:c1-google-chrome+ls-own-off:env:appleevents
+   1 Google Chrome Helper (Aperitif A deny(1) file-issue-extension target:/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/157.0.8103.51/Helpers/Google Chrome Helper (Aperitif Alerts).app extension-class:com.apple.app-sandbox.read	knsh:c1-google-chrome+ls-own-on:env:default
+   1 Google Chrome Helper (Aperitif A deny(1) file-issue-extension target:/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/157.0.8103.51/Helpers/Google Chrome Helper (Aperitif Alerts).app extension-class:com.apple.app-sandbox.read	knsh:c1-google-chrome+ls-own-off:env:default
+   1 2.1.325 deny(1) network-bind /private/tmp/cc-socks/59973.sock	knsh:c1-claude-code-own-off:env:default
+   1 2.1.325 deny(1) network-bind /private/tmp/cc-socks/59192.sock	knsh:c1-claude-code-own-on:env:default
+   1 2.1.325 deny(1) file-write-create /Users/USER/.local/state/claude/locks/2.1.325#59973.lock.tmp.54c61935	knsh:c1-claude-code-own-off:env:default
+   1 2.1.325 deny(1) file-write-create /Users/USER/.local/state/claude/locks/2.1.325#59192.lock.tmp.f9f4b886	knsh:c1-claude-code-own-on:env:default

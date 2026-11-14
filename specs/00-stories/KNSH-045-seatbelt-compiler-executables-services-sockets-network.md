@@ -10,7 +10,7 @@
 
 *Seatbelt compiler: executables, services, sockets, network, process info.* As the supervisor, I want the rest of the profile table compiled: executable rules, system service
 denials, Unix socket rules, network limited to the proxy port and loopback ports, process information and signals
-limited to the own process group, read-only system settings. Rule forms come from KNSH-025's results.
+limited to the own sandbox (decision 8), read-only system settings. Rule forms come from KNSH-025's results.
 
 *Compiled profile files and hashes.* As the supervisor, I want each compiled profile written to a private file in an engine path with a
 content hash, so that `knsh-exec` can apply it with `-f` and records can name exactly what ran.
@@ -25,7 +25,7 @@ content hash, so that `knsh-exec` can apply it with `-f` and records can name ex
 - [ ] Envelope profiles allow connecting to `agent.sock` only; command profiles allow no Unix socket; `user.sock` is
   always denied (FR-SBX-05); Docker and SSH agent sockets only when the profile allows.
 - [ ] Outbound network allowed only to `127.0.0.1:<proxy port>` and `network.loopback` ports.
-- [ ] Process info and signals limited to the own process group, as far as KNSH-025 showed is enforceable; any gap
+- [ ] Process info and signals limited to the own sandbox (decision 8; rule forms in KNSH-025's C8 results); any gap
   is documented in the profile header comment and the spec.
 
 *Compiled profile files and hashes*

@@ -1,0 +1,86 @@
+Filtering the log data using "sender == "Sandbox" AND composedMessage CONTAINS "knsh:c8:""
+Timestamp               Ty Process[PID:TID]
+2026-11-14 12:58:21.701 E  kernel[0:633d0d8] (Sandbox) Sandbox: cat(84918) deny(1) file-read-data /private/var/folders/XX/XXXXXXXX/T/tmp.OL7M4RgCsY/canary
+knsh:c8:canary
+2026-11-14 12:58:22.674 E  kernel[0:633d309] (Sandbox) Sandbox: bash(85038) deny(1) file-write-data /dev/tty
+knsh:c8:pinfo-self:default
+2026-11-14 12:58:22.772 E  kernel[0:633d376] (Sandbox) 1 duplicate report for Sandbox: probe(85052) deny(1) process-info-pidinfo others [sleep(84903)]
+knsh:c8:pinfo-procargs-argv-partial
+2026-11-14 12:58:22.793 E  kernel[0:633d391] (Sandbox) Sandbox: bash(85073) deny(1) file-write-data /dev/tty
+knsh:c8:pinfo-procargs-self:default
+2026-11-14 12:58:22.864 E  kernel[0:633d3e3] (Sandbox) Sandbox: probe(85094) deny(1) sysctl-read kern.proc.pid.84903
+knsh:c8:pinfo-kproc-other
+2026-11-14 12:58:22.885 E  kernel[0:633d3fe] (Sandbox) Sandbox: bash(85101) deny(1) file-write-data /dev/tty
+knsh:c8:pinfo-kproc-self:default
+2026-11-14 12:58:22.921 E  kernel[0:633d41e] (Sandbox) Sandbox: probe(85110) deny(1) process-info-pidinfo others [sleep-adhoc(84907)]
+knsh:c8:pinfo-procargs-env-nonplatform-partial
+2026-11-14 12:58:22.944 E  kernel[0:633d43a] (Sandbox) 1 duplicate report for Sandbox: probe(85110) deny(1) process-info-pidinfo others [sleep-adhoc(84907)]
+knsh:c8:pinfo-procargs-env-nonplatform-partial
+2026-11-14 12:58:22.944 E  kernel[0:633d43a] (Sandbox) Sandbox: probe(85117) deny(1) process-info-pidinfo others [sleep-adhoc(84907)]
+knsh:c8:pinfo-procargs-env-nonplatform
+2026-11-14 12:58:22.944 E  kernel[0:633d43a] (Sandbox) Sandbox: probe(85117) deny(1) sysctl-read kern.procargs2.84907
+knsh:c8:pinfo-procargs-env-nonplatform
+2026-11-14 12:58:23.011 E  kernel[0:633d490] (Sandbox) Sandbox: probe(85139) deny(1) network-outbound /private/var/folders/XX/XXXXXXXX/T/knsh-c8.ju3FoXAKOo/user.sock
+knsh:c8:sock-user
+2026-11-14 12:58:23.036 E  kernel[0:633d4ac] (Sandbox) Sandbox: probe(85146) deny(1) network-outbound /private/var/folders/XX/XXXXXXXX/T/knsh-c8.ju3FoXAKOo/user.sock
+knsh:c8:sock-user-symlink
+2026-11-14 12:58:23.059 E  kernel[0:633d4c8] (Sandbox) Sandbox: probe(85153) deny(1) network-outbound /private/var/folders/XX/XXXXXXXX/T/knsh-c8.ju3FoXAKOo/user.sock
+knsh:c8:sock-user-noncanonical
+2026-11-14 12:58:23.081 E  kernel[0:633d4e3] (Sandbox) Sandbox: probe(85160) deny(1) network-outbound /Users/USER/.docker/run/docker.sock
+knsh:c8:sock-docker:default
+2026-11-14 12:58:23.104 E  kernel[0:633d4fe] (Sandbox) Sandbox: probe(85167) deny(1) network-outbound /private/var/run/com.apple.launchd.YiTXOg5PIc/Listeners
+knsh:c8:sock-ssh-agent:default
+2026-11-14 12:58:23.127 E  kernel[0:633d519] (Sandbox) Sandbox: probe(85174) deny(1) network-outbound /private/var/folders/XX/XXXXXXXX/T/knsh-c8.ju3FoXAKOo/user.sock
+knsh:c8:sock-user-under-allow-all
+2026-11-14 12:58:23.150 E  kernel[0:633ced1] (Sandbox) Sandbox: probe(85181) deny(1) mach-lookup com.apple.lsd.mapdb
+knsh:c8:svc-ls-query
+2026-11-14 12:58:23.157 E  kernel[0:633c617] (Sandbox) Sandbox: probe(85181) deny(1) mach-lookup com.apple.CoreServices.coreservicesd
+knsh:c8:svc-ls-query
+2026-11-14 12:58:23.159 E  kernel[0:633ced1] (Sandbox) Sandbox: probe(85181) deny(1) mach-lookup com.apple.lsd.modifydb
+knsh:c8:svc-ls-query
+2026-11-14 12:58:23.339 E  kernel[0:633c617] (Sandbox) 409 duplicate reports for Sandbox: probe(85181) deny(1) mach-lookup com.apple.lsd.modifydb
+knsh:c8:svc-ls-query
+2026-11-14 12:58:23.339 E  kernel[0:633c617] (Sandbox) Sandbox: probe(85195) deny(1) mach-lookup com.apple.coreservices.appleevents
+knsh:c8:svc-ae-lookup
+2026-11-14 12:58:23.364 E  kernel[0:633ced1] (Sandbox) Sandbox: osascript(85202) deny(1) mach-lookup com.apple.CoreServices.coreservicesd
+knsh:c8:svc-ae-osascript
+2026-11-14 12:58:23.369 E  kernel[0:633d589] (Sandbox) Sandbox: osascript(85202) deny(1) file-write-data /private/var/folders/XX/XXXXXXXX/C/com.apple.Components2.LocalCache.AudioComponents
+knsh:c8:svc-ae-osascript:default
+2026-11-14 12:58:23.521 E  kernel[0:633ced1] (Sandbox) Sandbox: osascript(85202) deny(1) mach-lookup com.apple.coreservices.launchservicesd
+knsh:c8:svc-ae-osascript
+2026-11-14 12:58:23.521 E  kernel[0:633c617] (Sandbox) Sandbox: osascript(85202) deny(1) mach-lookup com.apple.lsd.mapdb
+knsh:c8:svc-ae-osascript
+2026-11-14 12:58:23.525 E  kernel[0:633c617] (Sandbox) Sandbox: osascript(85202) deny(1) mach-lookup com.apple.lsd.modifydb
+knsh:c8:svc-ae-osascript
+2026-11-14 12:58:23.661 E  kernel[0:633ced1] (Sandbox) 409 duplicate reports for Sandbox: osascript(85202) deny(1) mach-lookup com.apple.lsd.modifydb
+knsh:c8:svc-ae-osascript
+2026-11-14 12:58:23.661 E  kernel[0:633ced1] (Sandbox) Sandbox: osascript(85202) deny(1) mach-lookup com.apple.coreservices.appleevents
+knsh:c8:svc-ae-osascript
+2026-11-14 12:58:23.666 E  kernel[0:633c617] (Sandbox) Sandbox: osascript(85202) deny(1) mach-register com.apple.tsm.portname (per-pid)
+knsh:c8:svc-ae-osascript:default
+2026-11-14 12:58:23.679 E  kernel[0:633d45e] (Sandbox) Sandbox: osascript(85202) deny(1) mach-register com.apple.axserver (per-pid)
+knsh:c8:svc-ae-osascript:default
+2026-11-14 12:58:23.791 E  kernel[0:633ced1] (Sandbox) Sandbox: osascript(85202) deny(1) mach-register com.apple.coredrag (per-pid)
+knsh:c8:svc-ae-osascript:default
+2026-11-14 12:58:33.406 E  kernel[0:633d691] (Sandbox) Sandbox: launchctl(85384) deny(1) job-creation
+knsh:c8:svc-launchd-submit
+2026-11-14 12:58:33.435 E  kernel[0:633ced1] (Sandbox) Sandbox: launchctl(85393) deny(1) job-creation
+knsh:c8:svc-launchd-bootstrap
+2026-11-14 12:58:33.506 E  kernel[0:633d715] (Sandbox) Sandbox: curl(85414) deny(1) network-outbound /private/var/run/mDNSResponder
+knsh:c8:svc-dns-curl
+2026-11-14 12:58:33.558 E  kernel[0:633d731] (Sandbox) Sandbox: Python(85421) deny(1) network-outbound /private/var/run/mDNSResponder
+knsh:c8:svc-dns-localhost
+2026-11-14 12:58:33.559 E  kernel[0:633d731] (Sandbox) Sandbox: Python(85421) deny(1) network-outbound
+knsh:c8:svc-dns-localhost:default
+2026-11-14 12:58:33.605 E  kernel[0:633d74d] (Sandbox) 1 duplicate report for Sandbox: Python(85421) deny(1) network-outbound
+knsh:c8:svc-dns-localhost:default
+2026-11-14 12:58:33.605 E  kernel[0:633d74d] (Sandbox) Sandbox: Python(85428) deny(1) network-outbound
+knsh:c8:svc-dns-loopback-literal:default
+2026-11-14 12:58:33.701 E  kernel[0:633d787] (Sandbox) Sandbox: host(85444) deny(1) network-outbound remote:*:53
+knsh:c8:svc-dns-host-network-rule
+2026-11-14 12:58:41.803 E  kernel[0:633d691] (Sandbox) 3 duplicate reports for Sandbox: host(85444) deny(1) network-outbound remote:*:53
+knsh:c8:svc-dns-host-network-rule
+2026-11-14 12:58:41.803 E  kernel[0:633d691] (Sandbox) Sandbox: probe(85588) deny(1) mach-lookup com.knsh.control
+knsh:c8:svc-control-lookup
+2026-11-14 12:58:41.833 E  kernel[0:633d6d4] (Sandbox) Sandbox: probe(85595) deny(1) mach-lookup com.apple.coreservices.launchservicesd
+knsh:c8:svc-named-lookup-registered

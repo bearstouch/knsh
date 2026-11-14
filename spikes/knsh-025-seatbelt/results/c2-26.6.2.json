@@ -1,0 +1,27 @@
+{
+ "macos": "26.6.2",
+ "user_is_root": false,
+ "log_stream_ready_s": 0.27,
+ "latency": {
+  "sent": 50,
+  "received": 50,
+  "ms_p50": 38.2,
+  "ms_p95": 43.1,
+  "ms_max": 44.3,
+  "note": "spawn of sandbox-exec + cat included: an upper bound"
+ },
+ "dup_same_process_20": {
+  "entries": 2,
+  "messages": [
+   "Sandbox: bash(46990) deny(1) file-read-data /private/var/folders/XX/XXXXXXXX/T/knsh-c2-0qji68un/se",
+   "19 duplicate reports for Sandbox: bash(46990) deny(1) file-read-data /private/var/folders/XX/XXXXXXXX"
+  ]
+ },
+ "dup_20_processes": 20,
+ "distinct_paths_one_process_300": 300,
+ "burst_100_processes_received": 100,
+ "burst_50_noisy_processes_received": 50,
+ "noise_entries": 500,
+ "signal_denials_10_received": 0,
+ "enoent_denial_received": 0
+}

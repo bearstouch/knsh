@@ -1,0 +1,19 @@
+case	mode	rc	marker	note
+chromium-headless-shell	control	0	yes	[1114/124022.986124:ERROR:ui/display/mac/cv_display_link_mac.mm:195] CVDisplayLinkCreateWithCGDisplay failed. CVReturn: -6670
+chromium-headless-shell	own-on	133	no	sandbox initialization failed: Operation not permitted
+chromium-headless-shell	own-off	0	yes	[1114/124024.043075:ERROR:ui/display/mac/cv_display_link_mac.mm:195] CVDisplayLinkCreateWithCGDisplay failed. CVReturn: -6670
+google-chrome	control	0	yes	[57486:103999381:1114/124025.122118:ERROR:ui/display/mac/cv_display_link_mac.mm:188] CVDisplayLinkCreateWithCGDisplay failed. CVReturn: -6670
+google-chrome	own-on	134	no	
+google-chrome+ls	own-on	133	no	[1114/124025.695213:ERROR:third_party/crashpad/crashpad/util/file/file_io_posix.cc:208] open /Users/USER/Library/Application Support/Google/Chrome/Crashpa
+google-chrome	own-off	134	no	
+google-chrome+ls	own-off	0	yes	[1114/124034.287561:ERROR:third_party/crashpad/crashpad/util/file/file_io_posix.cc:208] open /Users/USER/Library/Application Support/Google/Chrome/Crashpa
+playwright	control	0	yes	
+playwright	own-on	1	no	error: browser.newPage: Target page, context or browser has been closed
+playwright	own-off	0	yes	
+swift-build	control	0	yes	
+swift-build	own-on	1	no	error: 'swiftpkg': Invalid manifest (compiled with: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc", "-vfsoverl
+swift-build	own-off	0	yes	
+claude-code	control	0	yes	
+claude-code	own-on	0	no	I couldn't read `marker.txt`. The shell sandbox failed before the command ran, with this error both times I tried:
+claude-code	own-off	0	yes	
+codex	-	-	-	BLOCKED: codex --version does not start within 20 s outside any sandbox (quarantined binary, Gatekeeper)

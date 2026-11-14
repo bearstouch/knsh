@@ -17,7 +17,7 @@ code, network narrowing via the proxy, `secret.injected` events, `secrets_inject
 - [ ] The receiving line can reach only the secret's `hosts` through the proxy (FR-SEC-03, FR-NET-10).
 - [ ] Dynamic code never receives a secret, even if it matches a pattern (FR-SEC-04).
 - [ ] `secret.injected` reports name and command, never the value; the record lists names only (FR-SEC-06).
-- [ ] The injected line's profile restricts process information to its own process group (FR-SEC-05).
+- [ ] The injected line's profile restricts process information to its own sandbox (FR-SEC-05, decision 8).
 - [ ] If the secret is unavailable, the line is denied with a reason that names the secret.
 
 **Unit tests**

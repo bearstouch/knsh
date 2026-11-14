@@ -10,11 +10,15 @@ Two kinds of profile confine every agent: the envelope profile and a per-command
 | File write | The profile's write roots | Plus the fixed write denies below |
 | Fixed write denies | `.git/hooks/`, `.git/config`, shell startup files (`~/.zshrc`, `~/.zprofile`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`), `~/Library/LaunchAgents`, `~/.ssh`, engine paths | Blocks planting code that later runs outside the sandbox; git configuration changes go through an approved command |
 | Executables | Trusted binary folders, paths the profile names, and project executables if allowed | Enforced by the kernel at every exec, including by children |
-| System services | A short list command-line tools need | Denied: LaunchServices (`open`), Apple Events (scripting other apps), launchd job submission, the knsh control service, the DNS resolver |
-| Unix sockets | `agent.sock` for envelopes; none for commands | Denied unless the profile allows: `user.sock`, the Docker socket, the SSH agent socket |
+| System services | A short list command-line tools need | Denied: LaunchServices (`open`), Apple Events (scripting other apps), launchd job submission, the knsh control service, the DNS resolver. Denying the resolver does not stop a tool that sends DNS over UDP itself; the network row does. App bundles that need LaunchServices (such as Chrome.app) run only as trusted tools (KNSH-025, decision 10) |
+| Unix sockets | `agent.sock` for envelopes; none for commands | Denied unless the profile allows: `user.sock`, the Docker socket, the SSH agent socket. Binding a socket under the profile's own write roots is allowed; only connecting is limited |
 | Network | The proxy's port and the profile's loopback ports | All other traffic is refused |
-| Process information and signals | Own process group only | Other processes' arguments and environment stay hidden |
+| Process information and signals | Own sandbox only (was "own process group"; proposed by decision 8, pending acceptance) | Other processes' arguments and environment stay hidden, and so does the system-wide process list. macOS withholds the environment of Apple platform binaries only, so the profile must hide it for every other process. setuid tools such as `ps` cannot run in any profile |
 | System settings | Read-only, short list | |
+
+The Seatbelt operations and filters that implement each row on macOS, and what each one cannot do, were measured by
+KNSH-025 and are recorded in [verification claims C8](../07-testing/verification-claims.md#c8-process-information-signals-sockets-and-services).
+Seatbelt matches canonical paths only, so every path in a compiled profile is canonical.
 
 ## Requirements
 
