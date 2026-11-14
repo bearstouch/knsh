@@ -15,6 +15,7 @@
 //! - `specs/05-models/grant.md`
 //! - `specs/05-models/execution-record.md`
 //! - `specs/05-models/event.md`, `specs/03-functional-requirements/events.md`
+//! - `specs/03-functional-requirements/command-lifecycle.md` (FR-LC-03: resolve each command to a canonical path)
 //!
 //! # Value types (KNSH-002)
 //!
@@ -49,6 +50,14 @@
 //! bounded queue that drops its oldest events and reports them as [`Lost`] instead of ever making a publisher wait
 //! (FR-EVT-04). [`EventScope`] limits a subscription to one session (FR-EVT-01).
 //!
+//! # Binary resolution (KNSH-035)
+//!
+//! [`resolve`] turns a simple command's name into a [`Resolution`] the way bash would run it: a function, a builtin,
+//! or a binary found by path or on the caller's `PATH` and classified by its canonical path as [`Resolution::Trusted`]
+//! (directly in one of the [`TrustedFolders`], FR-POL-13) or [`Resolution::ProjectExecutable`] (anywhere else,
+//! FR-POL-14), or [`Resolution::NotFound`] so the line fails with 127 (FR-LC-03, FR-POL-11). The filesystem is
+//! reached only through [`BinaryLookup`], which `knsh-platform` implements over its `Fs` trait.
+//!
 //! All failures are reported through the single crate error, [`CoreError`].
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -62,6 +71,7 @@ mod path;
 mod record;
 mod redacted;
 mod registry;
+mod resolve;
 mod session;
 mod time;
 mod ulid;
@@ -76,6 +86,9 @@ pub use path::CanonicalPath;
 pub use record::{ExecutionRecord, OutputInfo, OutputStream, RecordDetails};
 pub use redacted::{REDACTED_MARKER, Redacted};
 pub use registry::{EqualProfileOnly, ProfileOrder, SessionRegistry};
+pub use resolve::{
+    BinaryLookup, CommandName, DEFAULT_TRUSTED_FOLDERS, MAX_PATH_ENTRIES, Resolution, TrustedFolders, resolve,
+};
 pub use session::{
     Actor, ActorKind, AgentId, MAX_NAME_LEN, ProfileName, STATE_CHANGED_EVENT, Session, SessionSpec, SessionState,
     StateChanged, Transition, default_recording,
