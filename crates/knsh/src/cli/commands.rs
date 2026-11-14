@@ -31,11 +31,61 @@ pub static KNSH: Command = group(
             ..leaf("agent", "Start an agent CLI inside an envelope")
         },
         leaf("run", "Run a line through the engine"),
-        leaf("history", "Query records"),
+        Command {
+            options: &[
+                OptionSpec {
+                    long: "session",
+                    value: Some("id"),
+                    required: false,
+                    help: "Only this session's records",
+                },
+                OptionSpec {
+                    long: "since",
+                    value: Some("date"),
+                    required: false,
+                    help: "Only records started at or after this UTC date or timestamp",
+                },
+                OptionSpec {
+                    long: "until",
+                    value: Some("date"),
+                    required: false,
+                    help: "Only records started before this UTC date or timestamp",
+                },
+                OptionSpec {
+                    long: "text",
+                    value: Some("text"),
+                    required: false,
+                    help: "Only commands containing this text (case-sensitive)",
+                },
+                OptionSpec {
+                    long: "limit",
+                    value: Some("n"),
+                    required: false,
+                    help: "Show the newest n matching records (default 100)",
+                },
+            ],
+            ..leaf("history", "Query records, newest first")
+        },
         leaf("undo", "Undo a change"),
         leaf("redo", "Redo a change"),
         leaf("checkpoints", "List checkpoints and states"),
-        leaf("events", "Stream events"),
+        Command {
+            options: &[
+                OptionSpec {
+                    long: "session",
+                    value: Some("id"),
+                    required: false,
+                    help: "Only this session's events",
+                },
+                OptionSpec {
+                    long: "since",
+                    value: Some("seq"),
+                    required: false,
+                    help: "First replay the session's buffered events after this seq (needs --session)",
+                },
+            ],
+            ..leaf("events", "Stream events until interrupted")
+        },
         leaf("approvals", "List pending asks"),
         Command {
             positionals: &[Positional {

@@ -70,8 +70,14 @@ pub fn params(parsed: &ParsedCommand) -> Result<RecordsForgetParams, UsageError>
     })
 }
 
-/// Reads `--since`: a date `YYYY-MM-DD` means midnight UTC of that day; otherwise the engine's strict timestamp form.
+/// Reads `--since`: see [`parse_instant`].
 fn parse_since(text: &str) -> Result<Timestamp, UsageError> {
+    parse_instant(text).ok_or(UsageError::BadSince)
+}
+
+/// Reads a date-or-time option of the CLI (`--since`, `--until`): a date `YYYY-MM-DD` means midnight UTC of that day;
+/// otherwise the engine's strict timestamp form `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. `None` for anything else.
+pub(crate) fn parse_instant(text: &str) -> Option<Timestamp> {
     let is_date = text.len() == 10
         && text.bytes().enumerate().all(|(index, byte)| {
             if index == 4 || index == 7 {
@@ -85,7 +91,7 @@ fn parse_since(text: &str) -> Result<Timestamp, UsageError> {
     } else {
         text.to_owned()
     };
-    full.parse().map_err(|_| UsageError::BadSince)
+    full.parse().ok()
 }
 
 /// Sends `params` as `records.forget` on a connected client and returns how many records were deleted.

@@ -73,6 +73,31 @@ impl FromJson for RecordsQueryParams {
     }
 }
 
+impl ToJson for RecordsQueryParams {
+    /// Absent filters are left out; `limit` is always written. [`FromJson`] reads the output back to an equal value
+    /// (`knsh history`, KNSH-023).
+    fn to_json(&self) -> Result<Value, JsonError> {
+        let mut object = Object::new();
+        if let Some(session_id) = self.session_id {
+            object.insert("session_id", Value::from(session_id.to_string()))?;
+        }
+        if let Some(since) = self.since {
+            object.insert("since", Value::from(since.to_string()))?;
+        }
+        if let Some(until) = self.until {
+            object.insert("until", Value::from(until.to_string()))?;
+        }
+        if let Some(text) = &self.text {
+            object.insert("text", Value::from(text.as_str()))?;
+        }
+        object.insert("limit", self.limit.to_json()?)?;
+        if let Some(cursor) = self.cursor {
+            object.insert("cursor", Value::from(cursor.to_string()))?;
+        }
+        Ok(Value::Object(object))
+    }
+}
+
 /// The parameters of `records.output`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordsOutputParams {
@@ -382,6 +407,13 @@ mod tests {
         );
         assert_eq!(full.text.as_deref(), Some("git"));
         assert_eq!((full.limit, full.cursor), (2, Some(RECORD.parse().unwrap())));
+
+        // What a client writes, the engine reads back unchanged (KNSH-023).
+        assert_eq!(RecordsQueryParams::from_json(&full.to_json().unwrap()).unwrap(), full);
+        assert_eq!(
+            knsh_json::write(&empty.to_json().unwrap()).unwrap(),
+            format!(r#"{{"limit":{DEFAULT_RECORDS_PAGE}}}"#)
+        );
     }
 
     #[test]
