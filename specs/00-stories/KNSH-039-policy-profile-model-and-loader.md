@@ -12,14 +12,16 @@ profile. Scope: every key in [../05-models/policy-profile.md](../05-models/polic
 `${HOME}`, `${TMPDIR}`; `~`; canonicalisation through the `Fs` trait. Signature checks are KNSH-065.
 
 **Acceptance criteria**
-- [ ] Unknown keys, wrong types and invalid enum values are errors naming the key; an invalid profile is never
+- [x] Unknown keys, wrong types and invalid enum values are errors naming the key; an invalid profile is never
   partially applied.
-- [ ] `extends` chains resolve with child overriding parent per key; cycles are an error.
-- [ ] `fs.read` defaults to `"all"` (FR-POL-12); `exec.default` defaults are documented.
-- [ ] `${PROJECT}` resolves to the git root, or the session start directory when there is none (FR-POL-10).
-- [ ] All paths are canonical (`/private/var/…`), symlinks followed (FR-POL-11).
-- [ ] The resolved profile is a value type (`Eq`, `Clone`), so it can be hashed and compared.
-- [ ] The engine never writes or generates profile content (FR-POL-03); only presets shipped as data.
+- [x] `extends` chains resolve with child overriding parent per key; cycles are an error.
+- [x] `fs.read` defaults to `"all"` (FR-POL-12); `exec.default` defaults are documented
+  ([defaults](../05-models/policy-profile.md#defaults)).
+- [x] `${PROJECT}` resolves to the git root, or the session start directory when there is none (FR-POL-10).
+- [x] All paths are canonical (`/private/var/…`), symlinks followed (FR-POL-11). Observed with the in-memory
+  filesystems (core fake and `MemFs`); `RealFs::canonicalise` is `realpath(3)`, already tested on `/var` (KNSH-007).
+- [x] The resolved profile is a value type (`Eq`, `Clone`), so it can be hashed and compared.
+- [x] The engine never writes or generates profile content (FR-POL-03); only presets shipped as data.
 
 **Unit tests**
 - `loads_web_app_example_profile` — the example in the models page parses.
@@ -31,4 +33,7 @@ profile. Scope: every key in [../05-models/policy-profile.md](../05-models/polic
 - `invalid_profile_is_not_partially_applied`.
 
 **Notes.** — The spec lists profile settings without TOML keys (trusted folders, trusted tools, irreversible list,
-agent bash path, default output mode). Propose key names in the models page with this story.
+agent bash path, default output mode). Propose key names in the models page with this story. Proposed:
+`exec.trusted_folders`, `exec.trusted_tools`, `approvals.irreversible_commands`, `exec.bash`, `output.mode`, with
+defaults and loading rules in [the models page](../05-models/policy-profile.md#loading). Preset contents shipped here
+are provisional until KNSH-058 tests them; signature checks belong in the profile source (KNSH-065).

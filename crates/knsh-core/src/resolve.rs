@@ -82,7 +82,7 @@ pub enum Resolution {
 ///
 /// Each folder is a [`CanonicalPath`] and appears once. A binary is trusted only if its canonical path's parent is
 /// exactly one of them: subfolders are not trusted, so `/usr/local/bin/sub/x` is not.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TrustedFolders(Vec<CanonicalPath>);
 
 impl TrustedFolders {

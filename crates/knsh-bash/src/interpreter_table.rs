@@ -54,7 +54,7 @@ use crate::error::InterpreterTableError;
 /// Options are written as on the command line: a short option is `-` and one character (`-c`), and clusters with
 /// other short options; a long option is `--` and a name (`--eval`), and also matches `--eval=value`. Single-dash
 /// long options (`-Command`) are not read as such: they are read as clusters, which can only add dynamic marks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Interpreter {
     /// The family name: a resolved binary's base name with any version suffix removed (`python` for `python3.12`).
     pub family: String,
@@ -546,7 +546,7 @@ enum Step {
 }
 
 /// The interpreter families the classifier knows: the [defaults](Self::defaults), plus what a profile adds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Interpreters {
     /// One entry per family, defaults first.
     entries: Vec<Interpreter>,

@@ -72,16 +72,21 @@ Outside the subset, and rejected as such: dates and times, floats (including `in
 | `exec.project_executables` | `allow` \| `ask` \| `deny` | Binaries from agent-writable places |
 | `exec.interpreters.<family>` | table | Adds an interpreter family, or options to a known one, for dynamic-code detection (below). **Proposed** (KNSH-036) |
 | `exec.default` | `allow` \| `ask` \| `deny` | When no rule matches |
+| `exec.trusted_folders` | list of paths | Folders added to the default trusted folders (FR-POL-13). **Proposed** (KNSH-039) |
+| `exec.trusted_tools` | list of patterns | Tools run without a per-command profile, after an approval or grant (FR-SBX-09). **Proposed** (KNSH-039) |
+| `exec.bash` | path | The bash that runs agent lines. **Proposed** (KNSH-039) |
 | `network.mode` | `none` \| `allowlist` | |
 | `network.hosts` | list | Open to every command |
 | `network.approval_hosts` | list | Only for commands whose class or approval includes them |
 | `network.loopback` | list of ports | Loopback ports allowed |
-| `approvals.irreversible` | `ask` \| … | Treatment of irreversible lines |
+| `approvals.irreversible` | `allow` \| `ask` \| `deny` | Treatment of irreversible lines |
+| `approvals.irreversible_commands` | list of patterns | Commands the profile adds to the irreversible list. **Proposed** (KNSH-039) |
 | `checkpoints.roots` | list of paths | Protected roots |
 | `checkpoints.required` | bool | Lines touching a root wait for its shadow |
 | `checkpoints.exclude` | list | Default `node_modules`, `target`, `.venv`, `dist`, `build` |
 | `recording.commands`, `recording.output` | bool | Recording settings |
 | `recording.retention_days` | int | Record retention |
+| `output.mode` | `full` \| `truncate` \| `head_tail` \| `errors_only` \| `ref` | Default `exec.run` output mode (FR-OUT-02). **Proposed** (KNSH-039) |
 | `secrets.env.<VAR>` | table | Secret injection ([secret](secret.md)) |
 
 ### `exec.interpreters` (proposed, KNSH-036)
@@ -107,7 +112,57 @@ Every key but the table name is optional. Options are spelled `-x` (clusters wit
 (also matches `--name=value`). The family name must be a base name without a version suffix (`lua`, not `lua5.4`). An
 entry for a family the table already has only adds options: a profile can make detection stricter, never weaker.
 
-Profiles may also set: trusted binary folders, trusted tools (run without a per-command profile after approval), an irreversible-command list, the agent's bash path, and the default output mode.
+Profiles may also set trusted binary folders, trusted tools (run without a per-command profile after approval), an
+irreversible-command list, the agent's bash path, and the default output mode. KNSH-039 proposes the keys
+`exec.trusted_folders`, `exec.trusted_tools`, `approvals.irreversible_commands`, `exec.bash` and `output.mode` for them
+(table above).
+
+## Defaults
+
+Every key is optional except `name`. An unset key takes its default:
+
+| Key | Default |
+| --- | --- |
+| `fs.read` | `"all"` (FR-POL-12) |
+| `fs.write`, `fs.deny` | none (the fixed denies of FR-POL-30 are added by the sandbox compiler, never by the profile) |
+| `exec.allow`, `exec.ask`, `exec.deny`, `exec.trusted_tools` | none |
+| `exec.project_executables` | `ask` |
+| `exec.default` | `ask`: a command no rule names is never run without a decision |
+| `exec.trusted_folders` | none beyond the defaults (`/usr/bin`, `/bin`, `/usr/sbin`, `/opt/homebrew/bin`, `/usr/local/bin`) |
+| `exec.bash` | `/bin/bash` |
+| `network.mode` | `none` |
+| `network.hosts`, `network.approval_hosts`, `network.loopback` | none |
+| `approvals.irreversible` | `ask` |
+| `approvals.irreversible_commands` | none |
+| `checkpoints.roots` | none |
+| `checkpoints.required` | `false` |
+| `checkpoints.exclude` | `node_modules`, `target`, `.venv`, `dist`, `build` (a profile's list replaces it) |
+| `recording.commands`, `recording.output` | `true`, `false` |
+| `recording.retention_days` | 30 (1 to 36500) |
+| `output.mode` | `full` |
+
+## Loading
+
+The loader (KNSH-039, `knsh-core`) turns a profile into one resolved value, or refuses it whole; an invalid profile is
+never partially applied.
+
+- **Validation.** Unknown keys, wrong types and invalid values are errors naming the dotted key (`fs.write[1]`) and its
+  line and column. A profile loaded by name must have that `name`.
+- **`extends`.** Parents are read by name from the same place, up to 8 profiles in a chain. A key the child sets
+  replaces the parent's value whole (`exec.allow` is not appended to); keyed tables (`exec.interpreters.<family>`,
+  `secrets.env.<VAR>`) are merged per entry. `preset` is inherited like any key. A cycle is an error.
+- **`preset`.** Presets are profile fragments shipped as data with the engine (`claude-code`, `codex-cli`, `generic`;
+  their contents are KNSH-058's). A preset may only add to path and host lists (`fs.read` as a list, `fs.write`,
+  `fs.deny`, `exec.trusted_folders`, `network.hosts`, `network.approval_hosts`, `network.loopback`,
+  `checkpoints.roots`); its entries are appended to the profile's. It never changes any other setting, so it cannot
+  weaken a profile. An unknown preset is an error.
+- **Paths.** A path is absolute, or starts with `~`, `${PROJECT}`, `${HOME}` or `${TMPDIR}`, followed by nothing or
+  `/`. Any other `$`, `~user`, a relative path and `..` are errors. After expansion every path is canonicalised with
+  symlinks followed. A path that does not exist yet (`~/.aws` on a machine without it) keeps its deepest existing
+  ancestor's canonical form with the rest appended, so a deny still covers it if it is created later; any lookup
+  failure other than "not found" refuses the profile. A dangling symlink on the way counts as such a failure, not as
+  "not found", because the sandbox matches the link's target, never the link's own path. A path is at most 4096
+  bytes as written. Two entries resolving to the same path are kept once.
 
 ## Variables
 

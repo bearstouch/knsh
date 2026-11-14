@@ -58,7 +58,17 @@
 //! FR-POL-14), or [`Resolution::NotFound`] so the line fails with 127 (FR-LC-03, FR-POL-11). The filesystem is
 //! reached only through [`BinaryLookup`], which `knsh-platform` implements over its `Fs` trait.
 //!
-//! All failures are reported through the single crate error, [`CoreError`].
+//! # Policy profiles (KNSH-039)
+//!
+//! [`load_profile`] and [`load_profile_text`] read a profile from the TOML subset into one resolved [`Profile`]:
+//! every key typed and checked (an unknown key, wrong type or invalid value is a [`ProfileError`] naming the key),
+//! `extends` chains merged child over parent per key, the named preset from [`PRESETS`] (shipped as data, FR-POL-03)
+//! added, defaults filled (`fs.read = "all"`, FR-POL-12), and every path expanded (`~`, `${HOME}`, `${TMPDIR}`,
+//! `${PROJECT}`, FR-POL-10) and canonicalised with symlinks followed (FR-POL-11) through [`PolicyFs`]. Profiles are
+//! read by name through [`ProfileSource`]. A load either returns the whole profile or an error, never part of one.
+//!
+//! Failures are reported through [`CoreError`], except the profile loader's, which are [`ProfileError`] because they
+//! must name the key at fault.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
@@ -68,6 +78,7 @@ mod error;
 mod event;
 mod id;
 mod path;
+mod policy;
 mod record;
 mod redacted;
 mod registry;
@@ -76,13 +87,19 @@ mod session;
 mod time;
 mod ulid;
 
-pub use error::CoreError;
+pub use error::{CoreError, MAX_KEY_DISPLAY_LEN, ProfileError, ProfileErrorKind, ProfileOrigin};
 pub use event::{
     BusLimits, Delivery, EVENT_BUFFER_LEN, Event, EventBus, EventData, EventScope, Lost, MAX_ENDED_BUFFERS, Published,
     Subscribed, SubscriptionId,
 };
 pub use id::{CheckpointId, EventId, GrantId, RecordId, RequestId, SessionId};
 pub use path::CanonicalPath;
+pub use policy::{
+    ApprovalsPolicy, CheckpointPolicy, DEFAULT_AGENT_BASH, DEFAULT_CHECKPOINT_EXCLUDES, DEFAULT_RETENTION_DAYS,
+    ExecPolicy, FsPolicy, LookupError, MAX_EXTENDS_DEPTH, MAX_PROFILE_LEN, NetworkMode, NetworkPolicy, OutputMode,
+    OutputPolicy, PRESETS, PathContext, PolicyFs, Profile, ProfileSource, RETENTION_DAYS_RANGE, ReadScope,
+    RecordingPolicy, RuleAction, SecretInjection, load_profile, load_profile_text, project_root,
+};
 pub use record::{ExecutionRecord, OutputInfo, OutputStream, RecordDetails};
 pub use redacted::{REDACTED_MARKER, Redacted};
 pub use registry::{EqualProfileOnly, ProfileOrder, SessionRegistry};
