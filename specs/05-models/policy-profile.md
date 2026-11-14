@@ -163,6 +163,10 @@ never partially applied.
   failure other than "not found" refuses the profile. A dangling symlink on the way counts as such a failure, not as
   "not found", because the sandbox matches the link's target, never the link's own path. A path is at most 4096
   bytes as written. Two entries resolving to the same path are kept once.
+- **Fixed denies.** A path in a key that grants access (`fs.read` as a list, `fs.write`, `exec.trusted_folders`,
+  `exec.bash`, `checkpoints.roots`) may not be an engine path or lie below one (FR-POL-30, KNSH-041); the error names
+  the key. A path above one is accepted, since the sandbox compiler carves the fixed denies out of it. See
+  [policy](../03-functional-requirements/policy.md#fixed-denies).
 
 ## Variables
 

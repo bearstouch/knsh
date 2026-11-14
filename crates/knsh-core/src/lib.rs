@@ -15,7 +15,9 @@
 //! - `specs/05-models/grant.md`
 //! - `specs/05-models/execution-record.md`
 //! - `specs/05-models/event.md`, `specs/03-functional-requirements/events.md`
-//! - `specs/03-functional-requirements/command-lifecycle.md` (FR-LC-03: resolve each command to a canonical path)
+//! - `specs/03-functional-requirements/command-lifecycle.md` (FR-LC-03: resolve each command to a canonical path;
+//!   FR-LC-09: decide the whole line before anything runs)
+//! - `specs/03-functional-requirements/agent-integration.md` (FR-AGT-21: the `unattended` profile)
 //!
 //! # Value types (KNSH-002)
 //!
@@ -75,6 +77,16 @@
 //! only trusted binaries and builtins (FR-POL-13) while other binaries get `exec.project_executables` (FR-POL-14), and
 //! deny beats ask beats allow, with `exec.default` when nothing matches (FR-POL-17).
 //!
+//! # Line verdicts, dynamic code, fixed denies and `unattended` (KNSH-041)
+//!
+//! [`evaluate_line`] decides a whole classified line before any of it runs (FR-LC-09): deny if any part is denied,
+//! ask if any part asks (FR-POL-18), with every part's rule in [`LineDecision::matched_rules`] and what the line may
+//! receive in [`LineCapabilities`]. A line holding dynamic code is clamped to `network.hosts`, with no approval hosts,
+//! secrets or classes (FR-POL-20, FR-POL-21). Any failure inside is a deny ([`LineReason::EvaluationFailed`]). The
+//! fixed denies of FR-POL-30 ([`FixedDenies`]: engine directories, sockets, the control service) are compiled in, and
+//! the loader refuses a profile that would allow one ([`ProfileErrorKind::FixedDeny`]). The built-in
+//! [`UNATTENDED_PROFILE`] ([`load_unattended`]) turns every ask into a deny by the standalone rules (FR-AGT-21).
+//!
 //! Failures are reported through [`CoreError`], except the profile loader's, which are [`ProfileError`] because they
 //! must name the key at fault.
 
@@ -103,11 +115,13 @@ pub use event::{
 pub use id::{CheckpointId, EventId, GrantId, RecordId, RequestId, SessionId};
 pub use path::CanonicalPath;
 pub use policy::{
-    ApprovalsPolicy, CheckpointPolicy, CommandVerdict, DEFAULT_AGENT_BASH, DEFAULT_CHECKPOINT_EXCLUDES,
-    DEFAULT_RETENTION_DAYS, ExecPolicy, FsPolicy, LookupError, MAX_EXTENDS_DEPTH, MAX_PROFILE_LEN, NetworkMode,
-    NetworkPolicy, OutputMode, OutputPolicy, PRESETS, PathContext, PolicyFs, Profile, ProfileSource,
-    RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy, RuleAction, RuleId, SecretInjection, evaluate_command,
-    load_profile, load_profile_text, project_root,
+    ApprovalsPolicy, CONTROL_SERVICE, CheckpointPolicy, CommandVerdict, DEFAULT_AGENT_BASH,
+    DEFAULT_CHECKPOINT_EXCLUDES, DEFAULT_RETENTION_DAYS, DecisionSource, ENGINE_CONFIG_DIR, ENGINE_DATA_DIR,
+    ExecPolicy, FixedDenies, FsPolicy, LineCapabilities, LineDecision, LineReason, LookupError, MAX_EXTENDS_DEPTH,
+    MAX_PROFILE_LEN, MatchedRule, NetworkMode, NetworkPolicy, OutputMode, OutputPolicy, PRESETS, PathContext, PolicyFs,
+    Profile, ProfileSource, RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy, RuleAction, RuleId, SecretInjection,
+    UNATTENDED_PROFILE, UNATTENDED_PROFILE_TEXT, evaluate_command, evaluate_line, load_profile, load_profile_text,
+    load_unattended, project_root,
 };
 pub use record::{ExecutionRecord, OutputInfo, OutputStream, RecordDetails};
 pub use redacted::{REDACTED_MARKER, Redacted};

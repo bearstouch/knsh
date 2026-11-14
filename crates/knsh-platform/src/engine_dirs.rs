@@ -1,7 +1,9 @@
 //! Engine directories: where engine data lives, and preparing it owner-only and out of Spotlight and Time Machine.
 //!
-//! This module is the only place engine path literals may appear (KNSH-011). Everything else asks [`EnginePaths`],
-//! so the sandbox compiler can deny the whole set ([`EnginePaths::fixed_denies`]) without a path being missed.
+//! This module is the only place engine paths are built (KNSH-011). Everything else asks [`EnginePaths`], so the
+//! sandbox compiler can deny the whole set ([`EnginePaths::fixed_denies`]) without a path being missed. The two root
+//! directories come from `knsh-core` ([`knsh_core::ENGINE_DATA_DIR`], [`knsh_core::ENGINE_CONFIG_DIR`]), where the
+//! policy loader checks profiles against the same fixed denies (FR-POL-30, KNSH-041).
 //! Layout: `specs/09-reference/file-locations.md`.
 //!
 //! [`ensure_engine_dirs`] creates the directories on first use and re-checks them on every start:
@@ -53,9 +55,9 @@ pub const BACKUP_EXCLUDE_VALUE: &[u8] =
     b"bplist00_\x10\x11com.apple.backupd\x08\0\0\0\0\0\0\x01\x01\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x1c";
 
 /// Records, grants and pushed policy, relative to the home directory.
-const DATA_DIR: [&str; 3] = ["Library", "Application Support", "knsh"];
+const DATA_DIR: [&str; 3] = knsh_core::ENGINE_DATA_DIR;
 /// Configuration, hooks and policy files, relative to the home directory.
-const CONFIG_DIR: [&str; 2] = [".config", "knsh"];
+const CONFIG_DIR: [&str; 2] = knsh_core::ENGINE_CONFIG_DIR;
 /// Socket directory, inside the data directory.
 const RUN_DIR: &str = "run";
 /// Checkpoints for the home volume, inside the data directory.
@@ -586,11 +588,14 @@ mod tests {
         assert_eq!(paths.config_file(), Path::new("/Users/u/.config/knsh/config.toml"));
     }
 
-    // "No path literals elsewhere": engine path components appear in no other Rust source of the workspace.
+    // "No path literals elsewhere": engine path components appear in no other Rust source of the workspace, except
+    // `knsh-core`'s fixed-deny set, which defines the root directories this module builds on (FR-POL-30, KNSH-041),
+    // and test-only `tests.rs` modules, which check paths built from them.
     #[test]
     fn engine_path_literals_appear_only_in_this_module() {
         let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let this_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine_dirs.rs");
+        let fixed_denies = crates.join("knsh-core/src/policy/fixed.rs");
         let literals = [
             "\"Application Support\"",
             "Library/Application Support",
@@ -606,7 +611,11 @@ mod tests {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
                     pending.push(path);
-                } else if path.extension().is_some_and(|ext| ext == "rs") && path != this_file {
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && path != this_file
+                    && path != fixed_denies
+                    && path.file_name().is_none_or(|name| name != "tests.rs")
+                {
                     let text = std::fs::read_to_string(&path).unwrap();
                     if literals.iter().any(|literal| text.contains(literal)) {
                         offenders.push(path);

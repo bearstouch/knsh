@@ -156,6 +156,9 @@ pub enum ProfileErrorKind {
     /// `${HOME}`, `${TMPDIR}` or the session's start directory could not be resolved to an existing canonical
     /// directory, so no path using them can be expanded.
     VariableUnresolvable,
+    /// A key that grants access (`fs.read` as a list, `fs.write`, `exec.trusted_folders`, `exec.bash`,
+    /// `checkpoints.roots`) names an engine path or a path below one, which every profile must deny (FR-POL-30).
+    FixedDeny,
 }
 
 impl fmt::Display for ProfileErrorKind {
@@ -179,6 +182,7 @@ impl fmt::Display for ProfileErrorKind {
             Self::InvalidPath => f.write_str("path must be absolute after expansion, without '..', '~user' or NUL"),
             Self::PathUnresolvable => f.write_str("path could not be resolved to canonical form"),
             Self::VariableUnresolvable => f.write_str("path variable could not be resolved to an existing directory"),
+            Self::FixedDeny => f.write_str("path is an engine path, which every profile denies (FR-POL-30)"),
         }
     }
 }

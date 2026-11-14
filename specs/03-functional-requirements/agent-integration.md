@@ -38,7 +38,7 @@ knsh agent --profile web-app -- claude
 | ID | Requirement |
 | --- | --- |
 | FR-AGT-20 | Any process inside an envelope must be treated as the agent, whatever it claims. Commands typed into an envelope's terminal are agent commands too, and labels never relax policy. |
-| FR-AGT-21 | A non-interactive `knsh` or `knsh -c` outside any envelope (for example an agent CLI started with `SHELL=knsh` but not through `knsh agent`) must run under the `unattended` profile: supervised, sandboxed, and denied anything that needs approval. |
+| FR-AGT-21 | A non-interactive `knsh` or `knsh -c` outside any envelope (for example an agent CLI started with `SHELL=knsh` but not through `knsh agent`) must run under the `unattended` profile: supervised, sandboxed, and denied anything that needs approval ([contents](policy.md#the-unattended-profile)). |
 | FR-AGT-22 | Only an interactive `knsh` on a terminal outside any envelope is a human session. |
 | FR-AGT-23 | A request on `agent.sock` without a valid session token must be matched to its envelope through the caller's audit token. If that fails, it must be refused (`-32009`). |
 
