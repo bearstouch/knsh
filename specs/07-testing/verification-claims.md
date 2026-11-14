@@ -8,9 +8,9 @@ The design relies on these platform behaviours. Each must be verified before pha
 | C2 | Sandbox denials can be read from the system log as a non-admin user | `log stream` with the knsh tag: latency, duplicates, format. **Read without root on macOS 26.6, from an account in `admin`; best effort with gaps** ([results](#c2-denials-in-the-unified-log)); a standard (non-admin) account and macOS 14 and 15 pending |
 | C3 | Per-file copy-on-write cloning is fast enough | Time a 100,000-file root; check files with unflushed memory-mapped writes |
 | C4 | Flushing file events catches writes made milliseconds earlier by another process | Stress test with concurrent writers |
-| C5 | Keychain items stay readable only by `knshd` across updates and Homebrew builds | Access-control behaviour for ad-hoc and Developer ID signatures |
-| C6 | A launchd user agent can show the Touch ID prompt | LocalAuthentication from `knshd` with and without a logged-in GUI session |
-| C7 | XPC peer code-signing requirements work on macOS 14 | Both directions, including after the peer execs |
+| C5 | Keychain items stay readable only by `knshd` across updates and Homebrew builds | Access-control behaviour for ad-hoc and Developer ID signatures. **On macOS 26.6: holds across updates for Developer ID only; refuted for ad-hoc and Homebrew builds; any same-user process can overwrite the value unless sandboxed** ([results](#c5-keychain-access-control)); macOS 14 and 15 and the data-protection keychain with a provisioning profile pending |
+| C6 | A launchd user agent can show the Touch ID prompt | LocalAuthentication from `knshd` with and without a logged-in GUI session. **Confirmed on macOS 26.6 with the password fallback (lid closed), custom text shown in full** ([results](#c6-localauthentication-from-a-launchd-agent)); the Touch ID sensor, an SSH login with nobody at the console, cancellation and timeout pending |
+| C7 | XPC peer code-signing requirements work on macOS 14 | Both directions, including after the peer execs. **Confirmed on macOS 26.6 with APIs available since macOS 12 and earlier** ([results](#c7-xpc-peer-code-signing-requirements)); macOS 14 and 15 pending |
 | C8 | Seatbelt can limit process information, signals and Unix-socket connections as specified | One test per rule. **Enforceable on macOS 26.6, partly with different rule forms; gaps listed** ([results](#c8-process-information-signals-sockets-and-services)); macOS 14 and 15 pending |
 | C9 | Common tools honour per-command proxy credentials | curl, git, npm, pip, cargo and Node's HTTP clients |
 | C10 | The proxy can read the TLS server name without decrypting | Check against curl, git and npm |
@@ -156,6 +156,165 @@ below answer KNSH-045's question of which operations and filters to use for each
 
 Proposed spec and decision changes from these results are in [decisions](../09-reference/decisions.md) (decisions 8 to
 10) and the [sandbox profiles](../03-functional-requirements/sandbox-profiles.md) notes.
+
+## Code-signed identity results (KNSH-026: C5, C6, C7)
+
+Observed on 2026-11-14 on an Apple M1 Pro, macOS 26.6.2 (25G83), SIP on, from an account in `admin`; nothing ran as
+root. The lid was closed (an external display was in use). Developer ID builds were signed with a real "Developer ID
+Application" certificate, hardened runtime, no secure timestamp, and not notarized. The harnesses and raw results are
+in [`spikes/knsh-026-identity/`](../../spikes/knsh-026-identity/README.md); rerun them on each macOS version.
+
+**Pending (not observed, not claimed):** macOS 14 and 15 for all three claims; the Touch ID sensor itself (the lid was
+closed, so every prompt offered only the password); C6 from an SSH login with nobody logged in at the console (Remote
+Login was off); C6 cancellation and timeout outcomes (the person at the Mac typed the password every time); the
+data-protection keychain with a provisioning profile; an App Store-signed authority.
+
+### C5: Keychain access control
+
+One probe binary, compiled twice ("build 1" and "build 2" differ by one constant, so their code hashes differ), signed
+three ways with the same identifier. Every probe ran with Keychain user interaction disabled, so a would-be "allow
+access" dialog came back as an error instead of appearing. Results in
+[`results/c5-26.6.2.tsv`](../../spikes/knsh-026-identity/results/c5-26.6.2.tsv),
+[`c5-26.6.2-homebrew.tsv`](../../spikes/knsh-026-identity/results/c5-26.6.2-homebrew.tsv) and the ACL dumps in
+[`c5-26.6.2-acl.txt`](../../spikes/knsh-026-identity/results/c5-26.6.2-acl.txt).
+
+**Which identity the item records.** `SecItemAdd` on the file-based (legacy) login keychain gives the item an ACL
+whose decrypt entry trusts the creator's *designated requirement*, plus a *partition list*:
+
+| Creator's signature | Trusted requirement | Partition list |
+| --- | --- | --- |
+| Developer ID | `identifier "<id>" and anchor apple generic and <Developer ID OIDs> and certificate leaf[subject.OU] = <team>` | `teamid:<team>` |
+| Ad hoc (`codesign -s -`) | `cdhash H"<hash>"` | `cdhash:<hash>` |
+| Homebrew build from source (linker-signed ad hoc, identifier = file name) | `cdhash H"<hash>"` | `cdhash:<hash>` |
+
+**Reads, writes and deletes** (legacy keychain, default ACL; "fails" is `-25293`, the status a prompt would replace):
+
+| Actor | Developer ID item | Ad-hoc item | Homebrew item |
+| --- | --- | --- | --- |
+| Build 1 (creator) reads | Reads | Reads | Reads |
+| Build 2, same identifier, reads | **Reads** | **Fails** | **Fails** (`brew upgrade` 1.0 → 2.0); reads after `brew reinstall` of the same source (same code hash) |
+| Unrelated binary of the same user reads (same team for Developer ID) | Fails | Fails | Fails |
+| Unrelated binary deletes | Fails (`-25244`) | Fails | Fails |
+| Unrelated binary **overwrites** the value (`SecItemUpdate`) | **Succeeds**, no prompt | **Succeeds** | **Succeeds** |
+| Creator reads after that overwrite | Same-team writer: **reads the forged value**. Ad-hoc writer or `/usr/bin/security add-generic-password -U`: fails | Fails | Fails |
+| Unrelated binary in a sandbox that denies `file-write*` under `~/Library/Keychains` overwrites | Fails (`EPERM`); the item is unchanged | Fails | Fails |
+| Unrelated binary in that sandbox creates an item (pre-seeding) | Fails (`EPERM`) | Fails | Fails |
+| Creator in that sandbox reads its own item | Reads | Reads | Reads |
+| Unrelated binary creates the item first (pre-seeding) | `knshd` cannot read it, add over it (`-25299`) or delete it | Same | Same |
+| Developer ID build reads an item made by a Homebrew build, or the reverse | Fails | | |
+
+- **An overwrite replaces the partition list with the writer's** (`teamid:…`, `cdhash:…` or `apple-tool:`) and leaves
+  the trusted-application list alone. So code outside the team cannot plant a value that a Developer ID `knshd` then
+  reads silently: the read fails. Same-team code can, which is no weaker than the signature itself. The read failure
+  still has to be treated as tampering, and `knshd` must fail closed on it.
+- Limiting the item's *encrypt* ACL entry to the creator (instead of the default "any application") did **not** stop
+  overwrites *(ad hoc)*.
+- **Legacy keychain files are written by the client process itself.** A sandbox that denies `file-write*` under
+  `~/Library/Keychains` stops every overwrite and creation while reads still work (table above). Denying `file-read*`
+  too makes the keychain look empty (`-25300`), and denying the Mach service `com.apple.SecurityServer` breaks every
+  Keychain call (`-50`) *(ad hoc)*.
+- **Data-protection keychain:** without an entitlement, `SecItemAdd` fails with `-34018` (missing entitlement). With
+  `keychain-access-groups` (team-prefixed group), both an ad-hoc and a Developer ID binary are **killed at launch**
+  (`SIGKILL`, exit 137). AMFI logs "Code has restricted entitlements, but the validation of its code signature
+  failed": the entitlement needs a provisioning profile, which a bare command-line binary cannot embed. It needs `knshd`
+  inside an app bundle with a Developer ID provisioning profile from the Apple developer portal (**pending**).
+
+**Exit question: which mechanism should `knsh-platform` use?** See proposed [decision 11](../09-reference/decisions.md):
+the legacy keychain with the default ACL, from a Developer ID-signed `knshd`, never showing the "allow access" dialog;
+writes under `~/Library/Keychains` denied in every profile; a read failure treated as tampering. The data-protection
+keychain is preferred once `knshd` ships in an app bundle with a provisioning profile, but is not verified. Ad-hoc and
+Homebrew builds lose their items on every upgrade.
+
+### C6: LocalAuthentication from a launchd agent
+
+The probe calls `LAContext evaluatePolicy` with `LAPolicyDeviceOwnerAuthentication` (Touch ID with password fallback)
+and the reason text `approve the agent command: git push --force origin main (cwd ~/src/app, session
+01JD3Q9ZKX8M4T2V6B7N5C1H0E)`. Results in [`results/c6-26.6.2-*.txt`](../../spikes/knsh-026-identity/results/).
+
+| Case | Security session | Result |
+| --- | --- | --- |
+| Terminal, `interactionNotAllowed` | graphics, TTY | `-1004` (user interaction required) in 2 ms |
+| launchd agent in `gui/<uid>`, `interactionNotAllowed` | graphics | `-1004` in 1 ms |
+| launchd agent in `gui/<uid>` | graphics | **Prompt shown** (seen in a screenshot, confirmed by the user). Success after the user typed the password (16.6 s) |
+| launchd agent in `user/<uid>` (background domain, `LimitLoadToSessionType` `Background`) | **no graphics access** (`attrs=0x0`) | **The same prompt appeared on the console** (screenshot). Success after the user typed the password (3.4 s in the recorded run; two more runs also succeeded *(ad hoc)*) |
+
+- The prompt is a system dialog titled with the **process name** and reads "*<process> is trying to <reason>.* Enter
+  the password for the user "<full name>" to allow this." The 107-character reason, with `--force`, `~`, parentheses
+  and a ULID, was shown in full, wrapped, not truncated. So the reason must read naturally after "knshd is trying to".
+  The length at which it is cut was not measured.
+- With the lid closed, `canEvaluatePolicy` still reports Touch ID available (`biometryType` 1), but the dialog offers
+  only the password.
+- A `user/<uid>` job without `LimitLoadToSessionType` `Background` is refused by `launchctl bootstrap` ("5:
+  Input/output error").
+- **Without a GUI session:** a job whose security session has no graphics access still got its prompt onto the console
+  while a user was logged in there. So a `knshd` started from an SSH login would show its prompt on the Mac's screen,
+  not to the SSH user. With nobody logged in at the console, the result is **pending**.
+
+**Exit question: what must approvals do without a GUI session?** See proposed [decision 12](../09-reference/decisions.md):
+fail closed. `knshd` cannot rely on a "no GUI" error: the prompt went to the console even from a session without
+graphics access. Every outcome other than success (cancel, error, no answer by `timeout_at`) denies with a reason
+naming the cause, and the context is invalidated at the timeout.
+
+### C7: XPC peer code-signing requirements
+
+The service is a launchd agent declaring the Mach service in its plist (Developer ID, hardened runtime, version 1.0).
+Clients are signed in seven ways. The client requirement (FR-AUTH-13) is:
+
+```text
+anchor apple generic and certificate leaf[subject.OU] = "<team>" and identifier "<authority id>"
+and ((certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists)
+     or certificate leaf[field.1.2.840.113635.100.6.1.9] exists)
+and !(entitlement["com.apple.security.get-task-allow"] exists)
+```
+
+The first branch is Developer ID, the second Mac App Store (not tested). Hardened runtime and the minimum version
+cannot be written in the requirement language, so the service reads them from the sender's `SecCode` (FR-AUTH-14):
+the signature flags (`0x10000` runtime), the live code-signing status (`CS_GET_TASK_ALLOW`, `CS_DEBUGGED`) and
+`CFBundleVersion` from the Info.plist bound into the signature (embedded in a bare binary with `-sectcreate __TEXT
+__info_plist`). Two service variants ran: **xpc**, with `xpc_connection_set_peer_code_signing_requirement` on each peer
+(macOS 12+) plus the `SecCode` checks; and **secode**, with no XPC-level requirement and every check on
+`SecCodeCreateWithXPCMessage` (builds without availability warnings for a macOS 12 deployment target, like the XPC call). Results in
+[`results/c7-26.6.2.tsv`](../../spikes/knsh-026-identity/results/c7-26.6.2.tsv) and the service log.
+
+| Client | xpc variant | secode variant |
+| --- | --- | --- |
+| Developer ID, right identifier, runtime, version 2.0 | Accepted | Accepted |
+| Ad hoc, same identifier | **Rejected** by XPC before the handler (`XPC_ERROR_PEER_CODE_SIGNING_REQUIREMENT`); the client sees `CONNECTION_INTERRUPTED` | Rejected: requirement not met (`-67050`) |
+| Developer ID, other identifier | Rejected by XPC | Rejected: requirement |
+| Developer ID with `get-task-allow` | **Rejected** by XPC (the `!entitlement` clause) | Rejected: requirement; live status also has `CS_GET_TASK_ALLOW` |
+| Developer ID without hardened runtime | Passes the requirement, **rejected** by the flag check | Same |
+| Developer ID, version 0.9 (minimum 1.0) | Rejected: below minimum version | Same |
+| Developer ID, no Info.plist | Rejected: no version | Same |
+
+**After `exec`.** The client sends a message, waits until it has left (barrier), then `execv`s another binary in the
+same process (same pid). The service handles the message 1 s later:
+
+| Case | By audit token (`SecCodeCreateWithXPCMessage`) | By pid (`SecCodeCopyGuestWithAttributes`) | XPC requirement |
+| --- | --- | --- | --- |
+| Ad-hoc client sends, then execs the trusted client | **Rejected:** the code object no longer validates (`-67065`, no guest) | **Would accept** (sees the trusted binary) | Rejected |
+| Trusted client sends, then execs an ad-hoc binary | Rejected (`-67065`) | Rejected | Rejected |
+
+A pid-based check is exploitable; both audit-token-based checks fail closed when the sender has changed identity.
+
+**The client checks the service (FR-AUTH-15).** With the real job unloaded, an impostor job declaring the same name
+answers. A client that sets `xpc_connection_set_peer_code_signing_requirement` on its connection rejects the impostor
+(ad-hoc same identifier, or Developer ID other identifier) with `XPC_ERROR_PEER_CODE_SIGNING_REQUIREMENT`; without the
+requirement it talks to the impostor. **But the impostor received and processed the client's first message before
+the client rejected the reply.** The client's requirement guards what it receives, not what it sends.
+
+**Who can hold the name (FR-AUTH-12).** launchd gives a Mach name to the **first** job that declares it. A second job
+declaring the same name still loads (`launchctl bootstrap` exits 0); launchd logs "The endpoint … already exists and
+is owned by: <first label>", and the first job keeps answering. Loaded in the other order, the impostor holds the
+name and `knshd`'s job loads without it. A listener started outside launchd gets `CONNECTION_INVALID` for a declared
+name and for an undeclared one. So the name is safe from envelopes, which cannot submit launchd jobs or write
+`~/Library/LaunchAgents` ([C8](#c8-process-information-signals-sockets-and-services)), but not from other software of
+the same user (out of scope); the authority's check of `knshd` is what catches an impostor.
+
+**Exit question: which API is used on macOS 14?** See proposed [decision 13](../09-reference/decisions.md):
+`xpc_connection_set_peer_code_signing_requirement` (macOS 12+) on every peer connection, plus
+`SecCodeCreateWithXPCMessage` on every message for hardened runtime, live status and version, never the pid. The
+lightweight code requirements of macOS 14.4 and the `xpc_peer_requirement_t` API of macOS 26 were not tested and are
+not needed.
 
 ## Endpoint Security (macOS 27+)
 

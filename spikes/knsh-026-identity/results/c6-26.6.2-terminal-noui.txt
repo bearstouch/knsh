@@ -1,0 +1,8 @@
+case=terminal-noui macos=26.6.2 date=2026-11-14T14:52:20Z clamshell_closed=Yes
+reason=approve the agent command: git push --force origin main (cwd ~/src/app, session 01JD3Q9ZKX8M4T2V6B7N5C1H0E)
+session_status=0 session_id=100015 attrs=0x2030 graphic=1 remote=0 tty=1
+pid=25417 ppid=25376
+can_evaluate=1 can_error=0 biometry_type=1
+success=0 error_domain=com.apple.LocalAuthentication error_code=-1004 elapsed_ms=2
+error_text=User interaction required.
+launchd_domain=none (child of the terminal)

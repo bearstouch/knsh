@@ -1,0 +1,73 @@
+scheme	actor	op	status	detail
+adhoc	build1-creates	add	status=0	add legacy status=0 (No error.) value=kc-build-1
+adhoc	build1-reads	read	status=0	read legacy status=0 (No error.) value=kc-build-1
+adhoc	build2-reads	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+adhoc	unrelated-reads	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+adhoc	unrelated-sandboxed-reads	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+adhoc	unrelated-deletes	delete	status=-25244	delete legacy status=-25244 (Invalid attempt to change the owner of this item.) 
+adhoc	sandboxed-no-kc-write-overwrites	update	status=100001	update legacy status=100001 (UNIX[Operation not permitted]) value=forged-in-sandbox
+adhoc	build1-reads-after-sandbox	read	status=0	read legacy status=0 (No error.) value=kc-build-1
+adhoc	build1-reads-in-no-kc-write-sandbox	read	status=0	read legacy status=0 (No error.) value=kc-build-1
+adhoc	unrelated-overwrites	update	status=0	update legacy status=0 (No error.) value=forged
+adhoc	build1-reads-after-overwrite	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+adhoc	build2-overwrites	update	status=0	update legacy status=0 (No error.) value=written-by-build2
+adhoc	build1-deletes	delete	status=0	delete legacy status=0 (No error.) 
+adhoc	unrelated-preseeds	add	status=0	add legacy status=0 (No error.) value=planted
+adhoc	build1-reads-preseeded	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+adhoc	build1-adds-over-preseeded	add	status=-25299	add legacy status=-25299 (The specified item already exists in the keychain.) value=kc-build-1
+adhoc	build1-deletes-preseeded	delete	status=-25244	delete legacy status=-25244 (Invalid attempt to change the owner of this item.) 
+adhoc	sandboxed-no-kc-write-preseeds	add	status=100001	add legacy status=100001 (UNIX[Operation not permitted]) value=planted
+homebrew	build1-creates	add	status=0	add legacy status=0 (No error.) value=kc-build-1
+homebrew	build1-reads	read	status=0	read legacy status=0 (No error.) value=kc-build-1
+homebrew	build2-reads	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+homebrew	unrelated-reads	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+homebrew	unrelated-sandboxed-reads	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+homebrew	unrelated-deletes	delete	status=-25244	delete legacy status=-25244 (Invalid attempt to change the owner of this item.) 
+homebrew	sandboxed-no-kc-write-overwrites	update	status=100001	update legacy status=100001 (UNIX[Operation not permitted]) value=forged-in-sandbox
+homebrew	build1-reads-after-sandbox	read	status=0	read legacy status=0 (No error.) value=kc-build-1
+homebrew	build1-reads-in-no-kc-write-sandbox	read	status=0	read legacy status=0 (No error.) value=kc-build-1
+homebrew	unrelated-overwrites	update	status=0	update legacy status=0 (No error.) value=forged
+homebrew	build1-reads-after-overwrite	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+homebrew	build2-overwrites	update	status=0	update legacy status=0 (No error.) value=written-by-build2
+homebrew	build1-deletes	delete	status=0	delete legacy status=0 (No error.) 
+homebrew	unrelated-preseeds	add	status=0	add legacy status=0 (No error.) value=planted
+homebrew	build1-reads-preseeded	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+homebrew	build1-adds-over-preseeded	add	status=-25299	add legacy status=-25299 (The specified item already exists in the keychain.) value=kc-build-1
+homebrew	build1-deletes-preseeded	delete	status=-25244	delete legacy status=-25244 (Invalid attempt to change the owner of this item.) 
+homebrew	sandboxed-no-kc-write-preseeds	add	status=100001	add legacy status=100001 (UNIX[Operation not permitted]) value=planted
+devid	build1-creates	add	status=0	add legacy status=0 (No error.) value=kc-build-1
+devid	build1-reads	read	status=0	read legacy status=0 (No error.) value=kc-build-1
+devid	build2-reads	read	status=0	read legacy status=0 (No error.) value=kc-build-1
+devid	unrelated-reads	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+devid	unrelated-sandboxed-reads	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+devid	unrelated-deletes	delete	status=-25244	delete legacy status=-25244 (Invalid attempt to change the owner of this item.) 
+devid	sandboxed-no-kc-write-overwrites	update	status=100001	update legacy status=100001 (UNIX[Operation not permitted]) value=forged-in-sandbox
+devid	build1-reads-after-sandbox	read	status=0	read legacy status=0 (No error.) value=kc-build-1
+devid	build1-reads-in-no-kc-write-sandbox	read	status=0	read legacy status=0 (No error.) value=kc-build-1
+devid	unrelated-overwrites	update	status=0	update legacy status=0 (No error.) value=forged
+devid	build1-reads-after-overwrite	read	status=0	read legacy status=0 (No error.) value=forged
+devid	build2-overwrites	update	status=0	update legacy status=0 (No error.) value=written-by-build2
+devid	build1-deletes	delete	status=0	delete legacy status=0 (No error.) 
+devid	unrelated-preseeds	add	status=0	add legacy status=0 (No error.) value=planted
+devid	build1-reads-preseeded	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+devid	build1-adds-over-preseeded	add	status=-25299	add legacy status=-25299 (The specified item already exists in the keychain.) value=kc-build-1
+devid	build1-deletes-preseeded	delete	status=-25244	delete legacy status=-25244 (Invalid attempt to change the owner of this item.) 
+devid	sandboxed-no-kc-write-preseeds	add	status=100001	add legacy status=100001 (UNIX[Operation not permitted]) value=planted
+switch	homebrew-creates	add	status=0	add legacy status=0 (No error.) value=kc-build-1
+switch	devid-reads-homebrew-item	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+switch	homebrew-deletes	delete	status=0	delete legacy status=0 (No error.) 
+switch	devid-creates	add	status=0	add legacy status=0 (No error.) value=kc-build-1
+switch	homebrew-reads-devid-item	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+switch	devid-deletes	delete	status=0	delete legacy status=0 (No error.) 
+cross	devid-creates	add	status=0	add legacy status=0 (No error.) value=kc-build-1
+cross	adhoc-unrelated-overwrites	update	status=0	update legacy status=0 (No error.) value=forged
+cross	devid-reads-after-adhoc-overwrite	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+cross	devid-deletes	delete	status=0	delete legacy status=0 (No error.) 
+cross	devid-creates	add	status=0	add legacy status=0 (No error.) value=kc-build-1
+cross	security-tool-overwrites	update	exit=0	/usr/bin/security add-generic-password -U: 
+cross	devid-reads-after-security-tool-overwrite	read	status=-25293	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+cross	devid-deletes	delete	status=0	delete legacy status=0 (No error.) 
+dp	no-entitlement-devid	add	status=-34018	add dp status=-34018 (A required entitlement isn't present.) value=kc-build-1
+dp	no-entitlement-adhoc	add	status=-34018	add dp status=-34018 (A required entitlement isn't present.) value=kc-build-1
+dp	adhoc-with-access-group	add	exit=137	exit=137 
+dp	devid-with-access-group-no-profile	add	exit=137	exit=137 

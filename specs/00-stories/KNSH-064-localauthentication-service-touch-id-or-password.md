@@ -26,3 +26,11 @@ that no client can claim the user is present.
 **Integration tests**
 - **Pending (manual):** a Touch ID prompt from `knshd` with a logged-in GUI session, and the behaviour without one
   (claim C6 from KNSH-026).
+
+**Notes**
+- From KNSH-026 ([C6 results](../07-testing/verification-claims.md#code-signed-identity-results-knsh-026-c5-c6-c7), proposed decision 12): a launchd agent shows the prompt, titled with the process
+  name ("knshd is trying to <reason>"), with the reason shown in full. The dialog reached the console even from a job
+  without graphics access, so "no GUI" cannot be detected from an error: every outcome other than success, including no
+  answer by `timeout_at`, is "not authenticated", and the context is invalidated at the timeout. With the lid closed only
+  the password is offered. Still pending: Touch ID with the lid open, an SSH login with nobody at the console, and the
+  cancel and timeout outcomes.

@@ -50,3 +50,7 @@ me.
 *Authority registration*
 
 - The spec gives no error code for a refused second registration. Propose `-32003`.
+- From KNSH-026 ([C5 and C7 results](../07-testing/verification-claims.md#code-signed-identity-results-knsh-026-c5-c6-c7), proposed decisions 11 and 13): the trust record follows the same Keychain
+  rules as the policy key (a read failure on an existing record is tampering). An authority's peer requirement guards
+  only what it receives, so its first message (`hello`) must carry nothing sensitive. The authority must bind a
+  `CFBundleVersion` into its signature for the `--min-version` check.

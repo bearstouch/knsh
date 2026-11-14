@@ -33,3 +33,8 @@ or other process cannot change my policy unnoticed.
 - Spec gap: the signature algorithm (HMAC-SHA256 with a Keychain secret, or an asymmetric key) and where the
   signature is stored (a sidecar file or an embedded trailer) are not specified. Decide and record them in
   [policy](../03-functional-requirements/policy.md).
+- From KNSH-026 ([C5 results](../07-testing/verification-claims.md#code-signed-identity-results-knsh-026-c5-c6-c7), proposed decision 11): use the file-based keychain from a Developer ID-signed
+  `knshd`, with Keychain user interaction disabled. Any same-user process can overwrite the item; code outside the team
+  then makes `knshd`'s read fail, so a read failure on an existing key is tampering (fail closed, recover only with
+  Touch ID or the password). Ad-hoc and Homebrew-from-source builds lose the key on every upgrade. The manual integration test above was
+  observed on macOS 26.6 by the spike; it still needs to run against the real `knshd`.

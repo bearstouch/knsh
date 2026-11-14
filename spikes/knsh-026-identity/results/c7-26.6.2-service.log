@@ -1,0 +1,208 @@
+== accept-good (mode xpc, client good )
+service start server=knsh.spike.knshd/pid24257 pid=24257 ppid=1 mode=xpc requirement_parse=0
+peer pid=24255 euid=501
+  set_peer_code_signing_requirement rc=0
+message tag=accept-good pid=24255
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: accept
+  decision: accept
+peer event: CONNECTION_INVALID
+== reject-adhoc (mode xpc, client adhoc )
+peer pid=24310 euid=501
+  set_peer_code_signing_requirement rc=0
+peer event: PEER_CODE_SIGNING_REQUIREMENT
+peer event: CONNECTION_INVALID
+== reject-other-identifier (mode xpc, client other-id )
+peer pid=24334 euid=501
+  set_peer_code_signing_requirement rc=0
+peer event: PEER_CODE_SIGNING_REQUIREMENT
+peer event: CONNECTION_INVALID
+== reject-get-task-allow (mode xpc, client get-task-allow )
+peer pid=24388 euid=501
+  set_peer_code_signing_requirement rc=0
+peer event: PEER_CODE_SIGNING_REQUIREMENT
+peer event: CONNECTION_INVALID
+== reject-no-hardened-runtime (mode xpc, client no-runtime )
+peer pid=24407 euid=501
+  set_peer_code_signing_requirement rc=0
+message tag=reject-no-hardened-runtime pid=24407
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x0 cs_status=0x22000201
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x0 cs_status=0x22000201
+  pid-based decision would be: no-hardened-runtime
+  decision: no-hardened-runtime
+peer event: CONNECTION_INVALID
+== reject-old-version (mode xpc, client old-version )
+peer pid=24426 euid=501
+  set_peer_code_signing_requirement rc=0
+message tag=reject-old-version pid=24426
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=0.9 sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=0.9 sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: below-min-version
+  decision: below-min-version
+peer event: CONNECTION_INVALID
+== reject-no-version (mode xpc, client no-version )
+peer pid=24479 euid=501
+  set_peer_code_signing_requirement rc=0
+message tag=reject-no-version pid=24479
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=- sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=- sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: no-version
+  decision: no-version
+peer event: CONNECTION_INVALID
+== accept-good (mode secode, client good )
+service start server=knsh.spike.knshd/pid24503 pid=24503 ppid=1 mode=secode requirement_parse=0
+peer pid=24502 euid=501
+message tag=accept-good pid=24502
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: accept
+  decision: accept
+peer event: CONNECTION_INVALID
+== reject-adhoc (mode secode, client adhoc )
+peer pid=24522 euid=501
+message tag=reject-adhoc pid=24522
+  by-audit-token: create=0 valid=-67050 id=knsh.spike.authority version=2.0 sig_flags=0x2 cs_status=0x22000201
+  by-pid (unsafe): create=0 valid=-67050 id=knsh.spike.authority version=2.0 sig_flags=0x2 cs_status=0x22000201
+  pid-based decision would be: requirement-not-met
+  decision: requirement-not-met
+peer event: CONNECTION_INVALID
+== reject-other-identifier (mode secode, client other-id )
+peer pid=24541 euid=501
+message tag=reject-other-identifier pid=24541
+  by-audit-token: create=0 valid=-67050 id=knsh.spike.other version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=-67050 id=knsh.spike.other version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: requirement-not-met
+  decision: requirement-not-met
+peer event: CONNECTION_INVALID
+== reject-get-task-allow (mode secode, client get-task-allow )
+peer pid=24594 euid=501
+message tag=reject-get-task-allow pid=24594
+  by-audit-token: create=0 valid=-67050 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011315
+  by-pid (unsafe): create=0 valid=-67050 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011315
+  pid-based decision would be: requirement-not-met
+  decision: requirement-not-met
+peer event: CONNECTION_INVALID
+== reject-no-hardened-runtime (mode secode, client no-runtime )
+peer pid=24613 euid=501
+message tag=reject-no-hardened-runtime pid=24613
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x0 cs_status=0x22000201
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x0 cs_status=0x22000201
+  pid-based decision would be: no-hardened-runtime
+  decision: no-hardened-runtime
+peer event: CONNECTION_INVALID
+== reject-old-version (mode secode, client old-version )
+peer pid=24633 euid=501
+message tag=reject-old-version pid=24633
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=0.9 sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=0.9 sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: below-min-version
+  decision: below-min-version
+peer event: CONNECTION_INVALID
+== reject-no-version (mode secode, client no-version )
+peer pid=24652 euid=501
+message tag=reject-no-version pid=24652
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=- sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=- sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: no-version
+  decision: no-version
+peer event: CONNECTION_INVALID
+== exec-untrusted-into-trusted (mode secode, client adhoc --exec /Users/USER/.cache/knsh-spike-026/c7/good)
+service start server=knsh.spike.knshd/pid24676 pid=24676 ppid=1 mode=secode requirement_parse=0
+peer pid=24675 euid=501
+message tag=exec-untrusted-into-trusted pid=24675
+  by-audit-token: create=0 valid=-67065 id=- version=- sig_flags=0x0 cs_status=0x0
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: accept
+  decision: requirement-not-met
+peer event: CONNECTION_INVALID
+== exec-trusted-into-untrusted (mode secode, client good --exec /Users/USER/.cache/knsh-spike-026/c7/adhoc)
+peer pid=24763 euid=501
+message tag=exec-trusted-into-untrusted pid=24763
+  by-audit-token: create=0 valid=-67065 id=- version=- sig_flags=0x0 cs_status=0x0
+  by-pid (unsafe): create=0 valid=-67050 id=knsh.spike.authority version=2.0 sig_flags=0x2 cs_status=0x22000201
+  pid-based decision would be: requirement-not-met
+  decision: requirement-not-met
+peer event: CONNECTION_INVALID
+== exec-untrusted-into-trusted (mode xpc, client adhoc --exec /Users/USER/.cache/knsh-spike-026/c7/good)
+service start server=knsh.spike.knshd/pid24856 pid=24856 ppid=1 mode=xpc requirement_parse=0
+peer pid=24855 euid=501
+  set_peer_code_signing_requirement rc=0
+peer event: PEER_CODE_SIGNING_REQUIREMENT
+peer event: CONNECTION_INVALID
+== exec-trusted-into-untrusted (mode xpc, client good --exec /Users/USER/.cache/knsh-spike-026/c7/adhoc)
+peer pid=24909 euid=501
+  set_peer_code_signing_requirement rc=0
+peer event: PEER_CODE_SIGNING_REQUIREMENT
+peer event: CONNECTION_INVALID
+== client-checks-service:impostor-adhoc (mode secode, client good --service-req anchor apple generic and certificate leaf[subject.OU] = "TEAMID0000" and identifier "knsh.spike.knshd" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists)
+service start server=knsh.spike.knshd(adhoc)/pid25002 pid=25002 ppid=1 mode=secode requirement_parse=0
+peer pid=25001 euid=501
+message tag=client-checks-service:impostor-adhoc pid=25001
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: accept
+  decision: accept
+peer event: CONNECTION_INVALID
+== client-no-check:impostor-adhoc (mode secode, client good )
+peer pid=25055 euid=501
+message tag=client-no-check:impostor-adhoc pid=25055
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: accept
+  decision: accept
+peer event: CONNECTION_INVALID
+== client-checks-service:impostor-other-id (mode secode, client good --service-req anchor apple generic and certificate leaf[subject.OU] = "TEAMID0000" and identifier "knsh.spike.knshd" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists)
+service start server=knsh.spike.impostor/pid25080 pid=25080 ppid=1 mode=secode requirement_parse=0
+peer pid=25079 euid=501
+message tag=client-checks-service:impostor-other-id pid=25079
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: accept
+  decision: accept
+peer event: CONNECTION_INVALID
+== client-no-check:impostor-other-id (mode secode, client good )
+peer pid=25099 euid=501
+message tag=client-no-check:impostor-other-id pid=25099
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: accept
+  decision: accept
+peer event: CONNECTION_INVALID
+== client-checks-service:knshd (mode secode, client good --service-req anchor apple generic and certificate leaf[subject.OU] = "TEAMID0000" and identifier "knsh.spike.knshd" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists)
+service start server=knsh.spike.knshd/pid25124 pid=25124 ppid=1 mode=secode requirement_parse=0
+peer pid=25123 euid=501
+message tag=client-checks-service:knshd pid=25123
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: accept
+  decision: accept
+peer event: CONNECTION_INVALID
+== client-no-check:knshd (mode secode, client good )
+peer pid=25177 euid=501
+message tag=client-no-check:knshd pid=25177
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: accept
+  decision: accept
+peer event: CONNECTION_INVALID
+second job declaring knsh.spike.026.c7: rc=0 ; launchd: The endpoint "knsh.spike.026.c7" defined in plist already exists and is owned by: knsh.spike.026.c7
+== after-second-job-good-client (mode xpc, client good )
+service start server=knsh.spike.knshd/pid25252 pid=25252 ppid=1 mode=xpc requirement_parse=0
+peer pid=25251 euid=501
+  set_peer_code_signing_requirement rc=0
+message tag=after-second-job-good-client pid=25251
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: accept
+  decision: accept
+peer event: CONNECTION_INVALID
+== after-impostor-first-good-client (mode secode, client good --service-req anchor apple generic and certificate leaf[subject.OU] = "TEAMID0000" and identifier "knsh.spike.knshd" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists)
+service start server=knsh.spike.knshd(adhoc)/pid25334 pid=25334 ppid=1 mode=secode requirement_parse=0
+peer pid=25333 euid=501
+message tag=after-impostor-first-good-client pid=25333
+  by-audit-token: create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  by-pid (unsafe): create=0 valid=0 id=knsh.spike.authority version=2.0 sig_flags=0x10000 cs_status=0x22011311
+  pid-based decision would be: accept
+  decision: accept
+peer event: CONNECTION_INVALID

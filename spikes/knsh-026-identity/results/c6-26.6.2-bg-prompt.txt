@@ -1,0 +1,14 @@
+case=bg-prompt macos=26.6.2 date=2026-11-14T14:21:01Z clamshell_closed=Yes
+reason=approve the agent command: git push --force origin main (cwd ~/src/app, session 01JD3Q9ZKX8M4T2V6B7N5C1H0E)
+session_status=0 session_id=100041 attrs=0x0 graphic=0 remote=0 tty=0
+pid=77045 ppid=1
+can_evaluate=1 can_error=0 biometry_type=1
+success=1 error_domain=- error_code=0 elapsed_ms=3396
+launchd_domain=user/501 label=knsh.spike.026.la.bg-prompt
+launchd_state = not running
+launchd_domain = user/501
+launchd_last exit code = 0
+# Human observation: the same password dialog appeared on the console GUI although this job's
+# security session has no graphics access (attrs=0x0); seen in a screenshot 1.5 s after start in a
+# third run (not committed). The user confirmed typing the password in each of the three runs
+# (14:18, 14:21:01 recorded here, 14:21:33). Cancellation was not exercised.

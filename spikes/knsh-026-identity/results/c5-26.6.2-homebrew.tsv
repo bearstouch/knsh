@@ -1,0 +1,6 @@
+step	signature	result
+1.0 installed, creates item	id=knshd flags=0x20002(adhoc,linker-signed) team=not set auth= cdhash=fb992f5f58a6	add legacy status=0 (No error.) value=kc-build-1
+1.0 reads	id=knshd flags=0x20002(adhoc,linker-signed) team=not set auth= cdhash=fb992f5f58a6	read legacy status=0 (No error.) value=kc-build-1
+1.0 reinstalled (rebuilt from the same source) reads	id=knshd flags=0x20002(adhoc,linker-signed) team=not set auth= cdhash=fb992f5f58a6	read legacy status=0 (No error.) value=kc-build-1
+2.0 (brew upgrade) reads	id=knshd flags=0x20002(adhoc,linker-signed) team=not set auth= cdhash=3fec38b274a0	read legacy status=-25293 (The user name or passphrase you entered is not correct.) 
+2.0 deletes	id=knshd flags=0x20002(adhoc,linker-signed) team=not set auth= cdhash=3fec38b274a0	delete legacy status=0 (No error.) 
