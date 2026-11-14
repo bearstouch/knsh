@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Dev-only workspace checks (dependency policy); never shipped"
+description = "Dev-only workspace checks (dependency policy) and the start-up benchmark; never shipped"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

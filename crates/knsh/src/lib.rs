@@ -25,6 +25,8 @@
 //!   `specs/06-api/user-socket.md#human-sessions` — `integration::config` and `integration::recorder`, KNSH-021:
 //!   the recording switch, human telemetry to `knshd`, the idle prompt and `KNSH_RECORDING`, FR-SES-21, FR-SES-23, FR-SES-24, FR-SES-25, FR-REC-09, NFR-REL-02,
 //!   NFR-PRIV-05
+//! - `specs/06-api/cli.md` "Version and the advisory label", `specs/01-overview/roadmap.md` — [`cli::version`],
+//!   KNSH-024: `knsh --version` labels phase 1 builds advisory
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]

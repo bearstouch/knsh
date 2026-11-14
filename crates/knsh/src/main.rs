@@ -25,6 +25,11 @@ fn main() -> ExitCode {
             let _ = std::io::stdout().write_all(text.as_bytes());
             ExitCode::SUCCESS
         }
+        // KNSH-024: the version, labelled advisory in phase 1.
+        Ok(Invocation::Version) => {
+            let _ = std::io::stdout().write_all(knsh::cli::version::text().as_bytes());
+            ExitCode::SUCCESS
+        }
         Ok(Invocation::Shell(shell)) => shell_mode(&shell),
         Ok(Invocation::Command(parsed)) => match parsed.path.as_slice() {
             ["daemon", action @ ("install" | "uninstall")] => daemon(action, parsed.json()),

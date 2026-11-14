@@ -21,6 +21,8 @@
 //! ```
 //!
 //! - Every command accepts `--json` and `--help` without declaring them ([`GLOBAL_OPTIONS`]).
+//! - `knsh --version`, alone on the line, prints the version and the build's advisory label ([`VERSION_OPTION`],
+//!   KNSH-024). It is a root option, not a command: `knsh history --version` is an unknown option.
 //! - Everything after the first `--` is passed through byte for byte, unparsed, to commands that declare
 //!   [`Command::trailing`] (e.g. `knsh agent -- claude --flag`).
 //! - Fail safe: an unknown flag, a missing or unexpected value, a repeated option, a missing required argument or
@@ -101,6 +103,14 @@ pub const GLOBAL_OPTIONS: &[OptionSpec] = &[
     },
 ];
 
+/// The root-only version flag: `knsh --version` (KNSH-024). Declared once, so the parser and the root help agree.
+pub const VERSION_OPTION: OptionSpec = OptionSpec {
+    long: "version",
+    value: None,
+    required: false,
+    help: "Print the version and whether this build is advisory, then exit",
+};
+
 /// The name of the global JSON output flag.
 const JSON: &str = "json";
 /// The name of the global help flag.
@@ -141,6 +151,8 @@ pub enum Invocation {
     Command(ParsedCommand),
     /// `--help` was given: print this generated text to stdout and exit with status 0.
     Help(String),
+    /// `knsh --version` was given: print [`crate::cli::version::text`] to stdout and exit with status 0.
+    Version,
 }
 
 /// A shell-mode invocation, classified but not interpreted: what to do with it belongs to later stories.
@@ -425,6 +437,16 @@ fn parse_command(root: &'static Command, args: Vec<OsString>) -> Result<Invocati
         if word == "--help" {
             return Ok(Invocation::Help(help(root, &path, command)));
         }
+        // Only the root takes `--version`, and only on its own: anything after it is refused rather than ignored,
+        // like every other leftover argument.
+        if path.is_empty() && word.strip_prefix("--") == Some(VERSION_OPTION.long) {
+            return match args.next() {
+                None => Ok(Invocation::Version),
+                Some(extra) => Err(ArgsError::UnexpectedArgument {
+                    arg: extra.to_string_lossy().into_owned(),
+                }),
+            };
+        }
         if word.starts_with('-') {
             return Err(ArgsError::UnknownFlag {
                 flag: flag_name(&word).to_owned(),
@@ -595,8 +617,14 @@ impl fmt::Display for Help<'_> {
             // The root also documents shell mode, from the same SHELL_OPTIONS table the shell parser uses.
             let letters: String = SHELL_OPTIONS.iter().map(|(c, _, _)| *c).collect();
             writeln!(f, "Usage: {name} [-{letters}] [<command line>] [<arg>...]")?;
-            writeln!(f, "       {name} <command> [options]\n\nShell options:")?;
+            writeln!(f, "       {name} <command> [options]")?;
+            writeln!(f, "       {name} --version\n\nShell options:")?;
             write_rows(f, SHELL_OPTIONS.iter().map(|(c, _, help)| (format!("-{c}"), *help)))?;
+            writeln!(f, "\nOptions:")?;
+            write_rows(
+                f,
+                std::iter::once((option_syntax(&VERSION_OPTION), VERSION_OPTION.help)),
+            )?;
         } else {
             writeln!(f, "Usage: {}", Usage { name, command })?;
         }
@@ -997,10 +1025,29 @@ mod tests {
         assert!(shell(argv(&["-i"])).interactive);
     }
 
+    // KNSH-024: `knsh --version` is a root option, alone on the line; anywhere else it is a usage error.
+    #[test]
+    fn version_is_a_root_only_option() {
+        assert_eq!(parse(&KNSH, argv(&["--version"])), Ok(Invocation::Version));
+        assert_eq!(
+            error(&["--version", "--json"]),
+            ArgsError::UnexpectedArgument {
+                arg: "--json".to_owned()
+            }
+        );
+        assert_eq!(error(&["--version=1"]), unknown_flag("--version"));
+        assert_eq!(error(&["history", "--version"]), unknown_flag("--version"));
+        assert_eq!(error(&["policy", "--version"]), unknown_flag("--version"));
+    }
+
     // KNSH-009 acceptance: help is generated from the same declarations the parser uses.
     #[test]
     fn help_is_generated_from_declarations() {
         let top = help_text(&["--help"]);
+        assert!(
+            top.contains("--version") && top.contains(VERSION_OPTION.help),
+            "top-level help misses --version"
+        );
         for sub in KNSH.subcommands {
             assert!(
                 top.contains(sub.name) && top.contains(sub.about),
