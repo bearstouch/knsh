@@ -13,18 +13,25 @@
 //! - Inside backticks, only a backslash protects the next character; the first other backtick closes them.
 //! - Inside `$( … )`, `<( … )` and `>( … )`, a comment that bash 3.2 and later versions read differently is refused
 //!   ([`LexError::AmbiguousComment`]), so neither reading can hide a command the other runs.
+//! - Here-document bodies (KNSH-031) are read at the newline that ends the line holding their `<<` or `<<-`, one after
+//!   the other in the order of the operators, each up to the first line equal to its delimiter (after quote removal;
+//!   leading tabs stripped for `<<-`). With an unquoted delimiter, a line continuation joins two body lines before
+//!   the comparison, and the body is split into segments like the inside of double quotes, so the substitutions bash
+//!   runs in it are found. A body bash versions would place differently is refused
+//!   ([`LexError::AmbiguousHereDocument`]).
 //!
-//! Out of scope (later stories): here-document bodies (KNSH-031; a body is refused, see
-//! [`LexError::HereDocumentBody`]), the special lexing inside `[[ … ]]` and `(( … ))` (left to the parser, which
-//! has the spans), and compound array assignments `a=( … )`, which arrive as a word, `(`, words and `)`.
+//! Out of scope: the special lexing inside `[[ … ]]` and `(( … ))` (left to the parser, which has the spans), and
+//! compound array assignments `a=( … )`, which arrive as a word, `(`, words and `)`. Substitution bodies are only
+//! delimited here; the parser lexes and parses them again ([`lex_range`]).
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+use std::mem;
 
 use crate::error::{Construct, LexError};
 use crate::limits::{MAX_INPUT_LEN, MAX_NESTING_DEPTH};
 use crate::token::{
-    IoNumber, Operator, Redirection, RedirectionOperator, ReservedWord, Segment, SegmentKind, Span, Token, TokenKind,
-    Word,
+    HereDocumentBody, IoNumber, Operator, Redirection, RedirectionOperator, ReservedWord, Segment, SegmentKind, Span,
+    Token, TokenKind, Word,
 };
 
 /// Splits a command line into tokens.
@@ -37,7 +44,11 @@ use crate::token::{
 /// - [`LexError::InputTooLarge`] when `input` is longer than [`MAX_INPUT_LEN`], checked before anything is read.
 /// - [`LexError::Unterminated`] when a quote or substitution is still open at the end.
 /// - [`LexError::NestingTooDeep`] when quotes and substitutions nest deeper than [`MAX_NESTING_DEPTH`].
-/// - [`LexError::HereDocumentBody`] when a here-document body follows (not lexed until KNSH-031).
+/// - [`LexError::Unterminated`] with [`Construct::HereDocument`] when a here-document's body starts but no line
+///   matches its delimiter. A body that never starts (the input ends on the operator's line) is not a lexer error,
+///   since inside `(( … ))` a `<<` is a shift; the parser refuses it for a redirection.
+/// - [`LexError::AmbiguousHereDocument`] when bash versions would read a here-document's body differently.
+/// - [`LexError::HereDocumentDelimiter`] when a here-document delimiter holds an expansion.
 /// - [`LexError::AmbiguousComment`] when a comment inside a substitution would end differently in bash 3.2.
 ///
 /// On error no tokens are returned: a partial token list would invite a guess.
@@ -60,7 +71,34 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             limit: MAX_INPUT_LEN,
         });
     }
-    let mut lexer = Lexer::new(input.as_bytes());
+    lex_range(input, Span::new(0, input.len()), LexContext::default())
+}
+
+/// Where a source being lexed sits in the line: how many quotes and substitutions enclose it, and how many of those
+/// are `$( … )`, `<( … )` and `>( … )` bodies (process substitutions counted apart). The parser lexes each
+/// substitution body again to parse it (KNSH-031), and the body must be read exactly as it was when the enclosing
+/// line was lexed: the nesting limit counts from the same depth, and the bash 3.2 rules for comments and here-documents
+/// inside substitutions still apply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LexContext {
+    /// Quotes and substitutions enclosing the source, counted towards [`MAX_NESTING_DEPTH`].
+    pub(crate) depth: usize,
+    /// `$( … )`, `<( … )` and `>( … )` bodies enclosing the source.
+    pub(crate) substitutions: usize,
+    /// Of those, the process substitutions.
+    pub(crate) process_substitutions: usize,
+}
+
+/// Lexes the part of `input` at `range`, in `context`. Spans are offsets into `input`, and the lexer never reads past
+/// `range.end`, which ends the source as the end of the input would. Bytes before `range.start` are only looked at
+/// to tell whether a `#` follows a blank, as when the whole line is lexed.
+///
+/// # Errors
+///
+/// As [`lex`], except that the size limit is not checked: `range` lies inside a line that already passed it.
+pub(crate) fn lex_range(input: &str, range: Span, context: LexContext) -> Result<Vec<Token>, LexError> {
+    let src = input.as_bytes();
+    let mut lexer = Lexer::new(src.get(..range.end).unwrap_or(src), range.start, context);
     let mut tokens = Vec::new();
     while let Some(token) = lexer.next_token()? {
         tokens.push(token);
@@ -82,8 +120,10 @@ struct Lexer<'a> {
     pos: usize,
     /// How many quotes and substitutions enclose `pos`; bounded by [`MAX_NESTING_DEPTH`].
     depth: usize,
-    /// The first `<<` or `<<-` whose body has not started yet.
-    pending_here_document: Option<Span>,
+    /// Here-document operators whose bodies have not been read yet, in source order.
+    pending_here_documents: Vec<PendingHereDocument>,
+    /// Tokens already read and not yet returned: the here-document bodies read at a newline.
+    queued: VecDeque<Token>,
     /// Starts of `$((` already found not to close with `))`. Without this, nested failing `$((` would be rescanned
     /// once per enclosing one, which is exponential in the nesting depth.
     not_arithmetic: HashSet<usize>,
@@ -93,16 +133,43 @@ struct Lexer<'a> {
     process_substitutions: usize,
 }
 
+/// A `<<` or `<<-` whose body is still to be read.
+struct PendingHereDocument {
+    /// The operator token.
+    operator: Span,
+    /// Whether it is `<<-`.
+    strip_tabs: bool,
+    /// How many `$( … )`, `<( … )` and `>( … )` bodies enclose the operator. Its body must start at a newline at the
+    /// same level.
+    level: usize,
+    /// The delimiter, once the word after the operator has been read. `None` until then.
+    delimiter: Option<Delimiter>,
+}
+
+/// A here-document delimiter after quote removal.
+struct Delimiter {
+    /// The text a line must equal to end the body.
+    text: Vec<u8>,
+    /// Whether any part of the word was quoted, which makes the body literal.
+    quoted: bool,
+}
+
+/// Bytes that bash 3.2 reads specially while it matches the parentheses of `$( … )` character by character: in a
+/// here-document body inside a substitution, any of them could end the substitution or open a quote there.
+const BASH_3_2_SUBSTITUTION_BYTES: &[u8] = b"()'\"`\\$";
+
 impl<'a> Lexer<'a> {
-    fn new(src: &'a [u8]) -> Self {
+    /// A lexer over `src` starting at `pos`, in `context`.
+    fn new(src: &'a [u8], pos: usize, context: LexContext) -> Self {
         Self {
             src,
-            pos: 0,
-            depth: 0,
-            pending_here_document: None,
+            pos,
+            depth: context.depth,
+            pending_here_documents: Vec::new(),
+            queued: VecDeque::new(),
             not_arithmetic: HashSet::new(),
-            substitutions: 0,
-            process_substitutions: 0,
+            substitutions: context.substitutions,
+            process_substitutions: context.process_substitutions,
         }
     }
 
@@ -182,8 +249,13 @@ impl<'a> Lexer<'a> {
 
     /// The next token, or `None` at the end of the input.
     fn next_token(&mut self) -> Result<Option<Token>, LexError> {
+        if let Some(token) = self.queued.pop_front() {
+            return Ok(Some(token));
+        }
         let start = self.pos;
         let Some(first) = self.peek() else {
+            // A here-document operator whose line never ended has no body token. The parser refuses it when the
+            // operator is a redirection (`ParseError::MissingHereDocumentBody`); inside `(( … ))` it is a shift.
             return Ok(None);
         };
         let kind = match first {
@@ -191,10 +263,6 @@ impl<'a> Lexer<'a> {
             b'\\' if self.is_continuation(start) => self.blank(),
             b'\n' => {
                 self.pos += 1;
-                // The lines after a here-document operator are its body, not commands.
-                if let Some(operator) = self.pending_here_document {
-                    return Err(LexError::HereDocumentBody { span: operator });
-                }
                 TokenKind::Newline
             }
             b'#' => self.comment()?,
@@ -213,14 +281,283 @@ impl<'a> Lexer<'a> {
             _ => self.word_or_io_number(start)?,
         };
         let span = Span::new(start, self.pos);
-        if let TokenKind::Redirection(Redirection {
-            operator: RedirectionOperator::HereDocument | RedirectionOperator::HereDocumentStripTabs,
-            ..
-        }) = kind
-        {
-            self.pending_here_document.get_or_insert(span);
+        self.track_here_document(&kind, span)?;
+        if kind == TokenKind::Newline {
+            // The lines after a here-document operator's line are its body, not commands: they are read now and
+            // returned after the newline.
+            self.read_here_document_bodies()?;
         }
         Ok(Some(Token { kind, span }))
+    }
+
+    // ---- Here-documents ---------------------------------------------------------------------------------------
+
+    /// Follows here-document operators and their delimiters as tokens are read: an operator waits for its delimiter
+    /// word, which must be the next token other than blanks. If something else comes, the operator has no target,
+    /// which the parser reports; it then has no body either.
+    fn track_here_document(&mut self, kind: &TokenKind, span: Span) -> Result<(), LexError> {
+        match kind {
+            TokenKind::Redirection(Redirection {
+                operator: operator @ (RedirectionOperator::HereDocument | RedirectionOperator::HereDocumentStripTabs),
+                ..
+            }) => self.pending_here_documents.push(PendingHereDocument {
+                operator: span,
+                strip_tabs: *operator == RedirectionOperator::HereDocumentStripTabs,
+                level: self.substitutions,
+                delimiter: None,
+            }),
+            TokenKind::Word(word) => {
+                if self.awaiting_delimiter() {
+                    let delimiter = self.here_document_delimiter(word, span)?;
+                    if let Some(pending) = self.pending_here_documents.last_mut() {
+                        pending.delimiter = Some(delimiter);
+                    }
+                }
+            }
+            TokenKind::Blank => {}
+            TokenKind::Operator(_)
+            | TokenKind::Redirection(_)
+            | TokenKind::Newline
+            | TokenKind::Comment
+            | TokenKind::HereDocumentBody(_) => self.drop_awaiting_delimiter(),
+        }
+        Ok(())
+    }
+
+    /// Whether the last here-document operator, read at the current substitution level, still waits for its
+    /// delimiter word.
+    fn awaiting_delimiter(&self) -> bool {
+        self.pending_here_documents
+            .last()
+            .is_some_and(|pending| pending.delimiter.is_none() && pending.level == self.substitutions)
+    }
+
+    /// Forgets a here-document operator that got no delimiter word: the parser rejects it.
+    fn drop_awaiting_delimiter(&mut self) {
+        if self.awaiting_delimiter() {
+            self.pending_here_documents.pop();
+        }
+    }
+
+    /// The delimiter that `word`, written after a here-document operator, stands for: its text after quote removal,
+    /// and whether any part was quoted. Bash never expands a delimiter, and a delimiter holding an expansion or an
+    /// ANSI-C or locale quote is refused rather than read the way one bash version would.
+    fn here_document_delimiter(&self, word: &Word, span: Span) -> Result<Delimiter, LexError> {
+        let mut delimiter = Delimiter {
+            text: Vec::new(),
+            quoted: false,
+        };
+        for segment in &word.segments {
+            self.push_delimiter_segment(segment, false, &mut delimiter)
+                .ok_or(LexError::HereDocumentDelimiter { span })?;
+        }
+        Ok(delimiter)
+    }
+
+    /// Appends one segment of a delimiter word after quote removal; `None` for a segment that would need expanding.
+    /// `in_double_quotes` is set for the segments of a double-quoted part.
+    fn push_delimiter_segment(
+        &self,
+        segment: &Segment,
+        in_double_quotes: bool,
+        delimiter: &mut Delimiter,
+    ) -> Option<()> {
+        match &segment.kind {
+            SegmentKind::Literal => delimiter.text.extend_from_slice(self.src.get(segment.span.range())?),
+            SegmentKind::LineContinuation => {}
+            SegmentKind::Escape | SegmentKind::SingleQuoted => {
+                delimiter.quoted = true;
+                delimiter.text.extend_from_slice(self.src.get(segment.body.range())?);
+            }
+            SegmentKind::DoubleQuoted(inner) if !in_double_quotes => {
+                delimiter.quoted = true;
+                for part in inner {
+                    self.push_delimiter_segment(part, true, delimiter)?;
+                }
+            }
+            SegmentKind::DoubleQuoted(_)
+            | SegmentKind::AnsiC
+            | SegmentKind::Locale(_)
+            | SegmentKind::Parameter
+            | SegmentKind::ParameterExpansion
+            | SegmentKind::CommandSubstitution
+            | SegmentKind::Backtick
+            | SegmentKind::Arithmetic
+            | SegmentKind::InputProcessSubstitution
+            | SegmentKind::OutputProcessSubstitution => return None,
+        }
+        Some(())
+    }
+
+    /// At a newline (already consumed): reads the bodies of the here-documents waiting at this substitution level, in
+    /// the order of their operators, and queues them as tokens to follow the newline.
+    fn read_here_document_bodies(&mut self) -> Result<(), LexError> {
+        self.drop_awaiting_delimiter();
+        if self.pending_here_documents.is_empty() {
+            return Ok(());
+        }
+        // An operator outside the substitution this newline is in: bash 3.2 would read the body from here, later
+        // versions after the line ends outside the substitution.
+        if let Some(outer) = self
+            .pending_here_documents
+            .iter()
+            .find(|pending| pending.level != self.substitutions)
+        {
+            return Err(LexError::AmbiguousHereDocument { span: outer.operator });
+        }
+        for pending in mem::take(&mut self.pending_here_documents) {
+            let token = self.here_document_body(pending)?;
+            self.queued.push_back(token);
+        }
+        Ok(())
+    }
+
+    /// When a substitution body closes: a here-document operator inside it whose body never started is refused, since
+    /// bash 3.2 runs the lines after it as commands (`$(cat <<EOF)` newline `rm f`) while later versions read them as
+    /// the body. One still waiting for its delimiter word is left to the parser.
+    fn close_here_documents(&mut self) -> Result<(), LexError> {
+        self.drop_awaiting_delimiter();
+        match self
+            .pending_here_documents
+            .iter()
+            .find(|pending| pending.level == self.substitutions)
+        {
+            Some(pending) => Err(LexError::AmbiguousHereDocument { span: pending.operator }),
+            None => Ok(()),
+        }
+    }
+
+    /// Reads one here-document body from `pos` (the start of a line) through its delimiter line, as a token.
+    fn here_document_body(&mut self, pending: PendingHereDocument) -> Result<Token, LexError> {
+        let start = self.pos;
+        // An operator still without its delimiter word here was followed by another here-document operator
+        // (`<< <<EOF`); with no word to match, its body could never end.
+        let Some(delimiter) = pending.delimiter else {
+            return Err(self.unterminated(Construct::HereDocument, pending.operator.start));
+        };
+        let Some((body_end, delimiter_end)) = self.find_delimiter_line(&delimiter, pending.strip_tabs) else {
+            return Err(self.unterminated(Construct::HereDocument, pending.operator.start));
+        };
+        // Bash 3.2 does not know where a body inside a substitution is (see `LexError::AmbiguousHereDocument`); only
+        // a body it would read as plain characters is the same under every version.
+        if self.substitutions > 0
+            && self
+                .src
+                .get(start..delimiter_end)
+                .is_none_or(|text| text.iter().any(|byte| BASH_3_2_SUBSTITUTION_BYTES.contains(byte)))
+        {
+            return Err(LexError::AmbiguousHereDocument { span: pending.operator });
+        }
+        let body = Span::new(start, body_end);
+        let segments = if delimiter.quoted {
+            // A quoted delimiter makes the body literal: nothing in it is expanded or run.
+            if body.is_empty() {
+                Vec::new()
+            } else {
+                vec![Segment {
+                    kind: SegmentKind::Literal,
+                    span: body,
+                    body,
+                }]
+            }
+        } else {
+            self.here_document_segments(body, pending.operator)?
+        };
+        // With `<<-`, bash strips the leading tabs of every body line before it expands the body, so a substitution
+        // spanning lines runs its text without them, while its spans (lexed again by the parser) keep them. A nested
+        // here-document's delimiter line `\tX` would then end it in bash and not here, hiding the lines after it
+        // (bash 3.2 checked): such a substitution is refused.
+        if pending.strip_tabs
+            && segments.iter().any(|segment| {
+                matches!(segment.kind, SegmentKind::CommandSubstitution | SegmentKind::Backtick)
+                    && self
+                        .src
+                        .get(segment.span.range())
+                        .is_none_or(|text| text.windows(2).any(|pair| pair == b"\n\t"))
+            })
+        {
+            return Err(LexError::AmbiguousHereDocument { span: pending.operator });
+        }
+        self.pos = delimiter_end;
+        Ok(Token {
+            kind: TokenKind::HereDocumentBody(HereDocumentBody {
+                operator: pending.operator,
+                strip_tabs: pending.strip_tabs,
+                quoted: delimiter.quoted,
+                body,
+                segments,
+                delimiter: Span::new(body_end, delimiter_end),
+            }),
+            span: Span::new(start, delimiter_end),
+        })
+    }
+
+    /// From `pos`, finds the first line equal to `delimiter`: returns where it starts (the end of the body) and where
+    /// it ends (past its newline, or at the end of the input). `None` if no line matches.
+    ///
+    /// Lines are compared as bash reads them: with an unquoted delimiter, a backslash that is not itself escaped
+    /// joins a line to the next (bash 3.2: a body line `foo\` followed by `EOF` is the line `fooEOF`, and `EO\`
+    /// followed by `F` ends the body); with `<<-`, leading tabs are removed from the start of the line first.
+    fn find_delimiter_line(&self, delimiter: &Delimiter, strip_tabs: bool) -> Option<(usize, usize)> {
+        let end = self.src.len();
+        let mut line_start = self.pos;
+        let mut logical = Vec::new();
+        while line_start < end {
+            logical.clear();
+            let mut at = line_start;
+            let line_end = loop {
+                let newline = self.find_byte(at, b'\n');
+                let physical_end = newline.unwrap_or(end);
+                let physical = self.src.get(at..physical_end)?;
+                let backslashes = physical.iter().rev().take_while(|&&byte| byte == b'\\').count();
+                if !delimiter.quoted && newline.is_some() && backslashes % 2 == 1 {
+                    logical.extend_from_slice(physical.get(..physical.len() - 1)?);
+                    at = physical_end + 1;
+                    continue;
+                }
+                logical.extend_from_slice(physical);
+                break physical_end;
+            };
+            let text = if strip_tabs {
+                let tabs = logical.iter().take_while(|&&byte| byte == b'\t').count();
+                logical.get(tabs..)?
+            } else {
+                logical.as_slice()
+            };
+            let next_line = (line_end + 1).min(end);
+            if text == delimiter.text.as_slice() {
+                return Some((line_start, next_line));
+            }
+            line_start = next_line;
+        }
+        None
+    }
+
+    /// The segments of an unquoted here-document body at `body`, read like the inside of double quotes except that
+    /// `"` is literal: escapes of `$`, `` ` `` and `\`, line continuations, parameters and substitutions. A separate
+    /// lexer that ends at the body's end reads them, so a construct in the body can never run on into the line after
+    /// it: bash delimits the body first and expands it afterwards. The body counts as one nesting level.
+    fn here_document_segments(&self, body: Span, operator: Span) -> Result<Vec<Segment>, LexError> {
+        let context = LexContext {
+            depth: self.depth,
+            substitutions: self.substitutions,
+            process_substitutions: self.process_substitutions,
+        };
+        let mut lexer = Lexer::new(self.src.get(..body.end).unwrap_or(self.src), body.start, context);
+        lexer.enter(operator)?;
+        let mut segments = SegmentList::default();
+        while let Some(byte) = lexer.peek() {
+            let at = lexer.pos;
+            let segment = match byte {
+                b'\\' if lexer.is_continuation(at) => Some(lexer.line_continuation()),
+                b'\\' if matches!(lexer.byte(at + 1), Some(b'$' | b'`' | b'\\')) => Some(lexer.escape_pair()),
+                b'`' => Some(lexer.backtick()?),
+                b'$' => lexer.dollar(Quoting::InDoubleQuotes)?,
+                _ => None,
+            };
+            lexer.push_segment_or_literal(&mut segments, segment);
+        }
+        Ok(segments.finish(body.end))
     }
 
     /// Spaces, tabs and line continuations.
@@ -456,6 +793,17 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// A backslash at `pos` and the ASCII character it escapes, inside double quotes or a here-document body.
+    fn escape_pair(&mut self) -> Segment {
+        let at = self.pos;
+        self.pos += 2;
+        Segment {
+            kind: SegmentKind::Escape,
+            span: Span::new(at, at + 2),
+            body: Span::new(at + 1, at + 2),
+        }
+    }
+
     /// `'…'`: no escapes; ends at the next `'`.
     fn single_quoted(&mut self) -> Result<Segment, LexError> {
         let start = self.pos;
@@ -519,14 +867,7 @@ impl<'a> Lexer<'a> {
                 b'\\' if self.is_continuation(at) => Some(self.line_continuation()),
                 // Inside double quotes a backslash escapes only `$`, `` ` ``, `"` and `\`; before anything else it
                 // is a literal character.
-                b'\\' if matches!(self.byte(at + 1), Some(b'$' | b'`' | b'"' | b'\\')) => {
-                    self.pos += 2;
-                    Some(Segment {
-                        kind: SegmentKind::Escape,
-                        span: Span::new(at, at + 2),
-                        body: Span::new(at + 1, at + 2),
-                    })
-                }
+                b'\\' if matches!(self.byte(at + 1), Some(b'$' | b'`' | b'"' | b'\\')) => Some(self.escape_pair()),
                 b'`' => Some(self.backtick()?),
                 b'$' => self.dollar(Quoting::InDoubleQuotes)?,
                 _ => None,
@@ -662,9 +1003,10 @@ impl<'a> Lexer<'a> {
                     command_start = reserved.is_some_and(ReservedWord::starts_command);
                 }
                 TokenKind::Redirection(_) => command_start = false,
-                TokenKind::Blank | TokenKind::Comment => {}
+                TokenKind::Blank | TokenKind::Comment | TokenKind::HereDocumentBody(_) => {}
             }
         };
+        self.close_here_documents()?;
         self.substitutions -= 1;
         if process {
             self.process_substitutions -= 1;
@@ -680,7 +1022,8 @@ impl<'a> Lexer<'a> {
             | Construct::Backtick
             | Construct::CommandSubstitution
             | Construct::ParameterExpansion
-            | Construct::ArithmeticExpansion => SegmentKind::CommandSubstitution,
+            | Construct::ArithmeticExpansion
+            | Construct::HereDocument => SegmentKind::CommandSubstitution,
         };
         Ok(Segment {
             kind,
@@ -1413,14 +1756,106 @@ mod tests {
     }
 
     #[test]
-    fn refuses_here_document_bodies_until_they_are_supported() {
-        // KNSH-031 reads bodies; until then a body must never be lexed as commands.
-        let error = lex("cat <<EOF\nrm -rf /\nEOF").unwrap_err();
-        assert_eq!(error, LexError::HereDocumentBody { span: Span::new(4, 6) });
-        let error = lex("x=$(cat <<EOF\nbody\nEOF\n)").unwrap_err();
-        assert!(matches!(error, LexError::HereDocumentBody { .. }));
-        // A here-string has no body.
-        assert!(lex("cat <<<word\nls").is_ok());
+    fn here_string_has_no_body() {
+        // The line after a here-string is a command, not a body.
+        let tokens = lex("cat <<<word\nls").unwrap();
+        assert_eq!(words(&tokens).len(), 3);
+    }
+
+    // ---- Here-documents (KNSH-031) ----
+
+    fn bodies(tokens: &[Token]) -> Vec<&HereDocumentBody> {
+        tokens
+            .iter()
+            .filter_map(|token| match &token.kind {
+                TokenKind::HereDocumentBody(body) => Some(body),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reads_here_document_body_after_the_newline() {
+        let input = "cat <<EOF >out\nline $x\nEOF\necho after";
+        let tokens = lex(input).unwrap();
+        let newline = tokens
+            .iter()
+            .position(|token| token.kind == TokenKind::Newline)
+            .unwrap();
+        let TokenKind::HereDocumentBody(body) = &tokens[newline + 1].kind else {
+            panic!("no body after the newline: {tokens:#?}");
+        };
+        assert_eq!(text(input, body.operator), "<<");
+        assert_eq!(text(input, body.body), "line $x\n");
+        assert_eq!(text(input, body.delimiter), "EOF\n");
+        assert_eq!(text(input, tokens[newline + 1].span), "line $x\nEOF\n");
+        assert!(!body.quoted);
+        assert_eq!(
+            kinds(&body.segments),
+            [&SegmentKind::Literal, &SegmentKind::Parameter, &SegmentKind::Literal]
+        );
+        // The lines after the delimiter are commands again.
+        assert_eq!(text(input, words(&tokens).last().unwrap().segments[0].span), "after");
+    }
+
+    #[test]
+    fn unquoted_body_is_read_like_double_quotes_without_quote_characters() {
+        // `"` is literal in a body, and only `\$`, `` \` ``, `\\` and `\` newline are escapes (bash 3.2).
+        let input = "cat <<EOF\n\"$(a \"b\")\" \\$ \\\" `c`\nEOF";
+        let tokens = lex(input).unwrap();
+        let body = bodies(&tokens)[0];
+        assert_eq!(
+            kinds(&body.segments),
+            [
+                &SegmentKind::Literal,
+                &SegmentKind::CommandSubstitution,
+                &SegmentKind::Literal,
+                &SegmentKind::Escape,
+                &SegmentKind::Literal,
+                &SegmentKind::Backtick,
+                &SegmentKind::Literal,
+            ]
+        );
+        assert_eq!(text(input, body.segments[2].span), "\" ");
+        assert_eq!(text(input, body.segments[4].span), " \\\" ");
+        // A substitution in the body never runs on past it: bash delimits the body first.
+        assert!(matches!(
+            lex("cat <<EOF\n$(a\nEOF\n)"),
+            Err(LexError::Unterminated {
+                construct: Construct::CommandSubstitution,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn quoted_body_is_one_literal() {
+        let input = "cat <<'EOF'\n$(a) `b`\nEOF\n";
+        let tokens = lex(input).unwrap();
+        let body = bodies(&tokens)[0];
+        assert!(body.quoted);
+        assert_eq!(kinds(&body.segments), [&SegmentKind::Literal]);
+        let tokens = lex("cat <<'EOF'\nEOF\n").unwrap();
+        assert_eq!(bodies(&tokens)[0].segments.len(), 0);
+    }
+
+    #[test]
+    fn several_bodies_follow_one_newline_in_operator_order() {
+        let input = "a <<X <<-Y\nx\nX\n\t\ty\n\tY\nb";
+        let tokens = lex(input).unwrap();
+        let found: Vec<(&str, bool)> = bodies(&tokens)
+            .iter()
+            .map(|body| (text(input, body.body), body.strip_tabs))
+            .collect();
+        assert_eq!(found, [("x\n", false), ("\t\ty\n", true)]);
+    }
+
+    #[test]
+    fn missing_delimiter_word_leaves_no_body() {
+        // The parser reports the missing target; the next line is not taken as a body.
+        let tokens = lex("cat << ;\nls").unwrap();
+        assert_eq!(bodies(&tokens).len(), 0);
+        assert_eq!(words(&tokens).len(), 2);
     }
 
     #[test]

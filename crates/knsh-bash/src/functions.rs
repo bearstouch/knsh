@@ -106,7 +106,11 @@ impl<'a> Resolver<'a> {
             unsettling: BTreeSet::new(),
             defined: BTreeSet::new(),
         };
-        for command in script.commands() {
+        // Only this script's own commands: substitutions run in child shells, whose definitions never reach the line,
+        // and their spans may index another text (un-escaped backticks).
+        let mut commands = Vec::new();
+        collect_commands(&script.items, &mut commands);
+        for &command in &commands {
             match command {
                 Command::Simple(simple) => {
                     if let Some(name) = simple.name() {
@@ -128,7 +132,11 @@ impl<'a> Resolver<'a> {
                 Command::Compound(_) | Command::Unsupported(_) => {}
             }
         }
-        for definition in script.function_definitions() {
+        let definitions = commands.iter().filter_map(|command| match command {
+            Command::FunctionDefinition(definition) => Some(definition),
+            Command::Simple(_) | Command::Compound(_) | Command::Unsupported(_) => None,
+        });
+        for definition in definitions {
             if !resolver.is_settled_body(&definition.body)
                 && let Some(name) = static_text(&definition.name.word, input)
             {
@@ -512,18 +520,28 @@ fn hides_commands(construct: UnsupportedConstruct) -> bool {
             CompoundStart::Arithmetic | CompoundStart::ReservedWord(ReservedWord::DoubleLeftBracket),
         ) => false,
         UnsupportedConstruct::Compound(CompoundStart::ArithmeticFor | CompoundStart::ReservedWord(_))
-        | UnsupportedConstruct::HereDocument
+        | UnsupportedConstruct::SubstitutionInExpansion
+        | UnsupportedConstruct::OpaqueHereDocument
         | UnsupportedConstruct::ArrayAssignment
         | UnsupportedConstruct::SubscriptAssignment
         | UnsupportedConstruct::RedirectionVariable => true,
     }
 }
 
-/// Whether expanding the targets of `redirections` may abandon the top-level command.
+/// Whether expanding the targets of `redirections`, or the bodies of unquoted here-documents among them, may abandon
+/// the top-level command. A body is expanded like double-quoted text (no globbing), so only its arithmetic and `${…}`
+/// expansions count.
 fn redirections_may_abandon(redirections: &[Redirect], input: &str) -> bool {
-    redirections
-        .iter()
-        .any(|redirect| word_may_abandon(&redirect.target.word, input, false))
+    redirections.iter().any(|redirect| {
+        word_may_abandon(&redirect.target.word, input, false)
+            || redirect.here_document.as_ref().is_some_and(|document| {
+                !document.quoted
+                    && document
+                        .segments
+                        .iter()
+                        .any(|segment| segment_may_abandon(segment, input, true))
+            })
+    })
 }
 
 /// Whether expanding `word` may fail in a way that abandons the rest of the top-level command: arithmetic and `${…}`
@@ -583,7 +601,7 @@ fn is_identifier(name: &str) -> bool {
 /// without glob, brace or tilde characters (which could expand into other words), escapes, line continuations,
 /// single quotes, and double quotes holding only text and escapes. `None` for anything else (expansions, `$'…'`).
 /// A call is looked up by this text: `"f"` and `\f` both call function `f`.
-fn static_text(word: &Word, input: &str) -> Option<String> {
+pub(crate) fn static_text(word: &Word, input: &str) -> Option<String> {
     let mut text = String::new();
     for segment in &word.segments {
         push_static_segment(segment, input, false, &mut text)?;

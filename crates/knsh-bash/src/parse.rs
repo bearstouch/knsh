@@ -28,30 +28,47 @@
 //! closing word (`then`, `fi`, `done`, `}`, …). Bash 3.2 (`/bin/bash` on macOS) is the reference; constructs bash 4
 //! added (`;&`, `;;&`) are parsed the bash 4 way, as KNSH-029 did for `|&`.
 //!
+//! Words are read recursively (KNSH-031): every `$( … )`, backtick, `<( … )` and `>( … )` in a word, an assignment, a
+//! redirection target or an unquoted here-document body is lexed and parsed again as a nested [`Script`], so the
+//! commands it runs are in the tree. A backtick body is first un-escaped the way bash does it. A here-document's body
+//! (read by the lexer) is attached to its `<<` or `<<-` redirection, and a here-document or here-string read by a
+//! shell or interpreter is marked ([`Redirect::feeds_interpreter`], see `interpreters`).
+//!
 //! Anything else that bash accepts is either kept whole as a [`Command::Unsupported`] node, when its extent is
-//! certain (`select`, `[[ … ]]`, `(( … ))`, `for (( … ))`), or refused with [`ParseError::Unsupported`] (here-documents,
-//! array assignments, `coproc`, `time`), and anything bash rejects is a syntax error. Either way the caller classifies
-//! the construct or the line as dynamic (KNSH-032): no error path and no unsupported node leads to an allow.
+//! certain (`select`, `[[ … ]]`, `(( … ))`, `for (( … ))`), or refused with [`ParseError::Unsupported`] (array
+//! assignments, `coproc`, `time`, a substitution inside `${ … }` or `$(( … ))`), and anything bash rejects is a syntax
+//! error. Either way the caller classifies the construct or the line as dynamic (KNSH-032): no error path and no
+//! unsupported node leads to an allow.
 //!
 //! Lists, and-or lists and pipelines are read iteratively, so the length of a line never deepens the call stack. Each
-//! nested list (inside a compound command or function body) enters [`Parser::list`] again with its depth, which is
-//! checked against [`MAX_NESTING_DEPTH`]; scanning `[[ … ]]` and `(( … ))` is iterative.
+//! nested list (inside a compound command, function body or substitution) enters [`Parser::list`] again with its
+//! depth, which is checked against [`MAX_NESTING_DEPTH`]; scanning `[[ … ]]` and `(( … ))` is iterative. A nested
+//! script starts one list deeper than the list holding its word, and its lexer starts at the quote and substitution
+//! depth of its body, so neither limit resets inside a substitution.
 //!
 //! After parsing, [`mark_function_calls`] marks the calls that certainly reach a function defined earlier in the line.
+//! Calls inside substitutions are never marked: their bodies run in child shells parsed under conditions the line does
+//! not show (aliases, functions of the parent), so they are always resolved as programs, which is safe.
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::mem;
 
 use crate::ast::{
     AndOr, AndOrOperator, AndOrPart, Assignment, CaseClause, CaseCommand, CaseTerminator, CaseTerminatorKind, Command,
-    CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems, FunctionDefinition, Group, IfClause,
-    IfCommand, ListItem, LoopBody, LoopCommand, PipeOperator, Pipeline, PipelinePart, Redirect, Script, Separator,
-    SeparatorKind, SimpleCommand, Subshell, UnsupportedCommand,
+    CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems, FunctionDefinition, Group,
+    HereDocument, IfClause, IfCommand, ListItem, LoopBody, LoopCommand, PipeOperator, Pipeline, PipelinePart, Redirect,
+    Script, Separator, SeparatorKind, SimpleCommand, Subshell, Substitution, SubstitutionKind, UnsupportedCommand,
 };
-use crate::error::{CompoundStart, ParseError, Unexpected, UnsupportedConstruct};
+use crate::error::{CompoundStart, LexError, ParseError, Unexpected, UnsupportedConstruct};
 use crate::functions::mark_function_calls;
-use crate::lex::lex;
-use crate::limits::MAX_NESTING_DEPTH;
-use crate::token::{Operator, Redirection, RedirectionOperator, ReservedWord, Span, Token, TokenKind, Word};
+use crate::interpreters::mark_interpreter_inputs;
+use crate::lex::{LexContext, lex_range};
+use crate::limits::{MAX_INPUT_LEN, MAX_NESTING_DEPTH};
+use crate::token::{
+    HereDocumentBody, Operator, Redirection, RedirectionOperator, ReservedWord, Segment, SegmentKind, Span, Token,
+    TokenKind, Word,
+};
 
 /// Parses a whole command line into a [`Script`].
 ///
@@ -62,9 +79,10 @@ use crate::token::{Operator, Redirection, RedirectionOperator, ReservedWord, Spa
 ///
 /// # Errors
 ///
-/// Returns the first problem found, with its span: a [`LexError`](crate::LexError) wrapped in
-/// [`ParseError::Lex`], a bash syntax error, or a construct this parser cannot delimit. A caller must treat any error
-/// as dynamic code, never as an allow (decision 6, KNSH-032).
+/// Returns the first problem found, with its span: a [`LexError`] wrapped in [`ParseError::Lex`], a bash syntax error,
+/// or a construct this parser cannot delimit. The line is lexed whole before anything is parsed, so a lexer error in
+/// the line always wins; errors inside a substitution's body come from parsing it, with spans in the line. A caller
+/// must treat any error as dynamic code, never as an allow (decision 6, KNSH-032).
 ///
 /// # Example
 ///
@@ -82,28 +100,55 @@ use crate::token::{Operator, Redirection, RedirectionOperator, ReservedWord, Spa
 /// assert!(call.function_call.is_some());
 /// ```
 pub fn parse(input: &str) -> Result<Script, ParseError> {
-    let tokens = lex(input)?;
+    // Checked before anything is read, as `lex` does (nested sources skip the check: they lie inside this one).
+    if input.len() > MAX_INPUT_LEN {
+        return Err(LexError::InputTooLarge {
+            len: input.len(),
+            limit: MAX_INPUT_LEN,
+        }
+        .into());
+    }
+    let mut script = parse_source(input, Span::new(0, input.len()), LexContext::default(), 0)?;
+    mark_function_calls(&mut script, input);
+    Ok(script)
+}
+
+/// Parses the part of `input` at `range` (the whole line, or a substitution body) as a script whose lists start at
+/// nesting `depth`, lexing it in `context` (see [`LexContext`]). Spans index `input`. Here-documents and here-strings
+/// fed to an interpreter are marked; function calls are not (only [`parse`] marks them, for the top-level script).
+fn parse_source(input: &str, range: Span, context: LexContext, depth: usize) -> Result<Script, ParseError> {
+    let tokens = lex_range(input, range, context)?;
     // Blanks and comments separate words but never change the structure; newlines do, so they stay. Comment spans
-    // are kept aside for the one place that must know about them (`(( … ))`).
+    // are kept aside for the one place that must know about them (`(( … ))`). Here-document bodies are set aside by
+    // operator, to be attached to the redirection that reads them.
     let mut comments = Vec::new();
+    let mut here_documents = BTreeMap::new();
     let tokens: Vec<Token> = tokens
         .into_iter()
-        .filter(|token| match token.kind {
-            TokenKind::Blank => false,
+        .filter_map(|token| match token.kind {
+            TokenKind::Blank => None,
             TokenKind::Comment => {
                 comments.push(token.span);
-                false
+                None
             }
-            TokenKind::Word(_) | TokenKind::Operator(_) | TokenKind::Redirection(_) | TokenKind::Newline => true,
+            TokenKind::HereDocumentBody(body) => {
+                here_documents.insert(body.operator.start, body);
+                None
+            }
+            TokenKind::Word(_) | TokenKind::Operator(_) | TokenKind::Redirection(_) | TokenKind::Newline => Some(token),
         })
         .collect();
     let mut parser = Parser {
         input,
+        end: range.end,
         tokens,
         position: 0,
         comments,
+        here_documents,
+        context,
+        depth,
     };
-    let items = parser.list(0)?;
+    let items = parser.list(depth)?;
     // The top-level list stops at the end of the input or before a token that only closes a construct (`)`, `;;`,
     // `fi`, `}`, …), which has nothing to close here.
     if let Some(token) = parser.peek() {
@@ -112,18 +157,26 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
             span: token.span,
         });
     }
-    let mut script = Script {
-        items,
-        span: Span::new(0, input.len()),
-    };
-    mark_function_calls(&mut script, input);
+    // A body no redirection took belongs to a `<<` the parser kept inside an unsupported construct, where bash reads
+    // a shift or a comparison (`(( x << 2 ))`), not a here-document. The lines the lexer took for its body would then
+    // be commands nobody sees, so the line is refused.
+    if let Some(body) = parser.here_documents.values().next() {
+        return Err(ParseError::Unsupported {
+            construct: UnsupportedConstruct::OpaqueHereDocument,
+            span: body.operator,
+        });
+    }
+    let mut script = Script { items, span: range };
+    mark_interpreter_inputs(&mut script.items, input);
     Ok(script)
 }
 
 /// The parser state: the significant tokens and how far they are read.
 struct Parser<'a> {
-    /// The line, needed to read assignment names out of word spans.
+    /// The text the spans index: the line, or the un-escaped body of a backtick substitution.
     input: &'a str,
+    /// Where the source being parsed ends in `input` (the end of the input, or of a substitution body).
+    end: usize,
     /// Tokens with blanks and comments removed. A consumed token is left behind as a blank placeholder, so taking it
     /// never clones its word; the parser never looks behind `position`.
     tokens: Vec<Token>,
@@ -131,6 +184,12 @@ struct Parser<'a> {
     position: usize,
     /// Where the comments were, in source order.
     comments: Vec<Span>,
+    /// The here-document bodies not yet attached to a redirection, by where their operator starts.
+    here_documents: BTreeMap<usize, HereDocumentBody>,
+    /// How the source was lexed, from which a substitution body's lexing context follows.
+    context: LexContext,
+    /// The nesting depth of the list being read; a substitution's script starts one deeper.
+    depth: usize,
 }
 
 /// The constructs that start with a word or operator in command position, other than simple commands.
@@ -204,6 +263,16 @@ impl Parser<'_> {
                 limit: MAX_NESTING_DEPTH,
             });
         }
+        // Words read in this list nest their substitutions one level below it; the enclosing list's depth is put
+        // back on the way out.
+        let enclosing = mem::replace(&mut self.depth, depth);
+        let items = self.list_items(depth)?;
+        self.depth = enclosing;
+        Ok(items)
+    }
+
+    /// The loop of [`Parser::list`].
+    fn list_items(&mut self, depth: usize) -> Result<Vec<ListItem>, ParseError> {
         let mut items = Vec::new();
         loop {
             self.skip_newlines();
@@ -239,7 +308,8 @@ impl Parser<'_> {
             | TokenKind::Word(_)
             | TokenKind::Redirection(_)
             | TokenKind::Blank
-            | TokenKind::Comment => {
+            | TokenKind::Comment
+            | TokenKind::HereDocumentBody(_) => {
                 return Err(ParseError::UnexpectedToken {
                     token: unexpected(&token.kind),
                     span: token.span,
@@ -356,7 +426,7 @@ impl Parser<'_> {
                 });
             }
             // A newline cannot start a command here: every caller has already skipped the newlines bash allows.
-            TokenKind::Newline | TokenKind::Blank | TokenKind::Comment => {
+            TokenKind::Newline | TokenKind::Blank | TokenKind::Comment | TokenKind::HereDocumentBody(_) => {
                 return Err(ParseError::UnexpectedToken {
                     token: unexpected(&token.kind),
                     span,
@@ -383,17 +453,18 @@ impl Parser<'_> {
         while let Some(token) = self.next_if(continues_simple_command) {
             match token.kind {
                 TokenKind::Word(word) => {
-                    let word = CommandWord { word, span: token.span };
-                    end = word.span.end;
-                    braced_word_end = self.is_braced(word.span).then_some(word.span.end);
+                    let span = token.span;
+                    end = span.end;
+                    braced_word_end = self.is_braced(span).then_some(span.end);
                     // Only words before the command name can be assignments: `env A=1` passes `A=1` as an argument.
                     if words.is_empty()
-                        && let Some(assignment) = self.assignment_shape(&word.word, word.span)?
+                        && let Some(mut assignment) = self.assignment_shape(&word, span)?
                     {
                         self.reject_array_value(&assignment)?;
+                        assignment.substitutions = self.substitutions(&assignment.word.segments, 0)?;
                         assignments.push(assignment);
                     } else {
-                        words.push(word);
+                        words.push(self.command_word(word, span)?);
                     }
                 }
                 TokenKind::Redirection(redirection) => {
@@ -414,7 +485,11 @@ impl Parser<'_> {
                     return Err(self.left_paren_in_command(&words, token.span));
                 }
                 // `continues_simple_command` lets none of these through.
-                TokenKind::Operator(_) | TokenKind::Newline | TokenKind::Blank | TokenKind::Comment => break,
+                TokenKind::Operator(_)
+                | TokenKind::Newline
+                | TokenKind::Blank
+                | TokenKind::Comment
+                | TokenKind::HereDocumentBody(_) => break,
             }
         }
         Ok(SimpleCommand {
@@ -426,15 +501,20 @@ impl Parser<'_> {
         })
     }
 
-    /// Reads the target word of a redirection whose operator token (at `operator_span`) was just consumed.
-    /// Here-documents are refused until their bodies are read (KNSH-031).
+    /// Reads the target word of a redirection whose operator token (at `operator_span`) was just consumed, and for a
+    /// here-document attaches the body the lexer read for it.
     fn redirect(&mut self, redirection: Redirection, operator_span: Span) -> Result<Redirect, ParseError> {
-        match redirection.operator {
+        // The target must be the very next token: a newline or an operator there is a syntax error in bash.
+        let target = match self.next_if(|kind| matches!(kind, TokenKind::Word(_))) {
+            Some(Token {
+                kind: TokenKind::Word(word),
+                span,
+            }) => self.command_word(word, span)?,
+            Some(_) | None => return Err(ParseError::MissingRedirectionTarget { span: operator_span }),
+        };
+        let here_document = match redirection.operator {
             RedirectionOperator::HereDocument | RedirectionOperator::HereDocumentStripTabs => {
-                return Err(ParseError::Unsupported {
-                    construct: UnsupportedConstruct::HereDocument,
-                    span: operator_span,
-                });
+                Some(self.here_document(operator_span)?)
             }
             RedirectionOperator::Input
             | RedirectionOperator::Output
@@ -445,22 +525,162 @@ impl Parser<'_> {
             | RedirectionOperator::DuplicateInput
             | RedirectionOperator::DuplicateOutput
             | RedirectionOperator::OutputAll
-            | RedirectionOperator::AppendAll => {}
-        }
-        // The target must be the very next token: a newline or an operator there is a syntax error in bash.
-        let target = match self.next_if(|kind| matches!(kind, TokenKind::Word(_))) {
-            Some(Token {
-                kind: TokenKind::Word(word),
-                span,
-            }) => CommandWord { word, span },
-            Some(_) | None => return Err(ParseError::MissingRedirectionTarget { span: operator_span }),
+            | RedirectionOperator::AppendAll => None,
         };
         Ok(Redirect {
             fd: redirection.fd,
             operator: redirection.operator,
             span: Span::new(operator_span.start, target.span.end),
             target,
+            here_document,
+            // Set afterwards, once the command reading it is known (`mark_interpreter_inputs`).
+            feeds_interpreter: false,
         })
+    }
+
+    /// The body of the here-document whose operator is at `operator`, with the substitutions of an unquoted body
+    /// parsed. The lexer reads a body only at the newline ending the operator's line, so a line that ends first has
+    /// none: bash would read an empty body with a warning, and the line is refused instead (KNSH-031).
+    fn here_document(&mut self, operator: Span) -> Result<HereDocument, ParseError> {
+        let Some(body) = self.here_documents.remove(&operator.start) else {
+            return Err(ParseError::MissingHereDocumentBody { span: operator });
+        };
+        let substitutions = if body.quoted {
+            Vec::new()
+        } else {
+            // The body is one nesting level, like double quotes (the lexer entered it as one). It is not double-quoted
+            // text for a backtick in it, though: bash 3.2 keeps the backslash of `\"` there (checked).
+            self.substitutions(&body.segments, 1)?
+        };
+        Ok(HereDocument {
+            strip_tabs: body.strip_tabs,
+            quoted: body.quoted,
+            body: body.body,
+            segments: body.segments,
+            substitutions,
+            delimiter: body.delimiter,
+        })
+    }
+
+    // ---- Substitutions ----
+
+    /// A word with the substitutions in it parsed.
+    fn command_word(&self, word: Word, span: Span) -> Result<CommandWord, ParseError> {
+        let substitutions = self.substitutions(&word.segments, 0)?;
+        Ok(CommandWord {
+            word,
+            span,
+            substitutions,
+        })
+    }
+
+    /// The substitutions in `segments`, in source order, each parsed into a nested script. `quotes` is how many
+    /// quotes (or here-document bodies) enclose the segments, for the nested lexer's depth; the segments themselves
+    /// are never inside double quotes (a here-document body is not, for the un-escaping of its backticks).
+    fn substitutions(&self, segments: &[Segment], quotes: usize) -> Result<Vec<Substitution>, ParseError> {
+        let mut found = Vec::new();
+        self.collect_substitutions(segments, quotes, false, &mut found)?;
+        Ok(found)
+    }
+
+    /// The recursion of [`Parser::substitutions`]: appends the substitutions of `segments` to `found`.
+    /// `in_double_quotes` is set inside `"…"` or `$"…"`, where a backtick body also loses the backslash of `\"`.
+    fn collect_substitutions(
+        &self,
+        segments: &[Segment],
+        quotes: usize,
+        in_double_quotes: bool,
+        found: &mut Vec<Substitution>,
+    ) -> Result<(), ParseError> {
+        for segment in segments {
+            match &segment.kind {
+                // `$"…"` is read like `"…"`, and both count as a quote towards the nesting depth, as in the lexer.
+                SegmentKind::DoubleQuoted(inner) | SegmentKind::Locale(inner) => {
+                    self.collect_substitutions(inner, quotes + 1, true, found)?;
+                }
+                SegmentKind::CommandSubstitution => {
+                    found.push(self.nested(segment, SubstitutionKind::Command, quotes)?);
+                }
+                SegmentKind::InputProcessSubstitution => {
+                    found.push(self.nested(segment, SubstitutionKind::InputProcess, quotes)?);
+                }
+                SegmentKind::OutputProcessSubstitution => {
+                    found.push(self.nested(segment, SubstitutionKind::OutputProcess, quotes)?);
+                }
+                SegmentKind::Backtick => found.push(self.backtick(segment, quotes, in_double_quotes)?),
+                SegmentKind::ParameterExpansion | SegmentKind::Arithmetic => {
+                    if self.hides_substitution(segment.body) {
+                        return Err(ParseError::Unsupported {
+                            construct: UnsupportedConstruct::SubstitutionInExpansion,
+                            span: segment.span,
+                        });
+                    }
+                }
+                SegmentKind::Literal
+                | SegmentKind::Escape
+                | SegmentKind::LineContinuation
+                | SegmentKind::SingleQuoted
+                | SegmentKind::AnsiC
+                | SegmentKind::Parameter => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Parses the body of `$( … )`, `<( … )` or `>( … )` in place: its spans index the same text as the word's.
+    fn nested(&self, segment: &Segment, kind: SubstitutionKind, quotes: usize) -> Result<Substitution, ParseError> {
+        let process = matches!(kind, SubstitutionKind::InputProcess | SubstitutionKind::OutputProcess);
+        // The body is lexed again exactly as the enclosing lexer read it: inside one more substitution (so the bash
+        // 3.2 comment and here-document rules still apply), at the depth it had there.
+        let context = LexContext {
+            depth: self.context.depth + quotes + 1,
+            substitutions: self.context.substitutions + 1,
+            process_substitutions: self.context.process_substitutions + usize::from(process),
+        };
+        let script = parse_source(self.input, segment.body, context, self.depth + 1)?;
+        Ok(Substitution {
+            kind,
+            span: segment.span,
+            text: None,
+            script,
+        })
+    }
+
+    /// Parses the body of a backtick substitution, after un-escaping it as bash does ([`unescape_backtick`]). Bash
+    /// reads the un-escaped body afresh when it runs it, so its lexing starts outside any substitution; only the depth
+    /// carries on. When un-escaping changes nothing the body is parsed in place; otherwise the un-escaped text is
+    /// parsed and kept, and an error's span is mapped back onto the line. `in_double_quotes` is set when the backticks
+    /// are inside `"…"` or `$"…"` (not in a here-document body, where bash keeps the backslash of `\"`).
+    fn backtick(&self, segment: &Segment, quotes: usize, in_double_quotes: bool) -> Result<Substitution, ParseError> {
+        let context = LexContext {
+            depth: self.context.depth + quotes + 1,
+            substitutions: 0,
+            process_substitutions: 0,
+        };
+        let body = segment.body.text(self.input).unwrap_or_default();
+        let (text, script) = match unescape_backtick(body, in_double_quotes, None) {
+            Cow::Borrowed(_) => (None, parse_source(self.input, segment.body, context, self.depth + 1)?),
+            Cow::Owned(text) => {
+                let script = parse_source(&text, Span::new(0, text.len()), context, self.depth + 1)
+                    .map_err(|error| error_on_line(error, segment.body, body, in_double_quotes))?;
+                (Some(text), script)
+            }
+        };
+        Ok(Substitution {
+            kind: SubstitutionKind::Backtick,
+            span: segment.span,
+            text,
+            script,
+        })
+    }
+
+    /// Whether the body of `${ … }`, `$(( … ))` or `$[ … ]` at `body` may hold a command substitution, backtick or
+    /// process substitution. The lexer keeps those bodies whole, so a substitution there would run unseen; any
+    /// `` ` ``, `$(`, `<(` or `>(` (line continuations removed, quotes not looked at) counts, which errs towards
+    /// refusing.
+    fn hides_substitution(&self, body: Span) -> bool {
+        let text = body.text(self.input).unwrap_or_default().replace("\\\n", "");
+        text.contains('`') || text.contains("$(") || text.contains("<(") || text.contains(">(")
     }
 
     /// Reads the redirections written after a compound command; bash allows nothing else before the next operator.
@@ -472,7 +692,8 @@ impl Parser<'_> {
             | TokenKind::Operator(_)
             | TokenKind::Newline
             | TokenKind::Blank
-            | TokenKind::Comment => None,
+            | TokenKind::Comment
+            | TokenKind::HereDocumentBody(_) => None,
         }) {
             redirections.push(self.redirect(redirection, span)?);
         }
@@ -561,7 +782,8 @@ impl Parser<'_> {
                 | TokenKind::Redirection(_)
                 | TokenKind::Newline
                 | TokenKind::Blank
-                | TokenKind::Comment => {}
+                | TokenKind::Comment
+                | TokenKind::HereDocumentBody(_) => {}
             }
             index += 1;
         };
@@ -705,9 +927,13 @@ impl Parser<'_> {
                 return Err(ParseError::Unclosed { span: start });
             };
             match token.kind {
-                TokenKind::Word(word) => words.push(CommandWord { word, span: token.span }),
+                TokenKind::Word(word) => words.push(self.command_word(word, token.span)?),
                 TokenKind::Operator(Operator::Semicolon) | TokenKind::Newline => break,
-                TokenKind::Operator(_) | TokenKind::Redirection(_) | TokenKind::Blank | TokenKind::Comment => {
+                TokenKind::Operator(_)
+                | TokenKind::Redirection(_)
+                | TokenKind::Blank
+                | TokenKind::Comment
+                | TokenKind::HereDocumentBody(_) => {
                     return Err(ParseError::UnexpectedToken {
                         token: unexpected(&token.kind),
                         span: token.span,
@@ -808,7 +1034,8 @@ impl Parser<'_> {
                 | TokenKind::Redirection(_)
                 | TokenKind::Newline
                 | TokenKind::Blank
-                | TokenKind::Comment => None,
+                | TokenKind::Comment
+                | TokenKind::HereDocumentBody(_) => None,
             })
             .map(|(kind, span)| CaseTerminator { kind, span });
         Ok(CaseClause {
@@ -843,7 +1070,8 @@ impl Parser<'_> {
                 | TokenKind::Operator(_)
                 | TokenKind::Redirection(_)
                 | TokenKind::Blank
-                | TokenKind::Comment => {}
+                | TokenKind::Comment
+                | TokenKind::HereDocumentBody(_) => {}
             }
         };
         Ok(CompoundCore::Unsupported(
@@ -940,6 +1168,8 @@ impl Parser<'_> {
                             append: plus,
                             value: Span::new(at + 1, span.end),
                             word: word.clone(),
+                            // Parsed by the caller once the word is known to be an assignment.
+                            substitutions: Vec::new(),
                             span,
                         }));
                     }
@@ -1104,7 +1334,7 @@ impl Parser<'_> {
             Some(Token {
                 kind: TokenKind::Word(word),
                 span,
-            }) => Ok(CommandWord { word, span }),
+            }) => self.command_word(word, span),
             Some(_) | None => Err(self.unexpected_or_unclosed(start)),
         }
     }
@@ -1133,10 +1363,72 @@ impl Parser<'_> {
         while self.next_if(|kind| matches!(kind, TokenKind::Newline)).is_some() {}
     }
 
-    /// An empty span at the end of the input, for errors at the end of the line.
+    /// An empty span at the end of the source, for errors at the end of the line (or of a substitution body).
     const fn end_span(&self) -> Span {
-        Span::new(self.input.len(), self.input.len())
+        Span::new(self.end, self.end)
     }
+}
+
+/// Moves `error`, found while parsing the un-escaped text of the backtick body at `body_span` (whose text in the line
+/// is `body`), back onto the line. The body is un-escaped again with origins recorded: only the error path pays for
+/// them. An offset past the un-escaped text (an error at its end) maps to the end of the body.
+fn error_on_line(error: ParseError, body_span: Span, body: &str, in_double_quotes: bool) -> ParseError {
+    let mut origins = Vec::new();
+    unescape_backtick(body, in_double_quotes, Some(&mut origins));
+    let origin = |offset: usize| {
+        origins
+            .get(offset)
+            .map_or(body_span.end, |origin| body_span.start + origin)
+    };
+    error.map_span(|span| Span::new(origin(span.start), origin(span.end)))
+}
+
+/// Un-escapes a backtick body as bash does before reading it as commands: a backslash is removed before `$`, `` ` ``
+/// and `\` (and before `"` when the backticks are inside double quotes), and a line continuation (`\` newline) is
+/// removed entirely; any other backslash stays. Checked against bash 3.2: the body `` echo \`date\` `` runs `date`, and a
+/// comment ending in `\` newline inside backticks swallows the next line. Returns `body` itself when nothing changes.
+///
+/// With `origins`, records for each byte of the result its offset in `body`, to map spans back onto the line.
+fn unescape_backtick<'b>(body: &'b str, in_double_quotes: bool, mut origins: Option<&mut Vec<usize>>) -> Cow<'b, str> {
+    let bytes = body.as_bytes();
+    let mut text = String::new();
+    let mut changed = false;
+    // Up to where `body` has been copied into `text`.
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes.get(at) != Some(&b'\\') {
+            at += 1;
+            continue;
+        }
+        let (resume, next_copy) = match bytes.get(at + 1) {
+            // `\` newline: both bytes go.
+            Some(b'\n') => (at + 2, at + 2),
+            // The backslash goes; the byte it escapes is kept, and never read as an escape itself.
+            Some(b'$' | b'`' | b'\\') => (at + 2, at + 1),
+            Some(b'"') if in_double_quotes => (at + 2, at + 1),
+            // A backslash before anything else is kept, with the byte it precedes.
+            Some(_) | None => {
+                at += 2;
+                continue;
+            }
+        };
+        text.push_str(body.get(copied..at).unwrap_or_default());
+        if let Some(origins) = origins.as_deref_mut() {
+            origins.extend(copied..at);
+        }
+        changed = true;
+        copied = next_copy;
+        at = resume;
+    }
+    if !changed && origins.is_none() {
+        return Cow::Borrowed(body);
+    }
+    text.push_str(body.get(copied..).unwrap_or_default());
+    if let Some(origins) = origins {
+        origins.extend(copied..bytes.len());
+    }
+    Cow::Owned(text)
 }
 
 /// The compound command a token starts in command position, if any. A `(` always starts one (a subshell or `((`).
@@ -1175,7 +1467,8 @@ fn compound_start(kind: &TokenKind) -> Option<CompoundStartToken> {
         | TokenKind::Redirection(_)
         | TokenKind::Newline
         | TokenKind::Blank
-        | TokenKind::Comment => None,
+        | TokenKind::Comment
+        | TokenKind::HereDocumentBody(_) => None,
     }
 }
 
@@ -1209,7 +1502,8 @@ fn closes_list(kind: &TokenKind) -> bool {
         | TokenKind::Redirection(_)
         | TokenKind::Newline
         | TokenKind::Blank
-        | TokenKind::Comment => false,
+        | TokenKind::Comment
+        | TokenKind::HereDocumentBody(_) => false,
     }
 }
 
@@ -1242,7 +1536,8 @@ const fn and_or_operator(kind: &TokenKind) -> Option<AndOrOperator> {
         | TokenKind::Redirection(_)
         | TokenKind::Newline
         | TokenKind::Blank
-        | TokenKind::Comment => None,
+        | TokenKind::Comment
+        | TokenKind::HereDocumentBody(_) => None,
     }
 }
 
@@ -1266,7 +1561,8 @@ const fn pipe_operator(kind: &TokenKind) -> Option<PipeOperator> {
         | TokenKind::Redirection(_)
         | TokenKind::Newline
         | TokenKind::Blank
-        | TokenKind::Comment => None,
+        | TokenKind::Comment
+        | TokenKind::HereDocumentBody(_) => None,
     }
 }
 
@@ -1327,7 +1623,9 @@ fn unexpected(kind: &TokenKind) -> Unexpected {
         }) => Unexpected::ReservedWord(*reserved),
         TokenKind::Word(_) | TokenKind::Redirection(_) => Unexpected::Word,
         // Blanks and comments are removed before parsing, so only a newline reaches this arm in practice.
-        TokenKind::Newline | TokenKind::Blank | TokenKind::Comment => Unexpected::Newline,
+        TokenKind::Newline | TokenKind::Blank | TokenKind::Comment | TokenKind::HereDocumentBody(_) => {
+            Unexpected::Newline
+        }
     }
 }
 
@@ -1703,9 +2001,7 @@ mod tests {
     // ---- Constructs refused until a later story (fail closed, decision 6) ----
 
     #[test]
-    fn here_documents_are_unsupported_for_now() {
-        assert_eq!(unsupported("cat <<EOF"), UnsupportedConstruct::HereDocument);
-        assert_eq!(unsupported("cat <<-EOF"), UnsupportedConstruct::HereDocument);
+    fn here_string_is_a_redirection_with_its_word_as_target() {
         // A here-string is an ordinary redirection with its word as target.
         let input = "cat <<< 'text'";
         let command = only_command(input);
@@ -1789,9 +2085,13 @@ mod tests {
         // KNSH-032: nested lists (KNSH-030, KNSH-031) enter `list` with their depth; past the limit it refuses.
         let parser = || Parser {
             input: "a",
-            tokens: lex("a").unwrap(),
+            end: 1,
+            tokens: crate::lex::lex("a").unwrap(),
             position: 0,
             comments: Vec::new(),
+            here_documents: BTreeMap::new(),
+            context: LexContext::default(),
+            depth: 0,
         };
         assert_eq!(
             parser().list(MAX_NESTING_DEPTH + 1),
@@ -2608,5 +2908,400 @@ mod tests {
         let script = parse(&input).unwrap();
         assert_eq!(script.simple_commands().count(), 1 + 2 * 20_000 + 1);
         assert!(script.simple_commands().last().unwrap().function_call.is_some());
+    }
+
+    // ---- Story unit tests (KNSH-031) ----
+
+    /// The name of every simple command of `input`, substitutions included, read in the text its spans index.
+    fn deep_names(input: &str) -> Vec<String> {
+        parse(input)
+            .unwrap()
+            .simple_commands_with_source(input)
+            .filter_map(|(source, command)| command.name().map(|name| text(source, name.span).to_owned()))
+            .collect()
+    }
+
+    /// The first simple command of the top-level script.
+    fn only_top_command(input: &str) -> SimpleCommand {
+        let script = parse(input).unwrap();
+        match &script.items[0].and_or.first.first {
+            Command::Simple(simple) => simple.clone(),
+            other => panic!("{input:?} gave {other:?}"),
+        }
+    }
+
+    /// The redirections of the only simple command of `input` at the top level.
+    fn top_redirections(input: &str) -> Vec<Redirect> {
+        let script = parse(input).unwrap();
+        match &script.items[0].and_or.first.first {
+            Command::Simple(simple) => simple.redirections.clone(),
+            other => panic!("{input:?} gave {other:?}"),
+        }
+    }
+
+    fn here_document_body<'a>(input: &'a str, redirect: &Redirect) -> &'a str {
+        text(input, redirect.here_document.as_ref().unwrap().body)
+    }
+
+    #[test]
+    fn parses_nested_command_substitution() {
+        // FR-LC-02, decision 6: substitutions are parsed recursively, and their commands are decided too.
+        let input = "echo $(a $(b))";
+        assert_eq!(deep_names(input), ["echo", "a", "b"]);
+        let command = only_top_command(input);
+        let outer = &command.words[1].substitutions[0];
+        assert_eq!(outer.kind, SubstitutionKind::Command);
+        assert_eq!(text(input, outer.span), "$(a $(b))");
+        assert_eq!(text(input, outer.script.span), "a $(b)");
+        assert!(outer.text.is_none());
+    }
+
+    #[test]
+    fn parses_backticks_with_escaped_backtick() {
+        // Bash un-escapes `\`` before reading the body, so the inner backticks are a nested substitution.
+        let input = r"echo `a \`b\``";
+        assert_eq!(deep_names(input), ["echo", "a", "b"]);
+        let command = only_top_command(input);
+        let outer = &command.words[1].substitutions[0];
+        assert_eq!(outer.kind, SubstitutionKind::Backtick);
+        assert_eq!(outer.text.as_deref(), Some("a `b`"));
+        let inner = parse(input).unwrap();
+        let (source, b) = inner.simple_commands_with_source(input).nth(2).unwrap();
+        assert_eq!(source, "a `b`");
+        assert_eq!(text(source, b.span), "b");
+        // A body that needs no un-escaping is parsed in place, with spans in the line.
+        let input = "echo `date`";
+        let command = only_top_command(input);
+        assert!(command.words[1].substitutions[0].text.is_none());
+        assert_eq!(deep_names(input), ["echo", "date"]);
+    }
+
+    #[test]
+    fn substitution_in_assignment_is_visible() {
+        let input = "X=$(curl https://example.test) cmd";
+        assert_eq!(deep_names(input), ["cmd", "curl"]);
+        let command = only_top_command(input);
+        assert_eq!(command.assignments[0].substitutions.len(), 1);
+        // An assignment alone runs its substitution too.
+        assert_eq!(deep_names("X=\"`id -u`\""), ["id"]);
+    }
+
+    #[test]
+    fn parses_heredoc_quoted_delimiter_body_literal() {
+        // A quoted delimiter makes the body literal: the `$( … )` in it is text, never run.
+        let input = "cat <<'EOF'\n$(rm -rf /)\nEOF\n";
+        assert_eq!(deep_names(input), ["cat"]);
+        let redirect = &top_redirections(input)[0];
+        let document = redirect.here_document.as_ref().unwrap();
+        assert!(document.quoted && !document.strip_tabs);
+        assert_eq!(document.substitutions.len(), 0);
+        assert_eq!(here_document_body(input, redirect), "$(rm -rf /)\n");
+        assert_eq!(text(input, document.delimiter), "EOF\n");
+        assert_eq!(text(input, redirect.target.span), "'EOF'");
+        // The same body with an unquoted delimiter runs `rm`.
+        let input = "cat <<EOF\n$(rm -rf /)\nEOF\n";
+        assert_eq!(deep_names(input), ["cat", "rm"]);
+        // Every quoting form of the delimiter counts (checked against bash 3.2).
+        for input in [
+            "cat <<\"EOF\"\n$(a)\nEOF",
+            "cat <<\\EOF\n$(a)\nEOF",
+            "cat <<E'OF'\n$(a)\nEOF",
+        ] {
+            assert_eq!(deep_names(input), ["cat"], "{input:?}");
+        }
+    }
+
+    #[test]
+    fn strips_tabs_for_dash_heredoc() {
+        // `<<-` removes leading tabs, so the indented delimiter ends the body; `<<` does not.
+        let input = "cat <<-EOF\n\tbody\n\t\tEOF\necho after";
+        assert_eq!(deep_names(input), ["cat", "echo"]);
+        let redirect = &top_redirections(input)[0];
+        assert!(redirect.here_document.as_ref().unwrap().strip_tabs);
+        assert_eq!(here_document_body(input, redirect), "\tbody\n");
+        let input = "cat <<EOF\n\tEOF\nEOF\necho after";
+        assert_eq!(here_document_body(input, &top_redirections(input)[0]), "\tEOF\n");
+    }
+
+    #[test]
+    fn matches_two_heredocs_on_one_line_in_order() {
+        // Bash reads the bodies in the order of the operators.
+        let input = "cat <<A 3<<-B; tac <<C\na\nA\n\tb\nB\nc\nC\nnext";
+        let script = parse(input).unwrap();
+        let bodies: Vec<&str> = script
+            .simple_commands()
+            .flat_map(|command| &command.redirections)
+            .map(|redirect| here_document_body(input, redirect))
+            .collect();
+        assert_eq!(bodies, ["a\n", "\tb\n", "c\n"]);
+        assert_eq!(deep_names(input), ["cat", "tac", "next"]);
+    }
+
+    #[test]
+    fn marks_heredoc_into_bash_as_dynamic_candidate() {
+        // Decision 6: a here-document fed to a shell or interpreter is dynamic code.
+        let input = "bash <<EOF\nrm -rf /\nEOF";
+        assert!(top_redirections(input)[0].feeds_interpreter);
+        for input in [
+            "/usr/bin/python3.12 - <<'EOF'\nprint(1)\nEOF",
+            "node <<< 'process.exit(1)'",
+            "env FOO=1 sh <<EOF\nx\nEOF",
+            "sudo -s <<EOF\nx\nEOF",
+            "ssh host <<EOF\nx\nEOF",
+            "$SHELL <<EOF\nx\nEOF",
+            "docker exec -i box sh <<EOF\nx\nEOF",
+        ] {
+            assert!(top_redirections(input)[0].feeds_interpreter, "{input:?}");
+        }
+        for input in ["cat <<EOF\nx\nEOF", "grep -c x <<< 'text'", "<<EOF\nx\nEOF"] {
+            assert!(!top_redirections(input)[0].feeds_interpreter, "{input:?}");
+        }
+        // On a compound command, any command inside may read it; a function of the line may run an interpreter.
+        let script = parse("{ cat; perl; } <<EOF\nx\nEOF").unwrap();
+        let Command::Compound(compound) = &script.items[0].and_or.first.first else {
+            panic!("not a compound command");
+        };
+        assert!(compound.redirections[0].feeds_interpreter);
+        let script = parse("f() { cat; }\nf <<EOF\nx\nEOF").unwrap();
+        let call = script.simple_commands().last().unwrap();
+        assert!(call.redirections[0].feeds_interpreter);
+        // Inside a substitution too.
+        let script = parse("x=$(python3 <<< 'print(1)')").unwrap();
+        let (_, inner) = script.simple_commands_with_source("").last().unwrap();
+        assert!(inner.redirections[0].feeds_interpreter);
+    }
+
+    #[test]
+    fn errors_on_missing_heredoc_delimiter() {
+        // KNSH-031: bash runs these with a warning; the parser refuses them.
+        let error = parse("cat <<EOF\nbody").unwrap_err();
+        assert_eq!(
+            error,
+            ParseError::Lex(LexError::Unterminated {
+                construct: crate::error::Construct::HereDocument,
+                span: Span::new(4, 14)
+            })
+        );
+        assert_eq!(
+            parse("cat <<EOF").unwrap_err(),
+            ParseError::MissingHereDocumentBody { span: Span::new(4, 6) }
+        );
+        // A delimiter followed by more text on its line is not the delimiter.
+        assert!(parse("cat <<EOF\nEOF \n").is_err());
+        assert!(matches!(
+            parse("cat <<"),
+            Err(ParseError::MissingRedirectionTarget { .. })
+        ));
+    }
+
+    // ---- Substitutions and here-documents (KNSH-031) ----
+
+    #[test]
+    fn substitutions_everywhere_are_parsed_in_source_order() {
+        // Words, double quotes, redirection targets, process substitutions, `for` items, `case` subject and patterns.
+        assert_eq!(
+            deep_names("X=$(a) cmd \"$(b)\" >$(c) <(d) >(e)"),
+            ["cmd", "a", "b", "c", "d", "e"]
+        );
+        assert_eq!(deep_names("for x in $(ls); do echo; done"), ["ls", "echo"]);
+        assert_eq!(deep_names("case $(a) in $(b)) c;; esac"), ["a", "b", "c"]);
+        assert_eq!(deep_names("{ x; } >$(y)"), ["x", "y"]);
+        assert_eq!(deep_names("f() { x; } <$(y)"), ["x", "y"]);
+        let input = "diff <(ls a) >(tee b)";
+        let command = only_top_command(input);
+        let kinds: Vec<SubstitutionKind> = command
+            .words
+            .iter()
+            .flat_map(|word| &word.substitutions)
+            .map(|substitution| substitution.kind)
+            .collect();
+        assert_eq!(kinds, [SubstitutionKind::InputProcess, SubstitutionKind::OutputProcess]);
+    }
+
+    #[test]
+    fn unquoted_heredoc_body_runs_its_substitutions() {
+        let input = "cat <<EOF\nuser: $(id -un) `hostname` \"$(pwd)\" \\$(not run)\nEOF\n";
+        assert_eq!(deep_names(input), ["cat", "id", "hostname", "pwd"]);
+        let document = top_redirections(input)[0].here_document.clone().unwrap();
+        assert_eq!(document.substitutions.len(), 3);
+    }
+
+    #[test]
+    fn heredoc_line_continuation_joins_lines_only_for_unquoted_delimiters() {
+        // Bash 3.2: `foo\` newline `EOF` is the line `fooEOF`; an escaped backslash does not join.
+        let input = "cat <<EOF\nfoo\\\nEOF\nEOF\necho after";
+        assert_eq!(here_document_body(input, &top_redirections(input)[0]), "foo\\\nEOF\n");
+        let input = "cat <<EOF\nfoo\\\\\nEOF\necho after";
+        assert_eq!(here_document_body(input, &top_redirections(input)[0]), "foo\\\\\n");
+        let input = "cat <<'EOF'\nfoo\\\nEOF\necho after";
+        assert_eq!(here_document_body(input, &top_redirections(input)[0]), "foo\\\n");
+        // The delimiter may end the input without a newline, and may be empty.
+        let input = "cat <<EOF\nx\nEOF";
+        assert_eq!(here_document_body(input, &top_redirections(input)[0]), "x\n");
+        let input = "cat <<''\nx\n\necho after";
+        assert_eq!(here_document_body(input, &top_redirections(input)[0]), "x\n");
+        assert_eq!(deep_names(input), ["cat", "echo"]);
+    }
+
+    #[test]
+    fn refuses_heredocs_bash_versions_read_differently() {
+        // Bash 3.2 closes `$( … )` at a `)` in a here-document body, and runs the lines after `$(cat <<EOF)`.
+        for input in [
+            "echo $(cat <<EOF\na)b\nEOF\n)",
+            "echo $(cat <<EOF\ndon't\nEOF\n)",
+            "echo $(cat <<EOF)\nhi\nEOF",
+            "cat <<EOF; echo $(a\nb)\nbody\nEOF",
+            "cat <(cat <<EOF\n$x\nEOF\n)",
+        ] {
+            assert!(
+                matches!(
+                    parse(input),
+                    Err(ParseError::Lex(LexError::AmbiguousHereDocument { .. }))
+                ),
+                "{input:?}"
+            );
+        }
+        // A plain body inside a substitution is read the same by every version.
+        assert_eq!(deep_names("echo $(cat <<EOF\nplain text\nEOF\n)"), ["echo", "cat"]);
+        // So is any here-document inside backticks, whose body bash parses afresh.
+        assert_eq!(deep_names("echo `cat <<EOF\na)b\nEOF\n`"), ["echo", "cat"]);
+    }
+
+    #[test]
+    fn refuses_dash_heredoc_substitution_running_onto_a_tab_indented_line() {
+        // FR-LC-02: bash strips the tabs before it reads the substitution, so `\tX` ends the inner here-document and
+        // runs `X` (bash 3.2 checked); read with its tabs, the body would hide `X`.
+        assert!(matches!(
+            parse("cat <<-O\n$(cat <<X\n\tX\nX\n)\nO\n"),
+            Err(ParseError::Lex(LexError::AmbiguousHereDocument { .. }))
+        ));
+        assert!(matches!(
+            parse("cat <<-O\n`cat <<X\n\tX\nX\n`\nO\n"),
+            Err(ParseError::Lex(LexError::AmbiguousHereDocument { .. }))
+        ));
+        // Indented one-line substitutions and `<<` bodies are unaffected.
+        assert_eq!(deep_names("cat <<-O\n\t$(a)\n\t`b`\n\tO\n"), ["cat", "a", "b"]);
+        assert_eq!(deep_names("cat <<O\n$(a\n\tb)\nO\n"), ["cat", "a", "b"]);
+    }
+
+    #[test]
+    fn heredoc_backtick_keeps_backslash_before_double_quote() {
+        // FR-LC-02: a here-document body is not double-quoted text for its backticks; bash 3.2 keeps `\"` there and
+        // runs `echo HIDDEN` here, unlike inside "…".
+        let input = "cat <<EOF\n`echo \\\"; echo HIDDEN; \\\"`\nEOF\n";
+        assert_eq!(deep_names(input), ["cat", "echo", "echo", "\\\""]);
+        let input = "echo \"`echo \\\"; echo x; \\\"`\"";
+        assert_eq!(deep_names(input), ["echo", "echo"]);
+    }
+
+    #[test]
+    fn refuses_heredoc_delimiters_with_expansions() {
+        for input in ["cat <<$EOF\nx\n$EOF", "cat <<\"$(x)\"\nx\n$(x)", "cat <<$'E'\nx\nE"] {
+            assert!(
+                matches!(
+                    parse(input),
+                    Err(ParseError::Lex(LexError::HereDocumentDelimiter { .. }))
+                ),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shift_inside_arithmetic_command_is_not_a_heredoc() {
+        // `(( … ))` is opaque; a `<<` in it is a shift, but its "body" would hide the next lines, so those are refused.
+        assert!(parse("(( x << 2 ))").is_ok());
+        assert!(matches!(
+            parse("(( x << y ))\nrm -rf /\ny\n"),
+            Err(ParseError::Unsupported {
+                construct: UnsupportedConstruct::OpaqueHereDocument,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn refuses_substitutions_hidden_in_expansions() {
+        // `${x:-$(rm f)}` and `$(( $(a) ))` run commands the lexer keeps inside the expansion.
+        for input in [
+            "echo ${x:-$(rm f)}",
+            "echo \"${x:-`rm f`}\"",
+            "echo $(( $(a) + 1 ))",
+            "echo $[`a`]",
+        ] {
+            assert_eq!(
+                unsupported(input),
+                UnsupportedConstruct::SubstitutionInExpansion,
+                "{input:?}"
+            );
+        }
+        assert!(parse("echo ${x:-default} $((1 + 2))").is_ok());
+    }
+
+    #[test]
+    fn errors_inside_substitutions_point_into_the_line() {
+        // A syntax error inside a substitution is the line's error.
+        let input = "echo $(if)";
+        let error = parse(input).unwrap_err();
+        assert_eq!(text(input, error.span().unwrap()), "if");
+        // Inside an un-escaped backtick body, the span is mapped back onto the line.
+        let input = r"echo `a \$(b`";
+        let error = parse(input).unwrap_err();
+        assert!(matches!(error, ParseError::Lex(LexError::Unterminated { .. })));
+        assert_eq!(text(input, error.span().unwrap()), "$(b");
+        let input = r"echo `fi \`x\``";
+        assert_eq!(text(input, parse(input).unwrap_err().span().unwrap()), "fi");
+    }
+
+    #[test]
+    fn substitution_nesting_is_bounded() {
+        // KNSH-032: the lexer's quote and substitution depth and the parser's list depth carry into substitutions.
+        let nested = |depth: usize| format!("{}x{}", "$(".repeat(depth), ")".repeat(depth));
+        assert!(parse(&nested(MAX_NESTING_DEPTH)).is_ok());
+        assert!(matches!(
+            parse(&nested(MAX_NESTING_DEPTH + 1)),
+            Err(ParseError::Lex(LexError::NestingTooDeep { .. }))
+        ));
+        // Backtick bodies are not lexed with the line, so the limit must hold when they are parsed.
+        let input = format!("`{}`", nested(MAX_NESTING_DEPTH));
+        assert!(matches!(
+            parse(&input),
+            Err(ParseError::Lex(LexError::NestingTooDeep { .. }))
+        ));
+        // Lists nested through substitutions count towards the list depth.
+        let input = format!(
+            "{}x{}",
+            "$({ ".repeat(MAX_NESTING_DEPTH),
+            "; })".repeat(MAX_NESTING_DEPTH)
+        );
+        assert!(matches!(
+            parse(&input),
+            Err(ParseError::NestingTooDeep { .. } | ParseError::Lex(LexError::NestingTooDeep { .. }))
+        ));
+    }
+
+    #[test]
+    fn calls_inside_substitutions_are_never_marked() {
+        // The body runs in a child shell parsed under conditions the line does not show: resolved as a program.
+        let script = parse("x=$(f() { :; }; f)").unwrap();
+        assert!(script.simple_commands().all(|command| command.function_call.is_none()));
+        // A definition inside a substitution does not reach the line either.
+        let script = parse("echo $(f() { :; }); f").unwrap();
+        assert!(script.simple_commands().all(|command| command.function_call.is_none()));
+    }
+
+    #[test]
+    fn unescapes_backticks_like_bash() {
+        let unescape = |body: &str, quoted: bool| unescape_backtick(body, quoted, None).into_owned();
+        assert_eq!(unescape(r"a \$b \`c\` \\ \x", false), r"a $b `c` \ \x");
+        // `\"` is un-escaped only inside double quotes (bash 3.2: "`echo \"hi\"`" prints hi).
+        assert_eq!(unescape(r#"echo \"hi\""#, false), r#"echo \"hi\""#);
+        assert_eq!(unescape(r#"echo \"hi\""#, true), r#"echo "hi""#);
+        // A line continuation goes entirely; `\\` then `$` is an escaped backslash before a plain `$`.
+        assert_eq!(unescape("a\\\nb \\\\$x é\\", false), "ab \\$x é\\");
+        let mut origins = Vec::new();
+        let text = unescape_backtick(r"a\$b", false, Some(&mut origins));
+        assert_eq!(text, "a$b");
+        assert_eq!(origins, [0, 2, 3]);
     }
 }

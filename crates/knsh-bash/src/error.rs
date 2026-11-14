@@ -28,6 +28,9 @@ pub enum Construct {
     ParameterExpansion,
     /// `$((…))` or `$[…]`
     ArithmeticExpansion,
+    /// A here-document (`<<` or `<<-`) whose body never ends: no line matches the delimiter. Bash runs such a line
+    /// with a warning; this lexer refuses it (KNSH-031).
+    HereDocument,
 }
 
 impl fmt::Display for Construct {
@@ -42,6 +45,7 @@ impl fmt::Display for Construct {
             Self::ProcessSubstitution => "process substitution",
             Self::ParameterExpansion => "parameter expansion",
             Self::ArithmeticExpansion => "arithmetic expansion",
+            Self::HereDocument => "here-document",
         })
     }
 }
@@ -72,10 +76,25 @@ pub enum LexError {
         /// The limit.
         limit: usize,
     },
-    /// A newline follows a here-document operator, so a here-document body starts there. Bodies are not lexed yet
-    /// (KNSH-031); lexing them as commands would misread them, so the line is refused instead.
-    HereDocumentBody {
-        /// The first here-document operator (`<<` or `<<-`) still waiting for its body.
+    /// A here-document that bash versions read differently (KNSH-031), refused because either reading could hide a
+    /// command the other runs. Bash 3.2 (`/bin/bash` on macOS) finds the end of `$( … )`, `<( … )` and `>( … )` by
+    /// matching characters, not by reading commands, so for a here-document inside one it does not know where the
+    /// body is: a `)`, quote, backslash, `$` or backtick in the body (or its delimiter line) can close the
+    /// substitution or open a quote there, and the line that follows a here-document operator written inside one but
+    /// ended outside it (`$(cat <<EOF)`) is run as commands. Later versions read such bodies as here-documents. A
+    /// newline inside a substitution while a here-document outside it still waits for its body is refused the same
+    /// way, and so is a substitution in an unquoted `<<-` body that runs onto a line starting with a tab: bash strips
+    /// the tab before it reads the substitution, which this parser reads with its tabs.
+    AmbiguousHereDocument {
+        /// The here-document operator (`<<` or `<<-`).
+        span: Span,
+    },
+    /// A here-document delimiter word holding an expansion or an ANSI-C or locale quote (`<<$EOF`, `<<"$(x)"`,
+    /// `<<$'E'`). Bash compares body lines with the delimiter's text after quote removal, never expanding it; this
+    /// lexer reads only delimiters made of plain text, escapes, single quotes and double quotes holding plain text,
+    /// and refuses the others rather than guess where the body ends (KNSH-031).
+    HereDocumentDelimiter {
+        /// The delimiter word.
         span: Span,
     },
     /// A `#` inside `$( … )`, `<( … )` or `>( … )` that bash versions read differently. Bash 4 and later read the
@@ -97,7 +116,8 @@ impl LexError {
             Self::InputTooLarge { .. } => None,
             Self::Unterminated { span, .. }
             | Self::NestingTooDeep { span, .. }
-            | Self::HereDocumentBody { span }
+            | Self::AmbiguousHereDocument { span }
+            | Self::HereDocumentDelimiter { span }
             | Self::AmbiguousComment { span } => Some(*span),
         }
     }
@@ -119,10 +139,17 @@ impl fmt::Display for LexError {
                     span.start
                 )
             }
-            Self::HereDocumentBody { span } => {
+            Self::AmbiguousHereDocument { span } => {
                 write!(
                     f,
-                    "here-document body for the operator at byte {} is not supported yet",
+                    "here-document at byte {} is read differently by bash versions",
+                    span.start
+                )
+            }
+            Self::HereDocumentDelimiter { span } => {
+                write!(
+                    f,
+                    "here-document delimiter at byte {} holds an expansion, which is not supported",
                     span.start
                 )
             }
@@ -182,6 +209,13 @@ pub enum ParseError {
         /// The limit.
         limit: usize,
     },
+    /// A here-document whose body never starts: the input (or the substitution holding the operator) ends before a
+    /// newline does. Bash reads an empty body with a warning; the line is refused instead (KNSH-031: a missing
+    /// delimiter is an error).
+    MissingHereDocumentBody {
+        /// The here-document operator (`<<` or `<<-`).
+        span: Span,
+    },
     /// The line ends inside a compound command or function definition (`if a; then b`, `{ a;`, `for x in a`), so
     /// the word or operator that closes it never comes. Bash reports an unexpected end of file.
     Unclosed {
@@ -198,10 +232,39 @@ impl ParseError {
             Self::Lex(error) => error.span(),
             Self::MissingCommand { span }
             | Self::MissingRedirectionTarget { span }
+            | Self::MissingHereDocumentBody { span }
             | Self::UnexpectedToken { span, .. }
             | Self::Unsupported { span, .. }
             | Self::NestingTooDeep { span, .. }
             | Self::Unclosed { span } => Some(*span),
+        }
+    }
+
+    /// The same error with its span passed through `map`, used to move an error found in an un-escaped backtick body
+    /// back onto the line.
+    pub(crate) fn map_span(self, map: impl Fn(Span) -> Span) -> Self {
+        match self {
+            Self::Lex(error) => Self::Lex(match error {
+                LexError::InputTooLarge { .. } => error,
+                LexError::Unterminated { construct, span } => LexError::Unterminated {
+                    construct,
+                    span: map(span),
+                },
+                LexError::NestingTooDeep { span, limit } => LexError::NestingTooDeep { span: map(span), limit },
+                LexError::AmbiguousHereDocument { span } => LexError::AmbiguousHereDocument { span: map(span) },
+                LexError::HereDocumentDelimiter { span } => LexError::HereDocumentDelimiter { span: map(span) },
+                LexError::AmbiguousComment { span } => LexError::AmbiguousComment { span: map(span) },
+            }),
+            Self::MissingCommand { span } => Self::MissingCommand { span: map(span) },
+            Self::MissingRedirectionTarget { span } => Self::MissingRedirectionTarget { span: map(span) },
+            Self::MissingHereDocumentBody { span } => Self::MissingHereDocumentBody { span: map(span) },
+            Self::UnexpectedToken { token, span } => Self::UnexpectedToken { token, span: map(span) },
+            Self::Unsupported { construct, span } => Self::Unsupported {
+                construct,
+                span: map(span),
+            },
+            Self::NestingTooDeep { span, limit } => Self::NestingTooDeep { span: map(span), limit },
+            Self::Unclosed { span } => Self::Unclosed { span: map(span) },
         }
     }
 }
@@ -221,6 +284,9 @@ impl fmt::Display for ParseError {
             }
             Self::MissingRedirectionTarget { span } => {
                 write!(f, "missing target for the redirection at byte {}", span.start)
+            }
+            Self::MissingHereDocumentBody { span } => {
+                write!(f, "missing body for the here-document at byte {}", span.start)
             }
             Self::UnexpectedToken { token, span } => {
                 write!(f, "syntax error near unexpected {token} at byte {}", span.start)
@@ -273,8 +339,14 @@ pub enum UnsupportedConstruct {
     /// `coproc` (dynamic by decision 6) and `time`, which prefix a pipeline rather than form a command, and a `(( … ))`
     /// that holds a comment, which bash and this parser could close at different places.
     Compound(CompoundStart),
-    /// `<<` or `<<-`, a here-document (KNSH-031).
-    HereDocument,
+    /// A command substitution, backtick or process substitution inside `${…}`, `$((…))` or `$[…]`
+    /// (`${x:-$(rm f)}`). Bash runs it when the expansion is evaluated, but the lexer keeps those bodies whole, so its
+    /// commands would not be seen: the line is refused rather than read without them (KNSH-031).
+    SubstitutionInExpansion,
+    /// A `<<` inside `(( … ))`, `[[ … ]]` or `for (( … ))`, where bash reads a shift or a comparison, followed by a
+    /// newline: the lexer took the next lines for a here-document body, which would hide them, so the line is
+    /// refused.
+    OpaqueHereDocument,
     /// `name=(…)`, an array assignment.
     ArrayAssignment,
     /// `name[subscript]=value`, an assignment to an array element, or a `name[` where a command starts whose
@@ -293,7 +365,10 @@ impl fmt::Display for UnsupportedConstruct {
             Self::Compound(CompoundStart::ReservedWord(word)) => {
                 write!(f, "compound command `{}`", reserved_word_text(*word))
             }
-            Self::HereDocument => f.write_str("here-document"),
+            Self::OpaqueHereDocument => f.write_str("`<<` inside an arithmetic or conditional command"),
+            Self::SubstitutionInExpansion => {
+                f.write_str("command substitution inside a parameter or arithmetic expansion")
+            }
             Self::ArrayAssignment => f.write_str("array assignment"),
             Self::SubscriptAssignment => f.write_str("array element assignment"),
             Self::RedirectionVariable => f.write_str("descriptor variable redirection"),
