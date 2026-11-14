@@ -1,5 +1,7 @@
 //! The syntax tree [`parse`](crate::parse) builds: lists, and-or lists, pipelines and simple commands with their
-//! assignments, words and redirections (KNSH-029), compound commands and function definitions (KNSH-030).
+//! assignments, words and redirections (KNSH-029), compound commands and function definitions (KNSH-030), and the
+//! command substitutions, backticks, process substitutions and here-documents inside them, each substitution parsed
+//! into a nested [`Script`] (KNSH-031).
 //!
 //! Every node keeps the [`Span`] of the source it came from, and every reserved word and operator of a compound
 //! command keeps its own, so a decision can point at the exact part of the line it is about. The tree is deliberately
@@ -7,47 +9,77 @@
 //! such as `a && a && …` repeated many times therefore never builds a deep chain of boxes. The tree only deepens where
 //! the source nests lists (compound commands, function bodies), and the parser bounds that nesting by
 //! [`MAX_NESTING_DEPTH`](crate::MAX_NESTING_DEPTH), so building, walking and dropping the tree recurse a bounded
-//! number of levels on untrusted input (CLAUDE.md "Untrusted input": bound recursion).
+//! number of levels on untrusted input (CLAUDE.md "Untrusted input": bound recursion). Nested scripts count towards
+//! the same limit as the lists that hold them.
+//!
+//! # Which text a span indexes
+//!
+//! Spans index the line, except inside a backtick substitution whose body bash un-escapes before reading it
+//! (a body such as `` a \`b\` ``): that substitution keeps the un-escaped body as [`Substitution::text`], and the spans of
+//! its nested script index that text. [`Script::commands_with_source`] pairs every command with the text its spans
+//! index.
 
 use crate::error::UnsupportedConstruct;
-use crate::token::{IoNumber, RedirectionOperator, Span, Word};
+use crate::token::{IoNumber, RedirectionOperator, Segment, Span, Word};
 
-/// A parsed command line: a list of and-or lists, separated by `;`, `&` or newlines.
+/// A parsed command line, or the body of a substitution inside one: a list of and-or lists, separated by `;`, `&` or
+/// newlines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Script {
     /// The and-or lists, in source order. Empty for a line of only blanks, comments and newlines.
     pub items: Vec<ListItem>,
-    /// The whole input.
+    /// The whole input; for a nested script, the substitution's body.
     pub span: Span,
 }
 
 impl Script {
     /// Every command of the line in source order, each one before the commands nested in it: compound commands are
     /// followed by the commands of their conditions, bodies and case arms, function definitions by the commands of
-    /// their bodies.
+    /// their bodies, and every command by the commands of the substitutions in its words, assignments, redirection
+    /// targets and here-documents (KNSH-031: commands hidden in substitutions are decided too).
     ///
     /// [`Command::Unsupported`] nodes are yielded too (never skipped), but nothing inside them: their contents are
     /// opaque, and the caller classifies them as dynamic (decision 6, KNSH-032).
+    ///
+    /// The spans of a command inside an un-escaped backtick substitution index that substitution's
+    /// [`text`](Substitution::text), not the line; use [`Script::commands_with_source`] to read them.
     pub fn commands(&self) -> impl Iterator<Item = &Command> + '_ {
+        self.commands_with_source("").map(|(_, command)| command)
+    }
+
+    /// [`Script::commands`], each command paired with the text its spans index: `input` (the line this script was
+    /// parsed from), or the [`text`](Substitution::text) of the innermost backtick substitution holding it.
+    pub fn commands_with_source<'a>(&'a self, input: &'a str) -> impl Iterator<Item = (&'a str, &'a Command)> + 'a {
         let mut commands = Vec::new();
-        collect_commands(&self.items, &mut commands);
+        collect_deep(&self.items, input, &mut commands);
         commands.into_iter()
     }
 
-    /// Every simple command of the line, in source order, including those inside pipelines, lists, compound commands
-    /// and function bodies (FR-LC-09: policy sees every part of the line).
+    /// Every simple command of the line, in source order, including those inside pipelines, lists, compound commands,
+    /// function bodies and substitutions (FR-LC-09: policy sees every part of the line).
     ///
-    /// `a | b && c; d` yields `a`, `b`, `c`, `d`; `f() { rm -rf x; }; f` yields `rm`, then the call `f`. A function body
-    /// is walked as code wherever it is defined, whether or not the line calls it, so its commands are always decided.
+    /// `a | b && c; d` yields `a`, `b`, `c`, `d`; `f() { rm -rf x; }; f` yields `rm`, then the call `f`; `echo $(a $(b))`
+    /// yields `echo`, `a`, `b`. A function body is walked as code wherever it is defined, whether or not the line calls
+    /// it, so its commands are always decided. See [`Script::commands`] for the spans of commands inside backticks.
     pub fn simple_commands(&self) -> impl Iterator<Item = &SimpleCommand> + '_ {
-        self.commands().filter_map(|command| match command {
-            Command::Simple(simple) => Some(simple),
-            Command::Compound(_) | Command::FunctionDefinition(_) | Command::Unsupported(_) => None,
-        })
+        self.simple_commands_with_source("").map(|(_, command)| command)
     }
 
-    /// Every function definition of the line, in source order, nested ones included. A [`FunctionCall`] names the
-    /// definitions it may run by their spans.
+    /// [`Script::simple_commands`], each command paired with the text its spans index (see
+    /// [`Script::commands_with_source`]).
+    pub fn simple_commands_with_source<'a>(
+        &'a self,
+        input: &'a str,
+    ) -> impl Iterator<Item = (&'a str, &'a SimpleCommand)> + 'a {
+        self.commands_with_source(input)
+            .filter_map(|(source, command)| match command {
+                Command::Simple(simple) => Some((source, simple)),
+                Command::Compound(_) | Command::FunctionDefinition(_) | Command::Unsupported(_) => None,
+            })
+    }
+
+    /// Every function definition of the line, in source order, nested ones included (those inside substitutions too).
+    /// A [`FunctionCall`] names the definitions it may run by their spans.
     pub fn function_definitions(&self) -> impl Iterator<Item = &FunctionDefinition> + '_ {
         self.commands().filter_map(|command| match command {
             Command::FunctionDefinition(definition) => Some(definition),
@@ -56,8 +88,81 @@ impl Script {
     }
 }
 
-/// Appends every command of `items` to `out` in the order of [`Script::commands`]. Recurses once per nested list, so
-/// its depth is bounded by the parser's nesting limit.
+/// Appends every command of `items` to `out` in the order of [`Script::commands`], substitutions included, each with
+/// the text its spans index (`source` for `items`). Recurses once per nested list or script, so its depth is bounded
+/// by the parser's nesting limit.
+fn collect_deep<'a>(items: &'a [ListItem], source: &'a str, out: &mut Vec<(&'a str, &'a Command)>) {
+    for command in items
+        .iter()
+        .flat_map(|item| item.and_or.pipelines())
+        .flat_map(Pipeline::commands)
+    {
+        out.push((source, command));
+        match command {
+            Command::Simple(simple) => {
+                let mut substitutions: Vec<&Substitution> = simple.substitutions().collect();
+                // Assignments come first, but words and redirections interleave: sort into source order.
+                substitutions.sort_by_key(|substitution| substitution.span.start);
+                collect_substitutions(substitutions, source, out);
+            }
+            Command::Compound(compound) => collect_compound_deep(compound, source, out),
+            Command::FunctionDefinition(definition) => {
+                collect_substitutions(&definition.name.substitutions, source, out);
+                collect_compound_deep(&definition.body, source, out);
+            }
+            Command::Unsupported(_) => {}
+        }
+    }
+}
+
+/// The commands of a compound command's header words, lists and redirections, in source order (see
+/// [`collect_deep`]).
+fn collect_compound_deep<'a>(compound: &'a CompoundCommand, source: &'a str, out: &mut Vec<(&'a str, &'a Command)>) {
+    match &compound.kind {
+        CompoundKind::For(command) => {
+            collect_substitutions(&command.variable.substitutions, source, out);
+            for word in command.items.iter().flat_map(|items| &items.words) {
+                collect_substitutions(&word.substitutions, source, out);
+            }
+            collect_deep(&command.body.body, source, out);
+        }
+        CompoundKind::Case(command) => {
+            collect_substitutions(&command.subject.substitutions, source, out);
+            for clause in &command.clauses {
+                for pattern in &clause.patterns {
+                    collect_substitutions(&pattern.substitutions, source, out);
+                }
+                collect_deep(&clause.body, source, out);
+            }
+        }
+        CompoundKind::Subshell(_)
+        | CompoundKind::Group(_)
+        | CompoundKind::If(_)
+        | CompoundKind::While(_)
+        | CompoundKind::Until(_) => {
+            for list in compound.kind.lists() {
+                collect_deep(list, source, out);
+            }
+        }
+    }
+    let substitutions = compound.redirections.iter().flat_map(Redirect::substitutions);
+    collect_substitutions(substitutions, source, out);
+}
+
+/// The commands of each substitution's script, in the text its spans index.
+fn collect_substitutions<'a>(
+    substitutions: impl IntoIterator<Item = &'a Substitution>,
+    source: &'a str,
+    out: &mut Vec<(&'a str, &'a Command)>,
+) {
+    for substitution in substitutions {
+        collect_deep(&substitution.script.items, substitution.source(source), out);
+    }
+}
+
+/// Appends every command of `items` to `out` in the order of [`Script::commands`], but without entering
+/// substitutions: only the commands of this script, whose spans all index the same text. Recurses once per nested
+/// list, so its depth is bounded by the parser's nesting limit.
 pub(crate) fn collect_commands<'a>(items: &'a [ListItem], out: &mut Vec<&'a Command>) {
     for command in items
         .iter()
@@ -262,6 +367,28 @@ pub enum CompoundKind {
 }
 
 impl CompoundKind {
+    /// The lists of [`CompoundKind::lists`], mutably, for the passes that annotate the tree after parsing.
+    pub(crate) fn lists_mut(&mut self) -> Vec<&mut Vec<ListItem>> {
+        match self {
+            Self::Subshell(subshell) => vec![&mut subshell.body],
+            Self::Group(group) => vec![&mut group.body],
+            Self::If(command) => {
+                let mut lists = Vec::with_capacity(command.clauses.len() * 2 + 1);
+                for clause in &mut command.clauses {
+                    lists.push(&mut clause.condition);
+                    lists.push(&mut clause.body);
+                }
+                if let Some(otherwise) = &mut command.else_clause {
+                    lists.push(&mut otherwise.body);
+                }
+                lists
+            }
+            Self::For(command) => vec![&mut command.body.body],
+            Self::While(command) | Self::Until(command) => vec![&mut command.condition, &mut command.body.body],
+            Self::Case(command) => command.clauses.iter_mut().map(|clause| &mut clause.body).collect(),
+        }
+    }
+
     /// The lists of commands the compound command holds, in source order: conditions, bodies and case arms.
     #[must_use]
     pub fn lists(&self) -> Vec<&[ListItem]> {
@@ -507,6 +634,15 @@ impl SimpleCommand {
     pub fn arguments(&self) -> &[CommandWord] {
         self.words.get(1..).unwrap_or_default()
     }
+
+    /// Every substitution of the command: in its assignments, then its words, then its redirections (targets and
+    /// here-document bodies). Bash runs them all before the command itself.
+    pub fn substitutions(&self) -> impl Iterator<Item = &Substitution> + '_ {
+        let assignments = self.assignments.iter().flat_map(|assignment| &assignment.substitutions);
+        let words = self.words.iter().flat_map(|word| &word.substitutions);
+        let redirections = self.redirections.iter().flat_map(Redirect::substitutions);
+        assignments.chain(words).chain(redirections)
+    }
 }
 
 /// A word of a command with its place in the line.
@@ -516,6 +652,50 @@ pub struct CommandWord {
     pub word: Word,
     /// Where it is.
     pub span: Span,
+    /// The command substitutions, backticks and process substitutions in the word (inside double quotes too), in
+    /// source order, each parsed into a nested script (KNSH-031). Empty for a here-document delimiter, which bash
+    /// never expands.
+    pub substitutions: Vec<Substitution>,
+}
+
+/// A command substitution, backtick or process substitution, with its body parsed (KNSH-031; decision 6: parsed
+/// recursively). Its commands run in a child shell before the command that holds it, or alongside it for a process
+/// substitution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Substitution {
+    /// Which form.
+    pub kind: SubstitutionKind,
+    /// The whole substitution, delimiters included, in the text that holds it.
+    pub span: Span,
+    /// For a backtick substitution whose body bash un-escapes before reading it: the un-escaped body. Bash removes
+    /// the backslash of `\$`, ``\` `` and `\\` (and of `\"` when the backticks are inside double quotes) and removes line
+    /// continuations; the spans of [`script`](Self::script) then index this text. `None` when the body is read as
+    /// written, and the script's spans index the text that holds the substitution.
+    pub text: Option<String>,
+    /// The body, parsed. Its span is the body (between the delimiters), or all of [`text`](Self::text).
+    pub script: Script,
+}
+
+impl Substitution {
+    /// The text the spans of [`script`](Self::script) index, given `enclosing`, the text that holds the
+    /// substitution.
+    #[must_use]
+    pub fn source<'a>(&'a self, enclosing: &'a str) -> &'a str {
+        self.text.as_deref().unwrap_or(enclosing)
+    }
+}
+
+/// The forms of [`Substitution`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubstitutionKind {
+    /// `$( … )`.
+    Command,
+    /// `` `…` ``.
+    Backtick,
+    /// `<( … )`: the body's output is read as a file.
+    InputProcess,
+    /// `>( … )`: the body's input is written as a file.
+    OutputProcess,
 }
 
 /// An assignment before a command name: `NAME=value` or `NAME+=value`.
@@ -532,6 +712,8 @@ pub struct Assignment {
     pub value: Span,
     /// The whole word, with its quoting structure.
     pub word: Word,
+    /// The substitutions in the value, each parsed into a nested script (KNSH-031): `X=$(curl …) cmd` runs `curl`.
+    pub substitutions: Vec<Substitution>,
     /// The whole assignment.
     pub span: Span,
 }
@@ -543,8 +725,44 @@ pub struct Redirect {
     pub fd: Option<IoNumber>,
     /// The operator.
     pub operator: RedirectionOperator,
-    /// The target word: a file, a descriptor number or `-` for `>&` and `<&`, or the string of a here-string.
+    /// The target word: a file, a descriptor number or `-` for `>&` and `<&`, the string of a here-string, or the
+    /// delimiter of a here-document.
     pub target: CommandWord,
-    /// From the descriptor number (or operator) to the end of the target.
+    /// For `<<` and `<<-`: the here-document's body, read from the lines after the one holding the operator.
+    /// `None` for every other operator.
+    pub here_document: Option<HereDocument>,
+    /// Set on a here-document or here-string whose text is read by a shell or interpreter (`bash <<EOF`,
+    /// `python3 <<< "…"`), or by a command that may run one (`env bash`, `ssh host`, a function of the line, a name
+    /// built from an expansion, a compound command holding such a command). Its text is then code, which the caller
+    /// classifies as dynamic (decision 6, FR-LC-05, KNSH-031). Never set on other redirections.
+    pub feeds_interpreter: bool,
+    /// From the descriptor number (or operator) to the end of the target. A here-document's body lies elsewhere.
     pub span: Span,
+}
+
+impl Redirect {
+    /// The substitutions of the redirection: in its target, then in its here-document body.
+    pub fn substitutions(&self) -> impl Iterator<Item = &Substitution> + '_ {
+        let body = self.here_document.iter().flat_map(|document| &document.substitutions);
+        self.target.substitutions.iter().chain(body)
+    }
+}
+
+/// A here-document's body (KNSH-031).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HereDocument {
+    /// Set for `<<-`: leading tabs are removed from each line of the body (they stay in the spans and segments).
+    pub strip_tabs: bool,
+    /// Set when the delimiter is quoted (`<<'EOF'`): the body is literal and runs nothing. Otherwise bash expands it,
+    /// running its substitutions.
+    pub quoted: bool,
+    /// The body lines, up to (not including) the delimiter line. May be empty.
+    pub body: Span,
+    /// The body split into segments (see [`HereDocumentBody::segments`](crate::HereDocumentBody::segments)).
+    pub segments: Vec<Segment>,
+    /// The substitutions bash runs while expanding an unquoted body, in source order, each parsed into a nested
+    /// script. Always empty for a quoted body.
+    pub substitutions: Vec<Substitution>,
+    /// The line that ends the body, its newline included (absent when the input ends right after it).
+    pub delimiter: Span,
 }

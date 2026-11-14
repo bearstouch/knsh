@@ -1,20 +1,21 @@
-//! The properties of the `bash_lex` (KNSH-028) and `bash_parse` (KNSH-029, KNSH-030) fuzz targets
+//! The properties of the `bash_lex` (KNSH-028, KNSH-031) and `bash_parse` (KNSH-029, KNSH-030, KNSH-031) fuzz targets
 //! (`specs/07-testing/fuzzing.md`, NFR-SEC-05).
 //!
 //! Also compiled on stable by `crates/knsh-bash/tests/fuzz_regressions.rs`, which includes this file by path, so it
 //! depends on nothing but `knsh-bash` and `std`. A failed property panics, which libFuzzer records as a crash.
 
 use knsh_bash::{
-    Command, CommandWord, CompoundCommand, CompoundKind, LexError, ListItem, LoopBody, LoopCommand, MAX_INPUT_LEN,
-    Operator, ParseError, Redirect, RedirectionOperator, Script, Segment, SegmentKind, SimpleCommand, Span, Token,
-    TokenKind, lex, parse,
+    Command, CommandWord, CompoundCommand, CompoundKind, Construct, LexError, ListItem, LoopBody, LoopCommand,
+    MAX_INPUT_LEN, Operator, ParseError, Redirect, RedirectionOperator, Script, Segment, SegmentKind, SimpleCommand,
+    Span, Substitution, Token, TokenKind, lex, parse,
 };
 
 /// `bash_lex`: the lexer never panics and is deterministic. An accepted line is tiled exactly by its token spans
 /// (FR-LC-02: nothing hides between tokens), each word by its segments and each double-quoted body by its inner
 /// segments; every span lies on character boundaries; operators, blanks, newlines and comments cover exactly the
-/// text they name. A rejection points inside the input (an unterminated construct runs to its end), and the size
-/// rejection happens exactly when the input is over the limit.
+/// text they name; a here-document body follows a newline, belongs to an earlier `<<` or `<<-`, and its segments
+/// tile its body. A rejection points inside the input (an unterminated construct runs to the end of the input or of
+/// the here-document body holding it), and the size rejection happens exactly when the input is over the limit.
 pub fn bash_lex(data: &[u8]) {
     // Invalid UTF-8 is replaced rather than skipped, so every fuzzer input exercises the lexer.
     let input = String::from_utf8_lossy(data);
@@ -28,12 +29,14 @@ pub fn bash_lex(data: &[u8]) {
     assert!(input.len() <= MAX_INPUT_LEN, "accepted input over the size limit");
 
     let mut end = 0;
+    let mut previous: Option<&TokenKind> = None;
     for token in &tokens {
         assert_eq!(token.span.start, end, "gap or overlap between tokens");
         assert!(token.span.end > token.span.start, "empty token");
         end = token.span.end;
         let text = span_text(input, token.span);
         let logical = text.replace("\\\n", "");
+        let after = previous.replace(&token.kind);
         match &token.kind {
             TokenKind::Word(word) => tiles(input, &word.segments, token.span),
             TokenKind::Operator(operator) => assert_eq!(logical, operator_text(*operator), "operator text"),
@@ -57,6 +60,35 @@ pub fn bash_lex(data: &[u8]) {
             TokenKind::Newline => assert_eq!(text, "\n"),
             TokenKind::Blank => assert!(logical.bytes().all(|byte| byte == b' ' || byte == b'\t')),
             TokenKind::Comment => assert!(text.starts_with('#') && !text.contains('\n')),
+            TokenKind::HereDocumentBody(body) => {
+                assert!(
+                    matches!(after, Some(TokenKind::Newline | TokenKind::HereDocumentBody(_))),
+                    "here-document body not after a newline"
+                );
+                assert_eq!(
+                    token.span,
+                    Span::new(body.body.start, body.delimiter.end),
+                    "body token span"
+                );
+                assert_eq!(body.body.end, body.delimiter.start, "delimiter right after the body");
+                assert!(body.operator.end <= token.span.start, "body before its operator");
+                let operator = span_text(input, body.operator).replace("\\\n", "");
+                assert!(
+                    operator.ends_with(if body.strip_tabs { "<<-" } else { "<<" }),
+                    "body of something other than a here-document operator"
+                );
+                assert!(
+                    body.body.is_empty() || span_text(input, body.body).ends_with('\n'),
+                    "partial body line"
+                );
+                tiles(input, &body.segments, body.body);
+                if body.quoted {
+                    assert!(
+                        body.segments.iter().all(|segment| segment.kind == SegmentKind::Literal),
+                        "quoted body not literal"
+                    );
+                }
+            }
         }
     }
     assert_eq!(end, input.len(), "tokens do not reach the end of the input");
@@ -70,23 +102,28 @@ fn check_error(input: &str, error: &LexError) {
                 "wrong size rejection"
             );
         }
-        LexError::Unterminated { span, .. } => {
-            span_text(input, *span);
-            assert_eq!(
-                span.end,
-                input.len(),
-                "an unterminated construct runs to the end of the input"
-            );
+        LexError::Unterminated { span, construct } => {
+            // To the end of the input, or of the here-document body (or backtick body, once parsed) holding it.
+            assert!(!span_text(input, *span).is_empty(), "empty unterminated construct");
+            if *construct == Construct::HereDocument {
+                assert!(
+                    span_text(input, *span).replace("\\\n", "").contains("<<"),
+                    "unterminated here-document without an operator"
+                );
+            }
         }
         LexError::NestingTooDeep { span, .. } => {
             assert!(!span_text(input, *span).is_empty(), "empty opener");
         }
-        LexError::HereDocumentBody { span } => {
+        LexError::AmbiguousHereDocument { span } => {
             let operator = span_text(input, *span).replace("\\\n", "");
             assert!(
                 operator.ends_with("<<") || operator.ends_with("<<-"),
                 "not a here-document operator"
             );
+        }
+        LexError::HereDocumentDelimiter { span } => {
+            assert!(!span_text(input, *span).is_empty(), "empty delimiter word");
         }
         LexError::AmbiguousComment { span } => {
             assert_eq!(span_text(input, *span), "#", "not a comment start");
@@ -162,13 +199,17 @@ fn redirection_text(operator: RedirectionOperator) -> &'static str {
     }
 }
 
-/// `bash_parse`: the parser never panics and is deterministic, and it fails exactly when the lexer does with the same
-/// error. A rejection points inside the input. An accepted line loses nothing (FR-LC-02, FR-LC-09): every word token
-/// of the line is claimed exactly once, by a part of a simple command, a reserved word, pattern or loop word of a
-/// compound command, a function's `function` or name, or a `!`, unless it lies inside an unsupported construct, which
-/// is kept whole; every redirection token is likewise one redirection or inside an unsupported construct. Each part
-/// lies inside the command that claims it, simple commands come in source order without overlapping, and every
-/// function call names definitions of the line.
+/// `bash_parse`: the parser never panics and is deterministic, and it fails whenever the lexer does, with the same
+/// error (it may also fail on a lexer error inside a substitution body, which the line's lexer only delimits). A
+/// rejection points inside the input. An accepted line loses nothing (FR-LC-02, FR-LC-09): every word token of the
+/// line is claimed exactly once, by a part of a simple command, a reserved word, pattern or loop word of a compound
+/// command, a function's `function` or name, or a `!`, unless it lies inside an unsupported construct, which is kept
+/// whole; every redirection token is likewise one redirection, and every here-document body exactly one
+/// here-document. Each part lies inside the command that claims it, simple commands of one script come in source
+/// order without overlapping, and every function call names earlier definitions of the line. Every substitution's
+/// script (KNSH-031) satisfies the same structure in the text it indexes, lies inside its substitution, and marks no
+/// function call; every command the deep iterators yield has a span inside the text paired with it; only
+/// here-documents and here-strings are ever marked as feeding an interpreter.
 pub fn bash_parse(data: &[u8]) {
     let input = String::from_utf8_lossy(data);
     let input = input.as_ref();
@@ -178,7 +219,6 @@ pub fn bash_parse(data: &[u8]) {
         (Err(ParseError::Lex(error)), Err(lex_error)) => {
             assert_eq!(error, lex_error, "parser reports a different lexer error");
         }
-        (Err(ParseError::Lex(_)), Ok(_)) => panic!("lexer error reported for a line that lexes"),
         (Ok(_) | Err(_), Err(_)) => panic!("line parsed past a lexer error"),
         (Err(error), Ok(_)) => {
             let span = error
@@ -190,8 +230,12 @@ pub fn bash_parse(data: &[u8]) {
             assert_eq!(script.span, Span::new(0, input.len()), "script span");
             let mut claims = Claims::default();
             claims.list(input, &script.items, script.span);
+            claims.check_order();
             claims.check(input, &tokens);
-            check_simple_commands(input, &script);
+            check_function_calls(&script);
+            for (source, command) in script.commands_with_source(input) {
+                assert!(!span_text(source, command.span()).is_empty(), "empty command");
+            }
         }
     }
 }
@@ -203,8 +247,12 @@ struct Claims {
     words: Vec<Span>,
     /// Redirection tokens claimed, by where they start.
     redirections: Vec<usize>,
+    /// Here-document body tokens claimed, by span.
+    here_documents: Vec<Span>,
     /// Unsupported constructs, which claim every token inside them.
     opaque: Vec<Span>,
+    /// The simple commands of this script (not of its substitutions), in tree order.
+    simple_commands: Vec<Span>,
 }
 
 impl Claims {
@@ -230,13 +278,13 @@ impl Claims {
         span_text(input, span);
         assert!(!span.is_empty(), "empty command");
         match command {
-            Command::Simple(simple) => self.simple(simple),
+            Command::Simple(simple) => self.simple(input, simple),
             Command::Compound(compound) => self.compound(input, compound),
             Command::FunctionDefinition(definition) => {
                 if let Some(keyword) = definition.keyword {
                     self.keyword(input, keyword, span, "function");
                 }
-                self.word(&definition.name, span);
+                self.word(input, &definition.name, span);
                 if let Some(parens) = definition.parens {
                     inside(parens, span);
                 }
@@ -248,7 +296,12 @@ impl Claims {
         }
     }
 
-    fn simple(&mut self, command: &SimpleCommand) {
+    fn simple(&mut self, input: &str, command: &SimpleCommand) {
+        self.simple_commands.push(command.span);
+        assert!(
+            command.function_call.is_none() || command.name().is_some(),
+            "function call without a name"
+        );
         for assignment in &command.assignments {
             inside(assignment.span, command.span);
             assert!(assignment.value.start > assignment.span.start && assignment.value.end == assignment.span.end);
@@ -263,11 +316,12 @@ impl Claims {
                 "assignment name"
             );
             self.words.push(assignment.span);
+            substitutions(input, &assignment.substitutions, assignment.span);
         }
         for word in &command.words {
-            self.word(word, command.span);
+            self.word(input, word, command.span);
         }
-        self.redirects(&command.redirections, command.span);
+        self.redirects(input, &command.redirections, command.span);
     }
 
     fn compound(&mut self, input: &str, compound: &CompoundCommand) {
@@ -299,11 +353,11 @@ impl Claims {
             }
             CompoundKind::For(command) => {
                 self.keyword(input, command.keyword, span, "for");
-                self.word(&command.variable, span);
+                self.word(input, &command.variable, span);
                 if let Some(items) = &command.items {
                     self.keyword(input, items.keyword, span, "in");
                     for word in &items.words {
-                        self.word(word, span);
+                        self.word(input, word, span);
                     }
                 }
                 self.loop_body(input, &command.body, span);
@@ -312,12 +366,12 @@ impl Claims {
             CompoundKind::Until(command) => self.loop_command(input, command, span, "until"),
             CompoundKind::Case(command) => {
                 self.keyword(input, command.keyword, span, "case");
-                self.word(&command.subject, span);
+                self.word(input, &command.subject, span);
                 self.keyword(input, command.in_keyword, span, "in");
                 for clause in &command.clauses {
                     assert!(!clause.patterns.is_empty(), "case arm without a pattern");
                     for pattern in &clause.patterns {
-                        self.word(pattern, span);
+                        self.word(input, pattern, span);
                     }
                     inside(clause.close, span);
                     self.list(input, &clause.body, span);
@@ -328,7 +382,7 @@ impl Claims {
                 self.keyword(input, command.esac, span, "esac");
             }
         }
-        self.redirects(&compound.redirections, span);
+        self.redirects(input, &compound.redirections, span);
     }
 
     fn loop_command(&mut self, input: &str, command: &LoopCommand, parent: Span, keyword: &str) {
@@ -362,12 +416,13 @@ impl Claims {
         self.words.push(span);
     }
 
-    fn word(&mut self, word: &CommandWord, parent: Span) {
+    fn word(&mut self, input: &str, word: &CommandWord, parent: Span) {
         inside(word.span, parent);
         self.words.push(word.span);
+        substitutions(input, &word.substitutions, word.span);
     }
 
-    fn redirects(&mut self, redirections: &[Redirect], parent: Span) {
+    fn redirects(&mut self, input: &str, redirections: &[Redirect], parent: Span) {
         for redirect in redirections {
             inside(redirect.span, parent);
             assert_eq!(
@@ -375,8 +430,45 @@ impl Claims {
                 "redirection ends at its target"
             );
             self.words.push(redirect.target.span);
+            substitutions(input, &redirect.target.substitutions, redirect.target.span);
             // The redirection token runs from the redirection's start to just before its target.
             self.redirections.push(redirect.span.start);
+            let here_document = matches!(
+                redirect.operator,
+                RedirectionOperator::HereDocument | RedirectionOperator::HereDocumentStripTabs
+            );
+            assert_eq!(here_document, redirect.here_document.is_some(), "here-document body");
+            if redirect.feeds_interpreter {
+                assert!(
+                    here_document || redirect.operator == RedirectionOperator::HereString,
+                    "only a here-document or here-string feeds an interpreter"
+                );
+            }
+            if let Some(document) = &redirect.here_document {
+                assert!(redirect.target.substitutions.is_empty(), "delimiter expanded");
+                let span = Span::new(document.body.start, document.delimiter.end);
+                assert!(span.start >= redirect.span.end, "body before its operator");
+                tiles(input, &document.segments, document.body);
+                assert!(
+                    !document.quoted || document.substitutions.is_empty(),
+                    "quoted body runs commands"
+                );
+                substitutions(input, &document.substitutions, document.body);
+                self.here_documents.push(span);
+            }
+        }
+    }
+
+    /// The simple commands of this script come in source order without overlapping.
+    fn check_order(&self) {
+        let mut previous_end = 0;
+        for span in &self.simple_commands {
+            assert!(!span.is_empty(), "empty simple command");
+            assert!(
+                span.start >= previous_end,
+                "simple commands overlap or are out of order"
+            );
+            previous_end = span.end;
         }
     }
 
@@ -392,10 +484,13 @@ impl Claims {
         };
         let mut words = Vec::new();
         let mut redirections = Vec::new();
+        let mut here_documents = Vec::new();
         for token in tokens {
             match token.kind {
                 TokenKind::Word(_) if !covered(token.span) => words.push(token.span),
                 TokenKind::Redirection(_) if !covered(token.span) => redirections.push(token.span.start),
+                // Never covered: a body whose operator lies in an unsupported construct is refused.
+                TokenKind::HereDocumentBody(_) => here_documents.push(token.span),
                 TokenKind::Word(_)
                 | TokenKind::Redirection(_)
                 | TokenKind::Operator(_)
@@ -404,6 +499,11 @@ impl Claims {
                 | TokenKind::Comment => {}
             }
         }
+        self.here_documents.sort_by_key(|span| span.start);
+        assert_eq!(
+            self.here_documents, here_documents,
+            "here-document bodies dropped, duplicated or invented"
+        );
         self.words.sort_by_key(|span| span.start);
         assert_eq!(self.words, words, "word tokens dropped, duplicated or invented");
         self.redirections.sort_unstable();
@@ -422,23 +522,14 @@ fn inside(span: Span, parent: Span) {
     );
 }
 
-/// Simple commands come in source order without overlapping, and each function call names definitions of the line.
-fn check_simple_commands(input: &str, script: &Script) {
+/// Each function call names earlier definitions of the line.
+fn check_function_calls(script: &Script) {
     let definitions: Vec<Span> = script
         .function_definitions()
         .map(|definition| definition.span)
         .collect();
-    let mut previous_end = 0;
     for command in script.simple_commands() {
-        span_text(input, command.span);
-        assert!(!command.span.is_empty(), "empty simple command");
-        assert!(
-            command.span.start >= previous_end,
-            "simple commands overlap or are out of order"
-        );
-        previous_end = command.span.end;
         if let Some(call) = &command.function_call {
-            assert!(command.name().is_some(), "function call without a name");
             assert!(!call.definitions.is_empty(), "function call without a definition");
             for definition in &call.definitions {
                 assert!(definitions.contains(definition), "function call names no definition");
@@ -447,6 +538,34 @@ fn check_simple_commands(input: &str, script: &Script) {
                     "function call before its definition"
                 );
             }
+        }
+    }
+}
+
+/// Each substitution's script, in the text it indexes (`input`, or the substitution's own text), has the structure
+/// of a line, lies inside the substitution (which lies inside `parent`), and marks no function call.
+fn substitutions(input: &str, substitutions: &[Substitution], parent: Span) {
+    for substitution in substitutions {
+        inside(substitution.span, parent);
+        span_text(input, substitution.span);
+        let source = substitution.source(input);
+        match &substitution.text {
+            Some(text) => assert_eq!(
+                substitution.script.span,
+                Span::new(0, text.len()),
+                "un-escaped script span"
+            ),
+            None => inside(substitution.script.span, substitution.span),
+        }
+        span_text(source, substitution.script.span);
+        let mut claims = Claims::default();
+        claims.list(source, &substitution.script.items, substitution.script.span);
+        claims.check_order();
+        for command in substitution.script.simple_commands() {
+            assert!(
+                command.function_call.is_none(),
+                "function call marked inside a substitution"
+            );
         }
     }
 }

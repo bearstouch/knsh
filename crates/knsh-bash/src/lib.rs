@@ -19,8 +19,15 @@
 //! condition, body, case arm and function body, and a call that certainly reaches a function defined earlier in the
 //! line is marked ([`SimpleCommand::function_call`]), so it is not resolved as a program. Constructs outside decision
 //! 6 whose extent is certain (`select`, `[[ … ]]`, `(( … ))`) are kept whole as [`Command::Unsupported`] nodes; other
-//! valid bash that later stories read (here-documents, `coproc`, `time`) is refused with [`ParseError::Unsupported`]
+//! valid bash it does not read (`coproc`, `time`, array assignments) is refused with [`ParseError::Unsupported`]
 //! rather than read partly.
+//!
+//! Substitutions and here-documents (KNSH-031): every `$( … )`, backtick (un-escaped as bash does first), `<( … )`
+//! and `>( … )` in a word, an assignment, a redirection target or an unquoted here-document body is parsed recursively
+//! into a nested [`Script`] ([`Substitution`]), and [`Script::simple_commands`] yields its commands too. The lexer
+//! reads here-document bodies ([`HereDocumentBody`]: `<<`, `<<-`, quoted and unquoted delimiters, several on one
+//! line), the parser attaches each to its redirection ([`HereDocument`]), and a here-document or here-string read by a
+//! shell or interpreter is marked for dynamic classification ([`Redirect::feeds_interpreter`]).
 //!
 //! # Boundaries
 //!
@@ -46,6 +53,7 @@
 mod ast;
 mod error;
 mod functions;
+mod interpreters;
 mod lex;
 mod limits;
 mod parse;
@@ -54,14 +62,15 @@ mod token;
 pub use ast::{
     AndOr, AndOrOperator, AndOrPart, Assignment, CaseClause, CaseCommand, CaseTerminator, CaseTerminatorKind, Command,
     CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems, FunctionCall, FunctionDefinition,
-    Group, IfClause, IfCommand, ListItem, LoopBody, LoopCommand, PipeOperator, Pipeline, PipelinePart, Redirect,
-    Script, Separator, SeparatorKind, SimpleCommand, Subshell, UnsupportedCommand,
+    Group, HereDocument, IfClause, IfCommand, ListItem, LoopBody, LoopCommand, PipeOperator, Pipeline, PipelinePart,
+    Redirect, Script, Separator, SeparatorKind, SimpleCommand, Subshell, Substitution, SubstitutionKind,
+    UnsupportedCommand,
 };
 pub use error::{CompoundStart, Construct, LexError, ParseError, Unexpected, UnsupportedConstruct};
 pub use lex::lex;
 pub use limits::{MAX_FUNCTION_DEFINITIONS, MAX_INPUT_LEN, MAX_NESTING_DEPTH};
 pub use parse::parse;
 pub use token::{
-    IoNumber, Operator, Redirection, RedirectionOperator, ReservedWord, Segment, SegmentKind, Span, Token, TokenKind,
-    Word,
+    HereDocumentBody, IoNumber, Operator, Redirection, RedirectionOperator, ReservedWord, Segment, SegmentKind, Span,
+    Token, TokenKind, Word,
 };

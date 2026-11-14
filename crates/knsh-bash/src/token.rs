@@ -79,6 +79,35 @@ pub enum TokenKind {
     /// A comment, from `#` up to (not including) the next newline. `#` starts a comment only where a word could
     /// start: `a#b` is one word, `a #b` is a word and a comment.
     Comment,
+    /// The body and delimiter line of a here-document (KNSH-031). It comes right after the [`TokenKind::Newline`]
+    /// that ends the line holding its `<<` or `<<-` operator; when one line holds several operators, their bodies
+    /// follow one another in the order of the operators, as bash reads them.
+    HereDocumentBody(HereDocumentBody),
+}
+
+/// A here-document's body, read after the newline that ends the line holding its operator (KNSH-031).
+///
+/// The token's span runs from the start of [`body`](Self::body) to the end of [`delimiter`](Self::delimiter).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HereDocumentBody {
+    /// The `<<` or `<<-` redirection token the body belongs to (its descriptor number included).
+    pub operator: Span,
+    /// Set for `<<-`: leading tabs are removed from each body line and from the delimiter line before they are used
+    /// or compared. The tabs stay in [`segments`](Self::segments); they never change what a body substitution runs.
+    pub strip_tabs: bool,
+    /// Set when any part of the delimiter word is quoted (`<<'EOF'`, `<<"EOF"`, `<<\EOF`, `<<E"OF"`): the body is
+    /// then taken literally. Otherwise bash expands parameters, command substitutions, backticks and arithmetic in
+    /// it, and removes line continuations, so the body's substitutions run.
+    pub quoted: bool,
+    /// The body lines, up to (not including) the delimiter line. May be empty.
+    pub body: Span,
+    /// The body split into segments, tiling [`body`](Self::body). A quoted body is one [`SegmentKind::Literal`]
+    /// (none when the body is empty). An unquoted body is read like the inside of double quotes, except that `"`
+    /// is an ordinary character there: literals, escapes (`\$`, ``\` ``, `\\`), line continuations, parameters and
+    /// every substitution.
+    pub segments: Vec<Segment>,
+    /// The line that ends the body, its newline included (absent when the input ends right after it).
+    pub delimiter: Span,
 }
 
 /// A control operator.
