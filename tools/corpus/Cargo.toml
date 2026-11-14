@@ -1,0 +1,16 @@
+[package]
+name = "knsh-corpus"
+description = "Dev-only agent-command corpus importer, normaliser and checker (KNSH-033); never shipped"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+# Dev-only tool: it reads trajectory JSON with the in-house reader and adds no third-party crate. No shipped crate
+# may depend on it (xtask/tests/dependency_policy.rs).
+[dependencies]
+knsh-json = { path = "../../crates/knsh-json" }
+
+[lints]
+workspace = true

@@ -71,6 +71,9 @@ jobs:
       - name: Test
         run: scripts/check.sh test
 
+      - name: Agent-command corpus (normalised, licensed, no raw paths or tokens)
+        run: scripts/check.sh corpus
+
       - name: Dependency checks (licences, advisories, duplicate versions)
         run: scripts/check.sh deny
 

@@ -35,6 +35,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "knsh-corpus"
+version = "0.0.0"
+dependencies = [
+ "knsh-json",
+]
+
+[[package]]
 name = "knsh-exec"
 version = "0.0.0"
 

@@ -56,6 +56,8 @@ const LAYOUT: &[(&str, &[&str])] = &[
     ("knsh-exec", &[]),
     // Dev-only checks crate: depends on nothing, and nothing may depend on it.
     ("xtask", &[]),
+    // Dev-only corpus tool (KNSH-033): reads trajectory JSON; nothing may depend on it.
+    ("knsh-corpus", &["knsh-json"]),
 ];
 
 /// One `[[package]]` entry of `Cargo.lock`.
