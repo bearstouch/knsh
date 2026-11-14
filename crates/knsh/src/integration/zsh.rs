@@ -35,10 +35,21 @@
 //! - The hook functions are parsed before the user's `.zshenv` runs, so its aliases cannot change them.
 //!
 //! The line format is in [`telemetry`](super::telemetry).
+//!
+//! # Terminal marks
+//!
+//! When `knsh` asks for them ([`MARKS_VAR`], KNSH-022), whether or not recording is on, the
+//! wrapper adds a second pair of hooks, `_knsh_mark_preexec` and `_knsh_mark_precmd`, that write OSC 7 and OSC 133
+//! ([`marks`](super::marks)) to standard output while it is a terminal. `A` is written by `precmd`, `B` is appended to
+//! `PS1` inside `%{ %}` (and taken off again by the next hook, unless something has set `PS1` since), `C` by
+//! `preexec`, and `D;<status>` by the next `precmd`. The marks' `precmd` moves both hooks to the end of their arrays
+//! whenever something was added after them, so `PS1` is final when it is marked.
 
 use std::ffi::{OsStr, OsString};
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
+
+use super::marks::MARKS_VAR;
 
 /// The stock zsh that integration mode hosts (NFR-COMPAT-03: zsh is supported by running real zsh).
 pub const SYSTEM_ZSH: &str = "/bin/zsh";
@@ -91,6 +102,13 @@ if (( ${+KNSH_TELEMETRY_FD} )); then
   }
 fi
 
+# Terminal marks (KNSH-022): OSC 7 and OSC 133, whether or not recording is on. knsh asks for them only when its
+# standard output is a terminal, and the hooks write nothing while it is not one.
+if (( ${+KNSH_TERMINAL_MARKS} )); then
+  [[ "$KNSH_TERMINAL_MARKS" == 1 && -o interactive ]] && typeset -gi _knsh_marks=1
+  unset KNSH_TERMINAL_MARKS
+fi
+
 # Escapes $1 for a telemetry field into the caller's $_knsh_out: \\ \n \t \r \0.
 _knsh_escape() {
   _knsh_out=${1//\\/\\\\}
@@ -130,14 +148,83 @@ _knsh_precmd() {
   return 0
 }
 
-# Appends the hooks after any the user has, with add-zsh-hook; the arrays directly only if it is unavailable.
-_knsh_install_hooks() {
+# Percent-encodes $1 for a file:// URL into the caller's $_knsh_out: every byte but A-Z a-z 0-9 / . _ ~ - becomes
+# %XX. Byte by byte (no_multibyte), so a non-ASCII name is encoded as its UTF-8 bytes.
+_knsh_urlenc() {
   emulate -L zsh
-  typeset -gi _knsh_pending=0
-  if ! { autoload -Uz add-zsh-hook && add-zsh-hook preexec _knsh_preexec && add-zsh-hook precmd _knsh_precmd } 2>/dev/null; then
+  setopt no_multibyte
+  _knsh_out=$1
+  [[ $1 == *[^A-Za-z0-9/._~-]* ]] || return 0
+  local _knsh_c _knsh_x
+  local -i _knsh_i
+  _knsh_out=
+  for (( _knsh_i = 1; _knsh_i <= ${#1}; _knsh_i++ )); do
+    _knsh_c=${1[_knsh_i]}
+    if [[ $_knsh_c == [A-Za-z0-9/._~-] ]]; then
+      _knsh_out+=$_knsh_c
+    else
+      printf -v _knsh_x '%%%02X' "'$_knsh_c"
+      _knsh_out+=$_knsh_x
+    fi
+  done
+  return 0
+}
+
+# Takes the command start mark off PS1 again, unless something has set PS1 since.
+_knsh_unmark() {
+  [[ -n $_knsh_ps1_marked && $PS1 == "$_knsh_ps1_marked" ]] && PS1=$_knsh_ps1
+  _knsh_ps1_marked=
+  return 0
+}
+
+# precmd for the marks: OSC 133 D with the status of the line that ran (only after its C), OSC 7, OSC 133 A, then
+# OSC 133 B at the end of PS1. Moves the marks' hooks after any added since (later startup files add theirs after the
+# wrapper's), so that PS1 is final when it is marked and C is the last thing before the line's output.
+_knsh_mark_precmd() {
+  local -i _knsh_status=$? _knsh_pct=0
+  [[ -o prompt_percent ]] && _knsh_pct=1
+  emulate -L zsh
+  _knsh_unmark
+  if [[ ${precmd_functions[-1]-} != _knsh_mark_precmd || ${preexec_functions[-1]-} != _knsh_mark_preexec ]]; then
+    { add-zsh-hook -d precmd _knsh_mark_precmd && add-zsh-hook precmd _knsh_mark_precmd &&
+      add-zsh-hook -d preexec _knsh_mark_preexec && add-zsh-hook preexec _knsh_mark_preexec } 2>/dev/null
+  fi
+  if [[ -t 1 ]]; then
+    local _knsh_out _knsh_d= _knsh_h
+    (( _knsh_mark_ran )) && _knsh_d=$'\e]133;D;'$_knsh_status$'\a'
+    _knsh_urlenc "$HOST"
+    _knsh_h=$_knsh_out
+    _knsh_urlenc "$PWD"
+    print -rn -- "$_knsh_d"$'\e]7;file://'"$_knsh_h$_knsh_out"$'\a\e]133;A\a' 2>/dev/null
+    # %{ %} tells zsh the mark takes no room; without prompt_percent it would be printed as text.
+    if (( _knsh_pct )); then
+      _knsh_ps1=$PS1
+      PS1+=$'%{\e]133;B\a%}'
+      _knsh_ps1_marked=$PS1
+    fi
+  fi
+  _knsh_mark_ran=0
+  return 0
+}
+
+# preexec for the marks: PS1 as the user set it, then OSC 133 C.
+_knsh_mark_preexec() {
+  emulate -L zsh
+  _knsh_unmark
+  [[ -t 1 ]] || return 0
+  print -rn -- $'\e]133;C\a' 2>/dev/null
+  _knsh_mark_ran=1
+  return 0
+}
+
+# Appends the preexec $1 and the precmd $2 after any hooks the user has, with add-zsh-hook; the arrays directly only
+# if it is unavailable.
+_knsh_add_hooks() {
+  emulate -L zsh
+  if ! { autoload -Uz add-zsh-hook && add-zsh-hook preexec $1 && add-zsh-hook precmd $2 } 2>/dev/null; then
     typeset -ga preexec_functions precmd_functions
-    (( ${preexec_functions[(Ie)_knsh_preexec]} )) || preexec_functions+=(_knsh_preexec)
-    (( ${precmd_functions[(Ie)_knsh_precmd]} )) || precmd_functions+=(_knsh_precmd)
+    (( ${preexec_functions[(Ie)$1]} )) || preexec_functions+=($1)
+    (( ${precmd_functions[(Ie)$2]} )) || precmd_functions+=($2)
   fi
 }
 
@@ -154,11 +241,20 @@ if [[ -r "${ZDOTDIR-$HOME}/.zshenv" ]]; then
 fi
 
 if (( ${+_knsh_telemetry_fd} )); then
-  \_knsh_install_hooks
+  typeset -gi _knsh_pending=0
+  \_knsh_add_hooks _knsh_preexec _knsh_precmd
 else
   \builtin unfunction _knsh_escape _knsh_preexec _knsh_precmd
 fi
-\builtin unfunction _knsh_install_hooks
+if (( ${_knsh_marks-0} )); then
+  typeset -gi _knsh_mark_ran=0
+  typeset -g _knsh_ps1= _knsh_ps1_marked=
+  \_knsh_add_hooks _knsh_mark_preexec _knsh_mark_precmd
+else
+  \builtin unfunction _knsh_urlenc _knsh_unmark _knsh_mark_precmd _knsh_mark_preexec
+fi
+\builtin unset _knsh_marks
+\builtin unfunction _knsh_add_hooks
 "#;
 
 /// Whether a shell-mode invocation is a human interactive shell that integration mode hosts.
@@ -192,6 +288,8 @@ pub struct ZshLaunch<'a> {
     pub force_interactive: bool,
     /// The inherited telemetry descriptor when recording is on; `None` when off.
     pub telemetry_fd: Option<RawFd>,
+    /// Whether the wrapper adds the terminal marks hooks (KNSH-022): `knsh`'s standard output is a terminal.
+    pub marks: bool,
 }
 
 /// How to start zsh: a pure function of [`ZshLaunch`], applied to a process by the caller.
@@ -225,9 +323,13 @@ impl ZshLaunch<'_> {
             OsString::from(ORIGINAL_ZDOTDIR_VAR),
             OsString::from(TELEMETRY_FD_VAR),
             OsString::from(super::RECORDING_VAR),
+            OsString::from(MARKS_VAR),
         ];
         let mut set_env = Vec::new();
         if let Some(startup_dir) = self.startup_dir {
+            if self.marks {
+                set_env.push((OsString::from(MARKS_VAR), OsString::from("1")));
+            }
             remove_env.push(OsString::from(ZDOTDIR_VAR));
             set_env.push((OsString::from(ZDOTDIR_VAR), startup_dir.as_os_str().to_owned()));
             if let Some(user_zdotdir) = self.user_zdotdir {
@@ -261,6 +363,7 @@ mod tests {
             login: false,
             force_interactive: false,
             telemetry_fd: None,
+            marks: false,
         }
     }
 
@@ -286,7 +389,7 @@ mod tests {
         let unset = position("unset ZDOTDIR");
         let takeover = position("unset KNSH_TELEMETRY_FD");
         let source = position("source \"${ZDOTDIR-$HOME}/.zshenv\"");
-        let install = position("\\_knsh_install_hooks\n");
+        let install = position("\\_knsh_add_hooks _knsh_preexec _knsh_precmd\n");
         assert!(
             restore < source && unset < source,
             "ZDOTDIR is restored before the user's .zshenv runs"
@@ -311,8 +414,9 @@ mod tests {
     // KNSH-019 unit test: hooks are appended with add-zsh-hook and the hook arrays are never assigned outright.
     #[test]
     fn hooks_are_added_not_replaced() {
-        assert!(ZSHENV.contains("add-zsh-hook preexec _knsh_preexec"));
-        assert!(ZSHENV.contains("add-zsh-hook precmd _knsh_precmd"));
+        assert!(ZSHENV.contains("add-zsh-hook preexec $1 && add-zsh-hook precmd $2"));
+        assert!(ZSHENV.contains("\\_knsh_add_hooks _knsh_preexec _knsh_precmd\n"));
+        assert!(ZSHENV.contains("\\_knsh_add_hooks _knsh_mark_preexec _knsh_mark_precmd\n"));
         assert!(ZSHENV.contains("autoload -Uz add-zsh-hook"));
         for clobber in [
             "preexec_functions=(",
@@ -324,8 +428,10 @@ mod tests {
             assert!(!ZSHENV.contains(clobber), "wrapper must not contain {clobber:?}");
         }
         // The fallback appends after the existing entries and skips an entry already present.
-        assert!(ZSHENV.contains("(( ${preexec_functions[(Ie)_knsh_preexec]} )) || preexec_functions+=(_knsh_preexec)"));
-        assert!(ZSHENV.contains("(( ${precmd_functions[(Ie)_knsh_precmd]} )) || precmd_functions+=(_knsh_precmd)"));
+        assert!(ZSHENV.contains("(( ${preexec_functions[(Ie)$1]} )) || preexec_functions+=($1)"));
+        assert!(ZSHENV.contains("(( ${precmd_functions[(Ie)$2]} )) || precmd_functions+=($2)"));
+        // The marks' hooks move themselves to the end with add-zsh-hook too: removed, then appended again.
+        assert!(ZSHENV.contains("add-zsh-hook -d precmd _knsh_mark_precmd && add-zsh-hook precmd _knsh_mark_precmd"));
     }
 
     // FR-SES-22: every hook is isolated from the user's options and traps, ignores SIGPIPE locally and silences
@@ -411,6 +517,56 @@ mod tests {
         .plan();
         assert_eq!(plan.arg0, "-zsh");
         assert_eq!(plan.args, [OsString::from("-i")]);
+    }
+
+    // KNSH-022 (NFR-COMPAT-10): the marks are asked for in the environment, whatever the recording state, only with
+    // the wrapper (which takes the variable out again before any user file runs); a stale value is never inherited.
+    #[test]
+    fn marks_are_passed_to_the_wrapper_only_when_wanted() {
+        let marks = |launch: ZshLaunch<'_>| env_value(&launch.plan(), MARKS_VAR).map(OsStr::to_owned);
+        assert_eq!(
+            marks(ZshLaunch {
+                marks: true,
+                ..launch()
+            }),
+            Some(OsString::from("1"))
+        );
+        let recorded = ZshLaunch {
+            marks: true,
+            telemetry_fd: Some(5),
+            ..launch()
+        };
+        assert_eq!(marks(recorded), Some(OsString::from("1")));
+        assert_eq!(marks(launch()), None);
+        let plain = ZshLaunch {
+            marks: true,
+            startup_dir: None,
+            ..launch()
+        };
+        assert_eq!(marks(plain), None);
+        assert!(launch().plan().remove_env.iter().any(|name| name == MARKS_VAR));
+        assert!(position("unset KNSH_TERMINAL_MARKS") < position("source \"${ZDOTDIR-$HOME}/.zshenv\""));
+    }
+
+    // KNSH-022: every write of a mark is guarded by a terminal on standard output at that moment, and the hooks are
+    // removed when the marks are not wanted.
+    #[test]
+    fn mark_hooks_write_only_to_a_terminal() {
+        for hook in ["_knsh_mark_precmd() {", "_knsh_mark_preexec() {"] {
+            let body = &ZSHENV[position(hook)..];
+            let body = &body[..body.find("\n}\n").expect("function end")];
+            assert!(body.contains("emulate -L zsh"), "{hook}");
+            let guard = body.find("[[ -t 1 ]]").expect("terminal check");
+            let write = body.find("print -rn").expect("write");
+            assert!(guard < write, "{hook}");
+            assert!(body.contains("2>/dev/null"), "{hook}");
+        }
+        // $? is read before anything else can change it.
+        assert!(position("local -i _knsh_status=$? _knsh_pct=0") < position("_knsh_mark_precmd() {") + 40);
+        assert!(ZSHENV.contains("\\builtin unfunction _knsh_urlenc _knsh_unmark _knsh_mark_precmd _knsh_mark_preexec"));
+        // B goes inside %{ %}, and only with prompt_percent (otherwise it would print as text).
+        assert!(ZSHENV.contains("PS1+=$'%{\\e]133;B\\a%}'"));
+        assert!(position("[[ -o prompt_percent ]]") < position("emulate -L zsh\n  _knsh_unmark"));
     }
 
     #[test]

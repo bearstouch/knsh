@@ -29,7 +29,7 @@ use knsh_platform::{EnginePaths, FileKind, Fs, PlatformError, ensure_engine_dirs
 #[cfg(target_os = "macos")]
 use knsh_platform::macos::{JobSignalsIgnored, TelemetryPipe, reraise_default};
 
-use super::bash::{self, BASHRC, BashLaunch, BashTelemetry};
+use super::bash::{self, BASHRC, BashLaunch};
 use super::telemetry::{LineReader, PromptCycle, TelemetryLine};
 use super::zsh::{self, LaunchPlan, ZSHENV, ZshLaunch};
 
@@ -269,11 +269,9 @@ impl HostedLaunch<'_> {
         match *self {
             Self::Zsh(launch) => ZshLaunch { telemetry_fd, ..launch }.plan(),
             Self::Bash(launch) => BashLaunch {
+                telemetry_fd,
                 // The shell is started by this process, so this is its parent.
-                telemetry: telemetry_fd.map(|fd| BashTelemetry {
-                    fd,
-                    parent_pid: std::process::id(),
-                }),
+                parent_pid: std::process::id(),
                 ..launch
             }
             .plan(),
@@ -432,13 +430,16 @@ mod tests {
                 login: false,
                 force_interactive: false,
                 telemetry_fd: None,
+                marks: false,
             };
             let bash = BashLaunch {
                 bash: Path::new("/bin/bash"),
                 startup_dir,
                 login: true,
                 force_interactive: false,
-                telemetry: None,
+                telemetry_fd: None,
+                marks: false,
+                parent_pid: 1,
                 user_prompt_command: None,
             };
             for launch in [HostedLaunch::from(zsh), HostedLaunch::from(bash)] {

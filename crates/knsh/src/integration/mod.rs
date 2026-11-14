@@ -24,7 +24,10 @@ pub mod bash;
 pub mod config;
 #[cfg(unix)]
 pub mod host;
+pub mod marks;
 #[cfg(unix)]
 pub mod recorder;
+#[cfg(unix)]
+pub mod shells;
 pub mod telemetry;
 pub mod zsh;

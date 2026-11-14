@@ -13,6 +13,8 @@
 | `command.long_running` | 30 s | Yes | [command lifecycle](../03-functional-requirements/command-lifecycle.md) |
 | `session.idle` | 5 s at a human prompt | — | [sessions](../03-functional-requirements/sessions.md) |
 | Human recording | Off | `[recording] human` in `~/.config/knsh/config.toml` | [terminals and shells](../08-integrations/terminals-and-shells.md#recording-a-human-session) |
+| Hosted shell (integration mode) | The bash `$SHELL` names, else `/bin/zsh`; an invalid choice starts `/bin/zsh` | `[shell] hosted` in `~/.config/knsh/config.toml` | [terminals and shells](../08-integrations/terminals-and-shells.md#login-shell) |
+| Terminal marks (OSC 7, OSC 133) | On when `knsh`'s standard output is a terminal | — | [terminals and shells](../08-integrations/terminals-and-shells.md#terminal-markup) |
 | Human telemetry queue in `knsh` | 1024 lines, then dropped | — | [terminals and shells](../08-integrations/terminals-and-shells.md#recording-a-human-session) |
 | Human telemetry reconnect | At most once every 30 s, at the next line | — | [terminals and shells](../08-integrations/terminals-and-shells.md#recording-a-human-session) |
 | Human telemetry timeouts | 5 s to start the session, 1 s per call, 500 ms at shell exit | — | [terminals and shells](../08-integrations/terminals-and-shells.md#recording-a-human-session) |

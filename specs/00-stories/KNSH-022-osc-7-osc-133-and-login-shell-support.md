@@ -17,19 +17,19 @@ hosted shell.
 **Acceptance criteria**
 *OSC 7 and OSC 133*
 
-- [ ] OSC 7 reports the working directory as a `file://host/path` URL with percent-encoding, on start and on every
+- [x] OSC 7 reports the working directory as a `file://host/path` URL with percent-encoding, on start and on every
       directory change.
-- [ ] OSC 133 `A` (prompt start), `B` (command start), `C` (output start) and `D;<exit>` (command end) are emitted in
+- [x] OSC 133 `A` (prompt start), `B` (command start), `C` (output start) and `D;<exit>` (command end) are emitted in
       that order, for zsh and bash, whether or not recording is on.
-- [ ] Sequences are written only when stdout is a terminal.
+- [x] Sequences are written only when stdout is a terminal.
 
 *Login shell support*
 
-- [ ] `knsh` detects login invocation (`argv[0]` starting with `-`, or `-l`/`--login`) and starts the hosted shell
+- [x] `knsh` detects login invocation (`argv[0]` starting with `-`, or `-l`/`--login`) and starts the hosted shell
       as a login shell.
 - [ ] A command `knsh shell install` (or documented steps) adds `knsh` to `/etc/shells` only after explicit user
       confirmation; it never edits `/etc/shells` silently.
-- [ ] The hosted shell is chosen from user configuration, defaulting to zsh; an invalid choice falls back to
+- [x] The hosted shell is chosen from user configuration, defaulting to zsh; an invalid choice falls back to
       `/bin/zsh` with a warning rather than leaving the user without a shell.
 
 **Unit tests**
@@ -45,6 +45,22 @@ hosted shell.
 - `invalid_hosted_shell_falls_back_to_zsh` — never lock the user out.
 
 **Notes**
+*OSC 7 and OSC 133*
+
+— Implemented in the zsh and bash wrappers, which are now read whenever the marks are wanted, recording or not
+(bash without recording previously ran with no file of `knsh`'s). Mechanism and limits:
+[terminal markup](../08-integrations/terminals-and-shells.md#terminal-markup).
+
 *Login shell support*
 
-— The hosted-shell configuration key is not specified; add it to the spec with KNSH-021's recording key.
+— Decided: `[shell] hosted` in `~/.config/knsh/config.toml`, next to KNSH-021's `[recording] human`
+([login shell](../08-integrations/terminals-and-shells.md#login-shell)). Without it, the KNSH-020 rule applies
+(the bash `$SHELL` names, else zsh), which is zsh once `knsh` is the login shell.
+
+— `knsh shell install`: the flow (already listed, yes, no, no terminal, unrepresentable path, failed append) is
+unit-tested with a fake, and the refusal without a terminal end to end. **Pending:** the real append through `sudo`
+and `chsh -s` to `knsh` followed by a new login in Terminal.app need a manual check with an administrator password.
+
+— **Known limit:** with `knsh` as the login shell, non-interactive login invocations (`ssh host cmd`, `scp`,
+`rsync`, `$SHELL -l -c env`) fail until `knsh -c` is implemented (agent and unattended paths, later stories).
+Documented in [CLI](../06-api/cli.md#login-shell) and printed by `knsh shell install`.

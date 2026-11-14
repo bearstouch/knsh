@@ -29,6 +29,7 @@ fn main() -> ExitCode {
         Ok(Invocation::Command(parsed)) => match parsed.path.as_slice() {
             ["daemon", action @ ("install" | "uninstall")] => daemon(action, parsed.json()),
             ["forget"] => forget(&parsed),
+            ["shell", "install"] => shell_install(parsed.json()),
             _ => not_implemented(&format!("'knsh {}'", parsed.path.join(" "))),
         },
         // Usage errors run nothing and exit with 2, like bash (KNSH-009).
@@ -127,6 +128,38 @@ fn forget(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
     not_implemented("'knsh forget' on this platform")
 }
 
+/// Runs `knsh shell install` (KNSH-022): adds the running `knsh` to `/etc/shells` after an explicit yes on the
+/// terminal. Exits with 1 and the reason on stderr when it cannot; `/etc/shells` is then unchanged.
+#[cfg(unix)]
+fn shell_install(json: bool) -> ExitCode {
+    use knsh::cli::shell::{self, SystemShellsHost};
+
+    // Resolved, so /etc/shells names the binary itself and not a symlink that may later point elsewhere.
+    let knsh = match std::env::current_exe().and_then(std::fs::canonicalize) {
+        Ok(path) => path,
+        Err(error) => {
+            report(&format!("knsh: cannot locate the running knsh binary: {error}\n"));
+            return ExitCode::FAILURE;
+        }
+    };
+    match shell::install(&mut SystemShellsHost, &knsh) {
+        Ok(outcome) => {
+            let _ = std::io::stdout().write_all(shell::report(outcome, &knsh, json).as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            report(&format!("knsh: shell install failed: {error}\n"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `/etc/shells` exists only on Unix.
+#[cfg(not(unix))]
+fn shell_install(_json: bool) -> ExitCode {
+    not_implemented("'knsh shell install' on this platform")
+}
+
 /// Runs a shell-mode invocation. A human interactive shell is hosted in integration mode (KNSH-019); `-c` lines and
 /// scripts (the agent and unattended paths) arrive in later stories.
 fn shell_mode(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
@@ -147,56 +180,83 @@ fn shell_mode(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
     }
 }
 
-/// Hosts the user's stock shell for a human: their bash when `$SHELL` is one (KNSH-020), zsh otherwise (KNSH-019).
-/// Recorded when `[recording] human = true` is set (KNSH-021); otherwise `knsh` never contacts `knshd` (FR-SES-23).
+/// Hosts the user's stock shell for a human: the one `[shell] hosted` names (KNSH-022), else their bash when `$SHELL`
+/// is one (KNSH-020), else zsh (KNSH-019). Recorded when `[recording] human = true` is set (KNSH-021); otherwise
+/// `knsh` never contacts `knshd` (FR-SES-23). A login invocation (`-knsh`, `-l`, `--login`) starts the hosted shell as
+/// a login shell (NFR-COMPAT-08).
 #[cfg(target_os = "macos")]
 fn human_shell(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
-    use knsh::integration::bash;
+    use knsh::integration::config::HostedShell;
 
     let host = Host::new();
-    let login_shell = std::env::var_os(bash::SHELL_VAR);
-    match bash::user_bash(login_shell.as_deref()) {
-        // A "bash" that is knsh itself would exec knsh again, forever.
-        Some(bash) if !is_this_program(bash) => human_bash(&host, shell, bash),
-        _ => human_zsh(&host, shell),
+    match &host.hosted {
+        HostedShell::Bash(bash) => human_bash(&host, shell, bash),
+        HostedShell::Zsh(zsh) => human_zsh(&host, shell, zsh),
     }
 }
 
-/// What every way of hosting the shell needs: the engine paths and whether this session is recorded.
+/// What every way of hosting the shell needs: the engine paths, the settings, and whether the terminal gets marks.
 #[cfg(target_os = "macos")]
 struct Host {
     /// The reason when `HOME` is unset or unusable: then no startup wrapper and no configuration, so no recording.
     paths: Result<knsh_platform::EnginePaths, String>,
     /// `[recording] human` (KNSH-021). Off unless the configuration says `true`.
     recording: bool,
+    /// The shell to host (KNSH-022): always one that can be started, `/bin/zsh` when the choice cannot.
+    hosted: knsh::integration::config::HostedShell,
+    /// OSC 7 and OSC 133 (KNSH-022): only when `knsh`'s standard output is a terminal.
+    marks: bool,
 }
 
 #[cfg(target_os = "macos")]
 impl Host {
-    /// Resolves the engine paths from `HOME` and reads the recording switch.
+    /// Resolves the engine paths from `HOME`, reads the settings once and chooses the shell. An unclear setting is
+    /// reported once on stderr; the shell starts either way.
     fn new() -> Self {
+        use std::io::IsTerminal;
         use std::path::Path;
 
-        use knsh::integration::config;
+        use knsh::integration::config::{self, Settings};
+        use knsh::integration::{bash, marks, shells};
         use knsh_platform::EnginePaths;
         use knsh_platform::macos::RealFs;
 
         let paths = std::env::var_os("HOME")
             .ok_or_else(|| "HOME is not set".to_owned())
             .and_then(|home| EnginePaths::for_home(Path::new(&home)).map_err(|error| error.to_string()));
-        let recording = match &paths {
+        let (settings, file) = match &paths {
             Ok(paths) => {
                 let file = paths.config_file();
-                config::human_recording(&RealFs::new(), &file).unwrap_or_else(|error| {
-                    // Unclear means off (privacy first), and is said once; the shell still starts.
-                    report(&format!("knsh: {}: {error}; recording is off\n", file.display()));
-                    false
-                })
+                (config::read_settings(&RealFs::new(), &file), file.display().to_string())
             }
-            // No configuration to read: recording keeps its default, off (FR-SES-04).
-            Err(_) => false,
+            // No configuration to read: every setting keeps its default (recording off, FR-SES-04).
+            Err(_) => (Settings::default(), String::new()),
         };
-        Self { paths, recording }
+        let login_shell = std::env::var_os(bash::SHELL_VAR);
+        let choice = shells::choose_hosted_shell(&settings.hosted_shell, login_shell.as_deref(), &is_usable_shell);
+        // A file that cannot be read or parsed spoils both settings with the same error: said once, with both effects.
+        let same_error = matches!((&settings.recording, &settings.hosted_shell), (Err(a), Err(b)) if a == b);
+        if let Err(error) = &settings.recording {
+            // Unclear means off (privacy first).
+            let also = if same_error { " and /bin/zsh starts" } else { "" };
+            report(&format!("knsh: {file}: {error}; recording is off{also}\n"));
+        }
+        if let Some(warning) = &choice.warning
+            && !same_error
+        {
+            let source = if settings.hosted_shell.is_err() {
+                format!("{file}: ")
+            } else {
+                String::new()
+            };
+            report(&format!("knsh: {source}{warning}\n"));
+        }
+        Self {
+            paths,
+            recording: settings.recording.unwrap_or(false),
+            hosted: choice.shell,
+            marks: marks::wanted(std::io::stdout().is_terminal()),
+        }
     }
 
     /// Starts recording, when it is on (KNSH-021): the worker that forwards telemetry to `knshd` over `user.sock`.
@@ -222,6 +282,17 @@ impl Host {
     }
 }
 
+/// Whether `path` can be started as the hosted shell: an executable regular file that is not `knsh` itself (which
+/// would start `knsh` again, forever).
+#[cfg(target_os = "macos")]
+fn is_usable_shell(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable =
+        std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
+    executable && !is_this_program(path)
+}
+
 /// How long `knsh` waits, after the shell has exited, for the last command lines to reach `knshd`. Bounded: exiting
 /// the shell must never hang on the daemon (NFR-REL-02); the session ends when `knsh`'s connection closes anyway.
 #[cfg(target_os = "macos")]
@@ -234,47 +305,77 @@ fn is_this_program(path: &std::path::Path) -> bool {
     matches!((this, std::fs::canonicalize(path)), (Ok(this), Ok(path)) if this == path)
 }
 
-/// Hosts the user's bash (KNSH-020). Recording off: `knsh` replaces itself with plain bash, with no file or variable
-/// of `knsh`'s, so every startup file runs exactly as under plain bash, with bash's own exit status, signals and
-/// terminal handling. Recording on (KNSH-021): bash runs as a child with the hooks and its telemetry goes to `knshd`.
+/// Hosts the user's bash (KNSH-020). Not recorded: `knsh` replaces itself with bash, so exit status, signals and
+/// terminal handling are bash's own; bash reads `knsh`'s wrapper only for the terminal marks (KNSH-022), and none
+/// at all without them. Recording on (KNSH-021): bash runs as a child with the hooks and its telemetry goes to
+/// `knshd`.
 ///
-/// If that bash cannot be started (for example `$SHELL` names a bash since uninstalled), zsh starts instead after a
-/// one-line warning: a human shell is never refused (FR-SES-22).
+/// If that bash cannot be started (for example it has been uninstalled), zsh starts instead after a one-line
+/// warning: a human shell is never refused (FR-SES-22).
 #[cfg(target_os = "macos")]
 fn human_bash(host: &Host, shell: &knsh::cli::args::ShellInvocation, bash: &std::path::Path) -> ExitCode {
-    use knsh::integration::bash::BashLaunch;
-    use knsh::integration::host;
+    use std::path::Path;
 
+    use knsh::integration::bash::{BashLaunch, PROMPT_COMMAND_VAR};
+    use knsh::integration::host as hosting;
+    use knsh::integration::zsh::SYSTEM_ZSH;
+    use knsh_platform::macos::{RealFs, effective_uid};
+
+    // A login bash that reads the wrapper starts with the bootstrap in PROMPT_COMMAND, followed by the user's own.
+    let user_prompt_command = std::env::var_os(PROMPT_COMMAND_VAR);
     let launch = BashLaunch {
         bash,
         startup_dir: None,
         login: shell.login,
         force_interactive: shell.interactive,
-        telemetry: None,
-        user_prompt_command: None,
+        telemetry_fd: None,
+        marks: host.marks,
+        // knsh replaces itself with bash, so bash's parent is knsh's.
+        parent_pid: std::os::unix::process::parent_id(),
+        user_prompt_command: user_prompt_command.as_deref(),
     };
     if let Some(code) = recorded_bash(host, shell, launch) {
         return code;
     }
-    let error = host::exec(&launch.plan());
+    // Not recorded: only the marks need the wrapper now; without them, or without the wrapper, plain bash.
+    let startup_dir = match &host.paths {
+        Ok(paths) if host.marks => match hosting::install_bash_startup_dir(&RealFs::new(), paths, effective_uid()) {
+            Ok(dir) => Some(dir),
+            Err(error) => {
+                report(&format!(
+                    "knsh: terminal marks unavailable ({error}); starting plain bash\n"
+                ));
+                None
+            }
+        },
+        _ => None,
+    };
+    let launch = BashLaunch {
+        startup_dir: startup_dir.as_deref(),
+        ..launch
+    };
+    let error = hosting::exec(&launch.plan());
     report(&format!(
         "knsh: cannot start {}: {error}; starting zsh\n",
         bash.display()
     ));
-    human_zsh(host, shell)
+    human_zsh(host, shell, Path::new(SYSTEM_ZSH))
 }
 
 /// Hosts `launch` as a recorded child (KNSH-021) and returns its exit code. `None` when it is not recorded: recording
 /// is off, the bash wrapper cannot be installed (no hook would exist to record with) or the worker cannot start; the
-/// caller then replaces itself with plain bash, as with recording off.
+/// caller then replaces itself with bash, as with recording off.
 #[cfg(target_os = "macos")]
 fn recorded_bash(
     host: &Host,
     shell: &knsh::cli::args::ShellInvocation,
     launch: knsh::integration::bash::BashLaunch<'_>,
 ) -> Option<ExitCode> {
+    use std::path::Path;
+
     use knsh::integration::bash::BashLaunch;
     use knsh::integration::host::{self, HostError};
+    use knsh::integration::zsh::SYSTEM_ZSH;
     use knsh_platform::macos::{RealFs, effective_uid};
 
     if !host.recording {
@@ -289,11 +390,8 @@ fn recorded_bash(
         }
     };
     let recording = host.start_recording()?;
-    // A recorded login shell would otherwise lose the user's own PROMPT_COMMAND to the hooks' bootstrap.
-    let user_prompt_command = std::env::var_os("PROMPT_COMMAND");
     let launch = BashLaunch {
         startup_dir: Some(&startup_dir),
-        user_prompt_command: user_prompt_command.as_deref(),
         ..launch
     };
     let code = match run_recorded(recording, launch) {
@@ -304,18 +402,25 @@ fn recorded_bash(
                 "knsh: cannot start {}: {error}; starting zsh\n",
                 launch.bash.display()
             ));
-            human_zsh(host, shell)
+            human_zsh(host, shell, Path::new(SYSTEM_ZSH))
         }
-        // The shell was never started: start it unrecorded rather than not at all.
+        // The shell was never started: start it unrecorded rather than not at all (`launch` carries no telemetry
+        // descriptor, and its parent is knsh's own once knsh is replaced by it).
         Err(HostError::Telemetry(error)) => {
             report(&format!(
                 "knsh: recording unavailable ({error}); starting bash unrecorded\n"
             ));
-            let plain = BashLaunch {
-                startup_dir: None,
+            let unrecorded = BashLaunch {
+                parent_pid: std::os::unix::process::parent_id(),
                 ..launch
             };
-            exec_shell(&plain.plan(), launch.bash)
+            // Returns only when bash cannot be started: zsh, as when it fails unrecorded (FR-SES-22).
+            let error = host::exec(&unrecorded.plan());
+            report(&format!(
+                "knsh: cannot start {}: {error}; starting zsh\n",
+                launch.bash.display()
+            ));
+            human_zsh(host, shell, Path::new(SYSTEM_ZSH))
         }
         // The shell ran but its end could not be observed: no exit status to pass on.
         Err(error @ HostError::Wait(_)) => {
@@ -326,14 +431,15 @@ fn recorded_bash(
     Some(code)
 }
 
-/// Hosts stock zsh (KNSH-019). Recording off: `knsh` replaces itself with zsh, so no telemetry, no `knshd`, and zsh's
-/// own exit status, signals and terminal handling. Recording on (KNSH-021): zsh runs as a child with the hooks and
-/// its telemetry goes to `knshd`.
+/// Hosts zsh (KNSH-019): `/bin/zsh`, or the zsh `[shell] hosted` names (KNSH-022). Recording off: `knsh` replaces
+/// itself with zsh, so no telemetry, no `knshd`, and zsh's own exit status, signals and terminal handling. Recording
+/// on (KNSH-021): zsh runs as a child with the hooks and its telemetry goes to `knshd`. The terminal marks come with
+/// the wrapper either way (KNSH-022).
 ///
-/// If the startup directory cannot be installed, plain zsh starts without it after a one-line warning: a human
-/// shell is never refused (FR-SES-22).
+/// If the startup directory cannot be installed, plain zsh starts without it after a one-line warning; if a zsh
+/// other than `/bin/zsh` cannot be started, `/bin/zsh` starts instead: a human shell is never refused (FR-SES-22).
 #[cfg(target_os = "macos")]
-fn human_zsh(host: &Host, shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
+fn human_zsh(host: &Host, shell: &knsh::cli::args::ShellInvocation, zsh_path: &std::path::Path) -> ExitCode {
     use std::path::Path;
 
     use knsh::integration::host::{self as hosting, HostError};
@@ -354,13 +460,15 @@ fn human_zsh(host: &Host, shell: &knsh::cli::args::ShellInvocation) -> ExitCode 
     };
     let user_zdotdir = std::env::var_os(zsh::ZDOTDIR_VAR);
     let launch = zsh::ZshLaunch {
-        zsh: Path::new(zsh::SYSTEM_ZSH),
+        zsh: zsh_path,
         startup_dir: startup_dir.as_deref(),
         user_zdotdir: user_zdotdir.as_deref(),
         login: shell.login,
         force_interactive: shell.interactive,
         telemetry_fd: None,
+        marks: host.marks,
     };
+    let system_zsh = Path::new(zsh::SYSTEM_ZSH);
     // Without the wrapper no hook exists to record with: plain zsh, as with recording off.
     if startup_dir.is_some()
         && let Some(recording) = host.start_recording()
@@ -373,8 +481,14 @@ fn human_zsh(host: &Host, shell: &knsh::cli::args::ShellInvocation) -> ExitCode 
                 report(&format!(
                     "knsh: recording unavailable ({error}); starting zsh unrecorded\n"
                 ));
-                exec_shell(&launch.plan(), Path::new(zsh::SYSTEM_ZSH))
+                // A chosen zsh that cannot be started falls back to /bin/zsh here too (FR-SES-22).
+                if zsh_path != system_zsh {
+                    let error = hosting::exec(&launch.plan());
+                    return system_zsh_instead(host, shell, zsh_path, &error);
+                }
+                exec_shell(&launch.plan(), zsh_path)
             }
+            Err(HostError::Start(error)) if zsh_path != system_zsh => system_zsh_instead(host, shell, zsh_path, &error),
             // The system zsh cannot start, or its end could not be observed: there is no other shell to fall back to.
             Err(error @ (HostError::Start(_) | HostError::Wait(_))) => {
                 report(&format!("knsh: {error}\n"));
@@ -382,7 +496,30 @@ fn human_zsh(host: &Host, shell: &knsh::cli::args::ShellInvocation) -> ExitCode 
             }
         };
     }
-    exec_shell(&launch.plan(), Path::new(zsh::SYSTEM_ZSH))
+    // A chosen zsh may be gone or broken, so its exec failing is not the end: the system one is the last resort, and
+    // only its failure goes to `exec_shell`.
+    if zsh_path != system_zsh {
+        let error = hosting::exec(&launch.plan());
+        return system_zsh_instead(host, shell, zsh_path, &error);
+    }
+    exec_shell(&launch.plan(), zsh_path)
+}
+
+/// A chosen zsh (`failed`) could not be started: says why once and hosts `/bin/zsh` instead (FR-SES-22).
+#[cfg(target_os = "macos")]
+fn system_zsh_instead(
+    host: &Host,
+    shell: &knsh::cli::args::ShellInvocation,
+    failed: &std::path::Path,
+    error: &dyn std::fmt::Display,
+) -> ExitCode {
+    use knsh::integration::zsh::SYSTEM_ZSH;
+
+    report(&format!(
+        "knsh: cannot start {}: {error}; starting {SYSTEM_ZSH}\n",
+        failed.display()
+    ));
+    human_zsh(host, shell, std::path::Path::new(SYSTEM_ZSH))
 }
 
 /// Runs `launch` as a child whose telemetry `recording` forwards to `knshd`, and returns the shell's exit code. Once
