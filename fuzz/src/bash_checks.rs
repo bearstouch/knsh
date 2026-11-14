@@ -7,10 +7,11 @@
 use std::path::PathBuf;
 
 use knsh_bash::{
-    Command, CommandClass, CommandWord, CompoundCommand, CompoundKind, Construct, DynamicReason, Interpreters,
-    LexError, ListItem, Lookup, LoopBody, LoopCommand, MAX_INPUT_LEN, MAX_TOKENS, Normalisation, Operator, ParseError,
-    ParseOutcome, Program, Redirect, RedirectionOperator, Resolver, SUBCOMMAND_TABLE, Script, Segment, SegmentKind,
-    SimpleCommand, SourceFile, Span, Substitution, Token, TokenKind, classify, lex, normalise, parse, parse_line,
+    Classification, Command, CommandClass, CommandWord, CompoundCommand, CompoundKind, Construct, DynamicReason,
+    Interpreters, LexError, ListItem, Lookup, LoopBody, LoopCommand, MAX_INPUT_LEN, MAX_TOKENS, Normalisation,
+    Operator, ParseError, ParseOutcome, Program, Redirect, RedirectionOperator, ReserialiseError, Resolver,
+    SUBCOMMAND_TABLE, Script, Segment, SegmentKind, SimpleCommand, SourceFile, Span, Substitution, Token, TokenKind,
+    classify, lex, normalise, parse, parse_line, reserialise,
 };
 
 /// `bash_lex`: the lexer never panics and is deterministic. An accepted line is tiled exactly by its token spans
@@ -374,6 +375,48 @@ fn check_classification(input: &str, outcome: &ParseOutcome) {
                 "link to a non-wrapper"
             );
         }
+    }
+    check_reserialise(input, outcome, &classification);
+}
+
+/// Re-serialisation (KNSH-038) never panics and is deterministic. It fails only for a path it cannot write (or that an
+/// `xargs` placeholder or a function of the line would change) or a name inside a backtick substitution bash
+/// un-escapes, never on its own round trip: an accepted output parses with the same outcome and classifies to the same
+/// entries (`TrustingSession` resolves `/usr/bin/x` to itself), and only the
+/// lines the parser could not read come back unchanged without a reason.
+fn check_reserialise(input: &str, outcome: &ParseOutcome, classification: &Classification) {
+    let result = reserialise(input, outcome, classification);
+    assert_eq!(
+        result,
+        reserialise(input, outcome, classification),
+        "reserialise is not deterministic"
+    );
+    let output = match result {
+        Ok(output) => output,
+        Err(
+            ReserialiseError::NameNotOnLine { .. }
+            | ReserialiseError::PathNotQuotable { .. }
+            | ReserialiseError::PathNotAbsolute { .. }
+            | ReserialiseError::PathHoldsPlaceholder { .. }
+            | ReserialiseError::FunctionShadowsPath { .. }
+            | ReserialiseError::OutputTooLarge,
+        ) => return,
+        Err(error) => panic!("reserialise failed its own round trip: {error:?}"),
+    };
+    let reparsed = parse_line(&output);
+    assert_eq!(reparsed.is_exact(), outcome.is_exact(), "re-serialised outcome differs");
+    let again = classify(&reparsed, &output, &TrustingSession, &Interpreters::defaults());
+    assert_eq!(
+        again.commands().len(),
+        classification.commands().len(),
+        "re-serialised entries differ"
+    );
+    for (old, new) in classification.commands().iter().zip(again.commands()) {
+        assert_eq!(
+            (old.class, &old.program),
+            (new.class, &new.program),
+            "re-serialised entry differs"
+        );
     }
 }
 

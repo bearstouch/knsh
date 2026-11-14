@@ -664,7 +664,7 @@ impl<R: Resolver + ?Sized> Classifier<'_, R> {
 /// Builtin and program wrappers are not told apart by how the name resolved: `nice command eval x` runs
 /// `/usr/bin/command`, a script macOS ships that runs the `command` builtin, and a project binary named like a
 /// wrapper is unwrapped too. Unwrapping only adds entries.
-fn wrapper_of(program: &Program, name: &str) -> Option<(Wrapper, bool)> {
+pub(crate) fn wrapper_of(program: &Program, name: &str) -> Option<(Wrapper, bool)> {
     match program {
         Program::Function => None,
         Program::Trusted(_) | Program::ProjectExecutable(_) => program

@@ -44,6 +44,20 @@ flowchart TD
 | 10. Capture | FR-LC-18 | The supervisor must capture output, redact secrets, and emit `command.output` when the session records output. |
 | 11. Finish | FR-LC-19 | The supervisor must write the record, compute file changes and the checkpoint ([checkpoints](checkpoints.md)), then emit `command.finished` and reply. |
 
+**Re-serialisation (FR-LC-13).** `knsh-bash`'s `reserialise` replaces the name word of every command that resolved to
+a binary (trusted or project executable), at any depth (wrapped commands, compound commands, function bodies,
+substitutions, here-document substitutions), by the binary's canonical absolute path, and changes nothing else. A path
+outside `[A-Za-z0-9/._+-]` is single-quoted (`'` written `'\''`). Builtins, calls to functions of the line, names not
+found and dynamic parts stay as written; a line the parser could not read is returned unchanged and decided as dynamic
+code. The output is parsed again and must keep the line's shape. Any of these is an error, and the line is denied:
+a path that is not UTF-8, not absolute and canonical, or that holds a control character, backslash or backtick; a path
+holding the replacement string of an `xargs` that runs the command (GNU `xargs -I` replaces it in the utility's name
+too); a function of the line named exactly like the path (bash calls it for that name before any binary); a name
+inside a backtick substitution bash un-escapes (`` `ls \$HOME` ``), whose place on the line is not exact; a changed
+shape. Known effects: a program run by its canonical path sees that path as `argv[0]`, so a multi-call binary reached
+through a symlink (`clang++` linking to `clang-18`, `view` to `vim`) behaves as its target; and a call the parser is
+not certain reaches a function of the line is resolved and replaced as a program.
+
 ## Denial
 
 | ID | Requirement |

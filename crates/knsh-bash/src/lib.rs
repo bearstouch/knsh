@@ -56,6 +56,12 @@
 //! FR-NET-03). An option the table does not know, an expansion or an unknown subcommand keeps the raw argv and gives
 //! no classes: the subcommand is never guessed.
 //!
+//! Re-serialisation, [`reserialise`] (KNSH-038): the classified line is re-emitted with every command name that
+//! resolved to a binary replaced by its absolute canonical path, quoted when needed, and nothing else changed, so the
+//! binary that runs is the one that was classified (FR-LC-13). Builtins, function calls and dynamic parts are left
+//! as written. The output is parsed again and must keep the line's shape; anything that cannot be replaced safely is a
+//! [`ReserialiseError`], and the supervisor denies the line.
+//!
 //! # Boundaries
 //!
 //! No workspace or third-party dependencies, no I/O, no global state, no `unsafe`. Input is untrusted (NFR-SEC-05):
@@ -73,6 +79,8 @@
 //! - `specs/03-functional-requirements/policy.md` (FR-POL-20, FR-POL-21: dynamic code never inherits classes)
 //! - `specs/05-models/execution-record.md` (`argv[].class`) and `specs/05-models/policy-profile.md`
 //!   (`exec.interpreters`)
+//! - `specs/03-functional-requirements/command-lifecycle.md` (FR-LC-13: run the line with resolved absolute paths;
+//!   FR-LC-15: executable rules stop a binary swapped after classification)
 //! - `specs/03-functional-requirements/policy.md` (FR-POL-15: subcommand normalisation) and
 //!   `specs/03-functional-requirements/network-proxy.md` (FR-NET-03: classes reaching `approval_hosts`)
 //! - `specs/09-reference/decisions.md` (decision 6: parser scope for phase 2)
@@ -96,6 +104,7 @@ mod lex;
 mod limits;
 mod outcome;
 mod parse;
+mod reserialise;
 mod subcommand_table;
 mod subcommands;
 mod token;
@@ -113,13 +122,15 @@ pub use classify::{
     Argument, Classification, ClassifiedCommand, CommandClass, Lookup, Program, Resolver, SourceFile, classify,
 };
 pub use error::{
-    CompoundStart, Construct, InterpreterTableError, LexError, ParseError, Unexpected, UnsupportedConstruct,
+    CompoundStart, Construct, InterpreterTableError, LexError, ParseError, ReserialiseError, Unexpected,
+    UnsupportedConstruct,
 };
 pub use interpreter_table::{Interpreter, Interpreters, family_of};
 pub use lex::lex;
 pub use limits::{MAX_FUNCTION_DEFINITIONS, MAX_INPUT_LEN, MAX_NESTING_DEPTH, MAX_TOKENS};
 pub use outcome::{Dynamic, DynamicPart, DynamicReason, Exact, ParseOutcome, parse_line};
 pub use parse::parse;
+pub use reserialise::reserialise;
 pub use subcommand_table::SUBCOMMAND_TABLE;
 pub use subcommands::{
     NetworkClass, Normalisation, Normalised, RawReason, SkippedOption, Subcommand, SubcommandTool, normalise,

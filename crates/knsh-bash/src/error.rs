@@ -1,5 +1,6 @@
-//! The crate's error types: [`LexError`] for the lexer and [`ParseError`], which wraps it, for the parser, and
-//! [`InterpreterTableError`] for interpreter entries a profile adds (KNSH-036).
+//! The crate's error types: [`LexError`] for the lexer and [`ParseError`], which wraps it, for the parser,
+//! [`InterpreterTableError`] for interpreter entries a profile adds (KNSH-036), and [`ReserialiseError`] for lines
+//! that cannot be re-serialised with resolved absolute paths (KNSH-038).
 //!
 //! Messages never echo the rejected input: command lines may hold paths, hosts or secrets, and errors are recorded
 //! and shown to agents (NFR-PRIV-02). Variants carry spans and limits, never text taken from the input. The
@@ -487,3 +488,97 @@ impl fmt::Display for InterpreterTableError {
 }
 
 impl std::error::Error for InterpreterTableError {}
+
+/// Why a line could not be re-serialised with resolved absolute paths (KNSH-038, FR-LC-13). The supervisor denies
+/// the line (fail closed). Variants carry the span of the command name at fault, never the path or any other text:
+/// paths name the user's folders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReserialiseError {
+    /// The resolved path is not valid UTF-8, so it cannot be written into the line.
+    PathNotUtf8 {
+        /// The command name.
+        span: Span,
+    },
+    /// The resolved path is not absolute and canonical (no `.` or `..`), so it would not name one binary wherever
+    /// the line runs.
+    PathNotAbsolute {
+        /// The command name.
+        span: Span,
+    },
+    /// The resolved path holds a control character, a backslash or a backtick, which no quoting reads the same way in
+    /// every context (a backtick substitution un-escapes backslashes and ends at a backtick).
+    PathNotQuotable {
+        /// The command name.
+        span: Span,
+    },
+    /// The command name is not a whole word whose span indexes the line: it is inside a backtick substitution whose
+    /// body bash un-escapes before reading it (`` `a \$x` ``), so a replacement cannot be placed exactly.
+    NameNotOnLine {
+        /// The span the classification gives for the name.
+        span: Span,
+    },
+    /// The command runs under an `xargs` whose replacement string (`-I`, `-i`, `--replace`, `-J`) appears in the
+    /// resolved path, or whose options cannot be read again: GNU `xargs` replaces it in the utility's name too, so
+    /// the binary would be chosen by the input at run time.
+    PathHoldsPlaceholder {
+        /// The command name.
+        span: Span,
+    },
+    /// A function of the line is named exactly like the resolved path. Bash calls such a function for the path
+    /// before any binary, so the replacement would not run the binary that was classified.
+    FunctionShadowsPath {
+        /// The command name.
+        span: Span,
+    },
+    /// Two different paths were given for the same command name.
+    ConflictingReplacements {
+        /// The command name.
+        span: Span,
+    },
+    /// The re-serialised line is longer than [`MAX_INPUT_LEN`](crate::MAX_INPUT_LEN), so it could not be read again.
+    OutputTooLarge,
+    /// The re-serialised line does not parse to the same shape as the original: a replacement changed how the line
+    /// reads.
+    RoundTrip,
+    /// The classification does not belong to the parse outcome it was given with (one read the line, the other
+    /// did not).
+    Mismatch,
+}
+
+impl fmt::Display for ReserialiseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PathNotUtf8 { span } => {
+                write!(f, "resolved path of the command at {span:?} is not valid UTF-8")
+            }
+            Self::PathNotAbsolute { span } => write!(
+                f,
+                "resolved path of the command at {span:?} is not absolute and canonical"
+            ),
+            Self::PathNotQuotable { span } => write!(
+                f,
+                "resolved path of the command at {span:?} holds a character that cannot be quoted safely"
+            ),
+            Self::NameNotOnLine { span } => write!(
+                f,
+                "command name at {span:?} is inside an un-escaped backtick substitution and cannot be replaced exactly"
+            ),
+            Self::PathHoldsPlaceholder { span } => write!(
+                f,
+                "resolved path of the command at {span:?} holds the replacement string of the xargs running it"
+            ),
+            Self::FunctionShadowsPath { span } => write!(
+                f,
+                "a function of the line is named like the resolved path of the command at {span:?}"
+            ),
+            Self::ConflictingReplacements { span } => {
+                write!(f, "two different paths for the command name at {span:?}")
+            }
+            Self::OutputTooLarge => f.write_str("re-serialised line is over the input size limit"),
+            Self::RoundTrip => f.write_str("re-serialised line does not parse to the same shape"),
+            Self::Mismatch => f.write_str("classification does not match the parse outcome"),
+        }
+    }
+}
+
+impl std::error::Error for ReserialiseError {}

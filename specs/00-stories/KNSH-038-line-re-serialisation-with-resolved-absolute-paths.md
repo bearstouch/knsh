@@ -12,11 +12,12 @@ Scope: replacement by span; quoting of paths with special characters; builtins, 
 untouched.
 
 **Acceptance criteria**
-- [ ] Output differs from input only at command-name spans of `Trusted` and `ProjectExecutable` resolutions.
-- [ ] Re-parsing the output yields the same AST shape and the same simple commands (property test over the corpus).
-- [ ] Paths containing spaces or shell metacharacters are single-quoted correctly.
-- [ ] Commands inside substitutions, function bodies and compound commands are rewritten too.
+- [x] Output differs from input only at command-name spans of `Trusted` and `ProjectExecutable` resolutions.
+- [x] Re-parsing the output yields the same AST shape and the same simple commands (property test over the corpus).
+- [x] Paths containing spaces or shell metacharacters are single-quoted correctly.
+- [x] Commands inside substitutions, function bodies and compound commands are rewritten too.
 - [ ] If any replacement cannot be done safely, the function returns an error and the supervisor denies (fail closed).
+  The error is done and tested (`ReserialiseError`); the supervisor's denial is pending its wiring in KNSH-050.
 
 **Unit tests**
 - `replaces_bare_name_with_absolute_path`.
