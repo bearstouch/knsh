@@ -151,8 +151,6 @@ impl EventHub {
     /// # Errors
     ///
     /// [`PublishError`] if the event cannot be stamped or the bus refuses it; nothing is delivered then.
-    // Emitters arrive with the stories that create sessions (KNSH-021 human telemetry, KNSH-056 `knsh agent`).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn publish(&self, session_id: SessionId, actor: &Actor, data: EventData) -> Result<u64, PublishError> {
         let mut state = lock(&self.state);
         // Stamped under the lock, so stamps follow `seq` order unless the wall clock itself steps back.
@@ -179,7 +177,6 @@ impl EventHub {
     /// # Errors
     ///
     /// As [`EventHub::publish`].
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn session_started(&self, session: &Session) -> Result<u64, PublishError> {
         self.publish(session.session_id(), session.actor(), EventData::started(session))
     }
@@ -190,7 +187,6 @@ impl EventHub {
     /// # Errors
     ///
     /// As [`EventHub::publish`]; `session.ended` is not published if `session.state_changed` failed.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn state_changed(&self, change: &StateChanged) -> Result<u64, PublishError> {
         let seq = self.publish(change.session_id, &change.actor, EventData::state_changed(change))?;
         match change.to {
@@ -386,7 +382,7 @@ impl Subscriber {
     }
 
     /// Subscribes this connection on `hub`.
-    fn subscribe(
+    pub(crate) fn subscribe(
         &self,
         hub: &Arc<EventHub>,
         scope: EventScope,
@@ -523,6 +519,7 @@ pub(crate) mod tests {
             stream: knsh_json::StreamId::new(1).unwrap(),
             request: &request,
             subscriber,
+            binding: crate::dispatch::tests::binding(),
         })
     }
 

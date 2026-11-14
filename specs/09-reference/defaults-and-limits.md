@@ -12,6 +12,11 @@
 | Rate limit | 5 denials of the same normalised line in 60 s → denied for 10 minutes | — | [hooks](../03-functional-requirements/hooks.md) |
 | `command.long_running` | 30 s | Yes | [command lifecycle](../03-functional-requirements/command-lifecycle.md) |
 | `session.idle` | 5 s at a human prompt | — | [sessions](../03-functional-requirements/sessions.md) |
+| Human recording | Off | `[recording] human` in `~/.config/knsh/config.toml` | [terminals and shells](../08-integrations/terminals-and-shells.md#recording-a-human-session) |
+| Human telemetry queue in `knsh` | 1024 lines, then dropped | — | [terminals and shells](../08-integrations/terminals-and-shells.md#recording-a-human-session) |
+| Human telemetry reconnect | At most once every 30 s, at the next line | — | [terminals and shells](../08-integrations/terminals-and-shells.md#recording-a-human-session) |
+| Human telemetry timeouts | 5 s to start the session, 1 s per call, 500 ms at shell exit | — | [terminals and shells](../08-integrations/terminals-and-shells.md#recording-a-human-session) |
+| `telemetry.command` | `command` 64 KiB, `cwd` 16 KiB | No | [user socket](../06-api/user-socket.md#human-sessions) |
 | Event buffer | Last 10,000 events per session | — | [events](../03-functional-requirements/events.md) |
 | Ended sessions' event buffers | The 64 most recently ended sessions | — | [user socket](../06-api/user-socket.md#events) |
 | Events queued per subscription | 10,000, then the oldest are dropped and reported (`events.lost`) | — | [user socket](../06-api/user-socket.md#events) |

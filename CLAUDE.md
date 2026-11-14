@@ -53,7 +53,7 @@ Each crate has one concern. Dependencies point downwards only: binaries → serv
 | `knsh-store` | Record store (system SQLite), retention, redaction at write time. | `knsh-core`, `knsh-platform` |
 | `knsh-checkpoint` | Shadows, capture, post-image identity, history tree, restore rules. | `knsh-core`, `knsh-platform` |
 | `knshd` | Daemon binary: endpoints, supervisor, event bus, wiring. Thin; logic lives in libraries. | all services |
-| `knsh` | Shell front end (integration mode), agent client, shims and CLI. | `knsh-proto`, `knsh-json`, `knsh-core` (IDs, timestamps), `knsh-platform` (engine paths, launchd agent) |
+| `knsh` | Shell front end (integration mode), agent client, shims and CLI. | `knsh-proto`, `knsh-json`, `knsh-core` (IDs, timestamps), `knsh-platform` (engine paths, launchd agent), `knsh-toml` (user settings) |
 | `knsh-exec` | Trampoline: applies a profile with `sandbox-exec -f`, then execs. **std only**, single-threaded, no workspace deps. | — |
 
 The decision and enforcement path never leaves Rust. A Swift helper is allowed only for a macOS service that is

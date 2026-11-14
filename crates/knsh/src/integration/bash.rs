@@ -490,10 +490,14 @@ impl BashLaunch<'_> {
             OsString::from(TELEMETRY_FD_VAR),
             OsString::from(PARENT_PID_VAR),
             OsString::from(BOOT_PATH_VAR),
+            // Only a shell that is recorded right now may claim it (FR-SES-25).
+            OsString::from(super::RECORDING_VAR),
         ];
         let mut set_env = Vec::new();
         if let (Some(dir), Some(telemetry)) = (self.startup_dir, self.telemetry) {
             let wrapper = wrapper_path(dir);
+            // Hooks installed and telemetry flowing: the shell is recorded (KNSH-021).
+            set_env.push((OsString::from(super::RECORDING_VAR), OsString::from("1")));
             set_env.push((
                 OsString::from(TELEMETRY_FD_VAR),
                 OsString::from(telemetry.fd.to_string()),

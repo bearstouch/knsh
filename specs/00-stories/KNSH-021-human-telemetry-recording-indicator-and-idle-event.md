@@ -17,20 +17,21 @@ then forwards telemetry lines. If `knshd` is unreachable, telemetry is dropped a
 **Acceptance criteria**
 *Human telemetry recording*
 
-- [ ] Recording is off by default; when off, `knsh` never connects to `knshd` (FR-SES-23).
-- [ ] When on, a human session is created with `actor.kind = human`; each typed line produces one record with
+- [x] Recording is off by default; when off, `knsh` never connects to `knshd` (FR-SES-23).
+- [x] When on, a human session is created with `actor.kind = human`; each typed line produces one record with
       `command`, `cwd`, `started_at`, `ended_at`, `exit_code` only, and a `command.finished` event.
-- [ ] `cwd.changed` is emitted when the working directory changes.
-- [ ] If `knshd` is unreachable or goes away, telemetry is dropped silently; the prompt is never delayed by more
+- [x] `cwd.changed` is emitted when the working directory changes.
+- [x] If `knshd` is unreachable or goes away, telemetry is dropped silently; the prompt is never delayed by more
       than a fixed small bound and never blocked (NFR-REL-02).
-- [ ] The session is ended (`session.ended`) when the shell exits.
-- [ ] Nothing leaves the machine (NFR-PRIV-01).
+- [x] The session is ended (`session.ended`) when the shell exits.
+- [x] Nothing leaves the machine (NFR-PRIV-01): the only transport is the local `user.sock` Unix socket (by
+      construction; no network code was added).
 
 *Recording indicator, `session.info` and `session.idle`*
 
-- [ ] A recording session exports `KNSH_RECORDING=1` to the shell; a non-recording session does not set it.
-- [ ] `session.info` returns actor, profile, state and recording settings for the caller's session.
-- [ ] `session.idle` is emitted once when a human prompt has waited 5 seconds for input, and again only after a new
+- [x] A recording session exports `KNSH_RECORDING=1` to the shell; a non-recording session does not set it.
+- [x] `session.info` returns actor, profile, state and recording settings for the caller's session.
+- [x] `session.idle` is emitted once when a human prompt has waited 5 seconds for input, and again only after a new
       command.
 
 **Unit tests**
@@ -50,10 +51,17 @@ then forwards telemetry lines. If `knshd` is unreachable, telemetry is dropped a
 *Human telemetry recording*
 
 - With recording on, type three commands in a scripted terminal; `knsh history --json` shows exactly three records.
-- Stop `knshd` mid-session; the shell keeps working.
+  *Done in parts:* `knsh/tests/recording_integration.rs` runs the real `knsh` binary on real zsh and bash 3.2 against a
+  stand-in `user.sock` and sees exactly three `telemetry.command` calls with only the telemetry fields; `knshd`'s
+  `sessions` tests turn three calls into exactly three human records read back from the store. **Pending:**
+  `knsh history` itself arrives with KNSH-023; a check against a launchd-started `knshd` is manual.
+- Stop `knshd` mid-session; the shell keeps working. *Done* against the stand-in daemon (it closes the connection and
+  stops listening mid-session), for zsh and bash 3.2.
 
 **Notes**
 *Human telemetry recording*
 
-— Where the human opts in (a config key in `~/.config/knsh/`, a flag, or both) is not specified; propose a
-`[recording] human = true` user setting in the spec before implementing.
+— Decided: `[recording] human = true` in `~/.config/knsh/config.toml`, no flag
+([terminals and shells](../08-integrations/terminals-and-shells.md#recording-a-human-session)). The methods `knsh`
+uses are specified in [user socket](../06-api/user-socket.md#human-sessions): `session.start_human` binds the session
+to the connection, which ends it when it closes.

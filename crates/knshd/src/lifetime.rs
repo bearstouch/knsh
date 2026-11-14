@@ -5,8 +5,8 @@
 //!
 //! The rule is a pure function of the injected monotonic clock ([`IdleTimer`]), so tests move time instead of waiting
 //! ten minutes. What keeps `knshd` alive besides connections ([`Activity`]) and what must be saved before it exits
-//! ([`PendingWrites`]) are traits, filled in by the session registry (KNSH-015) and the record store (KNSH-016,
-//! `crate::records::Records`).
+//! ([`PendingWrites`]) are traits, filled in by the session registry (`crate::sessions::Sessions`, KNSH-021) and
+//! the record store (KNSH-016, `crate::records::Records`).
 
 use std::fmt;
 use std::time::Duration;
@@ -21,17 +21,6 @@ pub(crate) const IDLE_LIMIT: Duration = Duration::from_mins(10);
 pub(crate) trait Activity: Send + Sync {
     /// Whether an envelope or a recording session exists now.
     fn keeps_alive(&self) -> bool;
-}
-
-/// No session ever exists. Used until the session registry (KNSH-015) is wired into `knshd`: until then only open
-/// connections keep it alive.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct NoSessions;
-
-impl Activity for NoSessions {
-    fn keeps_alive(&self) -> bool {
-        false
-    }
 }
 
 /// Writes that must reach disk before `knshd` exits, such as buffered records.
@@ -149,10 +138,5 @@ mod tests {
         let mut timer = IdleTimer::new(IDLE_LIMIT, clock.monotonic());
         clock.set_wall(u64::from(u32::MAX) * 1_000_000);
         assert_eq!(timer.observe(clock.monotonic(), false), Idle::Remaining(IDLE_LIMIT));
-    }
-
-    #[test]
-    fn default_keeps_nothing_alive() {
-        assert!(!NoSessions.keeps_alive());
     }
 }

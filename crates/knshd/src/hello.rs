@@ -102,10 +102,19 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every phase 1 handler besides `hello`: records without a store, and events on an empty bus.
+    /// Every phase 1 handler besides `hello`: records without a store, events on an empty bus, and sessions that
+    /// cannot record (no store).
     pub(crate) fn handlers() -> Handlers {
         let mut handlers = crate::records::Records::unavailable().handlers();
-        handlers.extend(crate::events::tests::hub().handlers());
+        let hub = crate::events::tests::hub();
+        handlers.extend(hub.handlers());
+        let sessions = crate::sessions::Sessions::new(
+            None,
+            hub,
+            std::sync::Arc::new(knsh_platform::testing::FakeClock::new(knsh_core::Timestamp::UNIX_EPOCH)),
+            std::sync::Arc::new(knsh_platform::testing::SeededRandom::new(1)),
+        );
+        handlers.extend(sessions.handlers());
         handlers
     }
 
@@ -120,6 +129,7 @@ pub(crate) mod tests {
                 stream: crate::dispatch::tests::stream(),
                 request: &request,
                 subscriber: crate::dispatch::tests::subscriber(),
+                binding: crate::dispatch::tests::binding(),
             })
             .map(|answer| answer.result.as_object().cloned().unwrap())
     }

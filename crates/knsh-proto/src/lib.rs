@@ -56,6 +56,14 @@
 //! it, whose params are the envelope of `specs/05-models/event.md` ([`event_envelope`]) plus `subscription_id`;
 //! [`lost_notification`] announces events a subscriber fell too far behind to receive ([`EVENTS_LOST`]).
 //!
+//! # Human sessions (KNSH-021)
+//!
+//! [`SessionStartHumanParams`] and [`SessionStartHumanResult`] start a recorded human session bound to a `user.sock`
+//! connection. [`TelemetryCommandParams`] carries one typed command line with only the fields of FR-REC-09,
+//! [`TelemetryCwdParams`] a working directory change and [`TelemetryIdleParams`] an idle prompt (FR-SES-24).
+//! [`SessionInfoResult`] answers `session.info` with the caller's session and its recording state (FR-SES-25,
+//! NFR-PRIV-05).
+//!
 //! Parameters and results of the other methods arrive with the stories that implement them.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -71,6 +79,7 @@ mod events;
 mod hello;
 mod method;
 mod records;
+mod session;
 
 pub use capability::{
     Backend, Capabilities, CheckpointBackend, FileEvents, NONE, NetworkFilter, Platform, Sandbox, Secrets,
@@ -99,4 +108,8 @@ pub use records::{
     DEFAULT_RECORDS_PAGE, MAX_BASE64_OUTPUT, MAX_RECORDS_PAGE, MAX_RECORDS_TEXT_LEN, OUTPUT_CONTENT_TYPE, OutputData,
     RecordEntry, RecordsForgetParams, RecordsForgetResult, RecordsOutputParams, RecordsOutputResult,
     RecordsQueryParams, RecordsQueryResult,
+};
+pub use session::{
+    MAX_TELEMETRY_COMMAND_LEN, MAX_TELEMETRY_CWD_LEN, SessionInfoResult, SessionStartHumanParams,
+    SessionStartHumanResult, TelemetryCommandParams, TelemetryCommandResult, TelemetryCwdParams, TelemetryIdleParams,
 };

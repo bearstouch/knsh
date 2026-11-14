@@ -57,6 +57,11 @@ pub enum Flow {
 /// ([`PromptCycle`]). A sink must not block for long: while it does, the pipe fills and the
 /// hooks drop lines (they never wait).
 pub trait TelemetrySink: Send {
+    /// The shell has been started and the forwarder runs; called once, before any line. Anything that opens a
+    /// descriptor (a connection to `knshd`, KNSH-021) waits for this, so the shell cannot inherit it by racing the
+    /// spawn.
+    fn started(&mut self) {}
+
     /// Handles one line.
     fn deliver(&mut self, line: TelemetryLine) -> Flow;
 }
@@ -328,7 +333,15 @@ pub fn run_recorded<'a>(
     // Only the shell may hold the write end, or the forwarder would never see end of file.
     drop(writer);
     drop(read_end_for_shell);
-    let forwarder = reader.map(|reader| thread::spawn(move || forward(reader, sink)));
+    // `thread::spawn` would panic if no thread can be made, leaving the running shell without its parent. Without a
+    // forwarder the read end is closed instead: the hooks' writes then fail at once (they never wait or raise
+    // `SIGPIPE`, see the bash and zsh hooks) and the session simply goes unrecorded (NFR-REL-02).
+    let forwarder = reader.and_then(|reader| {
+        thread::Builder::new()
+            .name("knsh-forwarder".to_owned())
+            .spawn(move || forward(reader, sink))
+            .ok()
+    });
 
     // Installed after the spawn, so the shell starts with the dispositions knsh was given. Failing to install it is
     // tolerated: a human session must not be refused for it (FR-SES-22).
@@ -375,6 +388,7 @@ pub fn finish(status: ExitStatus) -> u8 {
 /// [`Flow::Stop`]. Rejected lines, and lines out of order ([`PromptCycle`]), are dropped. Returning drops `reader`,
 /// which closes the read end.
 fn forward(reader: File, mut sink: Box<dyn TelemetrySink>) {
+    sink.started();
     let mut lines = LineReader::new(BufReader::new(reader));
     let mut cycle = PromptCycle::default();
     while let Ok(Some(line)) = lines.next_line() {
@@ -394,6 +408,45 @@ mod tests {
     use knsh_platform::testing::MemFs;
 
     const UID: u32 = 501;
+
+    // KNSH-021 (FR-SES-25): a recording session exports KNSH_RECORDING=1 to zsh and bash; a session that is not
+    // recorded (recording off, or no hooks to record with) never has it, even when knsh inherited it.
+    #[test]
+    fn recording_sets_knsh_recording_env() {
+        use std::ffi::OsString;
+
+        use super::super::RECORDING_VAR;
+
+        let recording = (OsString::from(RECORDING_VAR), OsString::from("1"));
+        let check = |launch: HostedLaunch<'_>, fd: Option<RawFd>, expected: bool| {
+            let plan = launch.plan(fd);
+            assert!(plan.remove_env.contains(&OsString::from(RECORDING_VAR)), "{launch:?}");
+            assert_eq!(plan.set_env.contains(&recording), expected, "{launch:?} fd {fd:?}");
+        };
+        let dir = Path::new("/h/engine/shell");
+        for startup_dir in [Some(dir), None] {
+            let zsh = ZshLaunch {
+                zsh: Path::new(zsh::SYSTEM_ZSH),
+                startup_dir,
+                user_zdotdir: None,
+                login: false,
+                force_interactive: false,
+                telemetry_fd: None,
+            };
+            let bash = BashLaunch {
+                bash: Path::new("/bin/bash"),
+                startup_dir,
+                login: true,
+                force_interactive: false,
+                telemetry: None,
+                user_prompt_command: None,
+            };
+            for launch in [HostedLaunch::from(zsh), HostedLaunch::from(bash)] {
+                check(launch, None, false);
+                check(launch, Some(20), startup_dir.is_some());
+            }
+        }
+    }
 
     // KNSH-019: `knsh` exits with zsh's own exit code (the signal case ends the process and is covered end to end).
     #[cfg(target_os = "macos")]

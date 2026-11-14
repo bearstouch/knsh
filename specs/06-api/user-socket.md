@@ -5,6 +5,8 @@ Reachable by the user's processes outside envelopes. Every envelope and command 
 | Method | Purpose |
 | --- | --- |
 | `session.start_agent`, `session.list`, `session.end` | Start and manage agent sessions (`knsh agent`) |
+| `session.start_human`, `telemetry.command`, `telemetry.cwd`, `telemetry.idle` | A recorded human session and its telemetry, sent by `knsh` ([below](#human-sessions)) |
+| `session.info` | The caller's own session: actor, profile, state, recording settings |
 | `records.query`, `records.output`, `events.subscribe`, `events.unsubscribe` | Read-only access to all sessions, for observers and the CLI |
 | `checkpoint.*` | All checkpoint operations, including `restore` and `force` |
 | `approval.list`, `approval.approve`, `approval.deny` | Pending asks; approving needs Touch ID or password, checked by `knshd` |
@@ -16,6 +18,66 @@ Reachable by the user's processes outside envelopes. Every envelope and command 
 - `approval.approve`, `policy.edit`, `profile.use` and `policy.grant` require Touch ID or the user's password. `knshd` shows the system authentication prompt itself, with the exact command or change in it.
 - The caller cannot claim that the user is present; no parameter skips the prompt.
 - `knsh authority trust` also requires Touch ID or password inside `knshd`.
+
+## Human sessions
+
+`knsh` hosting a recorded human shell ([terminals and shells](../08-integrations/terminals-and-shells.md#recording-a-human-session))
+starts a session over its own `user.sock` connection and reports each command line on it (KNSH-021, FR-SES-21). The
+session is **bound to the connection**: no call names a session, so one connection can never write into another's,
+and the session ends when the connection closes, however `knsh` went away (`session.state_changed` to `ended`, then
+`session.ended`). These methods exist on `user.sock` only: nothing inside an envelope may create a session (FR-SES-02)
+or write records as a human.
+
+### `session.start_human`
+
+No params. Creates a session with `actor.kind` `human`, `recording` true, `envelope` false, no parent, and the profile
+`default` (nothing in a human session is enforced; profiles are loaded in phase 2), writes its row, publishes
+`session.started`, and binds it to the connection. Result: `{"session_id": "01J…", "recording": true}`.
+
+A second call on the same connection is `-32602`. Without a record store (it could not be opened) the call is
+`-32603` and no session exists.
+
+### `telemetry.command`
+
+| Param | Type | Meaning |
+| --- | --- | --- |
+| `command` | string | The line as typed, at most 65536 bytes |
+| `cwd` | path | The working directory it started in: absolute, without `.`, `..` or `//`, at most 16384 bytes |
+| `started_at` | timestamp | When it started |
+| `ended_at` | timestamp | When the prompt came back; not before `started_at` |
+| `exit_code` | int | 0 to 255 |
+
+Writes one record with exactly these fields (FR-REC-09; no output, no agent fields), commits it, then publishes
+`command.finished`. Result: `{"record_id": "01J…"}`. The record ID is made when the record is written, so records
+keep creation order.
+
+### `telemetry.cwd`
+
+`{"cwd": path}`, with the same rules as above. Publishes `cwd.changed`. Result: `{}`.
+
+### `telemetry.idle`
+
+No params. Publishes `session.idle` unless it was already published since the session's last `telemetry.command`
+(FR-SES-24): `knsh` sends it once per idle prompt, and `knshd` checks again. Result: `{"emitted": bool}`.
+
+### `session.info`
+
+No params. The caller's own session (FR-SES-25, NFR-PRIV-05):
+
+```json
+{"session_id": "01J…", "actor": {"kind": "human"}, "profile": "default", "state": "active", "envelope": false,
+ "recording": true, "output_recording": false, "parent_session_id": null}
+```
+
+`recording` says whether command lines are recorded, `output_recording` whether their output is (never for a human
+session). On `user.sock` the caller's session is the one bound to the connection. On `agent.sock` it is the envelope's
+session; until a session is bound to an `agent.sock` connection (KNSH-048) the call is refused with `-32003`.
+
+### Errors
+
+A telemetry call or `session.info` on a connection without a session is `-32003`. Malformed params are `-32602`. A
+store that fails is `-32603`. Events are best effort: a record that was written is answered even if its event could
+not be published.
 
 ## Records
 

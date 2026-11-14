@@ -22,6 +22,8 @@
 //! - FR-REC-07, FR-REC-10, NFR-PRIV-03 (record retention and `records.forget`, KNSH-017)
 //! - `specs/05-models/event.md`, FR-EVT-01 to FR-EVT-04, FR-EVT-07, `specs/06-api/user-socket.md#events` (event bus,
 //!   `events.subscribe` and `events.unsubscribe`, KNSH-018)
+//! - `specs/06-api/user-socket.md#human-sessions`, FR-SES-21, FR-SES-24, FR-SES-25, FR-REC-09, NFR-PRIV-05 (human
+//!   sessions, telemetry and `session.info`, KNSH-021)
 //!
 //! On start it prepares the engine directories (KNSH-011) and takes its sockets from launchd ([`endpoints`],
 //! KNSH-012). It then serves them ([`server`], KNSH-013): a kqueue accept loop hands each connection to its own
@@ -31,9 +33,11 @@
 //! `records.output` from it ([`records`], KNSH-016), and `records.forget` on `user.sock`; the store applies record
 //! retention on its own thread, at start and hourly (KNSH-017). The event bus ([`events`], KNSH-018) numbers and
 //! buffers each session's events and serves `events.subscribe` and `events.unsubscribe`; a subscribed connection
-//! gets a second thread that writes its events as notifications. It exits after ten idle minutes ([`lifetime`]) or
-//! when launchd stops it, finishing in-flight requests and committing pending writes first. The supervisor arrives in
-//! later stories.
+//! gets a second thread that writes its events as notifications. The session registry ([`sessions`], KNSH-021) holds
+//! recorded human sessions, each bound to the `knsh` connection that started it and ended when it closes; their
+//! telemetry becomes records and events, and a recording session keeps `knshd` alive. It exits after ten idle
+//! minutes ([`lifetime`]) or when launchd stops it, finishing in-flight requests and committing pending writes first.
+//! The supervisor arrives in later stories.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
@@ -59,6 +63,9 @@ mod probe;
 mod records;
 #[cfg(target_os = "macos")]
 mod server;
+// Writes records, so built where the record store is.
+#[cfg(target_os = "macos")]
+mod sessions;
 
 use std::fmt;
 use std::process::ExitCode;
@@ -152,10 +159,10 @@ fn start() -> Result<(), StartError> {
     use knsh_store::{DATABASE_FILE, RecordStore, StoreConfig};
 
     use crate::events::EventHub;
-    use crate::lifetime::NoSessions;
     use crate::probe::{PROBE_TIMEOUT, Probes, probe};
     use crate::records::Records;
     use crate::server::{Config, Exit, Server, Services};
+    use crate::sessions::Sessions;
 
     let log: Arc<dyn SystemLog> = Arc::new(UnifiedLog::new(c"daemon"));
     let uid = effective_uid();
@@ -196,16 +203,15 @@ fn start() -> Result<(), StartError> {
                 None
             }
         };
-        let records = Records::new(store);
-        // The event bus with the specified limits (10,000 events per session). Emitters arrive with the stories that
-        // create sessions (KNSH-021, KNSH-056); until then subscribers see no events.
-        let events = EventHub::new(
-            knsh_core::EventBus::default(),
-            clock.clone(),
-            Arc::new(SystemRandom::new()),
-        );
+        let records = Records::new(store.clone());
+        // The event bus with the specified limits (10,000 events per session).
+        let random = Arc::new(SystemRandom::new());
+        let events = EventHub::new(knsh_core::EventBus::default(), clock.clone(), random.clone());
+        // The live sessions: recorded human sessions (KNSH-021); agent sessions arrive with `knsh agent` (KNSH-056).
+        let sessions = Sessions::new(store, Arc::clone(&events), clock.clone(), random);
         let mut handlers = records.handlers();
         handlers.extend(events.handlers());
+        handlers.extend(sessions.handlers());
         // Probed once, before serving: every hello of this process reports the same result, and a restarted knshd
         // probes again (KNSH-014).
         let probed = probe(&Probes {
@@ -221,9 +227,9 @@ fn start() -> Result<(), StartError> {
             log: Arc::clone(&log),
             own_uid: uid,
             clock,
-            // Until the session registry (KNSH-015) is wired in, only open connections keep knshd alive. Records are
-            // committed as they are written; on exit knshd waits for queued store jobs.
-            activity: Arc::new(NoSessions),
+            // A recording session keeps knshd alive, as does any open connection. Records are committed as they are
+            // written; on exit knshd waits for queued store jobs.
+            activity: sessions,
             pending: Arc::new(records),
         };
         let server = Server::new(listeners, services, Config::DEFAULT).map_err(StartError::Serve)?;

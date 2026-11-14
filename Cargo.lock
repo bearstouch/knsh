@@ -10,6 +10,7 @@ dependencies = [
  "knsh-json",
  "knsh-platform",
  "knsh-proto",
+ "knsh-toml",
 ]
 
 [[package]]

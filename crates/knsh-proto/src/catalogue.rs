@@ -256,8 +256,8 @@ pub struct Catalogue {
 }
 
 /// Every method in the specification. Phase 1 implements `hello`, `records.query` and `records.output` (KNSH-016),
-/// `records.forget` (KNSH-017), and `events.subscribe` and `events.unsubscribe` (KNSH-018); the rest arrive with their
-/// stories.
+/// `records.forget` (KNSH-017), `events.subscribe` and `events.unsubscribe` (KNSH-018), and the human session and
+/// telemetry methods with `session.info` (KNSH-021); the rest arrive with their stories.
 const ENGINE_METHODS: &[MethodSpec] = &[
     // Handshake (specs/06-api/handshake.md).
     MethodSpec::planned("hello", Endpoints::ALL).available(),
@@ -267,7 +267,9 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("exec.start", Endpoints::AGENT).requires(Backend::Sandbox),
     MethodSpec::planned("exec.wait", Endpoints::AGENT),
     MethodSpec::planned("exec.kill", Endpoints::AGENT),
-    MethodSpec::planned("session.info", Endpoints::AGENT),
+    // The caller's own session (KNSH-021): on user.sock the human session bound to the connection; on agent.sock
+    // refused until sessions are bound there (KNSH-048).
+    MethodSpec::planned("session.info", Endpoints::SOCKETS).available(),
     // Shared by agent.sock (own session) and user.sock (all sessions); the read and checkpoint methods are on the
     // control service too.
     MethodSpec::planned("policy.check", Endpoints::SOCKETS),
@@ -285,6 +287,13 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("session.start_agent", Endpoints::USER),
     MethodSpec::planned("session.list", Endpoints::USER),
     MethodSpec::planned("session.end", Endpoints::USER),
+    // Human telemetry (KNSH-021): `knsh` starts a recorded human session bound to its connection and reports each
+    // command line. Only ever on user.sock: nothing inside an envelope may create a session (FR-SES-02) or write
+    // records as a human.
+    MethodSpec::planned("session.start_human", Endpoints::USER).available(),
+    MethodSpec::planned("telemetry.command", Endpoints::USER).available(),
+    MethodSpec::planned("telemetry.cwd", Endpoints::USER).available(),
+    MethodSpec::planned("telemetry.idle", Endpoints::USER).available(),
     MethodSpec::planned("approval.list", Endpoints::USER),
     MethodSpec::planned("approval.approve", Endpoints::USER),
     MethodSpec::planned("approval.deny", Endpoints::USER),
@@ -441,7 +450,9 @@ mod tests {
         let on = |name: &str| Catalogue::ENGINE.find(name).unwrap().endpoints;
         assert_eq!(on("hello"), Endpoints::ALL);
         assert_eq!(on("exec.run"), Endpoints::AGENT);
-        assert_eq!(on("session.info"), Endpoints::AGENT);
+        assert_eq!(on("session.info"), Endpoints::SOCKETS);
+        assert_eq!(on("session.start_human"), Endpoints::USER);
+        assert_eq!(on("telemetry.command"), Endpoints::USER);
         assert_eq!(on("session.start_agent"), Endpoints::USER);
         assert_eq!(on("approval.approve"), Endpoints::USER);
         assert_eq!(on("records.query"), Endpoints::ALL);
@@ -496,7 +507,8 @@ mod tests {
     }
 
     // Phase 1 implements the handshake, the record reads (KNSH-016), on user.sock only `records.forget` (KNSH-017),
-    // and the event subscriptions (KNSH-018): no method is claimed before it exists.
+    // the event subscriptions (KNSH-018), and `session.info` with, on user.sock only, the human session and telemetry
+    // methods (KNSH-021): no method is claimed before it exists.
     #[test]
     fn phase1_lists_hello_record_and_event_methods_only() {
         let caps = capabilities(Sandbox::Seatbelt);
@@ -504,13 +516,26 @@ mod tests {
             let expected: &[&str] = match endpoint {
                 Endpoint::User => &[
                     "hello",
+                    "session.info",
                     "records.query",
                     "records.output",
                     "events.subscribe",
                     "events.unsubscribe",
+                    "session.start_human",
+                    "telemetry.command",
+                    "telemetry.cwd",
+                    "telemetry.idle",
                     "records.forget",
                 ],
-                Endpoint::Agent | Endpoint::Control => &[
+                Endpoint::Agent => &[
+                    "hello",
+                    "session.info",
+                    "records.query",
+                    "records.output",
+                    "events.subscribe",
+                    "events.unsubscribe",
+                ],
+                Endpoint::Control => &[
                     "hello",
                     "records.query",
                     "records.output",

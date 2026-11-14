@@ -22,6 +22,7 @@ use knsh_proto::{
 };
 
 use crate::events::Subscriber;
+use crate::sessions::SessionBinding;
 
 /// The name of the handshake method, which every connection must call first.
 pub(crate) const HELLO: &str = "hello";
@@ -70,6 +71,8 @@ pub(crate) struct Call<'a> {
     pub(crate) request: &'a Request,
     /// The connection's event subscriptions (`events.subscribe`, KNSH-018). Closed with the connection.
     pub(crate) subscriber: &'a Subscriber,
+    /// The human session bound to this connection (`session.start_human`, KNSH-021). Ended with the connection.
+    pub(crate) binding: &'a SessionBinding,
 }
 
 /// A successful answer: the `result`, and raw bytes to send after it on [`Call::stream`]
@@ -306,6 +309,12 @@ pub(crate) mod tests {
         &SUBSCRIBER
     }
 
+    /// A connection binding for test calls that start no session.
+    pub(crate) fn binding() -> &'static SessionBinding {
+        static BINDING: std::sync::LazyLock<SessionBinding> = std::sync::LazyLock::new(SessionBinding::new);
+        &BINDING
+    }
+
     /// The stream ID test calls use.
     pub(crate) fn stream() -> StreamId {
         StreamId::new(1).unwrap()
@@ -319,6 +328,7 @@ pub(crate) mod tests {
             stream: stream(),
             request: &request(method),
             subscriber: subscriber(),
+            binding: binding(),
         })
     }
 

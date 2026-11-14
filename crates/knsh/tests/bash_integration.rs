@@ -353,8 +353,10 @@ fn startup_trace_matches_plain_bash_while_recording() {
             let home = tmp.path("home");
             let trace = tmp.path("trace");
             write_all_rcs(&home, &trace);
+            // KNSH_RECORDING=1 is meant to be seen by every command of a recorded shell (KNSH-021, FR-SES-25); no
+            // other knsh variable may be.
             let script = format!(
-                "echo \"typed $(env | grep -c '^KNSH_') $(export -p | grep -c PROMPT_COMMAND)\" >> '{}'\nexit 0\n",
+                "echo \"typed $(env | grep '^KNSH_' | grep -vc '^KNSH_RECORDING=1$') $(export -p | grep -c PROMPT_COMMAND)\" >> '{}'\nexit 0\n",
                 trace.display()
             );
 
