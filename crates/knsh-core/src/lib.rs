@@ -67,6 +67,14 @@
 //! `${PROJECT}`, FR-POL-10) and canonicalised with symlinks followed (FR-POL-11) through [`PolicyFs`]. Profiles are
 //! read by name through [`ProfileSource`]. A load either returns the whole profile or an error, never part of one.
 //!
+//! # Command rules (KNSH-040)
+//!
+//! [`evaluate_command`] decides one classified simple command against a profile's `exec` rules and returns a
+//! [`CommandVerdict`] naming the deciding rule ([`RuleId`], `exec.allow[1]`). Patterns are globs over the
+//! normalised arguments (FR-POL-15), a pattern without `*` also matches with more arguments (FR-POL-16), names match
+//! only trusted binaries and builtins (FR-POL-13) while other binaries get `exec.project_executables` (FR-POL-14), and
+//! deny beats ask beats allow, with `exec.default` when nothing matches (FR-POL-17).
+//!
 //! Failures are reported through [`CoreError`], except the profile loader's, which are [`ProfileError`] because they
 //! must name the key at fault.
 
@@ -95,10 +103,11 @@ pub use event::{
 pub use id::{CheckpointId, EventId, GrantId, RecordId, RequestId, SessionId};
 pub use path::CanonicalPath;
 pub use policy::{
-    ApprovalsPolicy, CheckpointPolicy, DEFAULT_AGENT_BASH, DEFAULT_CHECKPOINT_EXCLUDES, DEFAULT_RETENTION_DAYS,
-    ExecPolicy, FsPolicy, LookupError, MAX_EXTENDS_DEPTH, MAX_PROFILE_LEN, NetworkMode, NetworkPolicy, OutputMode,
-    OutputPolicy, PRESETS, PathContext, PolicyFs, Profile, ProfileSource, RETENTION_DAYS_RANGE, ReadScope,
-    RecordingPolicy, RuleAction, SecretInjection, load_profile, load_profile_text, project_root,
+    ApprovalsPolicy, CheckpointPolicy, CommandVerdict, DEFAULT_AGENT_BASH, DEFAULT_CHECKPOINT_EXCLUDES,
+    DEFAULT_RETENTION_DAYS, ExecPolicy, FsPolicy, LookupError, MAX_EXTENDS_DEPTH, MAX_PROFILE_LEN, NetworkMode,
+    NetworkPolicy, OutputMode, OutputPolicy, PRESETS, PathContext, PolicyFs, Profile, ProfileSource,
+    RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy, RuleAction, RuleId, SecretInjection, evaluate_command,
+    load_profile, load_profile_text, project_root,
 };
 pub use record::{ExecutionRecord, OutputInfo, OutputStream, RecordDetails};
 pub use redacted::{REDACTED_MARKER, Redacted};

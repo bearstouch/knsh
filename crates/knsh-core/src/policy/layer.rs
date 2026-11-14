@@ -452,9 +452,20 @@ fn plain_string(value: &Value) -> Result<String, Refusal> {
 fn pattern(value: &Value) -> Result<String, Refusal> {
     checked_string(
         value,
-        is_free_form,
-        "a non-empty command pattern without control characters",
+        is_pattern,
+        "a command pattern without control characters: a program name without `/`, then its arguments",
     )
+}
+
+/// A command pattern (KNSH-040): at least one word, and a first word naming a program rather than a path. Rules match
+/// programs by name only (FR-POL-13), so a blank pattern or a path there would never match, and a deny rule that can
+/// never match is a silent hole; refusing the profile makes the mistake visible.
+fn is_pattern(text: &str) -> bool {
+    is_free_form(text)
+        && text
+            .split(' ')
+            .find(|word| !word.is_empty())
+            .is_some_and(|name| !name.contains('/'))
 }
 
 fn profile_name(value: &Value) -> Result<ProfileName, Refusal> {

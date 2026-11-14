@@ -439,3 +439,28 @@ fn snapshots_load_from_text_with_parents_from_the_source() {
     let error = load_profile_text(b"name = 1\n", &source, &context(), &mac_fs()).unwrap_err();
     assert_eq!(error.key(), Some("name"));
 }
+
+// KNSH-040: a command pattern that could never match (no words, or a path as its name) refuses the profile, so a deny
+// rule never silently names nothing.
+#[test]
+fn patterns_that_can_never_match_are_refused() {
+    for (rules, key) in [
+        ("[exec]\ndeny = [\"sudo *\", \"   \"]", "exec.deny[1]"),
+        ("[exec]\nask = [\"/usr/bin/git push\"]", "exec.ask[0]"),
+        ("[exec]\nallow = [\"./x\"]", "exec.allow[0]"),
+        (
+            "[approvals]\nirreversible_commands = [\" \"]",
+            "approvals.irreversible_commands[0]",
+        ),
+    ] {
+        let source = Source::default().with("p", &format!("name = \"p\"\n{rules}"));
+        let error = load(&source, "p").unwrap_err();
+        assert!(
+            matches!(error.kind(), ProfileErrorKind::InvalidValue { .. }),
+            "{rules}: {error}"
+        );
+        assert_eq!(error.key(), Some(key), "{rules}");
+    }
+    let source = Source::default().with("p", "name = \"p\"\n[exec]\ndeny = [\"  rm  -rf  * \", \"git*\"]");
+    assert_eq!(load(&source, "p").unwrap().exec.deny, ["  rm  -rf  * ", "git*"]);
+}

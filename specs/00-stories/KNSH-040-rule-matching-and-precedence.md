@@ -12,12 +12,12 @@ predictable and explainable. Scope: globs over normalised arguments; names match
 without `*` also matches with extra arguments; default when nothing matches.
 
 **Acceptance criteria**
-- [ ] `evaluate_command(&ResolvedProfile, &ClassifiedCommand) -> CommandVerdict { verdict, rule_id }` is pure.
-- [ ] `git` in `exec.allow` matches `/usr/bin/git` but not `./node_modules/.bin/git` (FR-POL-13/14).
-- [ ] `git push` matches `git push origin main` and `git -c x=y push` (FR-POL-15/16).
-- [ ] `rm -rf *` glob semantics are documented and tested (glob over the argument string, not the filesystem).
-- [ ] Precedence across all matching rules: deny > ask > allow; no match → `exec.default` (FR-POL-17).
-- [ ] Rule IDs have the form `exec.allow[1]` and refer to the resolved profile's index, documented across `extends`.
+- [x] `evaluate_command(&ResolvedProfile, &ClassifiedCommand) -> CommandVerdict { verdict, rule_id }` is pure.
+- [x] `git` in `exec.allow` matches `/usr/bin/git` but not `./node_modules/.bin/git` (FR-POL-13/14).
+- [x] `git push` matches `git push origin main` and `git -c x=y push` (FR-POL-15/16).
+- [x] `rm -rf *` glob semantics are documented and tested (glob over the argument string, not the filesystem).
+- [x] Precedence across all matching rules: deny > ask > allow; no match → `exec.default` (FR-POL-17).
+- [x] Rule IDs have the form `exec.allow[1]` and refer to the resolved profile's index, documented across `extends`.
 
 **Unit tests**
 - `name_rule_matches_only_trusted_binary`.
