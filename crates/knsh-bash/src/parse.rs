@@ -51,6 +51,7 @@
 //! not show (aliases, functions of the parent), so they are always resolved as programs, which is safe.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::mem;
 
@@ -64,7 +65,7 @@ use crate::error::{CompoundStart, LexError, ParseError, Unexpected, UnsupportedC
 use crate::functions::mark_function_calls;
 use crate::interpreters::mark_interpreter_inputs;
 use crate::lex::{LexContext, lex_range};
-use crate::limits::{MAX_INPUT_LEN, MAX_NESTING_DEPTH};
+use crate::limits::{MAX_INPUT_LEN, MAX_NESTING_DEPTH, MAX_TOKENS};
 use crate::token::{
     HereDocumentBody, Operator, Redirection, RedirectionOperator, ReservedWord, Segment, SegmentKind, Span, Token,
     TokenKind, Word,
@@ -108,7 +109,10 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
         }
         .into());
     }
-    let mut script = parse_source(input, Span::new(0, input.len()), LexContext::default(), 0)?;
+    // One token budget for the line and every substitution body in it: each body is lexed again when it is parsed,
+    // and a per-lex limit alone would let a line of many substitutions hold many times the limit (KNSH-032).
+    let tokens_left = Cell::new(MAX_TOKENS);
+    let mut script = parse_source(input, Span::new(0, input.len()), LexContext::default(), 0, &tokens_left)?;
     mark_function_calls(&mut script, input);
     Ok(script)
 }
@@ -116,8 +120,17 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
 /// Parses the part of `input` at `range` (the whole line, or a substitution body) as a script whose lists start at
 /// nesting `depth`, lexing it in `context` (see [`LexContext`]). Spans index `input`. Here-documents and here-strings
 /// fed to an interpreter are marked; function calls are not (only [`parse`] marks them, for the top-level script).
-fn parse_source(input: &str, range: Span, context: LexContext, depth: usize) -> Result<Script, ParseError> {
-    let tokens = lex_range(input, range, context)?;
+/// The tokens read are taken from `tokens_left`, the line's budget of [`MAX_TOKENS`].
+fn parse_source(
+    input: &str,
+    range: Span,
+    context: LexContext,
+    depth: usize,
+    tokens_left: &Cell<usize>,
+) -> Result<Script, ParseError> {
+    let tokens = lex_range(input, range, context, tokens_left.get())?;
+    // `lex_range` never returns more than it was given, so this cannot underflow; saturating keeps it panic-free.
+    tokens_left.set(tokens_left.get().saturating_sub(tokens.len()));
     // Blanks and comments separate words but never change the structure; newlines do, so they stay. Comment spans
     // are kept aside for the one place that must know about them (`(( … ))`). Here-document bodies are set aside by
     // operator, to be attached to the redirection that reads them.
@@ -147,6 +160,7 @@ fn parse_source(input: &str, range: Span, context: LexContext, depth: usize) -> 
         here_documents,
         context,
         depth,
+        tokens_left,
     };
     let items = parser.list(depth)?;
     // The top-level list stops at the end of the input or before a token that only closes a construct (`)`, `;;`,
@@ -190,6 +204,8 @@ struct Parser<'a> {
     context: LexContext,
     /// The nesting depth of the list being read; a substitution's script starts one deeper.
     depth: usize,
+    /// What is left of the line's token budget ([`MAX_TOKENS`]), shared with the scripts of its substitutions.
+    tokens_left: &'a Cell<usize>,
 }
 
 /// The constructs that start with a word or operator in command position, other than simple commands.
@@ -637,7 +653,7 @@ impl Parser<'_> {
             substitutions: self.context.substitutions + 1,
             process_substitutions: self.context.process_substitutions + usize::from(process),
         };
-        let script = parse_source(self.input, segment.body, context, self.depth + 1)?;
+        let script = parse_source(self.input, segment.body, context, self.depth + 1, self.tokens_left)?;
         Ok(Substitution {
             kind,
             span: segment.span,
@@ -659,10 +675,19 @@ impl Parser<'_> {
         };
         let body = segment.body.text(self.input).unwrap_or_default();
         let (text, script) = match unescape_backtick(body, in_double_quotes, None) {
-            Cow::Borrowed(_) => (None, parse_source(self.input, segment.body, context, self.depth + 1)?),
+            Cow::Borrowed(_) => (
+                None,
+                parse_source(self.input, segment.body, context, self.depth + 1, self.tokens_left)?,
+            ),
             Cow::Owned(text) => {
-                let script = parse_source(&text, Span::new(0, text.len()), context, self.depth + 1)
-                    .map_err(|error| error_on_line(error, segment.body, body, in_double_quotes))?;
+                let script = parse_source(
+                    &text,
+                    Span::new(0, text.len()),
+                    context,
+                    self.depth + 1,
+                    self.tokens_left,
+                )
+                .map_err(|error| error_on_line(error, segment.body, body, in_double_quotes))?;
                 (Some(text), script)
             }
         };
@@ -2083,6 +2108,7 @@ mod tests {
     #[test]
     fn nested_list_depth_is_bounded() {
         // KNSH-032: nested lists (KNSH-030, KNSH-031) enter `list` with their depth; past the limit it refuses.
+        let tokens_left = Cell::new(MAX_TOKENS);
         let parser = || Parser {
             input: "a",
             end: 1,
@@ -2092,6 +2118,7 @@ mod tests {
             here_documents: BTreeMap::new(),
             context: LexContext::default(),
             depth: 0,
+            tokens_left: &tokens_left,
         };
         assert_eq!(
             parser().list(MAX_NESTING_DEPTH + 1),
@@ -2105,11 +2132,19 @@ mod tests {
 
     #[test]
     fn long_lists_do_not_recurse() {
-        // Length must not deepen the stack: 100 000 commands in one and-or list and one pipeline.
+        // Length must not deepen the stack: as many commands in one and-or list and one pipeline as the token limit
+        // allows (`a && ` is four tokens: a word, a blank, the operator and a blank).
+        let count = MAX_TOKENS / 4 - 1;
+        let input = "a && ".repeat(count) + "a";
+        assert_eq!(parse(&input).unwrap().simple_commands().count(), count + 1);
+        let input = "a | ".repeat(count) + "a";
+        assert_eq!(parse(&input).unwrap().simple_commands().count(), count + 1);
+        // KNSH-032: past the limit the line is refused instead.
         let input = "a && ".repeat(100_000) + "a";
-        assert_eq!(parse(&input).unwrap().simple_commands().count(), 100_001);
-        let input = "a | ".repeat(100_000) + "a";
-        assert_eq!(parse(&input).unwrap().simple_commands().count(), 100_001);
+        assert!(matches!(
+            parse(&input),
+            Err(ParseError::Lex(LexError::TooManyTokens { .. }))
+        ));
     }
 
     #[test]
@@ -2903,10 +2938,11 @@ mod tests {
 
     #[test]
     fn long_compound_lines_do_not_blow_up() {
-        // Many sequential compound commands and conditional regions stay linear, function analysis included.
-        let input = "f() { a; }\n".to_owned() + &"if b; then f; fi && ".repeat(20_000) + "f";
+        // Many sequential compound commands and conditional regions stay linear, function analysis included. Each
+        // `if b; then f; fi && ` is 14 tokens, so 4 000 of them stay under the token limit (KNSH-032).
+        let input = "f() { a; }\n".to_owned() + &"if b; then f; fi && ".repeat(4_000) + "f";
         let script = parse(&input).unwrap();
-        assert_eq!(script.simple_commands().count(), 1 + 2 * 20_000 + 1);
+        assert_eq!(script.simple_commands().count(), 1 + 2 * 4_000 + 1);
         assert!(script.simple_commands().last().unwrap().function_call.is_some());
     }
 

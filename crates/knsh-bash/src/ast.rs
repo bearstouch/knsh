@@ -50,9 +50,17 @@ impl Script {
     /// [`Script::commands`], each command paired with the text its spans index: `input` (the line this script was
     /// parsed from), or the [`text`](Substitution::text) of the innermost backtick substitution holding it.
     pub fn commands_with_source<'a>(&'a self, input: &'a str) -> impl Iterator<Item = (&'a str, &'a Command)> + 'a {
+        self.deep_commands(input)
+            .into_iter()
+            .map(|deep| (deep.source, deep.command))
+    }
+
+    /// Every command in the order of [`Script::commands`], with the text its spans index and, for a command inside an
+    /// un-escaped backtick substitution, the span on the line of the outermost such substitution.
+    pub(crate) fn deep_commands<'a>(&'a self, input: &'a str) -> Vec<DeepCommand<'a>> {
         let mut commands = Vec::new();
-        collect_deep(&self.items, input, &mut commands);
-        commands.into_iter()
+        collect_deep(&self.items, input, None, &mut commands);
+        commands
     }
 
     /// Every simple command of the line, in source order, including those inside pipelines, lists, compound commands,
@@ -88,27 +96,52 @@ impl Script {
     }
 }
 
+/// A command found by [`Script::deep_commands`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeepCommand<'a> {
+    /// The text the command's spans index: the line, or the [`text`](Substitution::text) of the innermost un-escaped
+    /// backtick substitution holding it.
+    pub(crate) source: &'a str,
+    /// For a command inside an un-escaped backtick substitution, whose spans do not index the line: the span on the
+    /// line of the outermost such substitution. `None` when the command's spans index the line.
+    pub(crate) anchor: Option<Span>,
+    /// The command.
+    pub(crate) command: &'a Command,
+}
+
+impl DeepCommand<'_> {
+    /// `span` (which indexes [`source`](Self::source)) as a span on the line: itself, or the anchor when the command
+    /// is inside an un-escaped backtick substitution.
+    pub(crate) fn on_line(&self, span: Span) -> Span {
+        self.anchor.unwrap_or(span)
+    }
+}
+
 /// Appends every command of `items` to `out` in the order of [`Script::commands`], substitutions included, each with
-/// the text its spans index (`source` for `items`). Recurses once per nested list or script, so its depth is bounded
-/// by the parser's nesting limit.
-fn collect_deep<'a>(items: &'a [ListItem], source: &'a str, out: &mut Vec<(&'a str, &'a Command)>) {
+/// the text its spans index (`source` for `items`) and its `anchor` (see [`DeepCommand::anchor`]). Recurses once per
+/// nested list or script, so its depth is bounded by the parser's nesting limit.
+fn collect_deep<'a>(items: &'a [ListItem], source: &'a str, anchor: Option<Span>, out: &mut Vec<DeepCommand<'a>>) {
     for command in items
         .iter()
         .flat_map(|item| item.and_or.pipelines())
         .flat_map(Pipeline::commands)
     {
-        out.push((source, command));
+        out.push(DeepCommand {
+            source,
+            anchor,
+            command,
+        });
         match command {
             Command::Simple(simple) => {
                 let mut substitutions: Vec<&Substitution> = simple.substitutions().collect();
                 // Assignments come first, but words and redirections interleave: sort into source order.
                 substitutions.sort_by_key(|substitution| substitution.span.start);
-                collect_substitutions(substitutions, source, out);
+                collect_substitutions(substitutions, source, anchor, out);
             }
-            Command::Compound(compound) => collect_compound_deep(compound, source, out),
+            Command::Compound(compound) => collect_compound_deep(compound, source, anchor, out),
             Command::FunctionDefinition(definition) => {
-                collect_substitutions(&definition.name.substitutions, source, out);
-                collect_compound_deep(&definition.body, source, out);
+                collect_substitutions(&definition.name.substitutions, source, anchor, out);
+                collect_compound_deep(&definition.body, source, anchor, out);
             }
             Command::Unsupported(_) => {}
         }
@@ -117,22 +150,27 @@ fn collect_deep<'a>(items: &'a [ListItem], source: &'a str, out: &mut Vec<(&'a s
 
 /// The commands of a compound command's header words, lists and redirections, in source order (see
 /// [`collect_deep`]).
-fn collect_compound_deep<'a>(compound: &'a CompoundCommand, source: &'a str, out: &mut Vec<(&'a str, &'a Command)>) {
+fn collect_compound_deep<'a>(
+    compound: &'a CompoundCommand,
+    source: &'a str,
+    anchor: Option<Span>,
+    out: &mut Vec<DeepCommand<'a>>,
+) {
     match &compound.kind {
         CompoundKind::For(command) => {
-            collect_substitutions(&command.variable.substitutions, source, out);
+            collect_substitutions(&command.variable.substitutions, source, anchor, out);
             for word in command.items.iter().flat_map(|items| &items.words) {
-                collect_substitutions(&word.substitutions, source, out);
+                collect_substitutions(&word.substitutions, source, anchor, out);
             }
-            collect_deep(&command.body.body, source, out);
+            collect_deep(&command.body.body, source, anchor, out);
         }
         CompoundKind::Case(command) => {
-            collect_substitutions(&command.subject.substitutions, source, out);
+            collect_substitutions(&command.subject.substitutions, source, anchor, out);
             for clause in &command.clauses {
                 for pattern in &clause.patterns {
-                    collect_substitutions(&pattern.substitutions, source, out);
+                    collect_substitutions(&pattern.substitutions, source, anchor, out);
                 }
-                collect_deep(&clause.body, source, out);
+                collect_deep(&clause.body, source, anchor, out);
             }
         }
         CompoundKind::Subshell(_)
@@ -141,22 +179,25 @@ fn collect_compound_deep<'a>(compound: &'a CompoundCommand, source: &'a str, out
         | CompoundKind::While(_)
         | CompoundKind::Until(_) => {
             for list in compound.kind.lists() {
-                collect_deep(list, source, out);
+                collect_deep(list, source, anchor, out);
             }
         }
     }
     let substitutions = compound.redirections.iter().flat_map(Redirect::substitutions);
-    collect_substitutions(substitutions, source, out);
+    collect_substitutions(substitutions, source, anchor, out);
 }
 
-/// The commands of each substitution's script, in the text its spans index.
+/// The commands of each substitution's script, in the text its spans index. Entering the first un-escaped backtick
+/// substitution sets the anchor to its span, which indexes `source` and, since no anchor was set yet, the line.
 fn collect_substitutions<'a>(
     substitutions: impl IntoIterator<Item = &'a Substitution>,
     source: &'a str,
-    out: &mut Vec<(&'a str, &'a Command)>,
+    anchor: Option<Span>,
+    out: &mut Vec<DeepCommand<'a>>,
 ) {
     for substitution in substitutions {
-        collect_deep(&substitution.script.items, substitution.source(source), out);
+        let anchor = anchor.or_else(|| substitution.text.is_some().then_some(substitution.span));
+        collect_deep(&substitution.script.items, substitution.source(source), anchor, out);
     }
 }
 

@@ -28,7 +28,7 @@ use std::collections::{HashSet, VecDeque};
 use std::mem;
 
 use crate::error::{Construct, LexError};
-use crate::limits::{MAX_INPUT_LEN, MAX_NESTING_DEPTH};
+use crate::limits::{MAX_INPUT_LEN, MAX_NESTING_DEPTH, MAX_TOKENS};
 use crate::token::{
     HereDocumentBody, IoNumber, Operator, Redirection, RedirectionOperator, ReservedWord, Segment, SegmentKind, Span,
     Token, TokenKind, Word,
@@ -44,6 +44,7 @@ use crate::token::{
 /// - [`LexError::InputTooLarge`] when `input` is longer than [`MAX_INPUT_LEN`], checked before anything is read.
 /// - [`LexError::Unterminated`] when a quote or substitution is still open at the end.
 /// - [`LexError::NestingTooDeep`] when quotes and substitutions nest deeper than [`MAX_NESTING_DEPTH`].
+/// - [`LexError::TooManyTokens`] when the line has more than [`MAX_TOKENS`] tokens.
 /// - [`LexError::Unterminated`] with [`Construct::HereDocument`] when a here-document's body starts but no line
 ///   matches its delimiter. A body that never starts (the input ends on the operator's line) is not a lexer error,
 ///   since inside `(( … ))` a `<<` is a shift; the parser refuses it for a redirection.
@@ -71,7 +72,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             limit: MAX_INPUT_LEN,
         });
     }
-    lex_range(input, Span::new(0, input.len()), LexContext::default())
+    lex_range(input, Span::new(0, input.len()), LexContext::default(), MAX_TOKENS)
 }
 
 /// Where a source being lexed sits in the line: how many quotes and substitutions enclose it, and how many of those
@@ -93,14 +94,30 @@ pub(crate) struct LexContext {
 /// `range.end`, which ends the source as the end of the input would. Bytes before `range.start` are only looked at
 /// to tell whether a `#` follows a blank, as when the whole line is lexed.
 ///
+/// At most `max_tokens` tokens are read: the parser passes what is left of the line's [`MAX_TOKENS`] budget, so the
+/// limit holds over the line and every substitution body in it.
+///
 /// # Errors
 ///
-/// As [`lex`], except that the size limit is not checked: `range` lies inside a line that already passed it.
-pub(crate) fn lex_range(input: &str, range: Span, context: LexContext) -> Result<Vec<Token>, LexError> {
+/// As [`lex`], except that the size limit is not checked (`range` lies inside a line that already passed it), and
+/// [`LexError::TooManyTokens`] is returned at the first token past `max_tokens`, before it is stored: the list never
+/// grows past the budget, however long the line (KNSH-032).
+pub(crate) fn lex_range(
+    input: &str,
+    range: Span,
+    context: LexContext,
+    max_tokens: usize,
+) -> Result<Vec<Token>, LexError> {
     let src = input.as_bytes();
     let mut lexer = Lexer::new(src.get(..range.end).unwrap_or(src), range.start, context);
     let mut tokens = Vec::new();
     while let Some(token) = lexer.next_token()? {
+        if tokens.len() == max_tokens {
+            return Err(LexError::TooManyTokens {
+                span: token.span,
+                limit: MAX_TOKENS,
+            });
+        }
         tokens.push(token);
     }
     Ok(tokens)
@@ -1524,6 +1541,22 @@ mod tests {
         );
         let input = "a".repeat(MAX_INPUT_LEN);
         assert_eq!(lex(&input).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bounds_token_count() {
+        // KNSH-032: `a ` is a word and a blank. At the limit the line is read; the first token over it is refused
+        // before it is stored.
+        let at_limit = "a ".repeat(MAX_TOKENS / 2);
+        assert_eq!(lex(&at_limit).unwrap().len(), MAX_TOKENS);
+        let over = format!("{at_limit}a");
+        assert_eq!(
+            lex(&over).unwrap_err(),
+            LexError::TooManyTokens {
+                span: Span::new(at_limit.len(), over.len()),
+                limit: MAX_TOKENS
+            }
+        );
     }
 
     #[test]

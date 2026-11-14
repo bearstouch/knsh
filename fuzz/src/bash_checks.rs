@@ -6,8 +6,8 @@
 
 use knsh_bash::{
     Command, CommandWord, CompoundCommand, CompoundKind, Construct, LexError, ListItem, LoopBody, LoopCommand,
-    MAX_INPUT_LEN, Operator, ParseError, Redirect, RedirectionOperator, Script, Segment, SegmentKind, SimpleCommand,
-    Span, Substitution, Token, TokenKind, lex, parse,
+    MAX_INPUT_LEN, MAX_TOKENS, Operator, ParseError, ParseOutcome, Redirect, RedirectionOperator, Script, Segment,
+    SegmentKind, SimpleCommand, Span, Substitution, Token, TokenKind, lex, parse, parse_line,
 };
 
 /// `bash_lex`: the lexer never panics and is deterministic. An accepted line is tiled exactly by its token spans
@@ -115,6 +115,12 @@ fn check_error(input: &str, error: &LexError) {
         LexError::NestingTooDeep { span, .. } => {
             assert!(!span_text(input, *span).is_empty(), "empty opener");
         }
+        LexError::TooManyTokens { span, limit } => {
+            assert!(
+                *limit == MAX_TOKENS && !span_text(input, *span).is_empty(),
+                "wrong token-count rejection"
+            );
+        }
         LexError::AmbiguousHereDocument { span } => {
             let operator = span_text(input, *span).replace("\\\n", "");
             assert!(
@@ -215,6 +221,7 @@ pub fn bash_parse(data: &[u8]) {
     let input = input.as_ref();
     let result = parse(input);
     assert_eq!(result, parse(input), "parsing is not deterministic");
+    check_outcome(input, &result);
     match (result, lex(input)) {
         (Err(ParseError::Lex(error)), Err(lex_error)) => {
             assert_eq!(error, lex_error, "parser reports a different lexer error");
@@ -237,6 +244,32 @@ pub fn bash_parse(data: &[u8]) {
                 assert!(!span_text(source, command.span()).is_empty(), "empty command");
             }
         }
+    }
+}
+
+/// The fallback (KNSH-032): `parse_line` never panics, is deterministic and agrees with `parse`. A rejected line is
+/// dynamic as a whole, never exact, with one part placed inside the line; a parsed line keeps its script, and every
+/// dynamic part of it lies inside the line on character boundaries, in source order.
+fn check_outcome(input: &str, result: &Result<Script, ParseError>) {
+    let outcome = parse_line(input);
+    assert_eq!(outcome, parse_line(input), "parse_line is not deterministic");
+    match (result, &outcome) {
+        (Err(_), ParseOutcome::Exact(_)) => panic!("parser error became exact"),
+        (Err(_), ParseOutcome::Dynamic(dynamic)) => {
+            assert!(dynamic.is_whole_line(), "rejected line kept a script");
+            assert_eq!(dynamic.parts().len(), 1, "rejected line has one part");
+        }
+        (Ok(script), ParseOutcome::Exact(exact)) => assert_eq!(exact.script(), script, "exact script differs"),
+        (Ok(script), ParseOutcome::Dynamic(dynamic)) => {
+            assert_eq!(dynamic.script(), Some(script), "dynamic script differs");
+            assert!(!dynamic.parts().is_empty(), "dynamic line without parts");
+        }
+    }
+    let mut previous = 0;
+    for part in outcome.dynamic_parts() {
+        span_text(input, part.span);
+        assert!(part.span.start >= previous, "dynamic parts out of order");
+        previous = part.span.start;
     }
 }
 
