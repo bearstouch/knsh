@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the quality gates: format, lint, build, docs, test, dependency checks.
+# Runs the quality gates: format, lint, build, docs, test, corpus, dependency checks.
 #
 #   scripts/check.sh            run every step, in order (the same order as CI)
 #   scripts/check.sh <step>...  run only the named steps (CI runs one step per job step)
@@ -13,7 +13,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-readonly ALL_STEPS=(fmt clippy build doc test deny)
+readonly ALL_STEPS=(fmt clippy build doc test corpus deny)
 
 # Belt and braces with .cargo/config.toml ([net] offline = true): cargo itself never
 # touches the network (NFR-SUP-03).
@@ -45,6 +45,13 @@ step_doc() {
 
 step_test() {
     cargo test --workspace --offline --locked
+}
+
+step_corpus() {
+    # Agent-command corpus gate (KNSH-033, NFR-PRIV-08): fails on a malformed or unnormalised line, a raw home path
+    # or token, or an entry without a registered source and licence. `cargo test` runs the same check; this step
+    # prints the per-source and per-tag counts.
+    cargo run --quiet --offline --locked -p knsh-corpus -- check --corpus tests/corpus
 }
 
 step_deny() {

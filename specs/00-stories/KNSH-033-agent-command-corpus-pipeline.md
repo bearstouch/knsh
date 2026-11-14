@@ -13,12 +13,12 @@ CLIs run on open-source repositories in CI; normalise paths, user names, hosts a
 placeholders; record source and licence per line. Out of scope: `knsh corpus export` (KNSH-124); any user telemetry.
 
 **Acceptance criteria**
-- [ ] Corpus stored as versioned text files under `tests/corpus/`, one line per entry with source ID; licences listed.
-- [ ] Normaliser replaces home paths, user names, host names, IPs and secret-like tokens (high-entropy strings, known
+- [x] Corpus stored as versioned text files under `tests/corpus/`, one line per entry with source ID; licences listed.
+- [x] Normaliser replaces home paths, user names, host names, IPs and secret-like tokens (high-entropy strings, known
   token prefixes) with stable placeholders; a check fails CI if a raw `/Users/<name>` or token pattern remains.
-- [ ] The import tool is a dev-only binary with no runtime dependency added to shipped crates.
-- [ ] Corpus contains bash 3.2 vs 5.2 sensitive constructs tagged for NFR-COMPAT-05.
-- [ ] Contains no user telemetry; provenance documented in [../07-testing/agent-command-corpus.md](../07-testing/agent-command-corpus.md).
+- [x] The import tool is a dev-only binary with no runtime dependency added to shipped crates.
+- [x] Corpus contains bash 3.2 vs 5.2 sensitive constructs tagged for NFR-COMPAT-05.
+- [x] Contains no user telemetry; provenance documented in [../07-testing/agent-command-corpus.md](../07-testing/agent-command-corpus.md).
 
 **Unit tests**
 - `normalises_home_paths_to_placeholder`.

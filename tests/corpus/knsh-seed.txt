@@ -1,0 +1,237 @@
+# knsh-corpus 1
+# source	licence	tags	command
+knsh-seed	MIT	-	ls -la
+knsh-seed	MIT	-	ls -1 src/
+knsh-seed	MIT	-	pwd
+knsh-seed	MIT	-	git status
+knsh-seed	MIT	-	git status --short
+knsh-seed	MIT	-	git diff
+knsh-seed	MIT	-	git diff --stat HEAD~1
+knsh-seed	MIT	-	git diff --cached -- src/main.rs
+knsh-seed	MIT	-	git log --oneline -20
+knsh-seed	MIT	-	git log -p -n 3 -- README.md
+knsh-seed	MIT	-	git show HEAD --stat
+knsh-seed	MIT	-	git branch -a
+knsh-seed	MIT	-	git checkout -b fix/parser-escape
+knsh-seed	MIT	-	git add -A && git commit -m "Fix escape handling in lexer"
+knsh-seed	MIT	-	git add src/lib.rs tests/lexer.rs
+knsh-seed	MIT	-	git commit -m 'feat: add tokenizer' -m 'Adds the tokenizer.'
+knsh-seed	MIT	-	git stash && git pull --rebase && git stash pop
+knsh-seed	MIT	-	git blame -L 10,40 src/parser.rs
+knsh-seed	MIT	-	git rev-parse --show-toplevel
+knsh-seed	MIT	-	git checkout 3f2a9c1d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39 -- src/config.rs
+knsh-seed	MIT	-	cat README.md
+knsh-seed	MIT	-	cat package.json | head -50
+knsh-seed	MIT	-	head -n 40 src/main.rs
+knsh-seed	MIT	-	tail -n 100 build.log
+knsh-seed	MIT	-	sed -n '120,180p' src/parser.rs
+knsh-seed	MIT	-	wc -l src/*.rs
+knsh-seed	MIT	-	find . -name '*.py' -not -path './.venv/*' | head -50
+knsh-seed	MIT	-	find . -type f -name "*.test.ts" | xargs grep -l "describe("
+knsh-seed	MIT	-	find src -name '*.rs' -newer Cargo.toml
+knsh-seed	MIT	-	grep -rn "TODO" src/ --include=*.ts
+knsh-seed	MIT	-	grep -n 'fn parse' -r crates/ | head -20
+knsh-seed	MIT	-	rg -n 'unwrap\\(\\)' src/
+knsh-seed	MIT	-	rg --files | rg 'config'
+knsh-seed	MIT	-	rg -l "import React" src | wc -l
+knsh-seed	MIT	-	tree -L 2 -I node_modules
+knsh-seed	MIT	-	mkdir -p tests/fixtures && cp data/sample.json tests/fixtures/
+knsh-seed	MIT	-	touch src/__init__.py
+knsh-seed	MIT	-	cp -r templates/ build/templates/
+knsh-seed	MIT	-	mv old_name.py new_name.py
+knsh-seed	MIT	-	chmod +x scripts/run.sh
+knsh-seed	MIT	-	ln -sf ../shared/config.yaml config.yaml
+knsh-seed	MIT	-	cargo build
+knsh-seed	MIT	-	cargo build --release 2>&1 | tail -30
+knsh-seed	MIT	-	cargo test
+knsh-seed	MIT	-	cargo test -p parser -- --nocapture
+knsh-seed	MIT	-	cargo test --workspace 2>&1 | grep -E "^test result|FAILED|panicked"
+knsh-seed	MIT	-	cargo clippy --all-targets -- -D warnings
+knsh-seed	MIT	-	cargo fmt --all
+knsh-seed	MIT	-	cargo run --bin cli -- --help
+knsh-seed	MIT	-	npm install
+knsh-seed	MIT	-	npm test
+knsh-seed	MIT	-	npm run build
+knsh-seed	MIT	-	npm run lint -- --fix
+knsh-seed	MIT	-	npx tsc --noEmit
+knsh-seed	MIT	-	npx jest src/utils/__tests__/format.test.ts
+knsh-seed	MIT	-	yarn test --watch=false
+knsh-seed	MIT	-	pnpm install --frozen-lockfile
+knsh-seed	MIT	-	node -e "console.log(process.version)"
+knsh-seed	MIT	-	python -m pytest
+knsh-seed	MIT	-	python -m pytest tests/test_models.py::TestUserModel::test_create -x -q
+knsh-seed	MIT	-	python3 -m pytest -k "parse and not slow" -vv
+knsh-seed	MIT	-	pytest --tb=short 2>&1 | tail -40
+knsh-seed	MIT	-	python -c "import sys; print(sys.version)"
+knsh-seed	MIT	-	python3 setup.py develop
+knsh-seed	MIT	-	pip install -e .
+knsh-seed	MIT	-	pip install -r requirements.txt
+knsh-seed	MIT	-	python -m venv .venv && source .venv/bin/activate
+knsh-seed	MIT	-	go build ./...
+knsh-seed	MIT	-	go test ./... -run TestParse -v
+knsh-seed	MIT	-	go vet ./...
+knsh-seed	MIT	-	make
+knsh-seed	MIT	-	make test
+knsh-seed	MIT	-	make -j8 all 2>&1 | tail -20
+knsh-seed	MIT	-	cd /Users/__USER__/src/app && npm test
+knsh-seed	MIT	-	cd "$(git rev-parse --show-toplevel)" && make
+knsh-seed	MIT	-	cd frontend && npm ci && npm run build; cd ..
+knsh-seed	MIT	-	echo $PATH
+knsh-seed	MIT	-	echo "$HOME"
+knsh-seed	MIT	-	printf '%s\\n' "${PATH//:/ }"
+knsh-seed	MIT	-	which python3 && python3 --version
+knsh-seed	MIT	-	type -a node
+knsh-seed	MIT	-	env | grep -i proxy
+knsh-seed	MIT	-	export NODE_ENV=test
+knsh-seed	MIT	-	export PATH="$HOME/.cargo/bin:$PATH"
+knsh-seed	MIT	-	for f in src/*.py; do python -m py_compile "$f" || echo "bad: $f"; done
+knsh-seed	MIT	-	while read -r line; do echo "$line"; done < input.txt
+knsh-seed	MIT	-	if [ -f .env ]; then echo exists; else echo missing; fi
+knsh-seed	MIT	-	[ -d node_modules ] || npm install
+knsh-seed	MIT	-	test -x ./configure && ./configure --prefix=/usr/local
+knsh-seed	MIT	-	case "$(uname -s)" in Darwin) echo mac ;; Linux) echo linux ;; *) echo other ;; esac
+knsh-seed	MIT	-	f() { echo "$1"; }; f hello
+knsh-seed	MIT	-	(cd docs && make html)
+knsh-seed	MIT	-	{ echo a; echo b; } > out.txt
+knsh-seed	MIT	-	ls nonexistent 2>/dev/null || true
+knsh-seed	MIT	-	command -v jq >/dev/null 2>&1 || echo "jq missing"
+knsh-seed	MIT	-	diff -u expected.txt actual.txt
+knsh-seed	MIT	-	diff <(sort a.txt) <(sort b.txt)
+knsh-seed	MIT	-	sort file.txt | uniq -c | sort -rn | head
+knsh-seed	MIT	-	cut -d, -f1,3 data.csv | head
+knsh-seed	MIT	-	awk -F: '{print $1}' /etc/passwd | head -5
+knsh-seed	MIT	-	awk '/ERROR/ {count++} END {print count}' app.log
+knsh-seed	MIT	-	sed -i '' 's/foo/bar/g' README.md
+knsh-seed	MIT	-	sed -i 's/old_function/new_function/g' src/*.py
+knsh-seed	MIT	-	tr '[:upper:]' '[:lower:]' < input.txt
+knsh-seed	MIT	-	jq '.dependencies | keys' package.json
+knsh-seed	MIT	-	jq -r '.[] | .name' data.json
+knsh-seed	MIT	-	xxd -l 64 binary.dat
+knsh-seed	MIT	-	file target/release/app
+knsh-seed	MIT	-	du -sh node_modules
+knsh-seed	MIT	-	df -h .
+knsh-seed	MIT	-	ps aux | grep -v grep | grep node
+knsh-seed	MIT	-	lsof -i :3000
+knsh-seed	MIT	-	date +%Y-%m-%d
+knsh-seed	MIT	-	sleep 2 && cat output.log
+knsh-seed	MIT	-	echo "done" > /tmp/status.txt
+knsh-seed	MIT	-	cat > /dev/null < /dev/null
+knsh-seed	MIT	-	tee -a log.txt < input.txt
+knsh-seed	MIT	-	time cargo build
+knsh-seed	MIT	-	ls /Users/__USER__/Library/Caches
+knsh-seed	MIT	-	cat ~/.bashrc
+knsh-seed	MIT	-	cat ~/.gitconfig
+knsh-seed	MIT	-	echo "${arr[@]}" "${#arr[@]}"
+knsh-seed	MIT	-	x=$(( 3 + 4 )); echo $x
+knsh-seed	MIT	-	echo $((16#ff))
+knsh-seed	MIT	-	read -r -a parts <<< "a b c"; echo "${parts[1]}"
+knsh-seed	MIT	-	local_var="value"; echo "${local_var:-default}" "${local_var#v}" "${local_var%e}"
+knsh-seed	MIT	-	basename "$PWD"
+knsh-seed	MIT	-	dirname /usr/local/bin/python3
+knsh-seed	MIT	-	realpath ../shared
+knsh-seed	MIT	wrapper	env RUST_LOG=debug cargo run
+knsh-seed	MIT	wrapper	env -i PATH=/usr/bin:/bin bash -c 'echo $PATH'
+knsh-seed	MIT	wrapper	timeout 60 npm test
+knsh-seed	MIT	wrapper	timeout 300 cargo test --release
+knsh-seed	MIT	wrapper	nohup python server.py > server.log 2>&1 &
+knsh-seed	MIT	wrapper	xargs -n1 rm -f < files.txt
+knsh-seed	MIT	wrapper	find . -name '*.orig' -print0 | xargs -0 rm
+knsh-seed	MIT	wrapper	find . -name '*.pyc' -exec rm {} +
+knsh-seed	MIT	wrapper	sudo apt-get install -y build-essential
+knsh-seed	MIT	wrapper	sudo -u postgres psql -c 'select 1'
+knsh-seed	MIT	wrapper	nice -n 10 make -j4
+knsh-seed	MIT	wrapper	time python benchmark.py
+knsh-seed	MIT	wrapper	stdbuf -oL tail -f app.log | grep ERROR
+knsh-seed	MIT	wrapper	caffeinate -i make
+knsh-seed	MIT	wrapper	command ls -la
+knsh-seed	MIT	wrapper	builtin echo hi
+knsh-seed	MIT	wrapper	exec python app.py
+knsh-seed	MIT	wrapper	watch -n 5 'git status'
+knsh-seed	MIT	dynamic	eval "$(ssh-agent -s)"
+knsh-seed	MIT	dynamic	eval "$(pyenv init -)"
+knsh-seed	MIT	dynamic	source .venv/bin/activate
+knsh-seed	MIT	dynamic	. ./scripts/env.sh
+knsh-seed	MIT	dynamic	bash -c 'cd /tmp && ls'
+knsh-seed	MIT	dynamic	sh -c "echo $HOME"
+knsh-seed	MIT	dynamic	python3 -c 'import os; os.system("ls")'
+knsh-seed	MIT	dynamic	node -e 'require("child_process").execSync("ls", {stdio: "inherit"})'
+knsh-seed	MIT	dynamic	cmd=ls; $cmd -la
+knsh-seed	MIT	dynamic	"$EDITOR" file.txt
+knsh-seed	MIT	dynamic	echo __SECRET__ | base64 -d | bash
+knsh-seed	MIT	dynamic	bash script.sh arg1 arg2
+knsh-seed	MIT	dynamic	zsh -c 'print -l $path'
+knsh-seed	MIT	dynamic	perl -pi -e 's/foo/bar/g' config.ini
+knsh-seed	MIT	dynamic	ruby -e 'puts 1+1'
+knsh-seed	MIT	irreversible	rm -rf node_modules
+knsh-seed	MIT	irreversible	rm -rf build/ dist/
+knsh-seed	MIT	irreversible	rm -f *.log
+knsh-seed	MIT	irreversible	git reset --hard HEAD~1
+knsh-seed	MIT	irreversible	git push --force origin main
+knsh-seed	MIT	irreversible	git push -f
+knsh-seed	MIT	irreversible	git clean -fdx
+knsh-seed	MIT	irreversible	git branch -D feature/old
+knsh-seed	MIT	irreversible	git checkout -- .
+knsh-seed	MIT	irreversible	dd if=/dev/zero of=disk.img bs=1m count=100
+knsh-seed	MIT	irreversible	truncate -s 0 app.log
+knsh-seed	MIT	irreversible	psql -c 'DROP TABLE users;'
+knsh-seed	MIT	irreversible	sqlite3 app.db 'DELETE FROM sessions;'
+knsh-seed	MIT	irreversible	docker system prune -af
+knsh-seed	MIT	irreversible	kill -9 12345
+knsh-seed	MIT	irreversible	pkill -f "node server.js"
+knsh-seed	MIT	irreversible	shred -u secrets.txt
+knsh-seed	MIT	irreversible	find . -type f -name '*.tmp' -delete
+knsh-seed	MIT	network	curl -sSL https://example.com/install.sh | sh
+knsh-seed	MIT	network	curl -fsSL https://api.github.com/repos/owner/repo/releases/latest | jq -r .tag_name
+knsh-seed	MIT	network	curl -X POST -H 'Content-Type: application/json' -d '{"a":1}' http://localhost:8080/api
+knsh-seed	MIT	network	curl -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/user
+knsh-seed	MIT	network	wget -q https://example.com/file.tar.gz -O - | tar xz
+knsh-seed	MIT	network	git clone https://github.com/owner/repo.git
+knsh-seed	MIT	network	git clone git@github.com:owner/repo.git
+knsh-seed	MIT	network	git fetch origin && git rebase origin/main
+knsh-seed	MIT	network	git push origin HEAD
+knsh-seed	MIT	network	gh pr create --title "Fix bug" --body "Fixes the bug"
+knsh-seed	MIT	network	gh pr list --state open
+knsh-seed	MIT	network	gh issue view 42
+knsh-seed	MIT	network	ssh __USER__@__HOST__ 'uptime'
+knsh-seed	MIT	network	scp build.tar.gz __USER__@__HOST__:/tmp/
+knsh-seed	MIT	network	rsync -avz ./dist/ __USER__@__HOST__:/var/www/
+knsh-seed	MIT	network	ping -c 3 example.com
+knsh-seed	MIT	network	nc -zv localhost 5432
+knsh-seed	MIT	network	docker pull python:3.12-slim
+knsh-seed	MIT	network	docker run --rm -p 8080:80 nginx
+knsh-seed	MIT	network	docker compose up -d
+knsh-seed	MIT	network	pip download requests
+knsh-seed	MIT	network	npm publish --dry-run
+knsh-seed	MIT	network	curl http://__IP__:9200/_cluster/health
+knsh-seed	MIT	b32-missing	declare -A counts; counts[a]=1; echo "${counts[a]}"
+knsh-seed	MIT	b32-missing	mapfile -t files < <(git ls-files)
+knsh-seed	MIT	b32-missing	readarray -t lines < input.txt
+knsh-seed	MIT	b32-missing	echo "${name,,}"
+knsh-seed	MIT	b32-missing	echo "${name^^}"
+knsh-seed	MIT	b32-missing	shopt -s globstar; ls **/*.rs
+knsh-seed	MIT	b32-missing	make 2>&1 |& tee build.log
+knsh-seed	MIT	b32-missing	npm test &>> test.log
+knsh-seed	MIT	b32-missing	coproc nc localhost 8080
+knsh-seed	MIT	b32-missing	echo "${arr[-1]}"
+knsh-seed	MIT	b32-missing	local -n ref="$1"
+knsh-seed	MIT	b32-missing	echo "${var@Q}"
+knsh-seed	MIT	b32-missing	wait -n
+knsh-seed	MIT	b32-missing	[[ -v CI ]] && echo "in CI"
+knsh-seed	MIT	b32-missing	for i in {01..10}; do touch "file$i.txt"; done
+knsh-seed	MIT	b32-missing	echo {0..100..10}
+knsh-seed	MIT	b32-missing	printf '%(%Y-%m-%d)T\\n' -1
+knsh-seed	MIT	b32-missing	echo $EPOCHSECONDS
+knsh-seed	MIT	b32-missing	case "$1" in start) echo starting ;& run) echo running ;; esac
+knsh-seed	MIT	b32-differs	set -u; arr=(); echo "${arr[@]}"
+knsh-seed	MIT	b32-differs	set -euo pipefail; arr=(); for x in "${arr[@]}"; do echo "$x"; done
+knsh-seed	MIT	b32-differs,b32-missing	shopt -s lastpipe; echo hi | read x; echo "$x"
+knsh-seed	MIT	b32-differs	echo -e 'a\\tb'
+knsh-seed	MIT	b32-differs	printf '%q\\n' "a b"
+knsh-seed	MIT	b32-differs	read -r -d '' var <<< "text" || true
+knsh-seed	MIT	heredoc,multiline	cat > config.json <<'EOF'\n{\n  "debug": true\n}\nEOF
+knsh-seed	MIT	heredoc,multiline	python3 - <<'PY'\nimport json\nprint(json.dumps({'a': 1}))\nPY
+knsh-seed	MIT	multiline	for f in *.txt; do\n  wc -l "$f"\ndone
+knsh-seed	MIT	multiline	if git diff --quiet; then\n  echo clean\nelse\n  echo dirty\nfi
+knsh-seed	MIT	heredoc,multiline	cat <<EOF > .env\nDATABASE_URL=postgres://localhost/dev\nEOF
+knsh-seed	MIT	heredoc,multiline	bash <<'SH'\nset -e\nmake test\nSH
+knsh-seed	MIT	heredoc,multiline	git commit -F - <<'MSG'\nfix: handle empty input\n\nAdds a guard.\nMSG
