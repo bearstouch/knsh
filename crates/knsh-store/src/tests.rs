@@ -37,6 +37,16 @@ fn open_at(dir: &TempDir, clock: &Arc<FakeClock>, config: StoreConfig) -> Record
     try_open(dir, clock, effective_uid(), config).unwrap()
 }
 
+/// [`open_at`], then waits for the pass that runs at open to finish. A later [`RecordStore::run_retention`] joins a
+/// pass that is still running, whose cutoffs come from the clock when it started, so a test that moves the clock
+/// after opening must start from a settled store or, on a slow machine, see the open pass's report instead of a new
+/// one (seen in CI as `expired == 0`).
+fn open_settled(dir: &TempDir, clock: &Arc<FakeClock>, config: StoreConfig) -> RecordStore {
+    let store = open_at(dir, clock, config);
+    store.run_retention().unwrap();
+    store
+}
+
 fn try_open(dir: &TempDir, clock: &Arc<FakeClock>, uid: u32, config: StoreConfig) -> Result<RecordStore, StoreError> {
     let clock: Arc<dyn knsh_platform::Clock> = clock.clone();
     RecordStore::open(&RealFs::new(), &dir.db(), uid, clock, config)
@@ -688,7 +698,7 @@ fn deletes_records_older_than_retention() {
 fn retention_deletes_output_blobs_with_records() {
     let dir = TempDir::new("expire-output");
     let clock = clock();
-    let store = open_at(&dir, &clock, StoreConfig::default());
+    let store = open_settled(&dir, &clock, StoreConfig::default());
     write_records(&store, session_id(1), 1..=4);
     assert_eq!(count(&dir, "SELECT count(*) FROM outputs"), 8);
 
@@ -713,7 +723,7 @@ fn retention_deletes_output_blobs_with_records() {
 fn denials_and_approvals_follow_the_same_retention() {
     let dir = TempDir::new("expire-decisions");
     let clock = clock();
-    let store = open_at(&dir, &clock, StoreConfig::default());
+    let store = open_settled(&dir, &clock, StoreConfig::default());
     write_records(&store, session_id(1), 1..=2);
     {
         // Phase 1 writes no decisions yet; mark the records as a denial and an approval directly.
@@ -747,7 +757,7 @@ fn per_profile_retention_overrides_default() {
     retention
         .per_profile
         .insert(ProfileName::new("long").unwrap(), days(90));
-    let store = open_at(
+    let store = open_settled(
         &dir,
         &clock,
         StoreConfig {
@@ -851,7 +861,7 @@ fn size_limit_deletes_oldest_first() {
 fn retention_runs_in_batches_until_done() {
     let dir = TempDir::new("batches");
     let clock = clock();
-    let store = open_at(&dir, &clock, StoreConfig::default());
+    let store = open_settled(&dir, &clock, StoreConfig::default());
     let total = u64::from(crate::RETENTION_BATCH) * 2 + 7;
     {
         // Many records quickly: one transaction on a side connection rather than one fsync per record.
