@@ -1,7 +1,9 @@
-//! The crate's error types: [`LexError`] for the lexer and [`ParseError`], which wraps it, for the parser.
+//! The crate's error types: [`LexError`] for the lexer and [`ParseError`], which wraps it, for the parser, and
+//! [`InterpreterTableError`] for interpreter entries a profile adds (KNSH-036).
 //!
 //! Messages never echo the rejected input: command lines may hold paths, hosts or secrets, and errors are recorded
-//! and shown to agents (NFR-PRIV-02). Variants carry spans and limits, never text taken from the input.
+//! and shown to agents (NFR-PRIV-02). Variants carry spans and limits, never text taken from the input. The
+//! interpreter table's errors name the profile entry at fault: a profile is configuration, not an agent command line.
 
 use std::fmt;
 
@@ -350,7 +352,8 @@ impl fmt::Display for Unexpected {
 pub enum UnsupportedConstruct {
     /// A command outside decision 6's exact list. As a [`Command::Unsupported`](crate::Command::Unsupported) node:
     /// `select`, `[[ … ]]`, `(( … ))` and `for (( … ))`, alone or as a function body. As a [`ParseError::Unsupported`]:
-    /// `coproc` (dynamic by decision 6) and `time`, which prefix a pipeline rather than form a command, and a `(( … ))`
+    /// `coproc` (dynamic by decision 6) and `time` where bash versions read it differently (after `!` or a pipe, with
+    /// no command, or with an option other than `-p`; see [`TimeKeyword`](crate::TimeKeyword)), and a `(( … ))`
     /// that holds a comment, which bash and this parser could close at different places.
     Compound(CompoundStart),
     /// A command substitution, backtick or process substitution inside `${…}`, `$((…))` or `$[…]`
@@ -445,3 +448,42 @@ const fn reserved_word_text(word: ReservedWord) -> &'static str {
         ReservedWord::While => "while",
     }
 }
+
+/// An interpreter entry a profile adds that the table refuses (KNSH-036). The table is left unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterpreterTableError {
+    /// The family name is empty, holds `/` or NUL, or ends in a version suffix, so no base name could match it as
+    /// written (the family of `python3` is `python`).
+    InvalidFamily {
+        /// The name as given.
+        family: String,
+    },
+    /// An option is not spelled `-x` or `--name`.
+    InvalidOption {
+        /// The entry's family.
+        family: String,
+        /// The option as given.
+        option: String,
+    },
+}
+
+impl fmt::Display for InterpreterTableError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidFamily { family } => {
+                write!(
+                    f,
+                    "interpreter family {family:?} is not a base name without a version suffix"
+                )
+            }
+            Self::InvalidOption { family, option } => {
+                write!(
+                    f,
+                    "interpreter {family:?}: option {option:?} is not spelled -x or --name"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for InterpreterTableError {}

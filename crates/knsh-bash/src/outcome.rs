@@ -24,9 +24,11 @@
 //! [`ParseError`] to [`DynamicReason`] is an exhaustive `match` with no catch-all, so a new error variant cannot
 //! compile without being given a reason.
 //!
-//! Wrappers that run a command given as arguments (`command eval`, `env $CMD`, `sudo sh -c`) and interpreters with
-//! `-c` or `-e` are classified by KNSH-036, which starts from this outcome; this module marks only what the parser
-//! itself decides. A parser result is an intent filter, never a security boundary.
+//! Wrappers that run a command given as arguments (`command eval`, `env $CMD`) and interpreters with `-c` or `-e` are
+//! classified by [`classify`](crate::classify) (KNSH-036), which starts from this outcome and adds its own reasons;
+//! this module marks only what the parser itself decides. `source` and `.` are marked here whatever file they read;
+//! the classifier keeps the mark only for a file that is agent-writable or not resolved. A parser result is an intent
+//! filter, never a security boundary.
 
 use std::fmt;
 
@@ -164,15 +166,36 @@ pub enum DynamicReason {
     Unsupported(UnsupportedConstruct),
     /// `coproc`, dynamic by decision 6.
     Coproc,
-    /// `eval`, which runs its arguments as code.
+    /// `eval`, which runs its arguments as code. The classifier gives it too to the builtins that store code for bash
+    /// to run later: `trap` with an action, `mapfile -C` and `alias` with a value (KNSH-036).
     Eval,
-    /// `source` or `.`, which runs a file as code in the current shell.
+    /// `source` or `.`, which runs a file as code in the current shell. [`parse_line`] marks every one; the
+    /// classifier keeps the mark only when the file is agent-writable (under the session's write roots) or cannot be
+    /// resolved (KNSH-036).
     Source,
     /// A command name built from an expansion: a parameter, a substitution, arithmetic, a tilde, a glob, a brace
     /// expansion or an ANSI-C or locale quote. What runs is not known from the line.
     ExpandedCommandName,
     /// A here-document or here-string read by a shell or interpreter as code (KNSH-031).
     InterpreterInput,
+    /// A shell or interpreter given its program on the command line: `sh -c`, `python3 -c`, `node -e`, `deno eval`
+    /// (KNSH-036). Only the classifier gives this reason.
+    InterpreterCode,
+    /// A shell or interpreter given no script, so it reads its program from standard input (`curl … | bash`,
+    /// `bash -s`) or from arguments supplied at run time (`xargs bash`) (KNSH-036). Only the classifier gives this
+    /// reason.
+    InterpreterStdin,
+    /// A wrapper's option or operand, or an interpreter's argument before its script, built from an expansion: it may
+    /// split into several words or be a code option, so what runs is not known from the line (KNSH-036). Only the
+    /// classifier gives this reason.
+    ExpandedArgument,
+    /// A wrapper option outside the wrapper's grammar (`env -S …`, `env -P dir`), which is not guessed at (KNSH-036).
+    /// Only the classifier gives this reason.
+    UnknownWrapperOption,
+    /// A variable whose value a shell or program runs as code (`BASH_ENV`, `PS4`, `NODE_OPTIONS`, `GIT_PAGER`, …),
+    /// set for a command, as an `env` operand or by `export` and its kin (KNSH-036). Only the classifier gives this
+    /// reason.
+    CodeVariable,
 }
 
 impl DynamicReason {
@@ -192,6 +215,11 @@ impl DynamicReason {
             Self::Source => "source",
             Self::ExpandedCommandName => "expanded_command_name",
             Self::InterpreterInput => "interpreter_input",
+            Self::InterpreterCode => "interpreter_code",
+            Self::InterpreterStdin => "interpreter_stdin",
+            Self::ExpandedArgument => "expanded_argument",
+            Self::UnknownWrapperOption => "unknown_wrapper_option",
+            Self::CodeVariable => "code_variable",
         }
     }
 }
@@ -211,6 +239,11 @@ impl fmt::Display for DynamicReason {
             Self::Source => f.write_str("`source` or `.`"),
             Self::ExpandedCommandName => f.write_str("command name built from an expansion"),
             Self::InterpreterInput => f.write_str("here-document or here-string read by an interpreter"),
+            Self::InterpreterCode => f.write_str("interpreter given code on the command line"),
+            Self::InterpreterStdin => f.write_str("interpreter reading its program from standard input"),
+            Self::ExpandedArgument => f.write_str("wrapper or interpreter argument built from an expansion"),
+            Self::UnknownWrapperOption => f.write_str("wrapper option outside its grammar"),
+            Self::CodeVariable => f.write_str("variable whose value a shell or program runs as code"),
         }
     }
 }
@@ -353,7 +386,7 @@ fn simple_command_reason(simple: &SimpleCommand, deep: &DeepCommand<'_>) -> Opti
 /// arithmetic makes the name expanded, and so do these in unquoted text: a leading `~` (tilde expansion), `*` or `?`
 /// (globs), `{` (brace expansion: `{ls,-la}` runs `ls -la`) and `[` (a glob bracket), except the name `[` itself,
 /// which is the `test` builtin. ANSI-C and locale quotes are not decoded, so they count as expanded too.
-fn command_name_text(word: &Word, source: &str) -> Option<String> {
+pub(crate) fn command_name_text(word: &Word, source: &str) -> Option<String> {
     let mut text = String::new();
     let mut bracket = false;
     for (index, segment) in word.segments.iter().enumerate() {
@@ -695,6 +728,11 @@ mod tests {
             DynamicReason::Source,
             DynamicReason::ExpandedCommandName,
             DynamicReason::InterpreterInput,
+            DynamicReason::InterpreterCode,
+            DynamicReason::InterpreterStdin,
+            DynamicReason::ExpandedArgument,
+            DynamicReason::UnknownWrapperOption,
+            DynamicReason::CodeVariable,
         ];
         let mut codes: Vec<&str> = reasons.iter().map(|reason| reason.code()).collect();
         assert!(

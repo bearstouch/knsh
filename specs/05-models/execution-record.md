@@ -10,7 +10,7 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 | `attribution` | `command` \| `agent_edit` \| `external` \| `concurrent` | How the record's file changes were attributed ([checkpoints](../03-functional-requirements/checkpoints.md)) |
 | `command` | string | The line actually executed, after any rewrite, with secrets redacted |
 | `rewritten_from` | string or null | The original line when a rewrite was applied |
-| `argv` | array | Each simple command with resolved absolute path and class (`static`, `wrapper`, `dynamic`, `project_executable`) |
+| `argv` | array | Each simple command with resolved absolute path and class (`static`, `wrapper`, `dynamic`, `project_executable`). A wrapper and the command it runs are separate entries, the inner one linked to its wrapper; a dynamic entry carries its reason code |
 | `cwd` | path | Working directory at start |
 | `decision` | object | See below |
 | `sandbox_profile` | string | Profile name and a hash of the compiled profile |
@@ -41,10 +41,14 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 
 | Class | Meaning |
 | --- | --- |
-| `static` | A binary resolved from a trusted folder, matched by name rules |
-| `wrapper` | A known wrapper (`env`, `command`, `exec`, `nice`, `nohup`, `time`, `timeout`, `xargs`) that was unwrapped |
-| `dynamic` | Dynamic code: never inherits classes, network limited to `hosts`, no secrets |
+| `static` | A binary resolved from a trusted folder, matched by name rules; also builtins, calls of functions defined in the line, and names not found (which fail with 127) |
+| `wrapper` | A known wrapper (`env`, `command`, `exec`, `nice`, `nohup`, `time`, `timeout`, `xargs`, and the `builtin` builtin) that was unwrapped. A wrapper binary outside the trusted folders is unwrapped too but keeps `project_executable` |
+| `dynamic` | Dynamic code: never inherits classes, network limited to `hosts`, no secrets. The reason is one of a closed set (`eval`, `source`, `interpreter_code`, `interpreter_stdin`, `expanded_command_name`, `expanded_argument`, `unknown_wrapper_option`, `code_variable`, `interpreter_input`, and the parser's whole-line reasons) |
 | `project_executable` | A binary from an agent-writable place, governed by `project_executables` |
+
+The command `xargs` runs receives arguments only known at run time: its entry marks its arguments as incomplete, and
+rules that depend on arguments treat them as unknown. `command -v` and `command -V` run nothing, so no inner entry is
+made.
 
 ## Human telemetry records
 

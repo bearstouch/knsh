@@ -36,9 +36,9 @@
 //!
 //! Anything else that bash accepts is either kept whole as a [`Command::Unsupported`] node, when its extent is
 //! certain (`select`, `[[ … ]]`, `(( … ))`, `for (( … ))`), or refused with [`ParseError::Unsupported`] (array
-//! assignments, `coproc`, `time`, a substitution inside `${ … }` or `$(( … ))`), and anything bash rejects is a syntax
-//! error. Either way the caller classifies the construct or the line as dynamic (KNSH-032): no error path and no
-//! unsupported node leads to an allow.
+//! assignments, `coproc`, `time` anywhere but at the start of a pipeline, a substitution inside `${ … }` or
+//! `$(( … ))`), and anything bash rejects is a syntax error. Either way the caller classifies the construct or the line
+//! as dynamic (KNSH-032): no error path and no unsupported node leads to an allow.
 //!
 //! Lists, and-or lists and pipelines are read iteratively, so the length of a line never deepens the call stack. Each
 //! nested list (inside a compound command, function body or substitution) enters [`Parser::list`] again with its
@@ -59,7 +59,8 @@ use crate::ast::{
     AndOr, AndOrOperator, AndOrPart, Assignment, CaseClause, CaseCommand, CaseTerminator, CaseTerminatorKind, Command,
     CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems, FunctionDefinition, Group,
     HereDocument, IfClause, IfCommand, ListItem, LoopBody, LoopCommand, PipeOperator, Pipeline, PipelinePart, Redirect,
-    Script, Separator, SeparatorKind, SimpleCommand, Subshell, Substitution, SubstitutionKind, UnsupportedCommand,
+    Script, Separator, SeparatorKind, SimpleCommand, Subshell, Substitution, SubstitutionKind, TimeKeyword,
+    UnsupportedCommand,
 };
 use crate::error::{CompoundStart, LexError, ParseError, Unexpected, UnsupportedConstruct};
 use crate::functions::mark_function_calls;
@@ -365,9 +366,10 @@ impl Parser<'_> {
         Ok(AndOr { first, rest, span })
     }
 
-    /// Reads an optionally negated pipeline. `after` is the operator before it, if any, for the error when the line
-    /// ends there.
+    /// Reads a pipeline, optionally timed by the `time` keyword and negated by `!`. `after` is the operator before
+    /// it, if any, for the error when the line ends there.
     fn pipeline(&mut self, after: Option<Span>, depth: usize) -> Result<Pipeline, ParseError> {
+        let time = self.time_keyword()?;
         let negation = self
             .next_if(|kind| is_reserved(kind, ReservedWord::Bang))
             .map(|token| token.span);
@@ -382,7 +384,7 @@ impl Parser<'_> {
                 span: token.span,
             });
         }
-        let first = self.command(negation.or(after), depth)?;
+        let first = self.command(negation.or(time.map(|time| time.span())).or(after), depth)?;
         let mut rest = Vec::new();
         while let Some((operator, operator_span)) = self.next_if_map(pipe_operator) {
             self.skip_newlines();
@@ -393,14 +395,65 @@ impl Parser<'_> {
                 command,
             });
         }
-        let start = negation.map_or(first.span().start, |bang| bang.start);
+        let start = time
+            .map(|time| time.keyword)
+            .or(negation)
+            .map_or(first.span().start, |prefix| prefix.start);
         let end = rest.last().map_or(first.span().end, |part| part.command.span().end);
         Ok(Pipeline {
+            time,
             negation,
             first,
             rest,
             span: Span::new(start, end),
         })
+    }
+
+    /// Reads the `time` keyword and its `-p` option at the start of a pipeline, if there (KNSH-036).
+    ///
+    /// Only the form every bash reads the same way is accepted: `time` or `time -p`, then a command. The rest is
+    /// refused as unsupported, so the line is dynamic (KNSH-032) rather than read the way one bash version would:
+    /// `time` with no command (`time`, `time -p;`), another word starting with `-` (bash 3.2 runs `time --` as a
+    /// command named `--`, later bash takes `--` as the end of the options), and a second `time` (bash 3.2 runs the
+    /// `time` program, later bash may time the pipeline twice). `!` may follow (`time ! ls`). `time` after `!` or a
+    /// pipe never reaches here: bash 3.2 runs the `time` program there, and [`Parser::command`] refuses it.
+    fn time_keyword(&mut self) -> Result<Option<TimeKeyword>, ParseError> {
+        let Some(keyword) = self.next_if(|kind| is_reserved(kind, ReservedWord::Time)) else {
+            return Ok(None);
+        };
+        let keyword = keyword.span;
+        let input = self.input;
+        let posix = self
+            .peek()
+            .filter(|token| matches!(token.kind, TokenKind::Word(_)) && token.span.text(input) == Some("-p"))
+            .map(|token| token.span);
+        if posix.is_some() {
+            self.advance();
+        }
+        let refuse = || ParseError::Unsupported {
+            construct: UnsupportedConstruct::Compound(CompoundStart::ReservedWord(ReservedWord::Time)),
+            span: keyword,
+        };
+        let Some(next) = self.peek() else {
+            return Err(refuse());
+        };
+        let ambiguous = match &next.kind {
+            TokenKind::Word(word) => {
+                word.reserved == Some(ReservedWord::Time)
+                    || next
+                        .span
+                        .text(input)
+                        .is_some_and(|text| text.trim_start_matches(['"', '\'', '\\']).starts_with('-'))
+            }
+            // `time ( … )` times a subshell; any other operator or a newline ends a `time` with no command.
+            TokenKind::Operator(operator) => *operator != Operator::LeftParen,
+            TokenKind::Newline => true,
+            TokenKind::Redirection(_) | TokenKind::Blank | TokenKind::Comment | TokenKind::HereDocumentBody(_) => false,
+        };
+        if ambiguous {
+            return Err(refuse());
+        }
+        Ok(Some(TimeKeyword { keyword, posix }))
     }
 
     // ---- Commands ----
@@ -1603,9 +1656,10 @@ fn is_operator(kind: &TokenKind, operator: Operator) -> bool {
 
 /// The error for a reserved word in command position that starts neither a compound command nor a function
 /// definition. Only `!` starts a pipeline, and the pipeline has already consumed it, so a `!` here is a second one
-/// (`! ! a`) or follows a pipe (`a | ! b`): bash 3.2 rejects both. `coproc` and `time` are refused as unsupported (they
-/// prefix a pipeline, which this parser does not delimit); words that only continue or close a construct are syntax
-/// errors where a command should start, as in bash.
+/// (`! ! a`) or follows a pipe (`a | ! b`): bash 3.2 rejects both. `coproc` is refused as unsupported (it prefixes a
+/// pipeline, which this parser does not delimit), and so is `time` here, after `!` or a pipe, where bash 3.2 runs the
+/// `time` program but later bash may read the keyword ([`Parser::time_keyword`] reads it where they agree); words
+/// that only continue or close a construct are syntax errors where a command should start, as in bash.
 fn misplaced_reserved_word(reserved: ReservedWord, span: Span) -> ParseError {
     match reserved {
         ReservedWord::Coproc | ReservedWord::Time => ParseError::Unsupported {
@@ -2553,13 +2607,24 @@ mod tests {
     }
 
     #[test]
-    fn coproc_and_time_stay_refused() {
-        // They prefix a pipeline rather than form a command; decision 6 makes `coproc` dynamic.
+    fn coproc_and_ambiguous_time_stay_refused() {
+        // `coproc` prefixes a pipeline rather than forming a command, and decision 6 makes it dynamic. `time` is
+        // refused wherever bash 3.2 and later bash read it differently (KNSH-036).
         for (input, word) in [
             ("coproc a", ReservedWord::Coproc),
-            ("time a | b", ReservedWord::Time),
-            ("a && time b", ReservedWord::Time),
             ("{ coproc a; }", ReservedWord::Coproc),
+            ("time", ReservedWord::Time),
+            ("time -p", ReservedWord::Time),
+            ("time -p; a", ReservedWord::Time),
+            ("time\na", ReservedWord::Time),
+            ("time -- a", ReservedWord::Time),
+            ("time -x a", ReservedWord::Time),
+            ("time -p -p a", ReservedWord::Time),
+            ("time \"-p\" a", ReservedWord::Time),
+            ("time time a", ReservedWord::Time),
+            ("time | a", ReservedWord::Time),
+            ("! time a", ReservedWord::Time),
+            ("a | time b", ReservedWord::Time),
         ] {
             assert_eq!(
                 unsupported(input),
@@ -2567,6 +2632,33 @@ mod tests {
                 "{input:?}"
             );
         }
+    }
+
+    // KNSH-036: the `time` keyword at the start of a pipeline is read, with `-p`, before or after `!`.
+    #[test]
+    fn time_keyword_prefixes_a_pipeline() {
+        let input = "time -p a | b && time ! { c; } || time ( d ); x=1 time e";
+        let script = parse(input).unwrap();
+        let and_or = &script.items[0].and_or;
+        let time = and_or.first.time.unwrap();
+        assert_eq!(text(input, time.keyword), "time");
+        assert_eq!(text(input, time.posix.unwrap()), "-p");
+        assert_eq!(text(input, time.span()), "time -p");
+        assert_eq!(text(input, and_or.first.span), "time -p a | b");
+        assert_eq!(and_or.first.rest.len(), 1);
+        let second = &and_or.rest[0].pipeline;
+        assert_eq!(second.time.unwrap().posix, None);
+        assert!(second.is_negated());
+        assert_eq!(text(input, second.span), "time ! { c; }");
+        assert!(and_or.rest[1].pipeline.time.is_some());
+        // After an assignment `time` is an ordinary word: the program `time`.
+        assert_eq!(script.items[1].and_or.first.time, None);
+        assert_eq!(names(input), ["a", "b", "c", "d", "time"].map(Some));
+        // `time ! ! a` is still the error bash 3.2 reports.
+        assert_eq!(
+            unexpected_token("time ! ! a").0,
+            Unexpected::ReservedWord(ReservedWord::Bang)
+        );
     }
 
     // ---- Structure ----

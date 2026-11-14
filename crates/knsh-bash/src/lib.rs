@@ -19,8 +19,9 @@
 //! condition, body, case arm and function body, and a call that certainly reaches a function defined earlier in the
 //! line is marked ([`SimpleCommand::function_call`]), so it is not resolved as a program. Constructs outside decision
 //! 6 whose extent is certain (`select`, `[[ … ]]`, `(( … ))`) are kept whole as [`Command::Unsupported`] nodes; other
-//! valid bash it does not read (`coproc`, `time`, array assignments) is refused with [`ParseError::Unsupported`]
-//! rather than read partly.
+//! valid bash it does not read (`coproc`, `time` where bash versions read it differently, array assignments) is
+//! refused with [`ParseError::Unsupported`] rather than read partly. The `time` keyword at the start of a pipeline
+//! is read ([`TimeKeyword`], KNSH-036).
 //!
 //! Substitutions and here-documents (KNSH-031): every `$( … )`, backtick (un-escaped as bash does first), `<( … )`
 //! and `>( … )` in a word, an assignment, a redirection target or an unquoted here-document body is parsed recursively
@@ -39,6 +40,15 @@
 //! Builtins (KNSH-035): [`is_builtin`] names the commands bash 3.2 runs itself, so the supervisor does not resolve
 //! them on `PATH` (FR-LC-03). Later bash builtins are left out, so a program of the same name is never hidden.
 //!
+//! The classifier, [`classify`] (KNSH-036), starts from a [`ParseOutcome`] and gives every simple command a
+//! [`ClassifiedCommand`] with its record class ([`CommandClass`]): known wrappers (`env`, `command`, `exec`, `nice`,
+//! `nohup`, `time`, `timeout`, `xargs`) are unwrapped with explicit option grammars, so `env FOO=1 nice -n 5 git
+//! push` is decided as `git push` (FR-LC-04), and dynamic code is marked with a closed [`DynamicReason`]: `eval`,
+//! `source` of agent-writable or unresolved files, interpreters given code with `-c` or `-e` or reading standard
+//! input, names from expansions, and everything [`parse_line`] marks (FR-LC-05, FR-POL-20). Interpreters are data
+//! ([`Interpreters`]), matched by the resolved binary's family ([`family_of`]) and extendable by a profile. Name
+//! resolution and the trust of sourced files come from the caller through [`Resolver`].
+//!
 //! # Boundaries
 //!
 //! No workspace or third-party dependencies, no I/O, no global state, no `unsafe`. Input is untrusted (NFR-SEC-05):
@@ -51,7 +61,11 @@
 //! # Specification
 //!
 //! - `specs/03-functional-requirements/command-lifecycle.md` (FR-LC-02: parse the whole line with a bash grammar;
-//!   FR-LC-05: mark dynamic code; FR-LC-09: policy is evaluated for every part of the line)
+//!   FR-LC-04: unwrap known wrappers; FR-LC-05: mark dynamic code; FR-LC-09: policy is evaluated for every part of
+//!   the line)
+//! - `specs/03-functional-requirements/policy.md` (FR-POL-20, FR-POL-21: dynamic code never inherits classes)
+//! - `specs/05-models/execution-record.md` (`argv[].class`) and `specs/05-models/policy-profile.md`
+//!   (`exec.interpreters`)
 //! - `specs/09-reference/decisions.md` (decision 6: parser scope for phase 2)
 //! - `specs/04-non-functional-requirements/security.md` (NFR-SEC-05: memory-safe, fuzzed parsers)
 //! - `specs/09-reference/defaults-and-limits.md` (the parser limits and their rationale)
@@ -64,24 +78,33 @@
 
 mod ast;
 mod builtins;
+mod classify;
 mod error;
 mod functions;
+mod interpreter_table;
 mod interpreters;
 mod lex;
 mod limits;
 mod outcome;
 mod parse;
 mod token;
+mod wrappers;
 
 pub use ast::{
     AndOr, AndOrOperator, AndOrPart, Assignment, CaseClause, CaseCommand, CaseTerminator, CaseTerminatorKind, Command,
     CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems, FunctionCall, FunctionDefinition,
     Group, HereDocument, IfClause, IfCommand, ListItem, LoopBody, LoopCommand, PipeOperator, Pipeline, PipelinePart,
-    Redirect, Script, Separator, SeparatorKind, SimpleCommand, Subshell, Substitution, SubstitutionKind,
+    Redirect, Script, Separator, SeparatorKind, SimpleCommand, Subshell, Substitution, SubstitutionKind, TimeKeyword,
     UnsupportedCommand,
 };
 pub use builtins::is_builtin;
-pub use error::{CompoundStart, Construct, LexError, ParseError, Unexpected, UnsupportedConstruct};
+pub use classify::{
+    Argument, Classification, ClassifiedCommand, CommandClass, Lookup, Program, Resolver, SourceFile, classify,
+};
+pub use error::{
+    CompoundStart, Construct, InterpreterTableError, LexError, ParseError, Unexpected, UnsupportedConstruct,
+};
+pub use interpreter_table::{Interpreter, Interpreters, family_of};
 pub use lex::lex;
 pub use limits::{MAX_FUNCTION_DEFINITIONS, MAX_INPUT_LEN, MAX_NESTING_DEPTH, MAX_TOKENS};
 pub use outcome::{Dynamic, DynamicPart, DynamicReason, Exact, ParseOutcome, parse_line};
