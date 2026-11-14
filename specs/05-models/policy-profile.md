@@ -70,6 +70,7 @@ Outside the subset, and rejected as such: dates and times, floats (including `in
 | `fs.deny` | list of paths | Never readable or writable |
 | `exec.allow`, `exec.ask`, `exec.deny` | list of patterns | Command rules; names match trusted binaries only |
 | `exec.project_executables` | `allow` \| `ask` \| `deny` | Binaries from agent-writable places |
+| `exec.interpreters.<family>` | table | Adds an interpreter family, or options to a known one, for dynamic-code detection (below). **Proposed** (KNSH-036) |
 | `exec.default` | `allow` \| `ask` \| `deny` | When no rule matches |
 | `network.mode` | `none` \| `allowlist` | |
 | `network.hosts` | list | Open to every command |
@@ -82,6 +83,29 @@ Outside the subset, and rejected as such: dates and times, floats (including `in
 | `recording.commands`, `recording.output` | bool | Recording settings |
 | `recording.retention_days` | int | Record retention |
 | `secrets.env.<VAR>` | table | Secret injection ([secret](secret.md)) |
+
+### `exec.interpreters` (proposed, KNSH-036)
+
+Interpreters given code on the command line (`python3 -c`, `node -e`) or no script are dynamic code (FR-LC-05). The
+engine has a built-in table: `sh`, `bash`, `zsh` and the other shells, `python` (and `pypy`), `node`, `ruby`, `perl`,
+`php`, `deno`, `bun` and `osascript`. A family is matched by the resolved binary's base name without a version suffix,
+so `python3.12` is `python`. A profile extends the table:
+
+```toml
+[exec.interpreters.lua]
+code_options  = ["-e"]            # the value (or the option itself) is code
+value_options = ["-l"]            # take the next argument as their value
+stdin_options = ["-i"]            # make it read its program from standard input
+script_options = []               # name the program to run, like a script operand (python -m)
+info_options  = ["-v"]            # with no script, it runs nothing
+code_subcommands = []             # first operands that run code (deno eval)
+reads_stdin_without_script = true
+cluster_values_from_next = false  # a value option inside a cluster takes the next argument (bash -oc errexit code)
+```
+
+Every key but the table name is optional. Options are spelled `-x` (clusters with other short options) or `--name`
+(also matches `--name=value`). The family name must be a base name without a version suffix (`lua`, not `lua5.4`). An
+entry for a family the table already has only adds options: a profile can make detection stricter, never weaker.
 
 Profiles may also set: trusted binary folders, trusted tools (run without a per-command profile after approval), an irreversible-command list, the agent's bash path, and the default output mode.
 

@@ -107,6 +107,9 @@ pub(crate) struct DeepCommand<'a> {
     pub(crate) anchor: Option<Span>,
     /// The command.
     pub(crate) command: &'a Command,
+    /// For a command directly in a pipeline timed by the `time` keyword (not nested inside one of its commands),
+    /// that keyword (KNSH-036). Its spans index [`source`](Self::source).
+    pub(crate) time: Option<TimeKeyword>,
 }
 
 impl DeepCommand<'_> {
@@ -121,15 +124,16 @@ impl DeepCommand<'_> {
 /// the text its spans index (`source` for `items`) and its `anchor` (see [`DeepCommand::anchor`]). Recurses once per
 /// nested list or script, so its depth is bounded by the parser's nesting limit.
 fn collect_deep<'a>(items: &'a [ListItem], source: &'a str, anchor: Option<Span>, out: &mut Vec<DeepCommand<'a>>) {
-    for command in items
+    for (time, command) in items
         .iter()
         .flat_map(|item| item.and_or.pipelines())
-        .flat_map(Pipeline::commands)
+        .flat_map(|pipeline| pipeline.commands().map(|command| (pipeline.time, command)))
     {
         out.push(DeepCommand {
             source,
             anchor,
             command,
+            time,
         });
         match command {
             Command::Simple(simple) => {
@@ -302,17 +306,44 @@ pub enum AndOrOperator {
     Or,
 }
 
-/// Commands joined by `|` or `|&`, optionally negated by `!`.
+/// Commands joined by `|` or `|&`, optionally timed by the `time` keyword and negated by `!`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pipeline {
+    /// The `time` keyword before the pipeline (KNSH-036), which reports how long the whole pipeline took and runs it
+    /// unchanged: a wrapper (FR-LC-04) whose commands are decided as if it were not there.
+    pub time: Option<TimeKeyword>,
     /// The `!` before the pipeline, which inverts its status. Bash 3.2 (`/bin/bash` on macOS) accepts at most one.
     pub negation: Option<Span>,
     /// The first command.
     pub first: Command,
     /// Each later command with the pipe before it.
     pub rest: Vec<PipelinePart>,
-    /// From the `!` (or the first command) to the last command.
+    /// From the `time` keyword or the `!`, whichever comes first (or the first command), to the last command.
     pub span: Span,
+}
+
+/// The `time` keyword before a pipeline, `time` or `time -p` (KNSH-036).
+///
+/// Read only where bash 3.2 and later bash agree it is the keyword: first in a pipeline that is not after `!` or `|`,
+/// followed by a command. Elsewhere (`! time ls`, `a | time b`, `time` alone, `time --`) bash versions differ between
+/// the keyword and the `time` program, and the parser refuses the line (KNSH-032), so it is dynamic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TimeKeyword {
+    /// The `time` word.
+    pub keyword: Span,
+    /// The `-p` option (POSIX output format), the only one bash 3.2 takes.
+    pub posix: Option<Span>,
+}
+
+impl TimeKeyword {
+    /// From `time` to its option, if any.
+    #[must_use]
+    pub fn span(&self) -> Span {
+        Span::new(
+            self.keyword.start,
+            self.posix.map_or(self.keyword.end, |posix| posix.end),
+        )
+    }
 }
 
 impl Pipeline {

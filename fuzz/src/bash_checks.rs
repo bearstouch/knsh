@@ -4,10 +4,13 @@
 //! Also compiled on stable by `crates/knsh-bash/tests/fuzz_regressions.rs`, which includes this file by path, so it
 //! depends on nothing but `knsh-bash` and `std`. A failed property panics, which libFuzzer records as a crash.
 
+use std::path::PathBuf;
+
 use knsh_bash::{
-    Command, CommandWord, CompoundCommand, CompoundKind, Construct, LexError, ListItem, LoopBody, LoopCommand,
-    MAX_INPUT_LEN, MAX_TOKENS, Operator, ParseError, ParseOutcome, Redirect, RedirectionOperator, Script, Segment,
-    SegmentKind, SimpleCommand, Span, Substitution, Token, TokenKind, lex, parse, parse_line,
+    Command, CommandClass, CommandWord, CompoundCommand, CompoundKind, Construct, DynamicReason, Interpreters,
+    LexError, ListItem, Lookup, LoopBody, LoopCommand, MAX_INPUT_LEN, MAX_TOKENS, Operator, ParseError, ParseOutcome,
+    Program, Redirect, RedirectionOperator, Resolver, Script, Segment, SegmentKind, SimpleCommand, SourceFile, Span,
+    Substitution, Token, TokenKind, classify, lex, parse, parse_line,
 };
 
 /// `bash_lex`: the lexer never panics and is deterministic. An accepted line is tiled exactly by its token spans
@@ -271,6 +274,81 @@ fn check_outcome(input: &str, result: &Result<Script, ParseError>) {
         assert!(part.span.start >= previous, "dynamic parts out of order");
         previous = part.span.start;
     }
+    check_classification(input, &outcome);
+}
+
+/// A session where every name is a trusted binary of that name and every sourced file is trusted, so the classifier
+/// unwraps and reads as far as it can.
+struct TrustingSession;
+
+impl Resolver for TrustingSession {
+    fn resolve(&self, name: &str, lookup: Lookup) -> Program {
+        if lookup == Lookup::Shell && knsh_bash::is_builtin(name) {
+            Program::Builtin
+        } else {
+            Program::Trusted(PathBuf::from("/usr/bin").join(name.rsplit('/').next().unwrap_or(name)))
+        }
+    }
+
+    fn source_file(&self, _path: &str) -> SourceFile {
+        SourceFile::Trusted
+    }
+}
+
+/// The classifier (KNSH-036) never panics and is deterministic; it keeps every dynamic part of the parser except
+/// `source`; its parts lie inside the line in source order; every entry's spans lie inside the line, a dynamic entry
+/// has a matching part, and every wrapper link points at an earlier wrapper entry.
+fn check_classification(input: &str, outcome: &ParseOutcome) {
+    let interpreters = Interpreters::defaults();
+    let classification = classify(outcome, input, &TrustingSession, &interpreters);
+    assert_eq!(
+        classification,
+        classify(outcome, input, &TrustingSession, &interpreters),
+        "classify is not deterministic"
+    );
+    assert_eq!(
+        classification.is_whole_line(),
+        outcome.script().is_none(),
+        "whole-line mismatch"
+    );
+    for part in outcome.dynamic_parts() {
+        if part.reason != DynamicReason::Source {
+            assert!(classification.dynamic_parts().contains(part), "parser part dropped");
+        }
+    }
+    let mut previous = 0;
+    for part in classification.dynamic_parts() {
+        span_text(input, part.span);
+        assert!(part.span.start >= previous, "classified parts out of order");
+        previous = part.span.start;
+    }
+    for (index, command) in classification.commands().iter().enumerate() {
+        span_text(input, command.span);
+        for span in command
+            .name_span
+            .iter()
+            .chain(command.arguments.iter().map(|argument| &argument.span))
+        {
+            span_text(input, *span);
+        }
+        if let CommandClass::Dynamic { reason } = command.class {
+            assert!(
+                reason == DynamicReason::InterpreterInput
+                    || classification.dynamic_parts().iter().any(|part| part.reason == reason),
+                "dynamic entry without a part"
+            );
+        }
+        if let Some(wrapper) = command.wrapper {
+            assert!(wrapper < index, "wrapper after the command it runs");
+            assert!(
+                matches!(
+                    classification.commands()[wrapper].class,
+                    CommandClass::Wrapper | CommandClass::ProjectExecutable
+                ),
+                "link to a non-wrapper"
+            );
+        }
+    }
 }
 
 /// What the tree claims of the line's tokens.
@@ -294,6 +372,13 @@ impl Claims {
             inside(item.and_or.span, parent);
             for pipeline in item.and_or.pipelines() {
                 inside(pipeline.span, item.and_or.span);
+                if let Some(time) = pipeline.time {
+                    self.keyword(input, time.keyword, pipeline.span, "time");
+                    if let Some(posix) = time.posix {
+                        assert_eq!(span_text(input, posix), "-p", "time option is not `-p`");
+                        self.words.push(posix);
+                    }
+                }
                 if let Some(bang) = pipeline.negation {
                     assert_eq!(span_text(input, bang).replace("\\\n", ""), "!", "negation is not `!`");
                     self.words.push(bang);
