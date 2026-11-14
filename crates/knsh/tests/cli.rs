@@ -94,3 +94,22 @@ fn forget_without_knshd_fails_with_1() {
     assert!(stderr(&output).contains("cannot reach knshd"), "{}", stderr(&output));
     assert_eq!(output.stdout, b"");
 }
+
+// KNSH-022 (NFR-COMPAT-08): `knsh shell install` never edits /etc/shells without a yes on a terminal. Run without
+// one (standard input is /dev/null here), it asks nothing, changes nothing and exits with 1. The test binary's path is
+// never listed in /etc/shells, so the question would otherwise be reached.
+#[cfg(unix)]
+#[test]
+fn shell_install_without_a_terminal_changes_nothing() {
+    let before = std::fs::read("/etc/shells").unwrap_or_default();
+    let output = knsh(&["shell", "install"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("only after a yes on a terminal"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!stderr(&output).contains("[y/N]"), "nothing is asked");
+    assert_eq!(output.stdout, b"");
+    assert_eq!(std::fs::read("/etc/shells").unwrap_or_default(), before);
+}

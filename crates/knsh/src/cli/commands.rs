@@ -114,6 +114,14 @@ pub static KNSH: Command = group(
             ..leaf("forget", "Delete records and optionally checkpoints")
         },
         group(
+            "shell",
+            "Set knsh up as a login shell",
+            &[leaf(
+                "install",
+                "Add knsh to /etc/shells after asking, so that chsh accepts it",
+            )],
+        ),
+        group(
             "daemon",
             "Install or remove the knshd launch agent",
             &[

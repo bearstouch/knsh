@@ -3,12 +3,12 @@
 | Data | Path or name |
 | --- | --- |
 | Configuration, hooks and policy files | `~/.config/knsh/` (policies in `~/.config/knsh/policies/`; integrity-protected) |
-| User settings | `~/.config/knsh/config.toml` (`[recording] human`; written by the user, read by `knsh`) |
+| User settings | `~/.config/knsh/config.toml` (`[recording] human`, `[shell] hosted`; written by the user, read by `knsh`) |
 | Records, grants, pushed policy | `~/Library/Application Support/knsh/` (records in `records.db`, owner-only `0600`) |
 | Checkpoints, home volume | `~/Library/Application Support/knsh/checkpoints/` |
 | Checkpoints, other APFS volumes | `.knsh-checkpoints/` on that volume, when writable; otherwise plain copies in the home store |
 | zsh startup wrapper (integration mode) | `~/Library/Application Support/knsh/shell/zsh/.zshenv` (owner-only; rewritten by `knsh` when outdated) |
-| bash startup wrapper (integration mode, recording only) | `~/Library/Application Support/knsh/shell/bash/bashrc` (owner-only; rewritten by `knsh` when outdated) |
+| bash startup wrapper (integration mode, when recording or with terminal marks) | `~/Library/Application Support/knsh/shell/bash/bashrc` (owner-only; rewritten by `knsh` when outdated) |
 | Agent socket | `~/Library/Application Support/knsh/run/agent.sock` |
 | User socket | `~/Library/Application Support/knsh/run/user.sock` |
 | Control service | XPC Mach service `knsh.control` (final name tied to the signing identity) |

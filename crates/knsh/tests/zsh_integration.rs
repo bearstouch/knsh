@@ -302,6 +302,7 @@ fn run_recorded_with(
         login: false,
         force_interactive: true,
         telemetry_fd: None,
+        marks: false,
     };
     let isolation = Isolation {
         stdin: Stdio::from(fs::File::open(&script_path).expect("open script")),

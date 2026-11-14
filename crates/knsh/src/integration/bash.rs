@@ -8,12 +8,15 @@
 //!
 //! # Startup files
 //!
-//! - **Recording off:** `knsh` runs plain bash, with no file of its own and no variable of its own, so bash reads
+//! The wrapper ([`BASHRC`]) is read when it has something to add: telemetry (recording on, KNSH-021), the terminal
+//! marks (`knsh`'s standard output is a terminal, KNSH-022), or both.
+//!
+//! - **Neither:** `knsh` runs plain bash, with no file of its own and no variable of its own, so bash reads
 //!   `/etc/profile`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`, `~/.bashrc` and `~/.bash_logout` exactly as
 //!   it always does.
-//! - **Recording on, non-login shell:** `bash --rcfile <wrapper>`. bash reads the wrapper ([`BASHRC`]) instead of
-//!   `~/.bashrc`; the wrapper sources `~/.bashrc` itself, as bash would have, then adds the hooks.
-//! - **Recording on, login shell:** a login bash reads `/etc/profile` and the first of `~/.bash_profile`,
+//! - **Non-login shell:** `bash --rcfile <wrapper>`. bash reads the wrapper instead of `~/.bashrc`; the wrapper
+//!   sources `~/.bashrc` itself, as bash would have, then adds the hooks.
+//! - **Login shell:** a login bash reads `/etc/profile` and the first of `~/.bash_profile`,
 //!   `~/.bash_login` and `~/.profile` itself, and no option can replace them. Stock bash 3.2 reads no other file
 //!   (`ENV` only in POSIX mode, which bash 3.2 does not honour for a login shell). So bash starts exactly as a plain
 //!   login shell, with [`PROMPT_COMMAND_VAR`] set to a bootstrap ([`BOOTSTRAP`]) that sources the wrapper at the
@@ -59,11 +62,21 @@
 //!   the status restore after a pipeline.
 //!
 //! The line format is in [`telemetry`](super::telemetry).
+//!
+//! # Terminal marks
+//!
+//! With the marks wanted ([`MARKS_VAR`]), the same two `PROMPT_COMMAND` entries and the `DEBUG` trap also write
+//! OSC 7 and OSC 133 ([`marks`](super::marks)) while standard output is a terminal: `_knsh_precmd` writes `D;<status>`
+//! (only after a `C`), OSC 7 and `A`; `_knsh_arm`, the last entry, appends `B` to `PS1` inside `\[ \]` once the
+//! user's `PROMPT_COMMAND` has set it; the trap writes `C` before the first command of a typed line and takes `B` off
+//! `PS1` again (unless something has set `PS1` since). Without telemetry no history lookup is made, so the marks
+//! alone fork nothing.
 
 use std::ffi::{OsStr, OsString};
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
+use super::marks::MARKS_VAR;
 use super::zsh::{LaunchPlan, TELEMETRY_FD_VAR};
 
 /// The bash agents' lines use and that macOS ships (bash 3.2, NFR-COMPAT-04).
@@ -75,8 +88,9 @@ pub const SHELL_VAR: &str = "SHELL";
 /// The variable bash runs before each prompt.
 pub const PROMPT_COMMAND_VAR: &str = "PROMPT_COMMAND";
 
-/// Carries `knsh`'s process ID to the wrapper while recording, so that only the shell `knsh` started installs
-/// hooks: a bash started by a startup file inherits the bootstrap but has another parent. The wrapper removes it.
+/// Carries the process ID of the hosted bash's parent to the wrapper ([`BashLaunch::parent_pid`]), so that only the
+/// shell `knsh` started installs hooks: a bash started by a startup file inherits the bootstrap but has another
+/// parent. The wrapper removes it.
 pub const PARENT_PID_VAR: &str = "KNSH_TELEMETRY_PPID";
 
 /// Carries the wrapper's path to the bootstrap of a recorded login shell. The wrapper removes it.
@@ -97,9 +111,10 @@ pub const BOOTSTRAP: &str = r#". "${KNSH_BASH_BOOT:-/dev/null}" knsh-boot "$(bui
 
 /// The bash wrapper that `knsh` installs in its bash startup directory. Static: everything that varies per session
 /// arrives in the environment, so one copy serves every session.
-pub const BASHRC: &str = r#"# Kinetic Shell integration mode for bash (KNSH-020). Written by knsh, which overwrites any change.
+pub const BASHRC: &str = r#"# Kinetic Shell integration mode for bash (KNSH-020, KNSH-022). Written by knsh, which overwrites any change.
 #
-# Read only while a human session is recorded (with recording off knsh runs plain bash), in one of two ways:
+# Read while a human session is recorded or the terminal marks are wanted (otherwise knsh runs plain bash), in one of
+# two ways:
 # - non-login shell: `bash --rcfile <this file>`. It sources ~/.bashrc, as bash would have, then adds the hooks.
 # - login shell: bash reads its profile files itself; at the first prompt PROMPT_COMMAND runs
 #   `. <this file> knsh-boot`, which removes that bootstrap and adds the hooks.
@@ -113,7 +128,8 @@ _knsh_status=$?
 # Taken over and removed from the environment before any user file runs (non-login) or at once (login).
 _knsh_fd=${KNSH_TELEMETRY_FD-}
 _knsh_parent=${KNSH_TELEMETRY_PPID-}
-\builtin unset KNSH_TELEMETRY_FD KNSH_TELEMETRY_PPID KNSH_BASH_BOOT
+_knsh_marks=${KNSH_TERMINAL_MARKS-}
+\builtin unset KNSH_TELEMETRY_FD KNSH_TELEMETRY_PPID KNSH_BASH_BOOT KNSH_TERMINAL_MARKS
 _knsh_bs='\'
 
 # Gives back the status $1. Called with the $_ to give back as the last argument.
@@ -200,20 +216,93 @@ _knsh_last_entry() {
 # The first command of a line typed at the prompt is about to run (called by the DEBUG trap, after _knsh_arm).
 _knsh_started() {
   local _knsh_c=$BASH_COMMAND
-  _knsh_last_entry
-  if [[ $_knsh_n != "${_knsh_hn-}" || $_knsh_t != "${_knsh_ht-}" ]]; then
-    # The line reached history: the newest entry is the line as typed.
-    _knsh_hn=$_knsh_n _knsh_ht=$_knsh_t
-    _knsh_c=$_knsh_t
-  elif [[ "${PROMPT_COMMAND[*]-}" == *"$_knsh_c"* ]]; then
-    # A PROMPT_COMMAND entry added after _knsh_arm: not a line. _knsh_precmd moves _knsh_arm back to the end.
-    return 1
-  elif [[ -n $_knsh_t && $_knsh_t == "$_knsh_c"* ]]; then
-    # Not saved, most likely a repeat of the newest entry (HISTCONTROL=ignoredups): that entry is the line.
-    _knsh_c=$_knsh_t
+  if (( _knsh_tel )); then
+    _knsh_last_entry
+    if [[ $_knsh_n != "${_knsh_hn-}" || $_knsh_t != "${_knsh_ht-}" ]]; then
+      # The line reached history: the newest entry is the line as typed.
+      _knsh_hn=$_knsh_n _knsh_ht=$_knsh_t
+      _knsh_c=$_knsh_t
+    elif [[ "${PROMPT_COMMAND[*]-}" == *"$_knsh_c"* ]]; then
+      # A PROMPT_COMMAND entry added after _knsh_arm: not a line. _knsh_precmd moves _knsh_arm back to the end.
+      return 1
+    elif [[ -n $_knsh_t && $_knsh_t == "$_knsh_c"* ]]; then
+      # Not saved, most likely a repeat of the newest entry (HISTCONTROL=ignoredups): that entry is the line.
+      _knsh_c=$_knsh_t
+    fi
   fi
+  # Marks only: no history lookup (it forks once per line), so a PROMPT_COMMAND entry added after _knsh_arm counts
+  # as a line, once, until _knsh_precmd moves _knsh_arm back to the end. A substring test against PROMPT_COMMAND
+  # cannot replace it: a typed `exit` or `ls` is found in many PROMPT_COMMAND texts.
   _knsh_armed=0 _knsh_running=1
-  _knsh_emit preexec "$PWD" "$_knsh_c"
+  (( _knsh_tel )) && _knsh_emit preexec "$PWD" "$_knsh_c"
+  (( _knsh_marks )) && _knsh_mark_output
+  return 0
+}
+
+# Percent-encodes $1 for a file:// URL into $_knsh_out: every byte but A-Z a-z 0-9 / . _ ~ - becomes %XX. Byte by
+# byte, in the C locale for this function only; bash 3.2's printf gives a byte above 127 as a negative number, so
+# only its low 8 bits are kept.
+_knsh_urlenc() {
+  local LC_ALL=C _knsh_c _knsh_n _knsh_i=0
+  _knsh_out=$1
+  [[ $1 == *[!A-Za-z0-9/._~-]* ]] || return 0
+  _knsh_out=
+  while (( _knsh_i < ${#1} )); do
+    _knsh_c=${1:_knsh_i:1}
+    case $_knsh_c in
+      [A-Za-z0-9/._~-]) _knsh_out=$_knsh_out$_knsh_c ;;
+      *)
+        builtin printf -v _knsh_n '%d' "'$_knsh_c"
+        builtin printf -v _knsh_c '%%%02X' $(( _knsh_n & 255 ))
+        _knsh_out=$_knsh_out$_knsh_c ;;
+    esac
+    _knsh_i=$((_knsh_i + 1))
+  done
+  return 0
+}
+
+# Takes the command start mark off PS1 again, unless something has set PS1 since.
+_knsh_unmark() {
+  if [[ -n ${_knsh_ps1_marked-} && ${PS1-} == "$_knsh_ps1_marked" ]]; then
+    PS1=$_knsh_ps1
+  fi
+  _knsh_ps1_marked=
+  return 0
+}
+
+# Before a prompt: OSC 133 D with the status $1 of the line that ran (only after its C), OSC 7 and OSC 133 A.
+_knsh_mark_prompt() {
+  _knsh_unmark
+  if [[ -t 1 ]]; then
+    local _knsh_d= _knsh_h
+    if (( _knsh_mark_ran )); then
+      _knsh_d="\e]133;D;$1\a"
+    fi
+    _knsh_urlenc "${HOSTNAME-}"
+    _knsh_h=$_knsh_out
+    _knsh_urlenc "$PWD"
+    builtin printf "$_knsh_d"'\e]7;file://%s%s\a\e]133;A\a' "$_knsh_h" "$_knsh_out" 2>/dev/null || :
+  fi
+  _knsh_mark_ran=0
+  return 0
+}
+
+# After every PROMPT_COMMAND entry has set PS1: OSC 133 B at its end, inside \[ \] (it takes no room).
+_knsh_mark_ps1() {
+  _knsh_unmark
+  [[ -t 1 ]] || return 0
+  _knsh_ps1=${PS1-}
+  PS1="${PS1-}\[$_knsh_mark_b\]"
+  _knsh_ps1_marked=$PS1
+  return 0
+}
+
+# The first command of a typed line is about to run: PS1 as the user set it, then OSC 133 C.
+_knsh_mark_output() {
+  _knsh_unmark
+  [[ -t 1 ]] || return 0
+  builtin printf '\e]133;C\a' 2>/dev/null || :
+  _knsh_mark_ran=1
   return 0
 }
 
@@ -288,8 +377,8 @@ _knsh_precmd() {
   _knsh_before _knsh_precmd
   if (( _knsh_running )); then
     _knsh_running=0
-    _knsh_emit precmd "$_knsh_s" "$PWD"
-  elif [[ -n ${_knsh_hn+set} ]]; then
+    (( _knsh_tel )) && _knsh_emit precmd "$_knsh_s" "$PWD"
+  elif (( _knsh_tel )) && [[ -n ${_knsh_hn+set} ]]; then
     # No command of the last line reached the DEBUG trap (a line that only runs a subshell or defines a function,
     # or the trap was replaced): report it now if it reached history.
     _knsh_last_entry
@@ -300,6 +389,7 @@ _knsh_precmd() {
     fi
   fi
   _knsh_armed=0
+  (( _knsh_marks )) && _knsh_mark_prompt "$_knsh_s"
   _knsh_heal
   _knsh_restore_from "$_knsh_s" "$_knsh_p" "$_knsh_l"
   # The next command not of ours starts the user's PROMPT_COMMAND (see _knsh_debug).
@@ -312,10 +402,14 @@ _knsh_arm() {
   local _knsh_s=$? _knsh_pa=("${PIPESTATUS[@]}") _knsh_l= IFS=' '
   local _knsh_p="${_knsh_pa[*]}"
   _knsh_before _knsh_arm
-  # History as it is now, after any `history -n` of the user's PROMPT_COMMAND, so only the next line differs.
-  _knsh_last_entry
-  _knsh_hn=$_knsh_n _knsh_ht=$_knsh_t
+  if (( _knsh_tel )); then
+    # History as it is now, after any `history -n` of the user's PROMPT_COMMAND, so only the next line differs.
+    _knsh_last_entry
+    _knsh_hn=$_knsh_n _knsh_ht=$_knsh_t
+  fi
   _knsh_armed=1
+  # Last entry: PS1 is what the user's PROMPT_COMMAND left.
+  (( _knsh_marks )) && _knsh_mark_ps1
   _knsh_restore_from "$_knsh_s" "$_knsh_p" "$_knsh_l"
   return 0
 }
@@ -375,10 +469,14 @@ _knsh_after_boot() {
 # a function and inside a file read with `.`, and puts back on return the one it had on entry. In the login case
 # this file is read with `.`, so when the user already has a DEBUG trap, bash 3.2 undoes ours; the first
 # PROMPT_COMMAND entry then sets it from $_knsh_trap, at the top level, at the next prompt.
-# Returns 1, installing nothing, without a usable descriptor, in a shell knsh did not start (one started by a
-# startup file inherits the bootstrap), or when not interactive; 2 when the hooks are already there.
+# Telemetry needs a usable descriptor; the marks need KNSH_TERMINAL_MARKS=1. Returns 1, installing nothing, with
+# neither, in a shell knsh did not start (one started by a startup file inherits the bootstrap), or when not
+# interactive; 2 when the hooks are already there.
 _knsh_install() {
-  case $_knsh_fd in ''|*[!0-9]*|[0-9]|1[0-9]) return 1 ;; esac
+  _knsh_tel=1
+  case $_knsh_fd in ''|*[!0-9]*|[0-9]|1[0-9]) _knsh_tel=0 _knsh_fd= ;; esac
+  [[ $_knsh_marks == 1 ]] && _knsh_marks=1 || _knsh_marks=0
+  (( _knsh_tel || _knsh_marks )) || return 1
   [[ $PPID == "$_knsh_parent" && $- == *i* ]] || return 1
   local _knsh_prior=${2-}
   if [[ -n $_knsh_prior ]]; then
@@ -387,7 +485,8 @@ _knsh_install() {
     _knsh_prior=${_knsh_prior[2]-}
   fi
   [[ $_knsh_prior == *_knsh_debug* ]] && return 2
-  _knsh_armed=0 _knsh_running=0 _knsh_fresh=0 _knsh_tfor=
+  _knsh_armed=0 _knsh_running=0 _knsh_fresh=0 _knsh_tfor= _knsh_mark_ran=0 _knsh_ps1= _knsh_ps1_marked=
+  _knsh_mark_b=$'\e]133;B\a'
   _knsh_trap="_knsh_debug \"\$_\"; $_knsh_trap_restore${_knsh_prior:+; $_knsh_prior}"
   _knsh_pre="_knsh_precmd; [[ -z \${_knsh_trap-} ]] || { builtin trap -- \"\$_knsh_trap\" DEBUG; builtin unset _knsh_trap; }; $_knsh_restore"
   _knsh_post="_knsh_arm; $_knsh_restore"
@@ -401,9 +500,16 @@ _knsh_install() {
   if [[ $1 == boot ]]; then
     # Installed from the first prompt's PROMPT_COMMAND, whose remaining entries still run now. Armed (as the last
     # command of this file) only if none follows; otherwise _knsh_precmd reports the first line at the next prompt.
-    _knsh_last_entry
-    _knsh_hn=$_knsh_n _knsh_ht=$_knsh_t
+    if (( _knsh_tel )); then
+      _knsh_last_entry
+      _knsh_hn=$_knsh_n _knsh_ht=$_knsh_t
+    fi
     _knsh_arm_now=$_knsh_boot_last
+    # Our entries run from the next prompt on: this first prompt is marked from here.
+    if (( _knsh_marks )); then
+      _knsh_mark_prompt 0
+      _knsh_mark_ps1
+    fi
   fi
   return 0
 }
@@ -411,8 +517,9 @@ _knsh_install() {
 # Removes everything this file defined, when the hooks were not added.
 _knsh_remove() {
   \builtin unset -f _knsh_give _knsh_key _knsh_restore_from _knsh_esc _knsh_emit _knsh_last_entry _knsh_started _knsh_debug \
-    _knsh_before _knsh_heal _knsh_precmd _knsh_arm _knsh_pc_is_array
-  \builtin unset _knsh_fd _knsh_bs _knsh_restore _knsh_trap_restore _knsh_trap
+    _knsh_before _knsh_heal _knsh_precmd _knsh_arm _knsh_pc_is_array _knsh_urlenc _knsh_unmark _knsh_mark_prompt \
+    _knsh_mark_ps1 _knsh_mark_output
+  \builtin unset _knsh_fd _knsh_bs _knsh_restore _knsh_trap_restore _knsh_trap _knsh_marks _knsh_tel
 }
 
 if [[ ${1-} == knsh-boot ]]; then
@@ -451,15 +558,6 @@ pub fn user_bash(shell: Option<&OsStr>) -> Option<&Path> {
     (path.is_absolute() && path.file_name() == Some(OsStr::new("bash"))).then_some(path)
 }
 
-/// What the wrapper needs while recording.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BashTelemetry {
-    /// The inherited write end of the telemetry pipe.
-    pub fd: RawFd,
-    /// The process ID of `knsh`, the parent of the hosted bash.
-    pub parent_pid: u32,
-}
-
 /// Everything that varies when starting bash.
 #[derive(Debug, Clone, Copy)]
 pub struct BashLaunch<'a> {
@@ -472,9 +570,14 @@ pub struct BashLaunch<'a> {
     pub login: bool,
     /// `-i` was given.
     pub force_interactive: bool,
-    /// Recording: the descriptor and parent to hand the wrapper; `None` when recording is off.
-    pub telemetry: Option<BashTelemetry>,
-    /// The `PROMPT_COMMAND` `knsh` inherited, kept after the bootstrap of a recorded login shell.
+    /// Recording: the inherited write end of the telemetry pipe; `None` when recording is off.
+    pub telemetry_fd: Option<RawFd>,
+    /// Whether the wrapper adds the terminal marks (KNSH-022): `knsh`'s standard output is a terminal.
+    pub marks: bool,
+    /// The process ID the hosted bash's parent has, so that only that bash installs the hooks: `knsh`'s own when
+    /// bash runs as its child (recording on), `knsh`'s parent's when `knsh` replaces itself with bash.
+    pub parent_pid: u32,
+    /// The `PROMPT_COMMAND` `knsh` inherited, kept after the bootstrap of a login shell that reads the wrapper.
     pub user_prompt_command: Option<&'a OsStr>,
 }
 
@@ -492,19 +595,23 @@ impl BashLaunch<'_> {
             OsString::from(BOOT_PATH_VAR),
             // Only a shell that is recorded right now may claim it (FR-SES-25).
             OsString::from(super::RECORDING_VAR),
+            OsString::from(MARKS_VAR),
         ];
         let mut set_env = Vec::new();
-        if let (Some(dir), Some(telemetry)) = (self.startup_dir, self.telemetry) {
+        // The wrapper is read only when it has something to add: telemetry, marks, or both. Otherwise plain bash.
+        if let Some(dir) = self.startup_dir.filter(|_| self.telemetry_fd.is_some() || self.marks) {
             let wrapper = wrapper_path(dir);
-            // Hooks installed and telemetry flowing: the shell is recorded (KNSH-021).
-            set_env.push((OsString::from(super::RECORDING_VAR), OsString::from("1")));
-            set_env.push((
-                OsString::from(TELEMETRY_FD_VAR),
-                OsString::from(telemetry.fd.to_string()),
-            ));
+            if let Some(fd) = self.telemetry_fd {
+                // Hooks installed and telemetry flowing: the shell is recorded (KNSH-021).
+                set_env.push((OsString::from(super::RECORDING_VAR), OsString::from("1")));
+                set_env.push((OsString::from(TELEMETRY_FD_VAR), OsString::from(fd.to_string())));
+            }
+            if self.marks {
+                set_env.push((OsString::from(MARKS_VAR), OsString::from("1")));
+            }
             set_env.push((
                 OsString::from(PARENT_PID_VAR),
-                OsString::from(telemetry.parent_pid.to_string()),
+                OsString::from(self.parent_pid.to_string()),
             ));
             if self.login {
                 remove_env.push(OsString::from(PROMPT_COMMAND_VAR));
@@ -572,7 +679,9 @@ mod tests {
             startup_dir: Some(Path::new("/h/engine/shell/bash")),
             login: false,
             force_interactive: false,
-            telemetry: Some(BashTelemetry { fd: 5, parent_pid: 42 }),
+            telemetry_fd: Some(5),
+            marks: false,
+            parent_pid: 42,
             user_prompt_command: None,
         }
     }
@@ -639,7 +748,10 @@ mod tests {
         assert!(position("shopt -u expand_aliases") < position("_knsh_debug() {"));
         assert!(position("shopt -s expand_aliases") < position(". ~/.bashrc"));
         // The variables are gone before the user's file runs.
-        assert!(position("unset KNSH_TELEMETRY_FD KNSH_TELEMETRY_PPID KNSH_BASH_BOOT") < position(". ~/.bashrc"));
+        assert!(
+            position("unset KNSH_TELEMETRY_FD KNSH_TELEMETRY_PPID KNSH_BASH_BOOT KNSH_TERMINAL_MARKS")
+                < position(". ~/.bashrc")
+        );
     }
 
     // The bootstrap text in PROMPT_COMMAND is exactly the one the wrapper looks for and removes.
@@ -700,7 +812,7 @@ mod tests {
     #[test]
     fn recording_off_is_plain_bash() {
         let plan = BashLaunch {
-            telemetry: None,
+            telemetry_fd: None,
             login: true,
             ..launch()
         }
@@ -708,7 +820,7 @@ mod tests {
         assert_eq!(plan.arg0, "-bash");
         assert_eq!(plan.args.len(), 0);
         assert_eq!(plan.set_env.len(), 0);
-        for name in [TELEMETRY_FD_VAR, PARENT_PID_VAR, BOOT_PATH_VAR] {
+        for name in [TELEMETRY_FD_VAR, PARENT_PID_VAR, BOOT_PATH_VAR, MARKS_VAR] {
             assert!(plan.remove_env.iter().any(|removed| removed == name), "{name}");
         }
         assert!(!plan.remove_env.iter().any(|removed| removed == PROMPT_COMMAND_VAR));
@@ -721,6 +833,79 @@ mod tests {
         .plan();
         assert_eq!(plan.set_env.len(), 0);
         assert_eq!(plan.args.len(), 0);
+    }
+
+    // KNSH-022 (NFR-COMPAT-10): with the marks wanted, bash reads the wrapper even when not recorded, with the parent
+    // the caller names (knsh's own parent when knsh replaces itself with bash), and without the recording variables.
+    #[test]
+    fn marks_alone_read_the_wrapper() {
+        let unrecorded = BashLaunch {
+            telemetry_fd: None,
+            marks: true,
+            parent_pid: 7,
+            ..launch()
+        };
+        let plan = unrecorded.plan();
+        assert_eq!(
+            plan.args[..2],
+            [
+                OsString::from("--rcfile"),
+                OsString::from("/h/engine/shell/bash/bashrc")
+            ]
+        );
+        assert_eq!(env_value(&plan, MARKS_VAR), Some(OsStr::new("1")));
+        assert_eq!(env_value(&plan, PARENT_PID_VAR), Some(OsStr::new("7")));
+        assert_eq!(env_value(&plan, TELEMETRY_FD_VAR), None);
+        assert_eq!(env_value(&plan, super::super::RECORDING_VAR), None);
+
+        // A login shell gets the bootstrap, as when recorded.
+        let login = BashLaunch {
+            login: true,
+            ..unrecorded
+        }
+        .plan();
+        assert_eq!(env_value(&login, PROMPT_COMMAND_VAR), Some(OsStr::new(BOOTSTRAP)));
+        // Recorded and marked: both.
+        let both = BashLaunch {
+            marks: true,
+            ..launch()
+        }
+        .plan();
+        assert_eq!(env_value(&both, MARKS_VAR), Some(OsStr::new("1")));
+        assert_eq!(env_value(&both, TELEMETRY_FD_VAR), Some(OsStr::new("5")));
+        // No startup directory: plain bash, marks or not.
+        let without_wrapper = BashLaunch {
+            startup_dir: None,
+            ..unrecorded
+        }
+        .plan();
+        assert_eq!(without_wrapper.set_env.len(), 0);
+    }
+
+    // KNSH-022: every mark is written only while standard output is a terminal, never fails, and the marks alone
+    // never look history up (which forks).
+    #[test]
+    fn mark_hooks_write_only_to_a_terminal() {
+        for hook in ["_knsh_mark_prompt", "_knsh_mark_ps1", "_knsh_mark_output"] {
+            let body = function_body(hook);
+            assert!(body.contains("[[ -t 1 ]]"), "{hook}");
+            assert!(body.ends_with("return 0"), "{hook}");
+        }
+        for hook in ["_knsh_mark_prompt", "_knsh_mark_output"] {
+            assert!(function_body(hook).contains("2>/dev/null || :"), "{hook}");
+        }
+        // B inside \[ \], so it takes no room on the line.
+        assert!(function_body("_knsh_mark_ps1").contains(r#"PS1="${PS1-}\[$_knsh_mark_b\]""#));
+        for hook in ["_knsh_started", "_knsh_arm"] {
+            let body = function_body(hook);
+            assert!(
+                body.find("if (( _knsh_tel )); then") < body.find("_knsh_last_entry"),
+                "{hook} looks history up only with telemetry"
+            );
+        }
+        assert!(function_body("_knsh_precmd").contains("elif (( _knsh_tel )) && [[ -n ${_knsh_hn+set} ]]"));
+        // Neither telemetry nor marks: nothing is installed.
+        assert!(function_body("_knsh_install").contains("(( _knsh_tel || _knsh_marks )) || return 1"));
     }
 
     #[test]

@@ -47,18 +47,24 @@ implementation choice, not a requirement.
 
 As for zsh, the spec only requires the user's startup files to run unchanged; this is how `knsh` does it.
 
-- **Which shell:** `knsh` hosts bash when `$SHELL` is an absolute path to a program named `bash`, and runs that very
-  binary (`/bin/bash` 3.2, Homebrew's bash 5, …). Otherwise it hosts zsh. `argv[0]` is `-bash` for a login shell,
+- **Which shell:** `knsh` hosts bash when `[shell] hosted` names it ([login shell](#login-shell)) or, with no
+  setting, when `$SHELL` is an absolute path to a program named `bash`, and runs that very binary (`/bin/bash` 3.2,
+  Homebrew's bash 5, …). Otherwise it hosts zsh. `argv[0]` is `-bash` for a login shell,
   and `-i` is passed on. When that bash cannot be started, or resolves to `knsh` itself, zsh starts instead (a human
   shell is never refused).
-- **Recording off:** `knsh` `exec`s plain bash with no file and no variable of its own, so `/etc/profile`,
-  `~/.bash_profile`, `~/.bash_login`, `~/.profile`, `~/.bashrc` and `~/.bash_logout` run exactly as in plain bash,
-  and exit status, signals, job control and terminal ownership are bash's own.
-- **Recording on, non-login shell:** bash starts with `--rcfile` pointing at the static wrapper
+- **When the wrapper is read:** when recording is on, or when the [terminal marks](#terminal-markup) are wanted
+  (`knsh`'s standard output is a terminal, KNSH-022), or both. With neither, `knsh` `exec`s plain bash with no file and
+  no variable of its own, so `/etc/profile`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`, `~/.bashrc` and
+  `~/.bash_logout` run exactly as in plain bash.
+- **Recording off:** `knsh` `exec`s bash (with the wrapper only for the marks), so exit status, signals, job control
+  and terminal ownership are bash's own. The wrapper installs hooks only in the bash whose parent is the one `knsh`
+  names in `KNSH_TELEMETRY_PPID`: `knsh` itself when bash is its child (recording on), `knsh`'s own parent when `knsh`
+  replaces itself with bash.
+- **Non-login shell:** bash starts with `--rcfile` pointing at the static wrapper
   `~/Library/Application Support/knsh/shell/bash/bashrc` (owner-only, written by atomic replace when missing or
   outdated). The wrapper takes the knsh variables out of the environment, sources `~/.bashrc` as bash would have, then
   adds the hooks.
-- **Recording on, login shell:** no option or file can replace a login bash's profile files, and bash 3.2 reads no
+- **Login shell:** no option or file can replace a login bash's profile files, and bash 3.2 reads no
   other file. Bash starts exactly as a plain login shell, with `PROMPT_COMMAND` set to a fixed bootstrap (followed by
   the inherited `PROMPT_COMMAND`, if any). At the first prompt, after every startup file, the bootstrap sources the
   wrapper. The wrapper removes the bootstrap from `PROMPT_COMMAND` (string or array) and adds the hooks. A bash
@@ -89,8 +95,9 @@ As for zsh, the spec only requires the user's startup files to run unchanged; th
   prompt.
 - **Limits:**
   - Stock bash cannot make a descriptor close-on-exec, so commands inherit the two telemetry descriptors.
-  - In a recorded login shell, the profile files see the bootstrap `PROMPT_COMMAND` and the variables
-    `KNSH_TELEMETRY_FD`, `KNSH_TELEMETRY_PPID` and `KNSH_BASH_BOOT`. A profile file that assigns `PROMPT_COMMAND`
+  - In a login shell that reads the wrapper (recorded, or with the marks), the profile files see the bootstrap
+    `PROMPT_COMMAND` and the variables `KNSH_TELEMETRY_FD` (recorded only), `KNSH_TELEMETRY_PPID`, `KNSH_BASH_BOOT`
+    and `KNSH_TERMINAL_MARKS` (marks only). A profile file that assigns `PROMPT_COMMAND`
     without keeping its value turns telemetry off for the session, and the variables then stay in the environment.
   - In a recorded login shell, the first line is reported only at the next prompt (start time and directory taken
     then) when something runs after the bootstrap in the first `PROMPT_COMMAND`, or when the user has a `DEBUG` trap
@@ -124,9 +131,55 @@ In every mode the engine emits:
 
 Any terminal that supports them can mark commands.
 
+### In integration mode (KNSH-022)
+
+- **When:** `knsh` asks the hosted shell for the marks (`KNSH_TERMINAL_MARKS=1`, removed by the wrapper before any
+  user file runs) only when its own standard output is a terminal, whether or not recording is on. The hooks also
+  check, at every write, that standard output is still a terminal; otherwise they write nothing. A shell started
+  without the wrapper (it could not be installed) has no marks.
+- **What, in order, for each command line:** before the prompt, `ESC ]133;D;<exit> BEL` for the line that ran (only
+  after its `C`), then `ESC ]7;file://<host><path> BEL`, then `ESC ]133;A BEL`; `ESC ]133;B BEL` at the end of the
+  prompt, where the typed line begins; `ESC ]133;C BEL` when the line is about to run. A line that ran nothing (an
+  empty line) gets no `C` and no `D`. OSC 7 is written before every prompt, so on start and after every directory
+  change. The host is the shell's host name (`$HOST`, `$HOSTNAME`); host and path have every byte other than
+  `A-Z a-z 0-9 / . _ ~ -` written as `%XX` (upper-case hex, UTF-8 bytes as they are).
+- **zsh:** a second pair of hooks, `_knsh_mark_precmd` and `_knsh_mark_preexec`, added with `add-zsh-hook` like the
+  telemetry hooks. `B` is appended to `PS1` inside `%{ %}` (only with `PROMPT_PERCENT`, the default) and taken off
+  again by the next hook unless something has set `PS1` since. Whenever hooks were added after them, the marks' hooks
+  move themselves to the end of `precmd_functions` and `preexec_functions` (by `add-zsh-hook -d` then
+  `add-zsh-hook`), so that `PS1` is final when `B` is added.
+- **bash:** the hooks of [hosting bash](#hosting-bash-implementation-choice-knsh-020): `_knsh_precmd` writes `D`,
+  OSC 7 and `A`; `_knsh_arm`, the last `PROMPT_COMMAND` entry, appends `B` to `PS1` inside `\[ \]`; the `DEBUG`
+  trap writes `C` before the first command of a typed line. Without recording, no history lookup is made, so the
+  marks alone fork nothing. In a login shell the bootstrap marks the first prompt itself.
+- **Limits:** in zsh, a hook that a later startup file (`.zshrc`) adds and that assigns `PS1` runs after the marks'
+  hooks on the first prompt only, so that first prompt may lack `B`. In bash without recording, a `PROMPT_COMMAND`
+  entry added interactively runs after `_knsh_arm` once, and counts as a typed line there (a stray `C`) until the
+  next prompt puts `_knsh_arm` back at the end. A line that runs no simple command in bash itself (a subshell, a
+  function definition) gets no `C` or `D`.
+
 ## Login shell
 
 `knsh` can be added to `/etc/shells`, with the user's permission, so it works as a login shell with `chsh`. Login and startup-file behaviour follow the hosted shell.
+
+- **Login invocation:** `argv[0]` starting with `-` (as `login(1)` and terminals start a login shell: `-knsh`), `-l`
+  or `--login` starts the hosted shell as a login shell (`argv[0]` `-zsh` or `-bash`), which then reads its login
+  files as it always does.
+- **Hosted shell:** set in `~/.config/knsh/config.toml`, since `$SHELL` names `knsh` itself once it is the login
+  shell:
+
+  ```toml
+  [shell]
+  hosted = "zsh"   # "zsh" (/bin/zsh), "bash" (/bin/bash), or an absolute path to a program named zsh or bash
+  ```
+
+  Without the setting, `knsh` hosts the bash `$SHELL` names, if it is one (KNSH-020), and `/bin/zsh` otherwise, so
+  zsh by default. An invalid choice (another value or type, an unknown key inside `[shell]`, a file that cannot be
+  read or parsed, a program that is not an executable file or is `knsh` itself) starts `/bin/zsh` with a one-line
+  warning on stderr, never no shell. A chosen zsh or bash that then fails to start falls back to `/bin/zsh` too.
+- **`/etc/shells`:** `knsh shell install` ([CLI](../06-api/cli.md#login-shell)) adds the resolved path of the running
+  `knsh` after an explicit yes on a terminal, through `sudo`. Nothing else ever edits `/etc/shells`. The user then
+  runs `chsh -s <path>` themselves.
 
 ## Recording a human session
 

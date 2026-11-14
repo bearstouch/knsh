@@ -208,7 +208,9 @@ fn run_recorded(bash: &Path, home: &Path, login: bool, sink: Box<dyn TelemetrySi
         startup_dir: Some(&startup_dir),
         login,
         force_interactive: true,
-        telemetry: None,
+        telemetry_fd: None,
+        marks: false,
+        parent_pid: 0,
         user_prompt_command: None,
     };
     let isolation = Isolation {
@@ -855,7 +857,7 @@ fn binary_falls_back_to_zsh_when_bash_is_missing() {
     assert_eq!(output.status.code(), Some(4), "{}", text(&output.stderr));
     assert_eq!(text(&output.stdout), "zsh=zsh\n");
     assert!(
-        text(&output.stderr).contains("starting zsh"),
+        text(&output.stderr).contains("starting /bin/zsh"),
         "{}",
         text(&output.stderr)
     );

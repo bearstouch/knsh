@@ -17,6 +17,7 @@ The `knsh` binary wraps the API. Every command takes `--json` for machine-readab
 | `knsh profile use <profile>` | `user.sock` | Select a local profile; needs Touch ID |
 | `knsh authority trust --team-id <id> --identifier <bundle-id> --min-version <v>` | `user.sock` | Trust an authority; needs Touch ID or password |
 | `knsh forget [--session <id> \| --since <date>] [--with-checkpoints]` | `user.sock` | Delete records and optionally checkpoints |
+| `knsh shell install` | — (`/etc/shells`) | Add `knsh` to `/etc/shells` after asking, so `chsh` accepts it (see below) |
 | `knsh daemon install` | — (launchd) | Install and load the `knshd` launch agent (see below) |
 | `knsh daemon uninstall` | — (launchd) | Unload the `knshd` launch agent and remove its property list; engine data is kept |
 
@@ -45,6 +46,24 @@ installs and removes it without talking to `knshd`.
 - `--since` takes a UTC date `YYYY-MM-DD` (from midnight UTC) or an engine timestamp `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`.
 - `--with-checkpoints` is passed on. Until checkpoints exist (phase 3) `knshd` answers `-32005`: `knsh forget` says so,
   deletes nothing and exits with 1.
+
+## Login shell
+
+`knsh shell install` (KNSH-022, NFR-COMPAT-08) adds the running `knsh`, by its resolved absolute path, to
+`/etc/shells`, so that `chsh -s <path>` accepts it.
+
+- Nothing is asked or changed when `/etc/shells` already lists that path (a line equal to it, ignoring blanks and
+  `#` comments).
+- Otherwise it shows the exact path and asks `[y/N]` on the terminal. Only `y` or `yes` (any case) goes on; the line
+  is then appended with `/usr/bin/sudo /usr/bin/tee -a /etc/shells`, which asks for the password itself. A file not
+  ending in a line feed gets one first.
+- It never edits `/etc/shells` without that answer: without a terminal on standard input and standard error it
+  changes nothing and exits with 1. A path holding whitespace, a control character or `#` is refused before asking.
+- It prints what happened and the `chsh -s` line to run (`{"shell": …, "listed": …, "added": …}` with `--json`);
+  a decline exits with 0, a failure with 1. It does not run `chsh`.
+- **Limit until `knsh -c` exists:** a login shell also runs `ssh host cmd`, `scp`, `rsync` and apps that read the
+  login environment (`$SHELL -l -c …`), and those fail while `knsh -c` is not implemented. The text output says so
+  next to the `chsh` line.
 
 ## Shell invocation
 
