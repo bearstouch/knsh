@@ -76,6 +76,15 @@ pub enum LexError {
         /// The limit.
         limit: usize,
     },
+    /// The line produces more than [`MAX_TOKENS`](crate::MAX_TOKENS) tokens, counted over the line and every
+    /// substitution body parsed in it. Lexing stops at the first token over the limit, so the token lists never grow
+    /// past it (KNSH-032).
+    TooManyTokens {
+        /// The first token over the limit.
+        span: Span,
+        /// The limit.
+        limit: usize,
+    },
     /// A here-document that bash versions read differently (KNSH-031), refused because either reading could hide a
     /// command the other runs. Bash 3.2 (`/bin/bash` on macOS) finds the end of `$( … )`, `<( … )` and `>( … )` by
     /// matching characters, not by reading commands, so for a here-document inside one it does not know where the
@@ -116,6 +125,7 @@ impl LexError {
             Self::InputTooLarge { .. } => None,
             Self::Unterminated { span, .. }
             | Self::NestingTooDeep { span, .. }
+            | Self::TooManyTokens { span, .. }
             | Self::AmbiguousHereDocument { span }
             | Self::HereDocumentDelimiter { span }
             | Self::AmbiguousComment { span } => Some(*span),
@@ -138,6 +148,9 @@ impl fmt::Display for LexError {
                     "quotes and substitutions nested deeper than {limit} levels at byte {}",
                     span.start
                 )
+            }
+            Self::TooManyTokens { span, limit } => {
+                write!(f, "command line has more than {limit} tokens, at byte {}", span.start)
             }
             Self::AmbiguousHereDocument { span } => {
                 write!(
@@ -251,6 +264,7 @@ impl ParseError {
                     span: map(span),
                 },
                 LexError::NestingTooDeep { span, limit } => LexError::NestingTooDeep { span: map(span), limit },
+                LexError::TooManyTokens { span, limit } => LexError::TooManyTokens { span: map(span), limit },
                 LexError::AmbiguousHereDocument { span } => LexError::AmbiguousHereDocument { span: map(span) },
                 LexError::HereDocumentDelimiter { span } => LexError::HereDocumentDelimiter { span: map(span) },
                 LexError::AmbiguousComment { span } => LexError::AmbiguousComment { span: map(span) },

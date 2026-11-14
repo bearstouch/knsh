@@ -29,20 +29,29 @@
 //! line), the parser attaches each to its redirection ([`HereDocument`]), and a here-document or here-string read by a
 //! shell or interpreter is marked for dynamic classification ([`Redirect::feeds_interpreter`]).
 //!
+//! The fail-closed fallback, [`parse_line`] (KNSH-032), is the entry point for the classifier: it never fails, and
+//! turns every line into a [`ParseOutcome`], either [`Exact`] or [`Dynamic`] with a machine-readable
+//! [`DynamicReason`] and span for each dynamic part. A line over a limit, with a syntax error or with a construct the
+//! parser cannot delimit (`coproc` among them) is dynamic as a whole; a line that parses is dynamic in parts for an
+//! unsupported construct, `eval`, `source` or `.`, a command name built from an expansion, or a here-document fed to
+//! an interpreter. Only [`parse_line`] can build a `ParseOutcome`, so no parser error reaches [`Exact`].
+//!
 //! # Boundaries
 //!
 //! No workspace or third-party dependencies, no I/O, no global state, no `unsafe`. Input is untrusted (NFR-SEC-05):
-//! its size is checked before it is read ([`MAX_INPUT_LEN`]), recursion is bounded ([`MAX_NESTING_DEPTH`]), the first
-//! problem ends the lex or parse with a [`LexError`] or [`ParseError`] (never a guess), and both stages are fuzzed
-//! (`fuzz/`, targets `bash_lex` and `bash_parse`). Callers treat every error as dynamic code, never as an allow
-//! (decision 6, KNSH-032). A parser result is an intent filter, never a security boundary.
+//! its size is checked before it is read ([`MAX_INPUT_LEN`]), the tokens of a line are capped ([`MAX_TOKENS`]),
+//! recursion is bounded ([`MAX_NESTING_DEPTH`]), the first problem ends the lex or parse with a [`LexError`] or
+//! [`ParseError`] (never a guess), and both stages and the fallback are fuzzed (`fuzz/`, targets `bash_lex` and
+//! `bash_parse`). [`parse_line`] turns every error into dynamic code, never an allow (decision 6, KNSH-032). A parser
+//! result is an intent filter, never a security boundary.
 //!
 //! # Specification
 //!
 //! - `specs/03-functional-requirements/command-lifecycle.md` (FR-LC-02: parse the whole line with a bash grammar;
-//!   FR-LC-09: policy is evaluated for every part of the line)
+//!   FR-LC-05: mark dynamic code; FR-LC-09: policy is evaluated for every part of the line)
 //! - `specs/09-reference/decisions.md` (decision 6: parser scope for phase 2)
 //! - `specs/04-non-functional-requirements/security.md` (NFR-SEC-05: memory-safe, fuzzed parsers)
+//! - `specs/09-reference/defaults-and-limits.md` (the parser limits and their rationale)
 //! - `specs/02-architecture/implementation.md`
 //! - `specs/07-testing/conformance.md`
 
@@ -56,6 +65,7 @@ mod functions;
 mod interpreters;
 mod lex;
 mod limits;
+mod outcome;
 mod parse;
 mod token;
 
@@ -68,7 +78,8 @@ pub use ast::{
 };
 pub use error::{CompoundStart, Construct, LexError, ParseError, Unexpected, UnsupportedConstruct};
 pub use lex::lex;
-pub use limits::{MAX_FUNCTION_DEFINITIONS, MAX_INPUT_LEN, MAX_NESTING_DEPTH};
+pub use limits::{MAX_FUNCTION_DEFINITIONS, MAX_INPUT_LEN, MAX_NESTING_DEPTH, MAX_TOKENS};
+pub use outcome::{Dynamic, DynamicPart, DynamicReason, Exact, ParseOutcome, parse_line};
 pub use parse::parse;
 pub use token::{
     HereDocumentBody, IoNumber, Operator, Redirection, RedirectionOperator, ReservedWord, Segment, SegmentKind, Span,
