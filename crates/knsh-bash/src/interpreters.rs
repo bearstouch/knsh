@@ -25,6 +25,7 @@ use std::collections::BTreeSet;
 
 use crate::ast::{Command, CompoundCommand, ListItem, Pipeline, Redirect, SimpleCommand, collect_commands};
 use crate::functions::static_text;
+use crate::outcome::command_name_text;
 use crate::token::RedirectionOperator;
 
 /// Shells and interpreters that run their standard input as code when given no script, by base name without a
@@ -111,7 +112,9 @@ pub(crate) fn mark_interpreter_inputs(items: &mut [ListItem], input: &str) {
     let functions = commands
         .iter()
         .filter_map(|command| match command {
-            Command::FunctionDefinition(definition) => static_text(&definition.name.word, input),
+            // Read with the classifier's command-name rule, like the calls below, so a definition and a call of
+            // the same name always agree.
+            Command::FunctionDefinition(definition) => command_name_text(&definition.name.word, input),
             Command::Simple(_) | Command::Compound(_) | Command::Unsupported(_) => None,
         })
         .collect();
@@ -186,7 +189,12 @@ impl Marker<'_> {
             // Only assignments and redirections: nothing reads the text.
             return false;
         };
-        let Some(name) = static_text(&name.word, self.input) else {
+        // The name is read exactly as the classifier reads it (`command_name_text`), so this marks by the same
+        // program the classifier resolves and the supervisor runs. `static_text` is stricter: it treats any
+        // unquoted `~` as a tilde expansion, so `a~ <<X` was marked while the re-serialised `'/usr/bin/a~' <<X`
+        // was not, and re-serialisation failed its own round trip (KNSH-038). Bash expands `~` only at the start of
+        // a command name, which `command_name_text` reports as expanded.
+        let Some(name) = command_name_text(&name.word, self.input) else {
             return true;
         };
         if self.functions.contains(&name) || is_interpreter(&name) {

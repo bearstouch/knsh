@@ -760,6 +760,22 @@ mod tests {
         assert_eq!(quote("/a~b"), "'/a~b'");
     }
 
+    // KNSH-038 fuzz regression: a quoted path before a here-document or here-string keeps the line's shape (the
+    // marker reads `a~` as the classifier does, so the quotes change nothing).
+    #[test]
+    fn quoted_path_before_here_document_round_trips() {
+        assert_eq!(run("a~ <<X\nX\n").unwrap(), "'/usr/bin/a~' <<X\nX\n");
+        assert_eq!(
+            run("cat <$(ca~ <<X\n\tX\nX\n)\nO\n").unwrap(),
+            "/usr/bin/cat <$('/usr/bin/ca~' <<X\n\tX\nX\n)\n/usr/bin/O\n"
+        );
+        assert_eq!(run("e~c <<< x").unwrap(), "'/usr/bin/e~c' <<< x");
+        assert_eq!(
+            run("spaced <<X\nX\n").unwrap(),
+            "'/Applications/My Tools/bin/spaced' <<X\nX\n"
+        );
+    }
+
     // FR-POL-20, KNSH-038: dynamic parts are left as written; only names outside them are replaced.
     #[test]
     fn does_not_touch_dynamic_parts() {

@@ -648,6 +648,23 @@ mod tests {
         assert!(parse_line("cat <<EOF\nhello\nEOF\n").is_exact());
     }
 
+    // KNSH-038 fuzz regression: a `~` inside a command name is literal in bash, so `a~` reading a here-document is
+    // not an unknown program; a leading `~` (tilde expansion) still is, and functions keep their names.
+    #[test]
+    fn tilde_inside_a_command_name_is_not_an_expansion_for_here_documents() {
+        assert!(parse_line("a~ <<X\nX\n").is_exact());
+        assert!(parse_line("cat <$(ca~ <<X\n\tX\nX\n)\n").is_exact());
+        assert!(
+            parts("~/bin/x <<X\nX\n")
+                .iter()
+                .any(|(reason, _)| *reason == DynamicReason::InterpreterInput)
+        );
+        assert_eq!(
+            parts("a~() { bash; }; a~ <<X\nX\n")[0].0,
+            DynamicReason::InterpreterInput
+        );
+    }
+
     // Lexer refusals that are not syntax errors keep their own reasons.
     #[test]
     fn ambiguous_and_delimiter_refusals_are_dynamic() {

@@ -1,0 +1,7 @@
+# Preset `claude-code`: what Claude Code itself needs inside an envelope (FR-AGT-04).
+# Provisional: KNSH-058 verifies and completes it (proxy settings, classes).
+[fs]
+write = ["${PROJECT}", "~/.claude"]
+
+[network]
+hosts = ["api.anthropic.com"]

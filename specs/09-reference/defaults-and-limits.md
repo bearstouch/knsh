@@ -49,5 +49,10 @@
 | Human recording | Off | Per session | [privacy](../04-non-functional-requirements/privacy.md) |
 | Agent recording | Commands on, output off | Per profile, `recording.set` | [privacy](../04-non-functional-requirements/privacy.md) |
 | `fs.read` | `"all"` (except deny list) | Per profile | [policy](../03-functional-requirements/policy.md) |
+| `exec.default`, `exec.project_executables`, `approvals.irreversible` | `ask` | Per profile | [policy profile](../05-models/policy-profile.md#defaults) |
+| `network.mode` | `none` | Per profile | [policy profile](../05-models/policy-profile.md#defaults) |
+| Default `exec.run` output mode | `full` | Per profile (`output.mode`) | [policy profile](../05-models/policy-profile.md#defaults) |
+| Profile `extends` chain | 8 profiles, the loaded one included; longer is an error | — | [policy profile](../05-models/policy-profile.md#loading) |
+| Profile file | 1 MiB (the TOML parser's limit), refused before reading | — | [policy profile](../05-models/policy-profile.md#toml-subset) |
 | Agent bash | `/bin/bash` (3.2) | Per profile | [compatibility](../04-non-functional-requirements/compatibility.md) |
 | Trusted folders | `/usr/bin`, `/bin`, `/usr/sbin`, `/opt/homebrew/bin`, `/usr/local/bin` | Profile can add | [policy](../03-functional-requirements/policy.md) |

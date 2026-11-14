@@ -1,0 +1,7 @@
+# Preset `codex-cli`: what Codex CLI itself needs inside an envelope (FR-AGT-04).
+# Provisional: KNSH-058 verifies the model host and configuration folder per release.
+[fs]
+write = ["${PROJECT}", "~/.codex"]
+
+[network]
+hosts = ["api.openai.com"]

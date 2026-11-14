@@ -1,0 +1,236 @@
+//! The resolved policy profile: one typed value per key of `specs/05-models/policy-profile.md#keys`, after
+//! `extends` and `preset` are applied, defaults filled in and every path expanded to canonical form.
+//!
+//! The types are plain values (`Clone`, `Eq`, `Hash`), so two resolved profiles can be compared (a child agent's
+//! profile against its parent's, FR-SES-03) or hashed (records and caches). They are built by
+//! [`load_profile`](crate::load_profile) from profile text and the presets shipped as data; the engine never
+//! authors one itself (FR-POL-03).
+
+use std::collections::BTreeMap;
+
+use knsh_bash::Interpreters;
+
+use crate::path::CanonicalPath;
+use crate::resolve::TrustedFolders;
+use crate::session::ProfileName;
+
+/// The agent bash used when the profile names none: macOS's `/bin/bash` 3.2
+/// (`specs/09-reference/defaults-and-limits.md`, "Agent bash").
+pub const DEFAULT_AGENT_BASH: &str = "/bin/bash";
+
+/// Folder names never captured in checkpoints unless `checkpoints.exclude` replaces the list
+/// (`specs/09-reference/defaults-and-limits.md`, "Checkpoint excludes").
+pub const DEFAULT_CHECKPOINT_EXCLUDES: &[&str] = &["node_modules", "target", ".venv", "dist", "build"];
+
+/// Days a record is kept when `recording.retention_days` is not set (`specs/09-reference/defaults-and-limits.md`).
+pub const DEFAULT_RETENTION_DAYS: u32 = 30;
+
+/// The range `recording.retention_days` accepts (`specs/09-reference/defaults-and-limits.md`).
+pub const RETENTION_DAYS_RANGE: std::ops::RangeInclusive<u32> = 1..=36_500;
+
+/// A fully resolved policy profile (module documentation).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Profile {
+    /// `name`: the profile's name.
+    pub name: ProfileName,
+    /// The profiles merged into this one by `extends`, nearest parent first. Empty when it extends nothing.
+    pub extends: Vec<ProfileName>,
+    /// `preset`: the preset applied on top, if any.
+    pub preset: Option<String>,
+    /// `[fs]`.
+    pub fs: FsPolicy,
+    /// `[exec]`.
+    pub exec: ExecPolicy,
+    /// `[network]`.
+    pub network: NetworkPolicy,
+    /// `[approvals]`.
+    pub approvals: ApprovalsPolicy,
+    /// `[checkpoints]`.
+    pub checkpoints: CheckpointPolicy,
+    /// `[recording]`.
+    pub recording: RecordingPolicy,
+    /// `[output]`.
+    pub output: OutputPolicy,
+    /// `[secrets.env]`: secret injections by environment variable name.
+    pub secrets: BTreeMap<String, SecretInjection>,
+}
+
+/// What a rule or setting does with a matching command: run it, ask the authority, or refuse it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RuleAction {
+    /// Run it.
+    Allow,
+    /// Ask the authority first.
+    Ask,
+    /// Refuse it.
+    Deny,
+}
+
+impl RuleAction {
+    /// The profile spelling: `allow`, `ask` or `deny`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
+    }
+
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        match text {
+            "allow" => Some(Self::Allow),
+            "ask" => Some(Self::Ask),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
+/// `fs.read`: what an agent may read.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ReadScope {
+    /// `"all"`: everything except `fs.deny` (the default, FR-POL-12).
+    All,
+    /// Only these paths (and what is below them), except `fs.deny`.
+    Paths(Vec<CanonicalPath>),
+}
+
+/// `[fs]`: filesystem access. Every path is canonical (FR-POL-11) and appears once per list.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FsPolicy {
+    /// `fs.read`. Default [`ReadScope::All`] (FR-POL-12).
+    pub read: ReadScope,
+    /// `fs.write`: write roots. Default none.
+    pub write: Vec<CanonicalPath>,
+    /// `fs.deny`: never readable or writable. Default none (the fixed engine denies of FR-POL-30 are added by the
+    /// sandbox compiler, never by the profile).
+    pub deny: Vec<CanonicalPath>,
+}
+
+/// `[exec]`: command rules and how commands are found and run.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExecPolicy {
+    /// `exec.allow` patterns, in source order (rule IDs `exec.allow[N]`). Default none.
+    pub allow: Vec<String>,
+    /// `exec.ask` patterns, in source order. Default none.
+    pub ask: Vec<String>,
+    /// `exec.deny` patterns, in source order. Default none.
+    pub deny: Vec<String>,
+    /// `exec.project_executables`: binaries from agent-writable places (FR-POL-14). Default [`RuleAction::Ask`].
+    pub project_executables: RuleAction,
+    /// `exec.default`: when no rule matches (FR-POL-17). Default [`RuleAction::Ask`], so an unlisted command is
+    /// never run without a decision.
+    pub default: RuleAction,
+    /// `exec.interpreters`: the built-in interpreter table extended by the profile (KNSH-036).
+    pub interpreters: Interpreters,
+    /// `exec.trusted_folders` (proposed): the default trusted folders plus the profile's (FR-POL-13).
+    pub trusted_folders: TrustedFolders,
+    /// `exec.trusted_tools` (proposed): tools run without a per-command profile after approval (FR-SBX-09).
+    /// Default none.
+    pub trusted_tools: Vec<String>,
+    /// `exec.bash` (proposed): the bash that runs agent lines. Default [`DEFAULT_AGENT_BASH`].
+    pub bash: CanonicalPath,
+}
+
+/// `network.mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NetworkMode {
+    /// `none`: no network at all (the default).
+    None,
+    /// `allowlist`: only the listed hosts.
+    Allowlist,
+}
+
+/// `[network]`: what commands may reach.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NetworkPolicy {
+    /// `network.mode`. Default [`NetworkMode::None`].
+    pub mode: NetworkMode,
+    /// `network.hosts`: open to every command. Default none.
+    pub hosts: Vec<String>,
+    /// `network.approval_hosts`: only for commands whose class or approval includes them (FR-NET-03). Default
+    /// none.
+    pub approval_hosts: Vec<String>,
+    /// `network.loopback`: loopback ports allowed. Default none.
+    pub loopback: Vec<u16>,
+}
+
+/// `[approvals]`: how flagged lines are treated.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ApprovalsPolicy {
+    /// `approvals.irreversible`: lines classified as irreversible (FR-IRR-05). Default [`RuleAction::Ask`].
+    pub irreversible: RuleAction,
+    /// `approvals.irreversible_commands` (proposed): patterns the profile adds to the irreversible list. Default
+    /// none.
+    pub irreversible_commands: Vec<String>,
+}
+
+/// `[checkpoints]`: protected roots.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CheckpointPolicy {
+    /// `checkpoints.roots`. Default none.
+    pub roots: Vec<CanonicalPath>,
+    /// `checkpoints.required`: lines touching a root wait for its shadow. Default `false`.
+    pub required: bool,
+    /// `checkpoints.exclude`: folder names never captured. Default [`DEFAULT_CHECKPOINT_EXCLUDES`]; a profile's
+    /// list replaces it.
+    pub exclude: Vec<String>,
+}
+
+/// `[recording]`: what agent records keep.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RecordingPolicy {
+    /// `recording.commands`. Default `true` (agent recording default, NFR-PRIV).
+    pub commands: bool,
+    /// `recording.output`. Default `false`.
+    pub output: bool,
+    /// `recording.retention_days`, within [`RETENTION_DAYS_RANGE`]. Default [`DEFAULT_RETENTION_DAYS`].
+    pub retention_days: u32,
+}
+
+/// An `exec.run` output mode (`specs/03-functional-requirements/output-modes.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputMode {
+    /// `full`.
+    Full,
+    /// `truncate`.
+    Truncate,
+    /// `head_tail`.
+    HeadTail,
+    /// `errors_only`.
+    ErrorsOnly,
+    /// `ref`.
+    Ref,
+}
+
+impl OutputMode {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        match text {
+            "full" => Some(Self::Full),
+            "truncate" => Some(Self::Truncate),
+            "head_tail" => Some(Self::HeadTail),
+            "errors_only" => Some(Self::ErrorsOnly),
+            "ref" => Some(Self::Ref),
+            _ => None,
+        }
+    }
+}
+
+/// `[output]` (proposed): defaults for `exec.run`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OutputPolicy {
+    /// `output.mode`: the default output mode (FR-OUT-02). Default [`OutputMode::Full`].
+    pub mode: OutputMode,
+}
+
+/// One `secrets.env.<VAR>` entry (`specs/05-models/secret.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SecretInjection {
+    /// `secret`: the secret's name in the Keychain or as supplied by the authority.
+    pub secret: String,
+    /// `inject_for`: patterns of the lines that receive it. Default none.
+    pub inject_for: Vec<String>,
+    /// `hosts`: the only hosts a receiving line can reach. Default none.
+    pub hosts: Vec<String>,
+}

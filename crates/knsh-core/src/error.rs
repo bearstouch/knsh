@@ -1,11 +1,12 @@
-//! The crate's single error type.
+//! The crate's error types: [`CoreError`] for every constructor and parser, and [`ProfileError`] for the policy
+//! profile loader (KNSH-039), which must name the key at fault and so cannot be `Copy` like `CoreError`.
 //!
 //! Messages never echo the rejected input: a path or identifier may come from an untrusted agent line or carry
 //! private data, and errors are logged and sent over the wire (NFR-PRIV-02).
 
 use std::fmt;
 
-use crate::session::{SessionState, Transition};
+use crate::session::{ProfileName, SessionState, Transition};
 
 /// Every way a `knsh-core` constructor or parser can refuse its input.
 ///
@@ -110,3 +111,199 @@ impl fmt::Display for CoreError {
 }
 
 impl std::error::Error for CoreError {}
+
+/// Why a policy profile was refused (KNSH-039). Wrapped in [`ProfileError`] with where it happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileErrorKind {
+    /// The text is not valid TOML from the supported subset.
+    Syntax(knsh_toml::TomlError),
+    /// A key the profile model does not define (`specs/05-models/policy-profile.md#keys`).
+    UnknownKey,
+    /// A key has a value of the wrong TOML type. Carries what was expected.
+    WrongType {
+        /// The expected type, for example `"a list of strings"`.
+        expected: &'static str,
+    },
+    /// A value has the right type but is not one the key accepts. Carries what was expected.
+    InvalidValue {
+        /// What the key accepts, for example `"allow, ask or deny"`.
+        expected: &'static str,
+    },
+    /// A required key is missing (a profile's `name`, a secret's `secret`).
+    MissingKey,
+    /// A profile loaded by name says a different `name`, so its file and its contents disagree.
+    NameMismatch,
+    /// `extends` leads back to a profile already in the chain.
+    ExtendsCycle,
+    /// The `extends` chain is longer than [`MAX_EXTENDS_DEPTH`](crate::MAX_EXTENDS_DEPTH).
+    ExtendsTooDeep,
+    /// No profile with this name exists in the profile source.
+    ProfileNotFound,
+    /// The profile source has the profile but could not read it.
+    ProfileUnreadable,
+    /// `preset` names no preset the engine ships.
+    UnknownPreset,
+    /// A preset sets a key presets may not set: presets only add to lists (`fs.write`, `network.hosts`, …).
+    NotAllowedInPreset,
+    /// A path uses a variable other than `${PROJECT}`, `${HOME}` and `${TMPDIR}`, or uses one anywhere but at its
+    /// start.
+    UnknownVariable,
+    /// A path is not absolute after expansion, holds a `..` component or a NUL byte, uses `~user`, or is longer
+    /// than 4096 bytes.
+    InvalidPath,
+    /// A path could not be resolved to canonical form: the filesystem refused a lookup other than "not found".
+    PathUnresolvable,
+    /// `${HOME}`, `${TMPDIR}` or the session's start directory could not be resolved to an existing canonical
+    /// directory, so no path using them can be expanded.
+    VariableUnresolvable,
+}
+
+impl fmt::Display for ProfileErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Syntax(error) => write!(f, "invalid TOML: {error}"),
+            Self::UnknownKey => f.write_str("unknown key"),
+            Self::WrongType { expected } => write!(f, "wrong type, expected {expected}"),
+            Self::InvalidValue { expected } => write!(f, "invalid value, expected {expected}"),
+            Self::MissingKey => f.write_str("required key is missing"),
+            Self::NameMismatch => f.write_str("name does not match the name the profile was loaded by"),
+            Self::ExtendsCycle => f.write_str("extends chain forms a cycle"),
+            Self::ExtendsTooDeep => write!(f, "extends chain is longer than {} profiles", crate::MAX_EXTENDS_DEPTH),
+            Self::ProfileNotFound => f.write_str("profile not found"),
+            Self::ProfileUnreadable => f.write_str("profile could not be read"),
+            Self::UnknownPreset => f.write_str("unknown preset"),
+            Self::NotAllowedInPreset => f.write_str("presets may only add to path and host lists"),
+            Self::UnknownVariable => {
+                f.write_str("unknown variable: only ${PROJECT}, ${HOME} and ${TMPDIR}, at the start of a path")
+            }
+            Self::InvalidPath => f.write_str("path must be absolute after expansion, without '..', '~user' or NUL"),
+            Self::PathUnresolvable => f.write_str("path could not be resolved to canonical form"),
+            Self::VariableUnresolvable => f.write_str("path variable could not be resolved to an existing directory"),
+        }
+    }
+}
+
+/// Where a profile error was found: which profile or preset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileOrigin {
+    /// A profile, by name.
+    Profile(ProfileName),
+    /// A preset the engine ships, by name.
+    Preset(&'static str),
+}
+
+impl fmt::Display for ProfileOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Profile(name) => write!(f, "profile {name}"),
+            Self::Preset(name) => write!(f, "preset {name}"),
+        }
+    }
+}
+
+/// A policy profile that was refused, and where (KNSH-039).
+///
+/// Loading is all or nothing: when this is returned, no part of the profile is in effect (the loader builds a new
+/// value and never mutates one in place).
+///
+/// Unlike [`CoreError`], this names the offending key (`fs.write[1]`, `exec.interpreters.lua`): a profile is the
+/// user's own configuration, not an agent command line, and the acceptance criteria require the key to be named.
+/// Values are still never echoed. A key the model does not define is shown escaped and cut to
+/// [`MAX_KEY_DISPLAY_LEN`] characters, so a hostile file cannot inject control characters into logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileError {
+    kind: ProfileErrorKind,
+    origin: Option<ProfileOrigin>,
+    key: Option<String>,
+    position: Option<knsh_toml::Position>,
+}
+
+/// Longest key text a [`ProfileError`] shows, in characters, before it is cut with `…`.
+pub const MAX_KEY_DISPLAY_LEN: usize = 128;
+
+impl ProfileError {
+    pub(crate) fn new(kind: ProfileErrorKind) -> Self {
+        Self {
+            kind,
+            origin: None,
+            key: None,
+            position: None,
+        }
+    }
+
+    pub(crate) fn at_key(mut self, key: &str) -> Self {
+        self.key = Some(display_key(key));
+        self
+    }
+
+    pub(crate) fn at(mut self, position: knsh_toml::Position) -> Self {
+        self.position = Some(position);
+        self
+    }
+
+    /// Sets the origin unless an inner step already did: the innermost origin is the most precise.
+    pub(crate) fn in_origin(mut self, origin: &ProfileOrigin) -> Self {
+        if self.origin.is_none() {
+            self.origin = Some(origin.clone());
+        }
+        self
+    }
+
+    /// Why the profile was refused.
+    #[must_use]
+    pub fn kind(&self) -> &ProfileErrorKind {
+        &self.kind
+    }
+
+    /// The profile or preset at fault, when known (a syntax error in a snapshot comes before its name is read).
+    #[must_use]
+    pub fn origin(&self) -> Option<&ProfileOrigin> {
+        self.origin.as_ref()
+    }
+
+    /// The dotted key at fault, with a list index where one applies (`fs.write[1]`), when there is one.
+    #[must_use]
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
+    /// Where in the file the problem is, when known.
+    #[must_use]
+    pub fn position(&self) -> Option<knsh_toml::Position> {
+        self.position
+    }
+}
+
+/// Escapes control and non-ASCII characters in a key and cuts it to [`MAX_KEY_DISPLAY_LEN`] characters.
+fn display_key(key: &str) -> String {
+    let mut shown = String::new();
+    for (count, c) in key.chars().enumerate() {
+        if count == MAX_KEY_DISPLAY_LEN {
+            shown.push('…');
+            break;
+        }
+        if c.is_ascii_graphic() || c == ' ' {
+            shown.push(c);
+        } else {
+            shown.extend(c.escape_default());
+        }
+    }
+    shown
+}
+
+impl fmt::Display for ProfileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(origin) = &self.origin {
+            write!(f, "{origin}: ")?;
+        }
+        if let Some(position) = &self.position {
+            write!(f, "{position}: ")?;
+        }
+        if let Some(key) = &self.key {
+            write!(f, "{key}: ")?;
+        }
+        write!(f, "{}", self.kind)
+    }
+}
+
+impl std::error::Error for ProfileError {}

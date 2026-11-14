@@ -91,7 +91,13 @@ fn run_with_script(mut command: Command, script: &str) -> Output {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn");
+    // Spawning creates the stdio pipes, which on macOS are inheritable until std marks them close-on-exec; a recorded
+    // run forking on another thread at that moment would hand them to its commands, and the descriptor-leak check
+    // would blame knsh. Holding the recorded-run lock around the spawn closes that window (see `RECORDED_RUNS`).
+    let mut child = {
+        let _serial = RECORDED_RUNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        command.spawn().expect("spawn")
+    };
     let mut stdin = child.stdin.take().expect("stdin");
     stdin.write_all(script.as_bytes()).expect("write script");
     drop(stdin);
@@ -131,10 +137,14 @@ fn leaked_pipes(listing: &str) -> Vec<String> {
             .filter_map(|line| line.split_whitespace().last().map(str::to_owned))
             .collect()
     };
-    let baseline = Command::new("/bin/ls")
-        .args(["-l", "/dev/fd/"])
-        .output()
-        .expect("list inherited descriptors");
+    let baseline = {
+        // Its stdout pipe must not reach a recorded run on another thread (see `RECORDED_RUNS`).
+        let _serial = RECORDED_RUNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Command::new("/bin/ls")
+            .args(["-l", "/dev/fd/"])
+            .output()
+            .expect("list inherited descriptors")
+    };
     let inherited = pipes(&String::from_utf8_lossy(&baseline.stdout));
     pipes(listing)
         .into_iter()
@@ -293,10 +303,12 @@ impl TelemetrySink for ChannelSink {
     }
 }
 
-/// Serialises the recorded runs. The telemetry pipe's write end is inheritable until zsh has started, so a recorded
-/// zsh spawned by another thread at that moment would inherit a second, foreign write end and see it as a pipe
-/// (the documented precondition of `TelemetryPipe::new`; `knsh` itself starts no other process then). Plain-zsh
-/// tests may still inherit it, which only delays end of file, bounded by the forwarder drain.
+/// Serialises the recorded runs, and every other spawn in this file against them. The telemetry pipe's write end is
+/// inheritable until zsh has started, so a recorded zsh spawned by another thread at that moment would inherit a
+/// second, foreign write end and see it as a pipe (the documented precondition of `TelemetryPipe::new`; `knsh` itself
+/// starts no other process then). The other way round, the stdio pipes `Command::spawn` creates on macOS are
+/// inheritable for a moment too, so a recorded run forking then would pass them to its commands (CI saw this as
+/// a false telemetry leak); `run_with_script` takes this lock around its spawn for that reason.
 static RECORDED_RUNS: Mutex<()> = Mutex::new(());
 
 /// Runs the hosted zsh with recording on, in a minimal environment whose HOME is `home`, with `script` on standard
