@@ -13,12 +13,13 @@ persistence in `knshd`'s state store is wired in KNSH-074; creation authorisatio
 KNSH-071/262.
 
 **Acceptance criteria**
-- [ ] A matching unexpired grant turns an `ask` into `allow` with `decision.source` reflecting the grant; it never
+- [x] A matching unexpired grant turns an `ask` into `allow` with `decision.source` reflecting the grant; it never
   overrides a `deny` or a fixed deny.
-- [ ] Expired grants never match; expiry uses the injected `Clock`.
-- [ ] Session-scoped grants match only their session; profile-scoped grants match sessions using that profile.
-- [ ] Revoke by ID removes the grant immediately; unknown ID is an error.
-- [ ] Grants never relax dynamic-code clamps.
+- [x] Expired grants never match; expiry uses the injected `Clock`. (Core takes `now: Timestamp`, read by `knshd`
+  from `knsh_platform::Clock`; that wiring lands with KNSH-071/074.)
+- [x] Session-scoped grants match only their session; profile-scoped grants match sessions using that profile.
+- [x] Revoke by ID removes the grant immediately; unknown ID is an error.
+- [x] Grants never relax dynamic-code clamps.
 
 **Unit tests**
 - `grant_turns_ask_into_allow`.

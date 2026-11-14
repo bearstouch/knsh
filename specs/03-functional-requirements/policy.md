@@ -140,7 +140,8 @@ Any `ask` verdict under a profile named `unattended` becomes `deny` with source 
 profile and the rule that asked, because no one can answer. So does an allowed line holding dynamic code (the reason
 names the rule of its first dynamic part): an allowed tool given a code variable (`GIT_EXTERNAL_DIFF=./x git diff`,
 `PAGER=./x git log`) runs any program, which is never a plain read-only command. A deny rule still denies with source
-`rule`.
+`rule`. Grants (KNSH-042) are applied first: an ask a live grant answers is allowed with source `grant`
+(the grant is the prior answer), but a granted line holding dynamic code is still denied.
 
 | Setting | Value |
 | --- | --- |
@@ -183,6 +184,10 @@ A grant is a time-limited rule added on top of a profile, usually after an appro
 | FR-POL-60 | Grants must have a scope (`session` or `profile`), an `expires_at` and an ID, and must be kept in `knshd`'s state store. |
 | FR-POL-61 | Grants must be listable with `policy.grants` and revocable with `policy.revoke`. |
 | FR-POL-62 | Only the authority, or the user with Touch ID, may create grants. |
+
+A grant only turns an `ask` into an `allow` (source `grant`), when it covers every part of the line that asks. It never
+overrides a deny or a fixed deny, never relaxes the dynamic-code limits, and never matches once expired. The
+evaluation rules are in [../05-models/grant.md#evaluation-knsh-042](../05-models/grant.md#evaluation-knsh-042).
 
 ## Dry runs
 

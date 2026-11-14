@@ -1,7 +1,8 @@
 //! Policy profile model and loader (KNSH-039; FR-POL-01, FR-POL-02, FR-POL-03, FR-POL-10, FR-POL-11, FR-POL-12),
 //! command rule matching (KNSH-040; FR-POL-13 to FR-POL-17, in the `rules` module: [`evaluate_command`]), and line
 //! verdicts, fixed denies and the built-in `unattended` profile (KNSH-041; FR-POL-18, FR-POL-20, FR-POL-21,
-//! FR-POL-30, FR-AGT-21: [`evaluate_line`], [`FixedDenies`], [`load_unattended`]).
+//! FR-POL-30, FR-AGT-21: [`evaluate_line`], [`FixedDenies`], [`load_unattended`]), and grants (KNSH-042; FR-POL-60,
+//! FR-POL-61: [`Grant`], [`GrantSet`], [`evaluate_line_with_grants`]).
 //!
 //! [`load_profile`] (by name) and [`load_profile_text`] (a snapshot pushed with `policy.set`) turn profile text into
 //! one resolved [`Profile`]:
@@ -32,6 +33,7 @@
 //! `approvals.irreversible_commands` and `output.mode`.
 
 mod fixed;
+mod grant;
 mod layer;
 mod line;
 mod model;
@@ -44,8 +46,11 @@ mod unattended;
 mod tests;
 
 pub use fixed::{CONTROL_SERVICE, ENGINE_CONFIG_DIR, ENGINE_DATA_DIR, FixedDenies};
+pub use grant::{Grant, GrantScope, GrantSet, MAX_GRANTS};
 use layer::{Layer, LayerKind, ReadTemplate};
-pub use line::{DecisionSource, LineCapabilities, LineDecision, LineReason, MatchedRule, evaluate_line};
+pub use line::{
+    DecisionSource, LineCapabilities, LineDecision, LineReason, MatchedRule, evaluate_line, evaluate_line_with_grants,
+};
 pub use model::{
     ApprovalsPolicy, CheckpointPolicy, DEFAULT_AGENT_BASH, DEFAULT_CHECKPOINT_EXCLUDES, DEFAULT_RETENTION_DAYS,
     ExecPolicy, FsPolicy, NetworkMode, NetworkPolicy, OutputMode, OutputPolicy, Profile, RETENTION_DAYS_RANGE,

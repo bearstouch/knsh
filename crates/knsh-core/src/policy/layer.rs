@@ -460,7 +460,7 @@ fn pattern(value: &Value) -> Result<String, Refusal> {
 /// A command pattern (KNSH-040): at least one word, and a first word naming a program rather than a path. Rules match
 /// programs by name only (FR-POL-13), so a blank pattern or a path there would never match, and a deny rule that can
 /// never match is a silent hole; refusing the profile makes the mistake visible.
-fn is_pattern(text: &str) -> bool {
+pub(crate) fn is_pattern(text: &str) -> bool {
     is_free_form(text)
         && text
             .split(' ')

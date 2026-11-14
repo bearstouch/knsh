@@ -349,7 +349,12 @@ fn subscribe_error(error: SubscribeError, session_id: Option<SessionId>) -> RpcE
             | CoreError::ParentNotFoundOrEnded
             | CoreError::ProfileNotStricter
             | CoreError::HumanChildOfAgent
-            | CoreError::EventActorMismatch,
+            | CoreError::EventActorMismatch
+            | CoreError::InvalidGrantRule
+            | CoreError::GrantExpired
+            | CoreError::GrantExists
+            | CoreError::GrantNotFound
+            | CoreError::TooManyGrants,
         )
         | SubscribeError::Closed => RpcError::new(ErrorCode::InternalError),
     }
