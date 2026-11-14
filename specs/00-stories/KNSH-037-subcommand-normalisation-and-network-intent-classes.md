@@ -13,12 +13,12 @@ the subcommand (with and without values) skipped; class assignment (`network:non
 `network:publish`, …).
 
 **Acceptance criteria**
-- [ ] The table is static data in `knsh-bash` with documented entries; adding a tool needs no code change.
-- [ ] Normalised argv is `[tool, subcommand, …remaining args]` with skipped global options recorded.
-- [ ] Unknown global options before the subcommand make normalisation fail to the raw argv (rules still match on raw;
+- [x] The table is static data in `knsh-bash` with documented entries; adding a tool needs no code change.
+- [x] Normalised argv is `[tool, subcommand, …remaining args]` with skipped global options recorded.
+- [x] Unknown global options before the subcommand make normalisation fail to the raw argv (rules still match on raw;
   never guess the subcommand).
-- [ ] Each normalised command gets zero or more network-intent classes used later by host rules (KNSH-060).
-- [ ] Irreversibility hooks: the normalised form is what KNSH-093 matches; this story only exposes it.
+- [x] Each normalised command gets zero or more network-intent classes used later by host rules (KNSH-060).
+- [x] Irreversibility hooks: the normalised form is what KNSH-093 matches; this story only exposes it.
 
 **Unit tests**
 - `git_dash_c_before_push_normalises_to_git_push` — FR-POL-15.

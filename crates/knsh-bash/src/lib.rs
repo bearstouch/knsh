@@ -49,6 +49,13 @@
 //! ([`Interpreters`]), matched by the resolved binary's family ([`family_of`]) and extendable by a profile. Name
 //! resolution and the trust of sourced files come from the caller through [`Resolver`].
 //!
+//! Subcommand normalisation, [`normalise`] (KNSH-037): for a trusted binary of a tool in [`SUBCOMMAND_TABLE`] (git,
+//! npm, cargo, docker, kubectl and others; static data), global options before the subcommand are skipped and
+//! recorded, so `git -c x=y push` is matched as `git push` (FR-POL-15), and the subcommand's network-intent classes
+//! ([`NetworkClass`]: `network:none`, `network:fetch`, `network:publish`) are given for host rules (FR-LC-06,
+//! FR-NET-03). An option the table does not know, an expansion or an unknown subcommand keeps the raw argv and gives
+//! no classes: the subcommand is never guessed.
+//!
 //! # Boundaries
 //!
 //! No workspace or third-party dependencies, no I/O, no global state, no `unsafe`. Input is untrusted (NFR-SEC-05):
@@ -66,6 +73,8 @@
 //! - `specs/03-functional-requirements/policy.md` (FR-POL-20, FR-POL-21: dynamic code never inherits classes)
 //! - `specs/05-models/execution-record.md` (`argv[].class`) and `specs/05-models/policy-profile.md`
 //!   (`exec.interpreters`)
+//! - `specs/03-functional-requirements/policy.md` (FR-POL-15: subcommand normalisation) and
+//!   `specs/03-functional-requirements/network-proxy.md` (FR-NET-03: classes reaching `approval_hosts`)
 //! - `specs/09-reference/decisions.md` (decision 6: parser scope for phase 2)
 //! - `specs/04-non-functional-requirements/security.md` (NFR-SEC-05: memory-safe, fuzzed parsers)
 //! - `specs/09-reference/defaults-and-limits.md` (the parser limits and their rationale)
@@ -87,6 +96,8 @@ mod lex;
 mod limits;
 mod outcome;
 mod parse;
+mod subcommand_table;
+mod subcommands;
 mod token;
 mod wrappers;
 
@@ -109,6 +120,10 @@ pub use lex::lex;
 pub use limits::{MAX_FUNCTION_DEFINITIONS, MAX_INPUT_LEN, MAX_NESTING_DEPTH, MAX_TOKENS};
 pub use outcome::{Dynamic, DynamicPart, DynamicReason, Exact, ParseOutcome, parse_line};
 pub use parse::parse;
+pub use subcommand_table::SUBCOMMAND_TABLE;
+pub use subcommands::{
+    NetworkClass, Normalisation, Normalised, RawReason, SkippedOption, Subcommand, SubcommandTool, normalise,
+};
 pub use token::{
     HereDocumentBody, IoNumber, Operator, Redirection, RedirectionOperator, ReservedWord, Segment, SegmentKind, Span,
     Token, TokenKind, Word,

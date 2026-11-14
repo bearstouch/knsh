@@ -8,9 +8,9 @@ use std::path::PathBuf;
 
 use knsh_bash::{
     Command, CommandClass, CommandWord, CompoundCommand, CompoundKind, Construct, DynamicReason, Interpreters,
-    LexError, ListItem, Lookup, LoopBody, LoopCommand, MAX_INPUT_LEN, MAX_TOKENS, Operator, ParseError, ParseOutcome,
-    Program, Redirect, RedirectionOperator, Resolver, Script, Segment, SegmentKind, SimpleCommand, SourceFile, Span,
-    Substitution, Token, TokenKind, classify, lex, parse, parse_line,
+    LexError, ListItem, Lookup, LoopBody, LoopCommand, MAX_INPUT_LEN, MAX_TOKENS, Normalisation, Operator, ParseError,
+    ParseOutcome, Program, Redirect, RedirectionOperator, Resolver, SUBCOMMAND_TABLE, Script, Segment, SegmentKind,
+    SimpleCommand, SourceFile, Span, Substitution, Token, TokenKind, classify, lex, normalise, parse, parse_line,
 };
 
 /// `bash_lex`: the lexer never panics and is deterministic. An accepted line is tiled exactly by its token spans
@@ -297,7 +297,9 @@ impl Resolver for TrustingSession {
 
 /// The classifier (KNSH-036) never panics and is deterministic; it keeps every dynamic part of the parser except
 /// `source`; its parts lie inside the line in source order; every entry's spans lie inside the line, a dynamic entry
-/// has a matching part, and every wrapper link points at an earlier wrapper entry.
+/// has a matching part, and every wrapper link points at an earlier wrapper entry. Subcommand normalisation (KNSH-037)
+/// never panics, gives classes only to static entries with complete arguments, and its argv is the tool's name followed by the entry's own
+/// arguments from the subcommand on.
 fn check_classification(input: &str, outcome: &ParseOutcome) {
     let interpreters = Interpreters::defaults();
     let classification = classify(outcome, input, &TrustingSession, &interpreters);
@@ -336,6 +338,30 @@ fn check_classification(input: &str, outcome: &ParseOutcome) {
                 reason == DynamicReason::InterpreterInput
                     || classification.dynamic_parts().iter().any(|part| part.reason == reason),
                 "dynamic entry without a part"
+            );
+        }
+        if let Normalisation::Normalised(normalised) = normalise(command, SUBCOMMAND_TABLE) {
+            assert_eq!(
+                command.class,
+                CommandClass::Static,
+                "classes given to a non-static entry"
+            );
+            assert!(
+                command.arguments_complete,
+                "an entry with run-time arguments was normalised"
+            );
+            assert_eq!(
+                normalised.argv.first().cloned().flatten().as_deref(),
+                Some(normalised.tool)
+            );
+            let rest: Vec<_> = command.arguments[normalised.subcommand_index..]
+                .iter()
+                .map(|argument| argument.text.clone())
+                .collect();
+            assert_eq!(
+                normalised.argv[1..],
+                rest[..],
+                "normalised argv is not the arguments from the subcommand"
             );
         }
         if let Some(wrapper) = command.wrapper {
