@@ -10,7 +10,7 @@ Replacing well-tested crates with hand-written parsers moves the risk into our o
 | TOML subset parser | Policy and configuration files | No panics; rejects anything outside the subset |
 | Bash parser | Agent command lines | No panics; unparseable input classified as dynamic; differential checks against bash |
 | Bash lexer (`bash_lex`) | Agent command lines | No panics; deterministic; token spans tile the line, segments tile each word; rejections point inside the input |
-| Bash parser, simple commands and lists (`bash_parse`) | Agent command lines | No panics; deterministic; fails exactly when the lexer fails, with the same error; rejections point inside the input; on success every word token is exactly one assignment, command word, redirection target or `!` of the tree, every redirection token one redirection, and simple commands come in source order without overlapping |
+| Bash parser, simple and compound commands, functions (`bash_parse`) | Agent command lines | No panics; deterministic; fails exactly when the lexer fails, with the same error; rejections point inside the input; on success every word token outside an unsupported construct is exactly one assignment, command word, redirection target, `!`, reserved word, loop word, case subject or pattern, or function name of the tree, every such redirection token one redirection, each part lies inside the command that holds it, compound lists are non-empty, simple commands come in source order without overlapping, and every function call names earlier definitions of the line |
 | TLS ClientHello reader | Proxy connections | Server name extracted correctly or connection refused; no panics |
 | HTTP CONNECT and SOCKS handling | Proxy connections | No panics; malformed requests refused |
 

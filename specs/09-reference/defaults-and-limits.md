@@ -36,7 +36,8 @@
 | JSON integers | ±2^53 | — | [wire format](../06-api/wire-format.md) |
 | Agent command line (bash lexer) | 1 MiB (macOS `ARG_MAX`), rejected before tokenising | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md) (KNSH-028; final parser limits in KNSH-032) |
 | Bash quote and substitution nesting | 32 levels | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md) (KNSH-028; final parser limits in KNSH-032) |
-| Bash command-list nesting (parser) | 32 levels, the same constant | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md) (KNSH-029; reached once compound commands and substitutions nest lists, KNSH-030 and KNSH-031; final parser limits in KNSH-032) |
+| Bash command-list nesting (parser) | 32 levels, the same constant | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md) (KNSH-029; reached by compound commands and function bodies since KNSH-030, and by substitutions with KNSH-031; final parser limits in KNSH-032) |
+| Function definitions analysed for call marking (parser) | 64 per line; past it no call is marked as a function call, so every call is resolved as a program | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md) (KNSH-030; final parser limits in KNSH-032) |
 | Content hash in post-image identity | Files under 64 MB | — | [checkpoints](../03-functional-requirements/checkpoints.md) |
 | Checkpoint retention | 5 GB per volume, 200 per root, or 7 days | — | [checkpoints](../03-functional-requirements/checkpoints.md) |
 | Sensitive-file pre-images | 24 hours at most | — | [checkpoints](../03-functional-requirements/checkpoints.md) |

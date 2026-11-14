@@ -1,12 +1,15 @@
 //! The syntax tree [`parse`](crate::parse) builds: lists, and-or lists, pipelines and simple commands with their
-//! assignments, words and redirections (KNSH-029).
+//! assignments, words and redirections (KNSH-029), compound commands and function definitions (KNSH-030).
 //!
-//! Every node keeps the [`Span`] of the source it came from, so a decision can point at the exact part of the line it
-//! is about. The tree is deliberately flat: a list is a vector of items, an and-or list a vector of pipelines, and a
-//! pipeline a vector of commands. A line such as `a && a && …` repeated many times therefore never builds a deep chain
-//! of boxes, so neither building, walking nor dropping the tree recurses on untrusted input (CLAUDE.md "Untrusted
-//! input": bound recursion).
+//! Every node keeps the [`Span`] of the source it came from, and every reserved word and operator of a compound
+//! command keeps its own, so a decision can point at the exact part of the line it is about. The tree is deliberately
+//! flat: a list is a vector of items, an and-or list a vector of pipelines, and a pipeline a vector of commands. A line
+//! such as `a && a && …` repeated many times therefore never builds a deep chain of boxes. The tree only deepens where
+//! the source nests lists (compound commands, function bodies), and the parser bounds that nesting by
+//! [`MAX_NESTING_DEPTH`](crate::MAX_NESTING_DEPTH), so building, walking and dropping the tree recurse a bounded
+//! number of levels on untrusted input (CLAUDE.md "Untrusted input": bound recursion).
 
+use crate::error::UnsupportedConstruct;
 use crate::token::{IoNumber, RedirectionOperator, Span, Word};
 
 /// A parsed command line: a list of and-or lists, separated by `;`, `&` or newlines.
@@ -19,18 +22,57 @@ pub struct Script {
 }
 
 impl Script {
-    /// Every simple command of the line, in source order, including those inside pipelines and lists (FR-LC-09:
-    /// policy sees every part of the line).
+    /// Every command of the line in source order, each one before the commands nested in it: compound commands are
+    /// followed by the commands of their conditions, bodies and case arms, function definitions by the commands of
+    /// their bodies.
     ///
-    /// `a | b && c; d` yields `a`, `b`, `c`, `d`.
+    /// [`Command::Unsupported`] nodes are yielded too (never skipped), but nothing inside them: their contents are
+    /// opaque, and the caller classifies them as dynamic (decision 6, KNSH-032).
+    pub fn commands(&self) -> impl Iterator<Item = &Command> + '_ {
+        let mut commands = Vec::new();
+        collect_commands(&self.items, &mut commands);
+        commands.into_iter()
+    }
+
+    /// Every simple command of the line, in source order, including those inside pipelines, lists, compound commands
+    /// and function bodies (FR-LC-09: policy sees every part of the line).
+    ///
+    /// `a | b && c; d` yields `a`, `b`, `c`, `d`; `f() { rm -rf x; }; f` yields `rm`, then the call `f`. A function body
+    /// is walked as code wherever it is defined, whether or not the line calls it, so its commands are always decided.
     pub fn simple_commands(&self) -> impl Iterator<Item = &SimpleCommand> + '_ {
-        self.items
-            .iter()
-            .flat_map(|item| item.and_or.pipelines())
-            .flat_map(Pipeline::commands)
-            .map(|command| match command {
-                Command::Simple(simple) => simple,
-            })
+        self.commands().filter_map(|command| match command {
+            Command::Simple(simple) => Some(simple),
+            Command::Compound(_) | Command::FunctionDefinition(_) | Command::Unsupported(_) => None,
+        })
+    }
+
+    /// Every function definition of the line, in source order, nested ones included. A [`FunctionCall`] names the
+    /// definitions it may run by their spans.
+    pub fn function_definitions(&self) -> impl Iterator<Item = &FunctionDefinition> + '_ {
+        self.commands().filter_map(|command| match command {
+            Command::FunctionDefinition(definition) => Some(definition),
+            Command::Simple(_) | Command::Compound(_) | Command::Unsupported(_) => None,
+        })
+    }
+}
+
+/// Appends every command of `items` to `out` in the order of [`Script::commands`]. Recurses once per nested list, so
+/// its depth is bounded by the parser's nesting limit.
+pub(crate) fn collect_commands<'a>(items: &'a [ListItem], out: &mut Vec<&'a Command>) {
+    for command in items
+        .iter()
+        .flat_map(|item| item.and_or.pipelines())
+        .flat_map(Pipeline::commands)
+    {
+        out.push(command);
+        let nested = match command {
+            Command::Compound(compound) => &compound.kind,
+            Command::FunctionDefinition(definition) => &definition.body.kind,
+            Command::Simple(_) | Command::Unsupported(_) => continue,
+        };
+        for list in nested.lists() {
+            collect_commands(list, out);
+        }
     }
 }
 
@@ -160,22 +202,266 @@ pub enum PipeOperator {
     PipeAll,
 }
 
-/// A command. Compound commands (subshells, groups, `if`, loops, `case`, functions) arrive with KNSH-030; until then
-/// the parser rejects them as [`Unsupported`](crate::ParseError::Unsupported).
+/// A command: one element of a [`Pipeline`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// A simple command.
     Simple(SimpleCommand),
+    /// A compound command decision 6 makes exact: a subshell, a group, `if`, `for`, `while`, `until` or `case`.
+    Compound(CompoundCommand),
+    /// A function definition, `name () body` or `function name body`.
+    FunctionDefinition(FunctionDefinition),
+    /// Valid bash outside decision 6's exact list (`select`, `[[ … ]]`, `(( … ))`, `for (( … ))`, or a function whose
+    /// body is one of them). Its extent is known, so the rest of the line is still read exactly, but nothing inside it
+    /// is: the caller must classify it as dynamic (KNSH-032), never skip it.
+    Unsupported(UnsupportedCommand),
 }
 
 impl Command {
-    /// Where the command is.
+    /// Where the command is, redirections on a compound command included.
     #[must_use]
     pub const fn span(&self) -> Span {
         match self {
             Self::Simple(simple) => simple.span,
+            Self::Compound(compound) => compound.span,
+            Self::FunctionDefinition(definition) => definition.span,
+            Self::Unsupported(unsupported) => unsupported.span,
         }
     }
+}
+
+/// A compound command with the redirections written after it, which apply to everything it runs
+/// (`{ a; b; } 2>&1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompoundCommand {
+    /// Which compound command, with its parts.
+    pub kind: CompoundKind,
+    /// The redirections after the closing word or operator, in source order. Bash allows nothing else there.
+    pub redirections: Vec<Redirect>,
+    /// From the opening word or operator to the end of the last redirection (or the closing word or operator).
+    pub span: Span,
+}
+
+/// The compound commands decision 6 makes exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompoundKind {
+    /// `( list )`: runs the list in a child shell, so its assignments and definitions do not outlive it.
+    Subshell(Subshell),
+    /// `{ list; }`: runs the list in the current shell.
+    Group(Group),
+    /// `if list; then list; [elif list; then list;]… [else list;] fi`.
+    If(IfCommand),
+    /// `for name [in words]; do list; done` (or with `{ list; }` as the body).
+    For(ForCommand),
+    /// `while list; do list; done`.
+    While(LoopCommand),
+    /// `until list; do list; done`.
+    Until(LoopCommand),
+    /// `case word in [pattern) list ;;]… esac`.
+    Case(CaseCommand),
+}
+
+impl CompoundKind {
+    /// The lists of commands the compound command holds, in source order: conditions, bodies and case arms.
+    #[must_use]
+    pub fn lists(&self) -> Vec<&[ListItem]> {
+        match self {
+            Self::Subshell(subshell) => vec![&subshell.body],
+            Self::Group(group) => vec![&group.body],
+            Self::If(command) => {
+                let mut lists = Vec::with_capacity(command.clauses.len() * 2 + 1);
+                for clause in &command.clauses {
+                    lists.push(clause.condition.as_slice());
+                    lists.push(clause.body.as_slice());
+                }
+                if let Some(otherwise) = &command.else_clause {
+                    lists.push(&otherwise.body);
+                }
+                lists
+            }
+            Self::For(command) => vec![&command.body.body],
+            Self::While(command) | Self::Until(command) => vec![&command.condition, &command.body.body],
+            Self::Case(command) => command.clauses.iter().map(|clause| clause.body.as_slice()).collect(),
+        }
+    }
+}
+
+/// `( list )`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subshell {
+    /// The `(`.
+    pub open: Span,
+    /// The commands, never empty.
+    pub body: Vec<ListItem>,
+    /// The `)`.
+    pub close: Span,
+}
+
+/// `{ list; }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    /// The `{`.
+    pub open: Span,
+    /// The commands, never empty.
+    pub body: Vec<ListItem>,
+    /// The `}`.
+    pub close: Span,
+}
+
+/// `if … fi`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IfCommand {
+    /// The `if` clause, then each `elif` clause, in source order. Never empty.
+    pub clauses: Vec<IfClause>,
+    /// The `else` clause, if any.
+    pub else_clause: Option<ElseClause>,
+    /// The `fi`.
+    pub fi: Span,
+}
+
+/// An `if` or `elif` clause: a condition and the body it guards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IfClause {
+    /// The `if` or `elif`.
+    pub keyword: Span,
+    /// The condition's commands, never empty.
+    pub condition: Vec<ListItem>,
+    /// The `then`.
+    pub then: Span,
+    /// The commands run when the condition succeeds, never empty.
+    pub body: Vec<ListItem>,
+}
+
+/// The `else` clause of an `if`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElseClause {
+    /// The `else`.
+    pub keyword: Span,
+    /// The commands, never empty.
+    pub body: Vec<ListItem>,
+}
+
+/// `for name [in words]; do list; done`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForCommand {
+    /// The `for`.
+    pub keyword: Span,
+    /// The loop variable, as written (bash checks that it is a valid name only when the loop runs).
+    pub variable: CommandWord,
+    /// The `in` list. `None` when it is left out, so the loop runs over the positional parameters (`"$@"`).
+    pub items: Option<ForItems>,
+    /// The body.
+    pub body: LoopBody,
+}
+
+/// The `in words` part of a `for` loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForItems {
+    /// The `in`.
+    pub keyword: Span,
+    /// The words the loop runs over, possibly none (`for x in; do …`).
+    pub words: Vec<CommandWord>,
+}
+
+/// `while list; do list; done` or `until list; do list; done`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopCommand {
+    /// The `while` or `until`.
+    pub keyword: Span,
+    /// The condition's commands, never empty. Bash runs them at least once.
+    pub condition: Vec<ListItem>,
+    /// The body.
+    pub body: LoopBody,
+}
+
+/// The body of a loop: `do list; done`, or `{ list; }` (accepted by bash after a `for` header).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopBody {
+    /// The `do` or `{`.
+    pub open: Span,
+    /// The commands, never empty.
+    pub body: Vec<ListItem>,
+    /// The `done` or `}`.
+    pub close: Span,
+}
+
+/// `case word in … esac`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaseCommand {
+    /// The `case`.
+    pub keyword: Span,
+    /// The word matched against the patterns.
+    pub subject: CommandWord,
+    /// The `in`.
+    pub in_keyword: Span,
+    /// The arms, in source order, possibly none (`case x in esac`).
+    pub clauses: Vec<CaseClause>,
+    /// The `esac`.
+    pub esac: Span,
+}
+
+/// One arm of a `case`: `[(] pattern [| pattern]… ) list [;; | ;& | ;;&]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaseClause {
+    /// The optional `(` before the first pattern.
+    pub open: Option<Span>,
+    /// The patterns, never empty.
+    pub patterns: Vec<CommandWord>,
+    /// The `)` after the patterns.
+    pub close: Span,
+    /// The commands run when a pattern matches, possibly none.
+    pub body: Vec<ListItem>,
+    /// What ends the arm. `None` only for the last arm when `esac` follows its body directly.
+    pub terminator: Option<CaseTerminator>,
+}
+
+/// The operator that ends a [`CaseClause`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaseTerminator {
+    /// Which one.
+    pub kind: CaseTerminatorKind,
+    /// Where it is.
+    pub span: Span,
+}
+
+/// What a `case` arm does after its body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CaseTerminatorKind {
+    /// `;;`: leave the `case`.
+    Break,
+    /// `;&`: run the next arm's body too, without testing its patterns (bash 4; bash 3.2 rejects the line).
+    FallThrough,
+    /// `;;&`: go on testing the next arms' patterns (bash 4; bash 3.2 rejects the line).
+    Continue,
+}
+
+/// A function definition: `name () body` or `function name [()] body`.
+///
+/// Defining a function runs nothing; calling it runs the body. The body is walked as code wherever it is written
+/// ([`Script::simple_commands`]), and calls that certainly reach it are marked ([`SimpleCommand::function_call`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionDefinition {
+    /// The `function` reserved word, when that form is used.
+    pub keyword: Option<Span>,
+    /// The name, as written. Bash refuses a quoted name or one with `$` when the definition runs, and only a plain
+    /// identifier is ever matched to a call.
+    pub name: CommandWord,
+    /// The `()` (from `(` to `)`), required without `function`, optional with it.
+    pub parens: Option<Span>,
+    /// The body: a compound command, with the redirections applied on every call.
+    pub body: CompoundCommand,
+    /// From the `function` (or the name) to the end of the body.
+    pub span: Span,
+}
+
+/// A construct outside decision 6's exact list, kept whole so that it is never dropped (see
+/// [`Command::Unsupported`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedCommand {
+    /// What it is.
+    pub construct: UnsupportedConstruct,
+    /// All of it, redirections written after it included.
+    pub span: Span,
 }
 
 /// A simple command: assignments, then the command name and its arguments, with redirections anywhere among them.
@@ -191,8 +477,21 @@ pub struct SimpleCommand {
     pub words: Vec<CommandWord>,
     /// The redirections, in source order, wherever they were written (`>out cmd arg`, `cmd >out arg`).
     pub redirections: Vec<Redirect>,
+    /// Set when the command certainly calls a function defined earlier in the line, so its name is not a program to
+    /// resolve (KNSH-035): the function's body is what runs. `None` means the name may run a program, and the caller
+    /// resolves it as one; that is also the answer whenever the parser is not certain (FR-LC-09: a call is never
+    /// hidden behind a guess that it is a function).
+    pub function_call: Option<FunctionCall>,
     /// From the first part to the last.
     pub span: Span,
+}
+
+/// How a [`SimpleCommand`] that calls a function was resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionCall {
+    /// The spans of the [`FunctionDefinition`]s the call may run, in source order: the last one certainly run
+    /// before it, and any run conditionally after that one. Never empty.
+    pub definitions: Vec<Span>,
 }
 
 impl SimpleCommand {

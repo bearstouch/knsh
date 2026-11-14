@@ -12,8 +12,7 @@ everything else.
 | `frame_reader` | No panic; every delivered frame obeys the framing rules against an independent model of the open streams; every error is fatal and sticky; run with `-malloc_limit_mb=2`, so no allocation reaches 2 MiB (NFR-SEC-07) |
 | `toml_parser` | No panic; rejections name a line and column inside the input; accepted input is UTF-8, at most 32 levels deep, with every position inside the input, and round-trips through an independent TOML writer to an equal tree (KNSH-006) |
 | `bash_lex` | No panic; deterministic; accepted lines are tiled exactly by token spans, words by their segments and quoted bodies by their inner segments, all on character boundaries; operator tokens spell their operator; rejections point inside the input and unterminated constructs run to its end (KNSH-028) |
-
-The bash parser target (`bash_parse`) arrives with KNSH-029.
+| `bash_parse` | No panic; deterministic; fails exactly when the lexer fails, with the same error; on success every word and redirection token outside an unsupported construct is claimed exactly once by the tree, each part lies inside its command, simple commands come in source order, and every function call names earlier definitions (KNSH-029, KNSH-030) |
 
 ## Running
 

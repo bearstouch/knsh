@@ -1,32 +1,54 @@
-//! The parser: lexer tokens to a [`Script`] of lists, and-or lists, pipelines and simple commands (KNSH-029;
-//! FR-LC-02, decision 6).
+//! The parser: lexer tokens to a [`Script`] of lists, and-or lists, pipelines, simple commands (KNSH-029), compound
+//! commands and function definitions (KNSH-030; FR-LC-02, decision 6).
 //!
 //! The grammar read here is bash's, restricted to what decision 6 makes exact for phase 2 so far:
 //!
 //! ```text
-//! script    := newlines? (and_or (separator newlines? and_or)* separator?)? newlines?
+//! script    := list
+//! list      := newlines? (and_or (separator newlines? and_or)* separator?)? newlines?
+//!              (stops before a word or operator that closes an enclosing construct)
 //! separator := ';' | '&' | newline
 //! and_or    := pipeline (('&&' | '||') newlines? pipeline)*
 //! pipeline  := '!'? command (('|' | '|&') newlines? command)*
-//! command   := simple command: assignments, words and redirections
+//! command   := simple | compound redirection* | function
+//! compound  := '(' list ')' | '{' list '}'
+//!            | 'if' list 'then' list ('elif' list 'then' list)* ('else' list)? 'fi'
+//!            | 'for' word (';' | newlines ('in' word* (';' | newline))?)? newlines? body
+//!            | ('while' | 'until') list 'do' list 'done'
+//!            | 'case' word newlines? 'in' newlines? clause* 'esac'
+//!            | 'select' …  | '[[' … ']]'  | '((' … '))'  | 'for' '((' … '))' …   (kept whole, unsupported)
+//! body      := 'do' list 'done' | '{' list '}'
+//! clause    := '('? word ('|' word)* ')' list (';;' | ';&' | ';;&')? newlines?
+//! function  := word '(' ')' newlines? compound redirection*
+//!            | 'function' word ('(' ')')? newlines? compound redirection*
 //! ```
 //!
-//! Anything else that bash accepts (compound commands, function definitions, here-documents, array assignments) is
-//! refused with [`ParseError::Unsupported`] until a later story reads it exactly, and anything bash rejects is a
-//! syntax error. Either way the caller classifies the line as dynamic (KNSH-032): no error path leads to an allow.
+//! Lists inside compound commands must hold at least one command, except a `case` arm's. Reserved words are only
+//! recognised where a command starts (`echo fi` passes `fi` as an argument), which is also where a list stops at a
+//! closing word (`then`, `fi`, `done`, `}`, …). Bash 3.2 (`/bin/bash` on macOS) is the reference; constructs bash 4
+//! added (`;&`, `;;&`) are parsed the bash 4 way, as KNSH-029 did for `|&`.
 //!
-//! The parser is a loop over the token stream, not a recursion over it: lists, and-or lists and pipelines are read
-//! iteratively, so the length of a line never deepens the call stack. Nested lists (subshells, groups, substitutions)
-//! will enter [`Parser::list`] again; each entry passes its depth, which is checked against [`MAX_NESTING_DEPTH`].
+//! Anything else that bash accepts is either kept whole as a [`Command::Unsupported`] node, when its extent is
+//! certain (`select`, `[[ … ]]`, `(( … ))`, `for (( … ))`), or refused with [`ParseError::Unsupported`] (here-documents,
+//! array assignments, `coproc`, `time`), and anything bash rejects is a syntax error. Either way the caller classifies
+//! the construct or the line as dynamic (KNSH-032): no error path and no unsupported node leads to an allow.
+//!
+//! Lists, and-or lists and pipelines are read iteratively, so the length of a line never deepens the call stack. Each
+//! nested list (inside a compound command or function body) enters [`Parser::list`] again with its depth, which is
+//! checked against [`MAX_NESTING_DEPTH`]; scanning `[[ … ]]` and `(( … ))` is iterative.
+//!
+//! After parsing, [`mark_function_calls`] marks the calls that certainly reach a function defined earlier in the line.
 
-use std::iter::Peekable;
-use std::vec;
+use std::mem;
 
 use crate::ast::{
-    AndOr, AndOrOperator, AndOrPart, Assignment, Command, CommandWord, ListItem, PipeOperator, Pipeline, PipelinePart,
-    Redirect, Script, Separator, SeparatorKind, SimpleCommand,
+    AndOr, AndOrOperator, AndOrPart, Assignment, CaseClause, CaseCommand, CaseTerminator, CaseTerminatorKind, Command,
+    CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems, FunctionDefinition, Group, IfClause,
+    IfCommand, ListItem, LoopBody, LoopCommand, PipeOperator, Pipeline, PipelinePart, Redirect, Script, Separator,
+    SeparatorKind, SimpleCommand, Subshell, UnsupportedCommand,
 };
 use crate::error::{CompoundStart, ParseError, Unexpected, UnsupportedConstruct};
+use crate::functions::mark_function_calls;
 use crate::lex::lex;
 use crate::limits::MAX_NESTING_DEPTH;
 use crate::token::{Operator, Redirection, RedirectionOperator, ReservedWord, Span, Token, TokenKind, Word};
@@ -34,52 +56,147 @@ use crate::token::{Operator, Redirection, RedirectionOperator, ReservedWord, Spa
 /// Parses a whole command line into a [`Script`].
 ///
 /// Pure: no I/O and no global state, and the same input always gives the same result. Every simple command of the
-/// line is reachable from the result through [`Script::simple_commands`] (FR-LC-02, FR-LC-09).
+/// line, including those in compound commands and function bodies, is reachable from the result through
+/// [`Script::simple_commands`] (FR-LC-02, FR-LC-09), and every construct outside decision 6's exact list through a
+/// [`Command::Unsupported`] node.
 ///
 /// # Errors
 ///
 /// Returns the first problem found, with its span: a [`LexError`](crate::LexError) wrapped in
-/// [`ParseError::Lex`], a bash syntax error, or a construct this parser does not read yet. A caller must treat any
-/// error as dynamic code, never as an allow (decision 6, KNSH-032).
+/// [`ParseError::Lex`], a bash syntax error, or a construct this parser cannot delimit. A caller must treat any error
+/// as dynamic code, never as an allow (decision 6, KNSH-032).
 ///
 /// # Example
 ///
 /// ```
-/// let script = knsh_bash::parse("FOO=1 npm test | tee log && echo done").unwrap();
+/// let line = "f() { rm -rf build; }; FOO=1 npm test | tee log && f";
+/// let script = knsh_bash::parse(line).unwrap();
 /// let names: Vec<&str> = script
 ///     .simple_commands()
 ///     .filter_map(|command| command.name())
-///     .map(|name| &"FOO=1 npm test | tee log && echo done"[name.span.range()])
+///     .map(|name| &line[name.span.range()])
 ///     .collect();
-/// assert_eq!(names, ["npm", "tee", "echo"]);
+/// assert_eq!(names, ["rm", "npm", "tee", "f"]);
+/// // The last `f` calls the function defined first, whose body is what runs.
+/// let call = script.simple_commands().last().unwrap();
+/// assert!(call.function_call.is_some());
 /// ```
 pub fn parse(input: &str) -> Result<Script, ParseError> {
-    let mut tokens = lex(input)?;
-    // Blanks and comments separate words but never change the structure; newlines do, so they stay.
-    tokens.retain(|token| !matches!(token.kind, TokenKind::Blank | TokenKind::Comment));
+    let tokens = lex(input)?;
+    // Blanks and comments separate words but never change the structure; newlines do, so they stay. Comment spans
+    // are kept aside for the one place that must know about them (`(( … ))`).
+    let mut comments = Vec::new();
+    let tokens: Vec<Token> = tokens
+        .into_iter()
+        .filter(|token| match token.kind {
+            TokenKind::Blank => false,
+            TokenKind::Comment => {
+                comments.push(token.span);
+                false
+            }
+            TokenKind::Word(_) | TokenKind::Operator(_) | TokenKind::Redirection(_) | TokenKind::Newline => true,
+        })
+        .collect();
     let mut parser = Parser {
         input,
-        tokens: tokens.into_iter().peekable(),
+        tokens,
+        position: 0,
+        comments,
     };
     let items = parser.list(0)?;
-    // `list` stops only at the end of the input or on an error, so nothing can be left over here.
-    Ok(Script {
+    // The top-level list stops at the end of the input or before a token that only closes a construct (`)`, `;;`,
+    // `fi`, `}`, …), which has nothing to close here.
+    if let Some(token) = parser.peek() {
+        return Err(ParseError::UnexpectedToken {
+            token: unexpected(&token.kind),
+            span: token.span,
+        });
+    }
+    let mut script = Script {
         items,
         span: Span::new(0, input.len()),
-    })
+    };
+    mark_function_calls(&mut script, input);
+    Ok(script)
 }
 
-/// The parser state: the remaining significant tokens.
+/// The parser state: the significant tokens and how far they are read.
 struct Parser<'a> {
     /// The line, needed to read assignment names out of word spans.
     input: &'a str,
-    /// Tokens with blanks and comments removed.
-    tokens: Peekable<vec::IntoIter<Token>>,
+    /// Tokens with blanks and comments removed. A consumed token is left behind as a blank placeholder, so taking it
+    /// never clones its word; the parser never looks behind `position`.
+    tokens: Vec<Token>,
+    /// Index of the next token to read.
+    position: usize,
+    /// Where the comments were, in source order.
+    comments: Vec<Span>,
+}
+
+/// The constructs that start with a word or operator in command position, other than simple commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompoundStartToken {
+    /// `(`: a subshell, or `((` an arithmetic command.
+    Paren,
+    /// `{`
+    Group,
+    /// `if`
+    If,
+    /// `for`
+    For,
+    /// `select`
+    Select,
+    /// `while`
+    While,
+    /// `until`
+    Until,
+    /// `case`
+    Case,
+    /// `[[`
+    Conditional,
+}
+
+/// A compound command as read: exact, or kept whole as unsupported.
+enum Compound {
+    /// Read exactly.
+    Exact(CompoundCommand),
+    /// Outside decision 6's exact list.
+    Unsupported(UnsupportedCommand),
+}
+
+impl Compound {
+    const fn span(&self) -> Span {
+        match self {
+            Self::Exact(compound) => compound.span,
+            Self::Unsupported(unsupported) => unsupported.span,
+        }
+    }
+
+    fn into_command(self) -> Command {
+        match self {
+            Self::Exact(compound) => Command::Compound(compound),
+            Self::Unsupported(unsupported) => Command::Unsupported(unsupported),
+        }
+    }
+}
+
+/// The core of a compound command, before its redirections: what was read, and where its closing token ends.
+enum CompoundCore {
+    /// An exact compound command.
+    Exact(CompoundKind, Span),
+    /// An unsupported construct.
+    Unsupported(UnsupportedConstruct, Span),
 }
 
 impl Parser<'_> {
-    /// Reads a list up to the end of the input. `depth` is how many lists enclose this one; it bounds the recursion
-    /// that nested lists will add (KNSH-030, KNSH-031).
+    // ---- Lists ----
+
+    /// Reads a list: and-or lists separated by `;`, `&` or newlines. It ends at the end of the input or before a
+    /// token that closes an enclosing construct (`)`, `;;`, `;&`, `;;&`, or `then`, `elif`, `else`, `fi`, `do`,
+    /// `done`, `esac`, `}` where a command would start), which the caller checks. The list may be empty.
+    ///
+    /// `depth` is how many lists enclose this one; past [`MAX_NESTING_DEPTH`] the line is refused, which bounds the
+    /// recursion of compound commands (CLAUDE.md "Untrusted input").
     fn list(&mut self, depth: usize) -> Result<Vec<ListItem>, ParseError> {
         if depth > MAX_NESTING_DEPTH {
             return Err(ParseError::NestingTooDeep {
@@ -88,32 +205,36 @@ impl Parser<'_> {
             });
         }
         let mut items = Vec::new();
-        self.skip_newlines();
-        while self.tokens.peek().is_some() {
-            let and_or = self.and_or()?;
+        loop {
+            self.skip_newlines();
+            match self.peek() {
+                None => break,
+                Some(token) if closes_list(&token.kind) => break,
+                Some(_) => {}
+            }
+            let and_or = self.and_or(depth)?;
             let separator = self.separator()?;
+            let ended = separator.is_none();
             items.push(ListItem { and_or, separator });
-            if separator.is_none() {
-                // `separator` returns `None` only at the end of the input.
+            if ended {
                 break;
             }
-            self.skip_newlines();
         }
         Ok(items)
     }
 
-    /// Reads the separator after an and-or list: `;`, `&`, a newline, or nothing at the end of the input. Any other
-    /// token there is a syntax error (`a ;; b`, `a )`).
+    /// Reads the separator after an and-or list: `;`, `&` or a newline. `None` at the end of the input or before a
+    /// token that closes an enclosing construct, which ends the list. Any other token is a syntax error: a word after
+    /// a compound command (`{ a; } b`), or an operator that cannot follow a command (`(a) (b)`).
     fn separator(&mut self) -> Result<Option<Separator>, ParseError> {
-        let Some(token) = self.tokens.peek() else {
+        let Some(token) = self.peek() else {
             return Ok(None);
         };
         let kind = match token.kind {
             TokenKind::Operator(Operator::Semicolon) => SeparatorKind::Semicolon,
             TokenKind::Operator(Operator::Background) => SeparatorKind::Background,
             TokenKind::Newline => SeparatorKind::Newline,
-            // `and_or` stops only before an operator or a newline (words and redirections all belong to commands), so
-            // this is an operator that cannot end a list here: `;;`, `)`, `(` after a complete command.
+            _ if closes_list(&token.kind) => return Ok(None),
             TokenKind::Operator(_)
             | TokenKind::Word(_)
             | TokenKind::Redirection(_)
@@ -126,17 +247,27 @@ impl Parser<'_> {
             }
         };
         let span = token.span;
-        self.tokens.next();
+        self.advance();
         Ok(Some(Separator { kind, span }))
     }
 
+    /// Reads a list that must hold at least one command, as bash requires inside every compound command except a
+    /// `case` arm. `opener` is the construct's opening token, reported if the line ends first.
+    fn compound_list(&mut self, depth: usize, opener: Span) -> Result<Vec<ListItem>, ParseError> {
+        let items = self.list(depth + 1)?;
+        if items.is_empty() {
+            return Err(self.unexpected_or_unclosed(opener));
+        }
+        Ok(items)
+    }
+
     /// Reads pipelines joined by `&&` and `||`. A newline may follow either operator, as in bash.
-    fn and_or(&mut self) -> Result<AndOr, ParseError> {
-        let first = self.pipeline(None)?;
+    fn and_or(&mut self, depth: usize) -> Result<AndOr, ParseError> {
+        let first = self.pipeline(None, depth)?;
         let mut rest = Vec::new();
         while let Some((operator, operator_span)) = self.next_if_map(and_or_operator) {
             self.skip_newlines();
-            let pipeline = self.pipeline(Some(operator_span))?;
+            let pipeline = self.pipeline(Some(operator_span), depth)?;
             rest.push(AndOrPart {
                 operator,
                 operator_span,
@@ -150,15 +281,14 @@ impl Parser<'_> {
 
     /// Reads an optionally negated pipeline. `after` is the operator before it, if any, for the error when the line
     /// ends there.
-    fn pipeline(&mut self, after: Option<Span>) -> Result<Pipeline, ParseError> {
+    fn pipeline(&mut self, after: Option<Span>, depth: usize) -> Result<Pipeline, ParseError> {
         let negation = self
-            .tokens
-            .next_if(|token| is_reserved(&token.kind, ReservedWord::Bang))
+            .next_if(|kind| is_reserved(kind, ReservedWord::Bang))
             .map(|token| token.span);
         // Bash 3.2 rejects `!` followed by a newline (and `! ! a`, see `command`); so does this parser, rather than
         // guess.
         if negation.is_some()
-            && let Some(token) = self.tokens.peek()
+            && let Some(token) = self.peek()
             && matches!(token.kind, TokenKind::Newline)
         {
             return Err(ParseError::UnexpectedToken {
@@ -166,11 +296,11 @@ impl Parser<'_> {
                 span: token.span,
             });
         }
-        let first = self.command(negation.or(after))?;
+        let first = self.command(negation.or(after), depth)?;
         let mut rest = Vec::new();
         while let Some((operator, operator_span)) = self.next_if_map(pipe_operator) {
             self.skip_newlines();
-            let command = self.command(Some(operator_span))?;
+            let command = self.command(Some(operator_span), depth)?;
             rest.push(PipelinePart {
                 operator,
                 operator_span,
@@ -187,30 +317,38 @@ impl Parser<'_> {
         })
     }
 
+    // ---- Commands ----
+
     /// Reads one command. `after` is the operator before it, reported if the line ends instead.
     ///
     /// Bash recognises reserved words only as the first token of a command (`A=1 if` runs a program named `if`), so
-    /// that is the only place they are checked.
-    fn command(&mut self, after: Option<Span>) -> Result<Command, ParseError> {
-        let Some(token) = self.tokens.peek() else {
+    /// this is the only place they start compound commands. A word followed by `()` starts a function definition.
+    fn command(&mut self, after: Option<Span>, depth: usize) -> Result<Command, ParseError> {
+        let Some(token) = self.peek() else {
             return Err(ParseError::MissingCommand {
                 span: after.unwrap_or(self.end_span()),
             });
         };
         let span = token.span;
+        if let Some(start) = compound_start(&token.kind) {
+            return Ok(self.compound_command(start, depth)?.into_command());
+        }
         match &token.kind {
-            TokenKind::Word(word) => {
-                if let Some(reserved) = word.reserved {
-                    reserved_word_in_command_position(reserved, span)?;
+            TokenKind::Word(Word {
+                reserved: Some(reserved),
+                ..
+            }) => {
+                if *reserved == ReservedWord::Function {
+                    return self.function_definition(depth);
+                }
+                return Err(misplaced_reserved_word(*reserved, span));
+            }
+            TokenKind::Word(_) => {
+                if self.function_name_ahead() {
+                    return self.function_definition(depth);
                 }
             }
             TokenKind::Redirection(_) => {}
-            TokenKind::Operator(Operator::LeftParen) => {
-                return Err(ParseError::Unsupported {
-                    construct: UnsupportedConstruct::Compound(CompoundStart::Subshell),
-                    span,
-                });
-            }
             TokenKind::Operator(operator) => {
                 return Err(ParseError::UnexpectedToken {
                     token: Unexpected::Operator(*operator),
@@ -242,7 +380,7 @@ impl Parser<'_> {
         // Where the last word read ends, if it is spelled `{…}`: bash 4.1 and later read `{name}>file` as a
         // redirection that stores a new descriptor in `name` (in any position), not as a word.
         let mut braced_word_end = None;
-        while let Some(token) = self.tokens.next_if(|token| continues_simple_command(&token.kind)) {
+        while let Some(token) = self.next_if(continues_simple_command) {
             match token.kind {
                 TokenKind::Word(word) => {
                     let word = CommandWord { word, span: token.span };
@@ -273,18 +411,7 @@ impl Parser<'_> {
                     redirections.push(redirect);
                 }
                 TokenKind::Operator(Operator::LeftParen) => {
-                    // Every outcome is an error, so the `(` is consumed to see whether `)` follows it.
-                    let empty_parens = matches!(
-                        self.tokens.peek().map(|token| &token.kind),
-                        Some(TokenKind::Operator(Operator::RightParen))
-                    );
-                    return Err(self.left_paren_in_command(
-                        &assignments,
-                        &words,
-                        &redirections,
-                        token.span,
-                        empty_parens,
-                    ));
+                    return Err(self.left_paren_in_command(&words, token.span));
                 }
                 // `continues_simple_command` lets none of these through.
                 TokenKind::Operator(_) | TokenKind::Newline | TokenKind::Blank | TokenKind::Comment => break,
@@ -294,6 +421,7 @@ impl Parser<'_> {
             assignments,
             words,
             redirections,
+            function_call: None,
             span: Span::new(start, end),
         })
     }
@@ -320,7 +448,7 @@ impl Parser<'_> {
             | RedirectionOperator::AppendAll => {}
         }
         // The target must be the very next token: a newline or an operator there is a syntax error in bash.
-        let target = match self.tokens.next_if(|token| matches!(token.kind, TokenKind::Word(_))) {
+        let target = match self.next_if(|kind| matches!(kind, TokenKind::Word(_))) {
             Some(Token {
                 kind: TokenKind::Word(word),
                 span,
@@ -334,6 +462,461 @@ impl Parser<'_> {
             target,
         })
     }
+
+    /// Reads the redirections written after a compound command; bash allows nothing else before the next operator.
+    fn trailing_redirections(&mut self) -> Result<Vec<Redirect>, ParseError> {
+        let mut redirections = Vec::new();
+        while let Some((redirection, span)) = self.next_if_map(|kind| match kind {
+            TokenKind::Redirection(redirection) => Some(*redirection),
+            TokenKind::Word(_)
+            | TokenKind::Operator(_)
+            | TokenKind::Newline
+            | TokenKind::Blank
+            | TokenKind::Comment => None,
+        }) {
+            redirections.push(self.redirect(redirection, span)?);
+        }
+        Ok(redirections)
+    }
+
+    // ---- Compound commands ----
+
+    /// Reads the compound command starting at the next token (which `start` classifies) and the redirections after
+    /// it.
+    fn compound_command(&mut self, start: CompoundStartToken, depth: usize) -> Result<Compound, ParseError> {
+        let opener = self.peek_span().unwrap_or(self.end_span());
+        let core = match start {
+            CompoundStartToken::Paren => self.subshell(depth)?,
+            CompoundStartToken::Group => self.group(depth)?,
+            CompoundStartToken::If => self.if_command(depth)?,
+            CompoundStartToken::For => self.for_command(depth)?,
+            CompoundStartToken::Select => self.select_command(depth)?,
+            CompoundStartToken::While => self.loop_command(depth, CompoundKind::While)?,
+            CompoundStartToken::Until => self.loop_command(depth, CompoundKind::Until)?,
+            CompoundStartToken::Case => self.case_command(depth)?,
+            CompoundStartToken::Conditional => self.conditional()?,
+        };
+        let redirections = self.trailing_redirections()?;
+        let (CompoundCore::Exact(_, close) | CompoundCore::Unsupported(_, close)) = core;
+        let end = redirections.last().map_or(close.end, |redirect| redirect.span.end);
+        let span = Span::new(opener.start, end);
+        Ok(match core {
+            CompoundCore::Exact(kind, _) => Compound::Exact(CompoundCommand {
+                kind,
+                redirections,
+                span,
+            }),
+            // The redirections of an unsupported construct stay inside its opaque span.
+            CompoundCore::Unsupported(construct, _) => Compound::Unsupported(UnsupportedCommand { construct, span }),
+        })
+    }
+
+    /// `( list )`, or `(( … ))` when bash would read an arithmetic command there.
+    fn subshell(&mut self, depth: usize) -> Result<CompoundCore, ParseError> {
+        let open = self.advance_span();
+        if let Some(close) = self.arithmetic_close(open)? {
+            return Ok(CompoundCore::Unsupported(
+                UnsupportedConstruct::Compound(CompoundStart::Arithmetic),
+                close,
+            ));
+        }
+        let body = self.compound_list(depth, open)?;
+        let close = self.expect_operator(Operator::RightParen, open)?;
+        Ok(CompoundCore::Exact(
+            CompoundKind::Subshell(Subshell { open, body, close }),
+            close,
+        ))
+    }
+
+    /// After a `(` at `open`, decides whether it starts an arithmetic command `(( … ))` the way bash 3.2 does: the
+    /// next token must be a `(` touching it, and the `)` that matches that second `(` must be touched by another `)`.
+    /// Then the tokens up to that second `)` are consumed and its span is returned. Otherwise nothing is consumed and
+    /// bash reads nested subshells (`((a); (b))`), so `None` is returned.
+    ///
+    /// The scan counts paren tokens. Bash counts characters instead, and treats `#` as text inside `(( … ))`, where the
+    /// lexer starts a comment, so a comment in the scanned part could make the two close it at different places: such
+    /// a line is refused. Bash reports an unclosed `((` as an error, and so does this parser.
+    fn arithmetic_close(&mut self, open: Span) -> Result<Option<Span>, ParseError> {
+        match self.peek() {
+            Some(token) if is_operator(&token.kind, Operator::LeftParen) && token.span.start == open.end => {}
+            Some(_) | None => return Ok(None),
+        }
+        // Inside the second `(`; find the `)` that matches it.
+        let mut nesting = 1_usize;
+        let mut index = self.position + 1;
+        let close = loop {
+            let Some(token) = self.tokens.get(index) else {
+                return Err(ParseError::Unclosed { span: open });
+            };
+            match token.kind {
+                TokenKind::Operator(Operator::LeftParen) => nesting += 1,
+                TokenKind::Operator(Operator::RightParen) => {
+                    nesting -= 1;
+                    if nesting == 0 {
+                        break token.span;
+                    }
+                }
+                TokenKind::Word(_)
+                | TokenKind::Operator(_)
+                | TokenKind::Redirection(_)
+                | TokenKind::Newline
+                | TokenKind::Blank
+                | TokenKind::Comment => {}
+            }
+            index += 1;
+        };
+        if self.comment_within(Span::new(open.start, close.end)) {
+            return Err(ParseError::Unsupported {
+                construct: UnsupportedConstruct::Compound(CompoundStart::Arithmetic),
+                span: open,
+            });
+        }
+        match self.tokens.get(index + 1) {
+            Some(next) if is_operator(&next.kind, Operator::RightParen) && next.span.start == close.end => {
+                self.position = index + 2;
+                Ok(Some(next.span))
+            }
+            Some(_) | None => Ok(None),
+        }
+    }
+
+    /// `{ list }`.
+    fn group(&mut self, depth: usize) -> Result<CompoundCore, ParseError> {
+        let open = self.advance_span();
+        let body = self.compound_list(depth, open)?;
+        let close = self.expect_reserved(ReservedWord::RightBrace, open)?;
+        Ok(CompoundCore::Exact(
+            CompoundKind::Group(Group { open, body, close }),
+            close,
+        ))
+    }
+
+    /// `if list then list [elif list then list]… [else list] fi`.
+    fn if_command(&mut self, depth: usize) -> Result<CompoundCore, ParseError> {
+        let start = self.advance_span();
+        let mut keyword = start;
+        let mut clauses = Vec::new();
+        loop {
+            let condition = self.compound_list(depth, start)?;
+            let then = self.expect_reserved(ReservedWord::Then, start)?;
+            let body = self.compound_list(depth, start)?;
+            clauses.push(IfClause {
+                keyword,
+                condition,
+                then,
+                body,
+            });
+            match self.next_reserved(ReservedWord::Elif) {
+                Some(elif) => keyword = elif,
+                None => break,
+            }
+        }
+        let else_clause = match self.next_reserved(ReservedWord::Else) {
+            Some(otherwise) => Some(ElseClause {
+                keyword: otherwise,
+                body: self.compound_list(depth, start)?,
+            }),
+            None => None,
+        };
+        let fi = self.expect_reserved(ReservedWord::Fi, start)?;
+        Ok(CompoundCore::Exact(
+            CompoundKind::If(IfCommand {
+                clauses,
+                else_clause,
+                fi,
+            }),
+            fi,
+        ))
+    }
+
+    /// `for name [in words]; do list; done`, or `for (( … ))` kept whole as unsupported.
+    fn for_command(&mut self, depth: usize) -> Result<CompoundCore, ParseError> {
+        let keyword = self.advance_span();
+        if let Some(token) = self.peek()
+            && is_operator(&token.kind, Operator::LeftParen)
+        {
+            let open = self.advance_span();
+            // Bash accepts only `((` here; a lone `(` or nested parens are syntax errors.
+            if self.arithmetic_close(open)?.is_none() {
+                return Err(ParseError::UnexpectedToken {
+                    token: Unexpected::Operator(Operator::LeftParen),
+                    span: open,
+                });
+            }
+            self.next_if(|kind| is_operator(kind, Operator::Semicolon));
+            self.skip_newlines();
+            let body = self.loop_body(depth, keyword, true)?;
+            return Ok(CompoundCore::Unsupported(
+                UnsupportedConstruct::Compound(CompoundStart::ArithmeticFor),
+                body.close,
+            ));
+        }
+        let (variable, items, body) = self.for_header_and_body(depth, keyword)?;
+        let close = body.close;
+        Ok(CompoundCore::Exact(
+            CompoundKind::For(ForCommand {
+                keyword,
+                variable,
+                items,
+                body,
+            }),
+            close,
+        ))
+    }
+
+    /// `select name [in words]; do list; done`: read like `for` to find its end, then kept whole as unsupported
+    /// (decision 6 does not list it).
+    fn select_command(&mut self, depth: usize) -> Result<CompoundCore, ParseError> {
+        let keyword = self.advance_span();
+        let (_, _, body) = self.for_header_and_body(depth, keyword)?;
+        Ok(CompoundCore::Unsupported(
+            UnsupportedConstruct::Compound(CompoundStart::ReservedWord(ReservedWord::Select)),
+            body.close,
+        ))
+    }
+
+    /// The part of `for` and `select` after the reserved word at `keyword`: the variable, the optional `in` list and
+    /// the body. As in bash 3.2: `for x; do`, `for x do`, `for x in; do`, a newline before `in`, and `{ … }` instead of
+    /// `do … done` are all accepted; `in` is not recognised after a `;`, and the words after `in` are never reserved.
+    fn for_header_and_body(
+        &mut self,
+        depth: usize,
+        keyword: Span,
+    ) -> Result<(CommandWord, Option<ForItems>, LoopBody), ParseError> {
+        let variable = self.expect_word(keyword)?;
+        let items = if self.next_if(|kind| is_operator(kind, Operator::Semicolon)).is_some() {
+            None
+        } else {
+            self.skip_newlines();
+            self.next_reserved(ReservedWord::In)
+                .map(|in_keyword| self.for_items(in_keyword, keyword))
+                .transpose()?
+        };
+        self.skip_newlines();
+        let body = self.loop_body(depth, keyword, true)?;
+        Ok((variable, items, body))
+    }
+
+    /// The words after `in`, up to the `;` or newline that ends them.
+    fn for_items(&mut self, in_keyword: Span, start: Span) -> Result<ForItems, ParseError> {
+        let mut words = Vec::new();
+        loop {
+            let Some(token) = self.advance() else {
+                return Err(ParseError::Unclosed { span: start });
+            };
+            match token.kind {
+                TokenKind::Word(word) => words.push(CommandWord { word, span: token.span }),
+                TokenKind::Operator(Operator::Semicolon) | TokenKind::Newline => break,
+                TokenKind::Operator(_) | TokenKind::Redirection(_) | TokenKind::Blank | TokenKind::Comment => {
+                    return Err(ParseError::UnexpectedToken {
+                        token: unexpected(&token.kind),
+                        span: token.span,
+                    });
+                }
+            }
+        }
+        Ok(ForItems {
+            keyword: in_keyword,
+            words,
+        })
+    }
+
+    /// `while list do list done` or `until list do list done`; `kind` wraps the loop as one or the other.
+    fn loop_command(
+        &mut self,
+        depth: usize,
+        kind: fn(LoopCommand) -> CompoundKind,
+    ) -> Result<CompoundCore, ParseError> {
+        let keyword = self.advance_span();
+        let condition = self.compound_list(depth, keyword)?;
+        let body = self.loop_body(depth, keyword, false)?;
+        let close = body.close;
+        let command = LoopCommand {
+            keyword,
+            condition,
+            body,
+        };
+        Ok(CompoundCore::Exact(kind(command), close))
+    }
+
+    /// `do list done`, or `{ list }` when `braces` allows it (after a `for` or `select` header, as in bash).
+    fn loop_body(&mut self, depth: usize, start: Span, braces: bool) -> Result<LoopBody, ParseError> {
+        let (open, closing) = if let Some(open) = self.next_reserved(ReservedWord::Do) {
+            (open, ReservedWord::Done)
+        } else if let Some(open) = braces.then(|| self.next_reserved(ReservedWord::LeftBrace)).flatten() {
+            (open, ReservedWord::RightBrace)
+        } else {
+            return Err(self.unexpected_or_unclosed(start));
+        };
+        let body = self.compound_list(depth, start)?;
+        let close = self.expect_reserved(closing, start)?;
+        Ok(LoopBody { open, body, close })
+    }
+
+    /// `case word in [clause]… esac`.
+    fn case_command(&mut self, depth: usize) -> Result<CompoundCore, ParseError> {
+        let keyword = self.advance_span();
+        let subject = self.expect_word(keyword)?;
+        self.skip_newlines();
+        let in_keyword = self.expect_reserved(ReservedWord::In, keyword)?;
+        let mut clauses = Vec::new();
+        let esac = loop {
+            self.skip_newlines();
+            // `esac` ends the command where a pattern would start, unless a `(` opens the pattern list (`(esac)`).
+            if let Some(esac) = self.next_reserved(ReservedWord::Esac) {
+                break esac;
+            }
+            let clause = self.case_clause(depth, keyword)?;
+            let ended = clause.terminator.is_none();
+            clauses.push(clause);
+            if ended {
+                // Without a terminator, only `esac` may follow the arm's body.
+                break self.expect_reserved(ReservedWord::Esac, keyword)?;
+            }
+        };
+        Ok(CompoundCore::Exact(
+            CompoundKind::Case(CaseCommand {
+                keyword,
+                subject,
+                in_keyword,
+                clauses,
+                esac,
+            }),
+            esac,
+        ))
+    }
+
+    /// One `case` arm: `[(] pattern [| pattern]… ) list [;; | ;& | ;;&]`.
+    fn case_clause(&mut self, depth: usize, start: Span) -> Result<CaseClause, ParseError> {
+        let open = self
+            .next_if(|kind| is_operator(kind, Operator::LeftParen))
+            .map(|token| token.span);
+        let mut patterns = vec![self.expect_word(start)?];
+        while self.next_if(|kind| is_operator(kind, Operator::Pipe)).is_some() {
+            patterns.push(self.expect_word(start)?);
+        }
+        let close = self.expect_operator(Operator::RightParen, start)?;
+        // An arm's body may be empty (`a) ;;`).
+        let body = self.list(depth + 1)?;
+        let terminator = self
+            .next_if_map(|kind| match kind {
+                TokenKind::Operator(Operator::DoubleSemicolon) => Some(CaseTerminatorKind::Break),
+                TokenKind::Operator(Operator::SemicolonAmpersand) => Some(CaseTerminatorKind::FallThrough),
+                TokenKind::Operator(Operator::DoubleSemicolonAmpersand) => Some(CaseTerminatorKind::Continue),
+                TokenKind::Word(_)
+                | TokenKind::Operator(_)
+                | TokenKind::Redirection(_)
+                | TokenKind::Newline
+                | TokenKind::Blank
+                | TokenKind::Comment => None,
+            })
+            .map(|(kind, span)| CaseTerminator { kind, span });
+        Ok(CaseClause {
+            open,
+            patterns,
+            close,
+            body,
+            terminator,
+        })
+    }
+
+    /// `[[ … ]]`, kept whole as unsupported: everything up to the first `]]` word. Bash 3.2 ends the expression at
+    /// that word too and rejects a newline inside it; so does this parser rather than guess.
+    fn conditional(&mut self) -> Result<CompoundCore, ParseError> {
+        let open = self.advance_span();
+        let close = loop {
+            let Some(token) = self.advance() else {
+                return Err(ParseError::Unclosed { span: open });
+            };
+            match token.kind {
+                TokenKind::Word(Word {
+                    reserved: Some(ReservedWord::DoubleRightBracket),
+                    ..
+                }) => break token.span,
+                TokenKind::Newline => {
+                    return Err(ParseError::UnexpectedToken {
+                        token: Unexpected::Newline,
+                        span: token.span,
+                    });
+                }
+                TokenKind::Word(_)
+                | TokenKind::Operator(_)
+                | TokenKind::Redirection(_)
+                | TokenKind::Blank
+                | TokenKind::Comment => {}
+            }
+        };
+        Ok(CompoundCore::Unsupported(
+            UnsupportedConstruct::Compound(CompoundStart::ReservedWord(ReservedWord::DoubleLeftBracket)),
+            close,
+        ))
+    }
+
+    // ---- Function definitions ----
+
+    /// Whether the next tokens are `name ( )`, the start of a function definition without `function`. The name must
+    /// not be shaped like an assignment: bash rejects `a=b() …`.
+    fn function_name_ahead(&self) -> bool {
+        let (Some(name), Some(open), Some(close)) = (
+            self.tokens.get(self.position),
+            self.tokens.get(self.position + 1),
+            self.tokens.get(self.position + 2),
+        ) else {
+            return false;
+        };
+        let TokenKind::Word(word) = &name.kind else {
+            return false;
+        };
+        is_operator(&open.kind, Operator::LeftParen)
+            && is_operator(&close.kind, Operator::RightParen)
+            && matches!(self.assignment_shape(word, name.span), Ok(None))
+    }
+
+    /// `name () body` or `function name [()] body`, where the body is a compound command and its redirections. As in
+    /// bash 3.2, newlines may come before the body but not between `function name` and its `()`, and with `function`
+    /// a `(` must be followed by `)` (`function f ( a )` is a syntax error).
+    ///
+    /// A body outside decision 6's exact list makes the whole definition a [`Command::Unsupported`] node, so its name
+    /// never counts as defined and calls to it resolve as programs.
+    fn function_definition(&mut self, depth: usize) -> Result<Command, ParseError> {
+        let keyword = self
+            .next_if(|kind| is_reserved(kind, ReservedWord::Function))
+            .map(|token| token.span);
+        let start = keyword.unwrap_or(self.peek_span().unwrap_or(self.end_span()));
+        let name = self.expect_word(start)?;
+        let parens = if keyword.is_none()
+            || self
+                .peek()
+                .is_some_and(|token| is_operator(&token.kind, Operator::LeftParen))
+        {
+            let open = self.expect_operator(Operator::LeftParen, start)?;
+            let close = self.expect_operator(Operator::RightParen, start)?;
+            Some(Span::new(open.start, close.end))
+        } else {
+            None
+        };
+        self.skip_newlines();
+        let Some(body_start) = self.peek().and_then(|token| compound_start(&token.kind)) else {
+            return Err(self.unexpected_or_unclosed(start));
+        };
+        let body = self.compound_command(body_start, depth)?;
+        let span = Span::new(start.start, body.span().end);
+        Ok(match body {
+            Compound::Exact(body) => Command::FunctionDefinition(FunctionDefinition {
+                keyword,
+                name,
+                parens,
+                body,
+                span,
+            }),
+            Compound::Unsupported(body) => Command::Unsupported(UnsupportedCommand {
+                construct: body.construct,
+                span,
+            }),
+        })
+    }
+
+    // ---- Words and assignments ----
 
     /// Reads `word` as an assignment if it is one: an unquoted name, then an unquoted `=` or `+=`, as bash requires.
     /// `"A"=1` and `A\=1` are words. `name[…]=…` (an array element) is refused rather than taken for a command name.
@@ -422,9 +1005,9 @@ impl Parser<'_> {
 
     /// Refuses `name=(…)`: bash reads the parenthesised list as an array value, which this parser does not read yet.
     /// The `(` must touch the assignment; `name= (…)` is a different error, found by `left_paren_in_command`.
-    fn reject_array_value(&mut self, assignment: &Assignment) -> Result<(), ParseError> {
-        if let Some(token) = self.tokens.peek()
-            && matches!(token.kind, TokenKind::Operator(Operator::LeftParen))
+    fn reject_array_value(&self, assignment: &Assignment) -> Result<(), ParseError> {
+        if let Some(token) = self.peek()
+            && is_operator(&token.kind, Operator::LeftParen)
             && token.span.start == assignment.span.end
         {
             return Err(ParseError::Unsupported {
@@ -435,27 +1018,10 @@ impl Parser<'_> {
         Ok(())
     }
 
-    /// The error for a `(` inside a simple command. After a lone name and followed by `)` it starts a function
-    /// definition (`f() …`); glued to an assignment-shaped argument it is an array value (`declare -a x=(1)`);
-    /// elsewhere bash reports a syntax error (`echo (a)`).
-    fn left_paren_in_command(
-        &self,
-        assignments: &[Assignment],
-        words: &[CommandWord],
-        redirections: &[Redirect],
-        span: Span,
-        empty_parens: bool,
-    ) -> ParseError {
-        if empty_parens
-            && assignments.is_empty()
-            && redirections.is_empty()
-            && let [name] = words
-        {
-            return ParseError::Unsupported {
-                construct: UnsupportedConstruct::FunctionDefinition,
-                span: name.span,
-            };
-        }
+    /// The error for a `(` inside a simple command (a lone `name ()` was already read as a function definition by
+    /// `command`). Glued to an assignment-shaped argument it is an array value (`declare -a x=(1)`); elsewhere bash
+    /// reports a syntax error (`echo (a)`, `A=1 f()`).
+    fn left_paren_in_command(&self, words: &[CommandWord], span: Span) -> ParseError {
         if let Some(last) = words.last()
             && last.span.end == span.start
             && last.span.text(self.input).is_some_and(|text| text.ends_with('='))
@@ -471,23 +1037,100 @@ impl Parser<'_> {
         }
     }
 
+    // ---- Token access ----
+
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.position)
+    }
+
+    fn peek_span(&self) -> Option<Span> {
+        self.peek().map(|token| token.span)
+    }
+
+    /// Takes the next token, leaving a placeholder behind.
+    fn advance(&mut self) -> Option<Token> {
+        let slot = self.tokens.get_mut(self.position)?;
+        self.position += 1;
+        let placeholder = Token {
+            kind: TokenKind::Blank,
+            span: slot.span,
+        };
+        Some(mem::replace(slot, placeholder))
+    }
+
+    /// Takes the next token, which the caller has already looked at, and returns its span.
+    fn advance_span(&mut self) -> Span {
+        self.advance().map_or(self.end_span(), |token| token.span)
+    }
+
+    /// Takes the next token if `accept` says so.
+    fn next_if(&mut self, accept: impl FnOnce(&TokenKind) -> bool) -> Option<Token> {
+        if accept(&self.peek()?.kind) {
+            self.advance()
+        } else {
+            None
+        }
+    }
+
     /// Consumes the next token if `classify` recognises it, returning what it recognised and where the token was.
     fn next_if_map<T>(&mut self, classify: impl FnOnce(&TokenKind) -> Option<T>) -> Option<(T, Span)> {
-        let found = classify(&self.tokens.peek()?.kind)?;
-        let token = self.tokens.next()?;
+        let found = classify(&self.peek()?.kind)?;
+        let token = self.advance()?;
         Some((found, token.span))
     }
 
-    fn peek_span(&mut self) -> Option<Span> {
-        self.tokens.peek().map(|token| token.span)
+    /// Takes the next token if it is the reserved word `reserved`, returning its span.
+    fn next_reserved(&mut self, reserved: ReservedWord) -> Option<Span> {
+        self.next_if(|kind| is_reserved(kind, reserved)).map(|token| token.span)
+    }
+
+    /// Takes the reserved word `reserved`, which must come next. `start` is the construct's opening token, reported
+    /// if the line ends first.
+    fn expect_reserved(&mut self, reserved: ReservedWord, start: Span) -> Result<Span, ParseError> {
+        self.next_reserved(reserved)
+            .ok_or_else(|| self.unexpected_or_unclosed(start))
+    }
+
+    /// Takes the operator `operator`, which must come next.
+    fn expect_operator(&mut self, operator: Operator, start: Span) -> Result<Span, ParseError> {
+        self.next_if(|kind| is_operator(kind, operator))
+            .map(|token| token.span)
+            .ok_or_else(|| self.unexpected_or_unclosed(start))
+    }
+
+    /// Takes a word, which must come next. Reserved-word spellings are plain words here (`for do in …`).
+    fn expect_word(&mut self, start: Span) -> Result<CommandWord, ParseError> {
+        match self.next_if(|kind| matches!(kind, TokenKind::Word(_))) {
+            Some(Token {
+                kind: TokenKind::Word(word),
+                span,
+            }) => Ok(CommandWord { word, span }),
+            Some(_) | None => Err(self.unexpected_or_unclosed(start)),
+        }
+    }
+
+    /// The error when the next token is not what a construct opened at `start` needs: the unexpected token, or
+    /// [`ParseError::Unclosed`] at the end of the input.
+    fn unexpected_or_unclosed(&self, start: Span) -> ParseError {
+        match self.peek() {
+            Some(token) => ParseError::UnexpectedToken {
+                token: unexpected(&token.kind),
+                span: token.span,
+            },
+            None => ParseError::Unclosed { span: start },
+        }
+    }
+
+    /// Whether a comment starts inside `span`.
+    fn comment_within(&self, span: Span) -> bool {
+        let first_at_or_after = self.comments.partition_point(|comment| comment.start < span.start);
+        self.comments
+            .get(first_at_or_after)
+            .is_some_and(|comment| comment.start < span.end)
     }
 
     fn skip_newlines(&mut self) {
-        while self
-            .tokens
-            .next_if(|token| matches!(token.kind, TokenKind::Newline))
-            .is_some()
-        {}
+        while self.next_if(|kind| matches!(kind, TokenKind::Newline)).is_some() {}
     }
 
     /// An empty span at the end of the input, for errors at the end of the line.
@@ -496,8 +1139,82 @@ impl Parser<'_> {
     }
 }
 
+/// The compound command a token starts in command position, if any. A `(` always starts one (a subshell or `((`).
+fn compound_start(kind: &TokenKind) -> Option<CompoundStartToken> {
+    match kind {
+        TokenKind::Operator(Operator::LeftParen) => Some(CompoundStartToken::Paren),
+        TokenKind::Word(Word {
+            reserved: Some(reserved),
+            ..
+        }) => match reserved {
+            ReservedWord::LeftBrace => Some(CompoundStartToken::Group),
+            ReservedWord::If => Some(CompoundStartToken::If),
+            ReservedWord::For => Some(CompoundStartToken::For),
+            ReservedWord::Select => Some(CompoundStartToken::Select),
+            ReservedWord::While => Some(CompoundStartToken::While),
+            ReservedWord::Until => Some(CompoundStartToken::Until),
+            ReservedWord::Case => Some(CompoundStartToken::Case),
+            ReservedWord::DoubleLeftBracket => Some(CompoundStartToken::Conditional),
+            ReservedWord::Bang
+            | ReservedWord::RightBrace
+            | ReservedWord::DoubleRightBracket
+            | ReservedWord::Coproc
+            | ReservedWord::Do
+            | ReservedWord::Done
+            | ReservedWord::Elif
+            | ReservedWord::Else
+            | ReservedWord::Esac
+            | ReservedWord::Fi
+            | ReservedWord::Function
+            | ReservedWord::In
+            | ReservedWord::Then
+            | ReservedWord::Time => None,
+        },
+        TokenKind::Word(_)
+        | TokenKind::Operator(_)
+        | TokenKind::Redirection(_)
+        | TokenKind::Newline
+        | TokenKind::Blank
+        | TokenKind::Comment => None,
+    }
+}
+
+/// Whether a token, where a command would start, ends the list being read instead: a closing operator, or a
+/// reserved word that only continues or closes an enclosing construct. The enclosing construct checks that it is the
+/// one it expects; at the top level any of them is a syntax error.
+fn closes_list(kind: &TokenKind) -> bool {
+    match kind {
+        TokenKind::Operator(
+            Operator::RightParen
+            | Operator::DoubleSemicolon
+            | Operator::SemicolonAmpersand
+            | Operator::DoubleSemicolonAmpersand,
+        ) => true,
+        TokenKind::Word(Word {
+            reserved: Some(reserved),
+            ..
+        }) => matches!(
+            reserved,
+            ReservedWord::Then
+                | ReservedWord::Elif
+                | ReservedWord::Else
+                | ReservedWord::Fi
+                | ReservedWord::Do
+                | ReservedWord::Done
+                | ReservedWord::Esac
+                | ReservedWord::RightBrace
+        ),
+        TokenKind::Word(_)
+        | TokenKind::Operator(_)
+        | TokenKind::Redirection(_)
+        | TokenKind::Newline
+        | TokenKind::Blank
+        | TokenKind::Comment => false,
+    }
+}
+
 /// Whether a token belongs to the simple command being read. A `(` does too, only so that the command can report
-/// the precise error for it (`f()`, `x=(1)`, `echo (a)`); operators and newlines end the command.
+/// the precise error for it (`x=(1)`, `echo (a)`); operators and newlines end the command.
 const fn continues_simple_command(kind: &TokenKind) -> bool {
     matches!(
         kind,
@@ -558,40 +1275,45 @@ fn is_reserved(kind: &TokenKind, reserved: ReservedWord) -> bool {
     matches!(kind, TokenKind::Word(Word { reserved: Some(found), .. }) if *found == reserved)
 }
 
-/// Checks a reserved word found as the first token of a command. Only `!` starts a pipeline, and the pipeline has
-/// already consumed it, so a `!` here is a second one (`! ! a`) or follows a pipe (`a | ! b`): bash 3.2 rejects both.
-/// Words that start compound commands are refused until KNSH-030; words that only continue or close one are syntax
+/// Whether a token is the control operator `operator`.
+fn is_operator(kind: &TokenKind, operator: Operator) -> bool {
+    matches!(kind, TokenKind::Operator(found) if *found == operator)
+}
+
+/// The error for a reserved word in command position that starts neither a compound command nor a function
+/// definition. Only `!` starts a pipeline, and the pipeline has already consumed it, so a `!` here is a second one
+/// (`! ! a`) or follows a pipe (`a | ! b`): bash 3.2 rejects both. `coproc` and `time` are refused as unsupported (they
+/// prefix a pipeline, which this parser does not delimit); words that only continue or close a construct are syntax
 /// errors where a command should start, as in bash.
-fn reserved_word_in_command_position(reserved: ReservedWord, span: Span) -> Result<(), ParseError> {
+fn misplaced_reserved_word(reserved: ReservedWord, span: Span) -> ParseError {
     match reserved {
-        ReservedWord::LeftBrace
-        | ReservedWord::DoubleLeftBracket
-        | ReservedWord::Case
-        | ReservedWord::Coproc
-        | ReservedWord::For
-        | ReservedWord::Function
-        | ReservedWord::If
-        | ReservedWord::Select
-        | ReservedWord::Time
-        | ReservedWord::Until
-        | ReservedWord::While => Err(ParseError::Unsupported {
+        ReservedWord::Coproc | ReservedWord::Time => ParseError::Unsupported {
             construct: UnsupportedConstruct::Compound(CompoundStart::ReservedWord(reserved)),
             span,
-        }),
+        },
         ReservedWord::Bang
+        | ReservedWord::LeftBrace
         | ReservedWord::RightBrace
+        | ReservedWord::DoubleLeftBracket
         | ReservedWord::DoubleRightBracket
+        | ReservedWord::Case
         | ReservedWord::Do
         | ReservedWord::Done
         | ReservedWord::Elif
         | ReservedWord::Else
         | ReservedWord::Esac
         | ReservedWord::Fi
+        | ReservedWord::For
+        | ReservedWord::Function
+        | ReservedWord::If
         | ReservedWord::In
-        | ReservedWord::Then => Err(ParseError::UnexpectedToken {
+        | ReservedWord::Select
+        | ReservedWord::Then
+        | ReservedWord::Until
+        | ReservedWord::While => ParseError::UnexpectedToken {
             token: Unexpected::ReservedWord(reserved),
             span,
-        }),
+        },
     }
 }
 
@@ -612,6 +1334,7 @@ fn unexpected(kind: &TokenKind) -> Unexpected {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::FunctionCall;
     use crate::error::LexError;
 
     fn text(input: &str, span: Span) -> &str {
@@ -965,6 +1688,10 @@ mod tests {
             "secret-token && ",
             "secret-token ;; x",
             "if secret-token",
+            "if secret-token; then",
+            "case secret in secret) x;; fi",
+            "secret() echo",
+            "(( secret # x ))",
             "secret=(x)",
             "cat <<secret",
         ] {
@@ -974,44 +1701,6 @@ mod tests {
     }
 
     // ---- Constructs refused until a later story (fail closed, decision 6) ----
-
-    #[test]
-    fn compound_commands_are_unsupported_for_now() {
-        assert_eq!(
-            unsupported("(a; b)"),
-            UnsupportedConstruct::Compound(CompoundStart::Subshell)
-        );
-        for (input, word) in [
-            ("{ a; }", ReservedWord::LeftBrace),
-            ("if a; then b; fi", ReservedWord::If),
-            ("for x in a; do b; done", ReservedWord::For),
-            ("while a; do b; done", ReservedWord::While),
-            ("until a; do b; done", ReservedWord::Until),
-            ("case x in a) b;; esac", ReservedWord::Case),
-            ("select x in a; do b; done", ReservedWord::Select),
-            ("[[ -f x ]]", ReservedWord::DoubleLeftBracket),
-            ("function f { a; }", ReservedWord::Function),
-            ("coproc a", ReservedWord::Coproc),
-            ("time a", ReservedWord::Time),
-            ("a && if b; then c; fi", ReservedWord::If),
-            ("! { a; }", ReservedWord::LeftBrace),
-        ] {
-            assert_eq!(
-                unsupported(input),
-                UnsupportedConstruct::Compound(CompoundStart::ReservedWord(word)),
-                "{input:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn function_definitions_are_unsupported_for_now() {
-        assert_eq!(
-            unsupported("f() { rm -rf x; }; f"),
-            UnsupportedConstruct::FunctionDefinition
-        );
-        assert_eq!(unsupported("f () { a; }"), UnsupportedConstruct::FunctionDefinition);
-    }
 
     #[test]
     fn here_documents_are_unsupported_for_now() {
@@ -1100,7 +1789,9 @@ mod tests {
         // KNSH-032: nested lists (KNSH-030, KNSH-031) enter `list` with their depth; past the limit it refuses.
         let parser = || Parser {
             input: "a",
-            tokens: lex("a").unwrap().into_iter().peekable(),
+            tokens: lex("a").unwrap(),
+            position: 0,
+            comments: Vec::new(),
         };
         assert_eq!(
             parser().list(MAX_NESTING_DEPTH + 1),
@@ -1128,5 +1819,794 @@ mod tests {
             parse(&input),
             Err(ParseError::Lex(LexError::InputTooLarge { .. }))
         ));
+    }
+
+    // ---- KNSH-030 helpers ----
+
+    /// The only command of a one-command line.
+    fn only(input: &str) -> Command {
+        let script = parse(input).unwrap();
+        assert_eq!(script.items.len(), 1, "{input:?}");
+        let pipeline = &script.items[0].and_or.first;
+        assert!(
+            pipeline.rest.is_empty() && script.items[0].and_or.rest.is_empty(),
+            "{input:?}"
+        );
+        pipeline.first.clone()
+    }
+
+    fn only_compound(input: &str) -> CompoundCommand {
+        match only(input) {
+            Command::Compound(compound) => compound,
+            other => panic!("{input:?} gave {other:?}"),
+        }
+    }
+
+    fn only_unsupported(input: &str) -> UnsupportedCommand {
+        match only(input) {
+            Command::Unsupported(unsupported) => unsupported,
+            other => panic!("{input:?} gave {other:?}"),
+        }
+    }
+
+    fn only_function(input: &str) -> FunctionDefinition {
+        match only(input) {
+            Command::FunctionDefinition(definition) => definition,
+            other => panic!("{input:?} gave {other:?}"),
+        }
+    }
+
+    /// For each simple command with a name: its name and whether it is marked as a function call.
+    fn calls(input: &str) -> Vec<(&str, bool)> {
+        parse(input)
+            .unwrap()
+            .simple_commands()
+            .filter_map(|command| {
+                let name = command.name()?;
+                Some((text(input, name.span), command.function_call.is_some()))
+            })
+            .collect()
+    }
+
+    /// Whether the last simple command of `input` is marked as a function call.
+    fn last_is_function_call(input: &str) -> bool {
+        parse(input)
+            .unwrap()
+            .simple_commands()
+            .last()
+            .unwrap()
+            .function_call
+            .is_some()
+    }
+
+    fn list_names<'a>(input: &'a str, items: &[ListItem]) -> Vec<&'a str> {
+        let script = Script {
+            items: items.to_vec(),
+            span: Span::new(0, input.len()),
+        };
+        script
+            .simple_commands()
+            .filter_map(|command| command.name().map(|name| text(input, name.span)))
+            .collect()
+    }
+
+    fn unclosed(input: &str) -> &str {
+        match parse(input) {
+            Err(ParseError::Unclosed { span }) => text(input, span),
+            other => panic!("{input:?} gave {other:?}"),
+        }
+    }
+
+    // ---- Story unit tests (KNSH-030) ----
+
+    #[test]
+    fn parses_if_elif_else_fi() {
+        // KNSH-030: every branch's commands are visible, with each reserved word's span.
+        let input = "if a; then b; elif c\nthen d; else e; fi";
+        let compound = only_compound(input);
+        assert_eq!(text(input, compound.span), input);
+        let CompoundKind::If(command) = &compound.kind else {
+            panic!("{compound:?}")
+        };
+        assert_eq!(command.clauses.len(), 2);
+        let clause = &command.clauses[1];
+        assert_eq!(text(input, clause.keyword), "elif");
+        assert_eq!(text(input, clause.then), "then");
+        assert_eq!(list_names(input, &clause.condition), ["c"]);
+        assert_eq!(list_names(input, &clause.body), ["d"]);
+        let otherwise = command.else_clause.as_ref().unwrap();
+        assert_eq!(text(input, otherwise.keyword), "else");
+        assert_eq!(text(input, command.fi), "fi");
+        assert_eq!(names(input), [Some("a"), Some("b"), Some("c"), Some("d"), Some("e")]);
+        // Without elif and else, and with newlines everywhere bash allows them.
+        assert_eq!(names("if\na\nthen\nb\nfi"), [Some("a"), Some("b")]);
+    }
+
+    #[test]
+    fn parses_for_in_and_for_without_in() {
+        let input = "for x in a 'b c' $d; do echo $x; done";
+        let compound = only_compound(input);
+        let CompoundKind::For(command) = &compound.kind else {
+            panic!("{compound:?}")
+        };
+        assert_eq!(text(input, command.keyword), "for");
+        assert_eq!(text(input, command.variable.span), "x");
+        let items = command.items.as_ref().unwrap();
+        assert_eq!(text(input, items.keyword), "in");
+        assert_eq!(word_texts(input, &items.words), ["a", "'b c'", "$d"]);
+        assert_eq!(text(input, command.body.open), "do");
+        assert_eq!(text(input, command.body.close), "done");
+        assert_eq!(names(input), [Some("echo")]);
+
+        // Without `in` the loop runs over "$@"; every form bash 3.2 accepts.
+        for input in [
+            "for x; do a; done",
+            "for x do a; done",
+            "for x\ndo a; done",
+            "for x; { a; }",
+            "for x\nin; do a; done",
+        ] {
+            let compound = only_compound(input);
+            let CompoundKind::For(command) = &compound.kind else {
+                panic!("{input:?}")
+            };
+            assert_eq!(names(input), [Some("a")], "{input:?}");
+            assert_eq!(text(input, compound.span), input, "{input:?}");
+            if input.contains("in;") {
+                assert_eq!(command.items.as_ref().unwrap().words, []);
+            } else {
+                assert!(command.items.is_none(), "{input:?}");
+            }
+        }
+        // Reserved spellings are plain words after `in`.
+        let input = "for x in do done; do a; done";
+        let CompoundKind::For(command) = only_compound(input).kind else {
+            panic!()
+        };
+        assert_eq!(word_texts(input, &command.items.unwrap().words), ["do", "done"]);
+    }
+
+    #[test]
+    fn parses_while_and_until_loops() {
+        let input = "while a; b; do c; done";
+        let compound = only_compound(input);
+        let CompoundKind::While(command) = &compound.kind else {
+            panic!("{compound:?}")
+        };
+        assert_eq!(text(input, command.keyword), "while");
+        assert_eq!(list_names(input, &command.condition), ["a", "b"]);
+        assert_eq!(list_names(input, &command.body.body), ["c"]);
+        assert_eq!(text(input, compound.span), input);
+
+        let input = "until a\ndo\nb\ndone";
+        let compound = only_compound(input);
+        let CompoundKind::Until(command) = &compound.kind else {
+            panic!("{compound:?}")
+        };
+        assert_eq!(text(input, command.keyword), "until");
+        assert_eq!(names(input), [Some("a"), Some("b")]);
+        // `while` takes no `{ … }` body: the `{` is a command of the condition, and `do` never comes.
+        assert_eq!(unclosed("while a; { b; }"), "while");
+    }
+
+    #[test]
+    fn parses_case_with_multiple_patterns_and_fallthrough_terminators() {
+        // `;&` and `;;&` are bash 4 (bash 3.2 rejects them), parsed as the story asks.
+        let input = "case $x in a|b) one;; (c) two;& d|e|f) three;;& *) four\nesac";
+        let compound = only_compound(input);
+        let CompoundKind::Case(command) = &compound.kind else {
+            panic!("{compound:?}")
+        };
+        assert_eq!(text(input, command.keyword), "case");
+        assert_eq!(text(input, command.subject.span), "$x");
+        assert_eq!(text(input, command.in_keyword), "in");
+        assert_eq!(text(input, command.esac), "esac");
+        let patterns: Vec<Vec<&str>> = command
+            .clauses
+            .iter()
+            .map(|clause| word_texts(input, &clause.patterns))
+            .collect();
+        assert_eq!(patterns, [vec!["a", "b"], vec!["c"], vec!["d", "e", "f"], vec!["*"]]);
+        let terminators: Vec<Option<CaseTerminatorKind>> = command
+            .clauses
+            .iter()
+            .map(|clause| clause.terminator.map(|terminator| terminator.kind))
+            .collect();
+        assert_eq!(
+            terminators,
+            [
+                Some(CaseTerminatorKind::Break),
+                Some(CaseTerminatorKind::FallThrough),
+                Some(CaseTerminatorKind::Continue),
+                None,
+            ]
+        );
+        assert_eq!(text(input, command.clauses[1].open.unwrap()), "(");
+        assert_eq!(text(input, command.clauses[2].terminator.unwrap().span), ";;&");
+        assert_eq!(names(input), [Some("one"), Some("two"), Some("three"), Some("four")]);
+    }
+
+    #[test]
+    fn parses_subshell_and_group_with_redirection() {
+        let input = "(a; b) >f";
+        let compound = only_compound(input);
+        let CompoundKind::Subshell(subshell) = &compound.kind else {
+            panic!("{compound:?}")
+        };
+        assert_eq!(text(input, subshell.open), "(");
+        assert_eq!(text(input, subshell.close), ")");
+        assert_eq!(list_names(input, &subshell.body), ["a", "b"]);
+        assert_eq!(compound.redirections.len(), 1);
+        assert_eq!(text(input, compound.redirections[0].span), ">f");
+        assert_eq!(text(input, compound.span), input);
+
+        let input = "{ a; } 2>&1";
+        let compound = only_compound(input);
+        let CompoundKind::Group(group) = &compound.kind else {
+            panic!("{compound:?}")
+        };
+        assert_eq!(text(input, group.open), "{");
+        assert_eq!(text(input, group.close), "}");
+        assert_eq!(compound.redirections[0].fd.unwrap().value, Some(2));
+        assert_eq!(text(input, compound.redirections[0].target.span), "1");
+        assert_eq!(text(input, compound.span), input);
+        // The redirections belong to the compound command, not to its last simple command.
+        assert_eq!(only_command(input).redirections, []);
+    }
+
+    #[test]
+    fn parses_both_function_definition_forms() {
+        for (input, keyword, parens) in [
+            ("f() { a; }", false, true),
+            ("f () { a; }", false, true),
+            ("f( ) { a; }", false, true),
+            ("f()\n\n{ a; }", false, true),
+            ("function f { a; }", true, false),
+            ("function f\n{ a; }", true, false),
+            ("function f() { a; }", true, true),
+            ("function f () ( a )", true, true),
+        ] {
+            let definition = only_function(input);
+            assert_eq!(text(input, definition.name.span), "f", "{input:?}");
+            assert_eq!(definition.keyword.is_some(), keyword, "{input:?}");
+            assert_eq!(definition.parens.is_some(), parens, "{input:?}");
+            assert_eq!(text(input, definition.span), input, "{input:?}");
+            assert_eq!(names(input), [Some("a")], "{input:?}");
+        }
+        let input = "function f() { a; }";
+        let definition = only_function(input);
+        assert_eq!(text(input, definition.keyword.unwrap()), "function");
+        assert_eq!(text(input, definition.parens.unwrap()), "()");
+        // Any compound command is a body, with redirections that apply on every call.
+        let input = "f() if a; then b; fi >log";
+        let definition = only_function(input);
+        assert!(matches!(definition.body.kind, CompoundKind::If(_)));
+        assert_eq!(text(input, definition.body.redirections[0].span), ">log");
+        assert_eq!(text(input, definition.span), input);
+    }
+
+    #[test]
+    fn descends_into_function_bodies() {
+        // KNSH-030: `f() { rm -rf x; }; f` exposes `rm`, and the call is marked as reaching that body.
+        let input = "f() { rm -rf x; }; f";
+        let script = parse(input).unwrap();
+        let commands: Vec<&SimpleCommand> = script.simple_commands().collect();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(text(input, commands[0].name().unwrap().span), "rm");
+        assert_eq!(word_texts(input, commands[0].arguments()), ["-rf", "x"]);
+        assert_eq!(commands[0].function_call, None);
+        let definition = script.function_definitions().next().unwrap();
+        assert_eq!(
+            commands[1].function_call,
+            Some(FunctionCall {
+                definitions: vec![definition.span]
+            })
+        );
+        // A body is walked even when nothing calls it, and nested bodies too.
+        assert_eq!(names("f() { g() { rm x; }; }"), [Some("rm")]);
+    }
+
+    #[test]
+    fn marks_select_as_unsupported() {
+        // Decision 6 does not list `select`: it is kept whole, never omitted, and the rest of the line is still read.
+        let input = "select x in a b; do rm $x; done >out; echo after";
+        let script = parse(input).unwrap();
+        let commands: Vec<&Command> = script.commands().collect();
+        let Command::Unsupported(unsupported) = commands[0] else {
+            panic!("{commands:?}")
+        };
+        assert_eq!(
+            unsupported.construct,
+            UnsupportedConstruct::Compound(CompoundStart::ReservedWord(ReservedWord::Select))
+        );
+        assert_eq!(text(input, unsupported.span), "select x in a b; do rm $x; done >out");
+        assert_eq!(names(input), [Some("echo")]);
+        let input = "select x; { a; }";
+        assert_eq!(text(input, only_unsupported(input).span), input);
+    }
+
+    // ---- Other constructs outside decision 6 ----
+
+    #[test]
+    fn conditional_and_arithmetic_commands_are_unsupported_nodes() {
+        for (input, construct, extent) in [
+            (
+                "[[ -f x && $y == *.c ]] 2>/dev/null",
+                CompoundStart::ReservedWord(ReservedWord::DoubleLeftBracket),
+                "[[ -f x && $y == *.c ]] 2>/dev/null",
+            ),
+            ("(( i += 1 ))", CompoundStart::Arithmetic, "(( i += 1 ))"),
+            ("((a > (b)))", CompoundStart::Arithmetic, "((a > (b)))"),
+            ("((x)) >f", CompoundStart::Arithmetic, "((x)) >f"),
+            (
+                "for ((i = 0; i < 3; i++)); do a; done",
+                CompoundStart::ArithmeticFor,
+                "for ((i = 0; i < 3; i++)); do a; done",
+            ),
+            ("for ((;;))\n{ a; }", CompoundStart::ArithmeticFor, "for ((;;))\n{ a; }"),
+            // A function whose body is unsupported is unsupported as a whole.
+            (
+                "f() [[ -n x ]]",
+                CompoundStart::ReservedWord(ReservedWord::DoubleLeftBracket),
+                "f() [[ -n x ]]",
+            ),
+            (
+                "function g { select x; do a; done; }",
+                CompoundStart::ReservedWord(ReservedWord::Select),
+                "",
+            ),
+        ] {
+            let command = only(input);
+            let unsupported = match command {
+                Command::Unsupported(unsupported) => unsupported,
+                // An unsupported construct nested in a compound body is a node inside it.
+                Command::FunctionDefinition(definition) => {
+                    let script = Script {
+                        items: definition.body.kind.lists()[0].to_vec(),
+                        span: Span::new(0, input.len()),
+                    };
+                    match script.commands().next() {
+                        Some(Command::Unsupported(unsupported)) => *unsupported,
+                        other => panic!("{input:?} gave {other:?}"),
+                    }
+                }
+                other => panic!("{input:?} gave {other:?}"),
+            };
+            assert_eq!(
+                unsupported.construct,
+                UnsupportedConstruct::Compound(construct),
+                "{input:?}"
+            );
+            if !extent.is_empty() {
+                assert_eq!(text(input, unsupported.span), extent, "{input:?}");
+            }
+        }
+        // The rest of the line is still read exactly.
+        assert_eq!(names("[[ -d x ]] && rm -r x"), [Some("rm")]);
+        assert_eq!(names("(( n > 2 )) || { echo small; }"), [Some("echo")]);
+    }
+
+    #[test]
+    fn double_paren_that_does_not_close_as_arithmetic_is_nested_subshells() {
+        // Bash 3.2: `((echo a); (echo b))` runs two nested subshells, because the `)` matching the second `(` is not
+        // followed by `)`.
+        let input = "((echo a); (echo b))";
+        let compound = only_compound(input);
+        assert!(matches!(compound.kind, CompoundKind::Subshell(_)));
+        assert_eq!(names(input), [Some("echo"), Some("echo")]);
+        assert_eq!(names("( (a) )"), [Some("a")]);
+        assert_eq!(names("((a) )"), [Some("a")]);
+    }
+
+    #[test]
+    fn arithmetic_with_comment_or_unclosed_is_refused() {
+        // Bash reads `#` as text inside `(( ))` where the lexer starts a comment: the two could close it in
+        // different places, so the line is refused rather than guessed.
+        assert_eq!(
+            unsupported("(( 1 # ))\n)); rm x"),
+            UnsupportedConstruct::Compound(CompoundStart::Arithmetic)
+        );
+        assert_eq!(unclosed("(( 1 + 2"), "(");
+        assert_eq!(unclosed("[[ -f x"), "[[");
+        // A newline inside `[[ ]]` is a syntax error in bash 3.2.
+        assert_eq!(unexpected_token("[[ a\n== a ]]").0, Unexpected::Newline);
+        // `for` takes only `((` before its arithmetic header.
+        assert_eq!(
+            unexpected_token("for (a) do b; done"),
+            (Unexpected::Operator(Operator::LeftParen), "(")
+        );
+    }
+
+    #[test]
+    fn coproc_and_time_stay_refused() {
+        // They prefix a pipeline rather than form a command; decision 6 makes `coproc` dynamic.
+        for (input, word) in [
+            ("coproc a", ReservedWord::Coproc),
+            ("time a | b", ReservedWord::Time),
+            ("a && time b", ReservedWord::Time),
+            ("{ coproc a; }", ReservedWord::Coproc),
+        ] {
+            assert_eq!(
+                unsupported(input),
+                UnsupportedConstruct::Compound(CompoundStart::ReservedWord(word)),
+                "{input:?}"
+            );
+        }
+    }
+
+    // ---- Structure ----
+
+    #[test]
+    fn simple_commands_descend_into_every_body_and_condition() {
+        // FR-LC-09: commands at every depth, in source order.
+        let input = "a | { b; (c && d) } && if e; then while f; do g; done; fi; case x in y) h;; esac; i() { j; }";
+        assert_eq!(names(input), ["a", "b", "c", "d", "e", "f", "g", "h", "j"].map(Some));
+        // `commands` yields each compound command before the commands inside it.
+        let script = parse("{ a; }").unwrap();
+        let kinds: Vec<bool> = script
+            .commands()
+            .map(|command| matches!(command, Command::Compound(_)))
+            .collect();
+        assert_eq!(kinds, [true, false]);
+    }
+
+    #[test]
+    fn compound_commands_combine_with_lists_and_pipelines() {
+        let input = "! { a; } | (b) && for x in y; do c; done & d";
+        let script = parse(input).unwrap();
+        assert_eq!(script.items.len(), 2);
+        assert!(script.items[0].is_background());
+        let and_or = &script.items[0].and_or;
+        assert!(and_or.first.is_negated());
+        assert_eq!(and_or.first.rest.len(), 1);
+        assert_eq!(names(input), [Some("a"), Some("b"), Some("c"), Some("d")]);
+    }
+
+    #[test]
+    fn closing_words_are_recognised_right_after_a_compound_command() {
+        // Bash 3.2 accepts these: after `)` or `}`, a closing reserved word needs no separator.
+        for input in [
+            "{ (a) }",
+            "if (a) then b; fi",
+            "while (a) do b; done",
+            "{ { a; } }",
+            "case x in y) (a) esac",
+            "if a; then { b; } fi",
+        ] {
+            assert!(parse(input).is_ok(), "{input:?}: {:?}", parse(input));
+        }
+        // After a simple command they are arguments, so the construct stays open.
+        assert_eq!(unclosed("{ echo a }"), "{");
+        assert_eq!(unclosed("{ echo a; }}"), "{");
+        assert_eq!(names("echo }"), [Some("echo")]);
+    }
+
+    #[test]
+    fn reserved_words_inside_compound_commands_are_arguments_after_a_command_name() {
+        let input = "if echo then fi; then echo done; fi";
+        let script = parse(input).unwrap();
+        let commands: Vec<&SimpleCommand> = script.simple_commands().collect();
+        assert_eq!(word_texts(input, &commands[0].words), ["echo", "then", "fi"]);
+        assert_eq!(word_texts(input, &commands[1].words), ["echo", "done"]);
+    }
+
+    #[test]
+    fn case_edge_cases_bash_accepts() {
+        // No arms; an empty arm body; `esac` as a pattern when opened with `(`; newline before `in`.
+        assert!(parse("case a in esac").is_ok());
+        assert_eq!(names("case a in a) ;; b) c;; esac"), [Some("c")]);
+        let input = "case a in (esac) b;; esac";
+        let CompoundKind::Case(command) = only_compound(input).kind else {
+            panic!()
+        };
+        assert_eq!(word_texts(input, &command.clauses[0].patterns), ["esac"]);
+        assert!(parse("case a\nin a) b;; esac").is_ok());
+        assert_eq!(names("case a in a) b;; c) esac"), [Some("b")]);
+    }
+
+    // ---- Syntax errors (bash 3.2 rejects all of these) ----
+
+    #[test]
+    fn compound_syntax_errors() {
+        for (input, token, at) in [
+            ("{ a; } b", Unexpected::Word, "b"),
+            ("(a) b", Unexpected::Word, "b"),
+            ("(a) (b)", Unexpected::Operator(Operator::LeftParen), "("),
+            ("( )", Unexpected::Operator(Operator::RightParen), ")"),
+            ("{ }", Unexpected::ReservedWord(ReservedWord::RightBrace), "}"),
+            ("if then fi", Unexpected::ReservedWord(ReservedWord::Then), "then"),
+            ("if a; then fi", Unexpected::ReservedWord(ReservedWord::Fi), "fi"),
+            (
+                "if a; then b; done",
+                Unexpected::ReservedWord(ReservedWord::Done),
+                "done",
+            ),
+            (
+                "for x in a; do done",
+                Unexpected::ReservedWord(ReservedWord::Done),
+                "done",
+            ),
+            (
+                "for x in a b & do c; done",
+                Unexpected::Operator(Operator::Background),
+                "&",
+            ),
+            (
+                "for x; in a; do b; done",
+                Unexpected::ReservedWord(ReservedWord::In),
+                "in",
+            ),
+            ("case\na in a) b;; esac", Unexpected::Newline, "\n"),
+            ("case a in a) b;; esac c", Unexpected::Word, "c"),
+            ("case a in a) b; fi", Unexpected::ReservedWord(ReservedWord::Fi), "fi"),
+            ("function f ( echo a )", Unexpected::Word, "echo"),
+            ("function f() echo x", Unexpected::Word, "echo"),
+            ("f() echo x", Unexpected::Word, "echo"),
+            ("function f\n() { a; }", Unexpected::Operator(Operator::RightParen), ")"),
+            ("A=1 f() { a; }", Unexpected::Operator(Operator::LeftParen), "("),
+            (">x f() { a; }", Unexpected::Operator(Operator::LeftParen), "("),
+            ("{ a; } ; }", Unexpected::ReservedWord(ReservedWord::RightBrace), "}"),
+            ("a; esac", Unexpected::ReservedWord(ReservedWord::Esac), "esac"),
+            ("a ;& b", Unexpected::Operator(Operator::SemicolonAmpersand), ";&"),
+        ] {
+            assert_eq!(unexpected_token(input), (token, at), "{input:?}");
+        }
+        // Bash rejects `a=b() …` too; this parser already refuses it as an array value.
+        assert_eq!(unsupported("a=b() { a; }"), UnsupportedConstruct::ArrayAssignment);
+    }
+
+    #[test]
+    fn unclosed_compound_commands_are_errors() {
+        for (input, opener) in [
+            ("(a", "("),
+            ("{ a;", "{"),
+            ("if a", "if"),
+            ("if a; then b", "if"),
+            ("if a; then b; else", "if"),
+            ("for", "for"),
+            ("for x in a b", "for"),
+            ("for x in a; do b", "for"),
+            ("while a; do b; ", "while"),
+            ("case a", "case"),
+            ("case a in a) b;;", "case"),
+            ("f()", "f"),
+            ("function f", "function"),
+            ("function", "function"),
+        ] {
+            assert_eq!(unclosed(input), opener, "{input:?}");
+        }
+    }
+
+    // ---- Function calls (KNSH-030, KNSH-035) ----
+
+    #[test]
+    fn marks_call_to_function_defined_earlier_in_the_line() {
+        assert_eq!(calls("f() { a; }; f x"), [("a", false), ("f", true)]);
+        assert_eq!(calls("function f { a; }\nf"), [("a", false), ("f", true)]);
+        // Quoting does not change which function is called.
+        assert_eq!(
+            calls("f() { a; }; \"f\"; \\f; 'f'"),
+            [("a", false), ("\"f\"", true), ("\\f", true), ("'f'", true)]
+        );
+        // Inside a group, a pipeline's first command, an and-or list's first pipeline, a condition, a body.
+        assert!(last_is_function_call("f() { a; }; { f; }"));
+        assert!(last_is_function_call("f() { a; }; if b; then f; fi"));
+        assert_eq!(calls("f() { a; }; f | cat")[1], ("f", true));
+        assert!(last_is_function_call("f() { a; }; while b; do f; done"));
+        assert!(last_is_function_call("f() { a; } && b; f"));
+        // A later redefinition replaces the earlier one.
+        let input = "f() { a; }; f() { b; }; f";
+        let script = parse(input).unwrap();
+        let second = script.function_definitions().nth(1).unwrap().span;
+        let call = script.simple_commands().last().unwrap();
+        assert_eq!(call.function_call.as_ref().unwrap().definitions, [second]);
+    }
+
+    #[test]
+    fn call_to_undefined_or_later_defined_name_is_a_program() {
+        // KNSH-035 resolves these as binaries.
+        assert_eq!(calls("f; f() { a; }"), [("f", false), ("a", false)]);
+        assert_eq!(calls("g() { a; }; f"), [("a", false), ("f", false)]);
+    }
+
+    #[test]
+    fn definitions_that_do_not_reach_the_call_leave_it_unmarked() {
+        // Each of these runs the program, not the function, in bash (or may): marking it would hide the program.
+        for input in [
+            "(rm() { :; }); rm -rf x",
+            "rm() { :; } | cat; rm -rf x",
+            "rm() { :; } & rm -rf x",
+            "{ rm() { :; }; } & rm -rf x",
+            "false && rm() { :; }; rm -rf x",
+            "if a; then rm() { :; }; fi; rm -rf x",
+            "case a in b) rm() { :; };; esac; rm -rf x",
+            "for x in; do rm() { :; }; done; rm -rf x",
+            "rm() { :; }; unset -f rm; rm -rf x",
+            "rm() { :; }; (unset -f rm); rm -rf x; unset rm; rm -rf x",
+        ] {
+            let script = parse(input).unwrap();
+            let last = script.simple_commands().last().unwrap();
+            assert_eq!(text(input, last.name().unwrap().span), "rm", "{input:?}");
+            assert!(last.function_call.is_none(), "{input:?}");
+        }
+        // The definition in a subshell still marks calls inside that subshell.
+        assert!(last_is_function_call("(f() { a; }; f)"));
+    }
+
+    #[test]
+    fn calls_inside_a_function_body_count_only_definitions_in_that_body() {
+        // When `f` runs, `g` may have been removed: the call inside `f` is not marked.
+        assert_eq!(
+            calls("g() { a; }; f() { g; }; unset -f g; f"),
+            [("a", false), ("g", false), ("unset", false), ("f", false)]
+        );
+        assert_eq!(calls("f() { g() { a; }; g; }"), [("a", false), ("g", true)]);
+    }
+
+    #[test]
+    fn calling_a_function_that_may_change_functions_unsettles_them() {
+        // `u` removes `f` when called, so the later `f` is not certain.
+        assert_eq!(
+            calls("f() { a; }; u() { unset -f f; }; u; f").last(),
+            Some(&("f", false))
+        );
+        // `d` calls `u`, which may do anything a function body does.
+        assert!(!last_is_function_call("f() { a; }; u() { b; }; d() { u; }; d; f"));
+        // A settled body leaves the functions alone.
+        assert!(last_is_function_call("f() { a; }; s() { echo hi; }; s; f"));
+    }
+
+    #[test]
+    fn loops_that_change_functions_leave_calls_inside_unmarked() {
+        // On the second iteration `f` may be the new definition, or removed.
+        assert!(!calls("f() { a; }; while b; do f; unset -f f; done")[2].1);
+        assert_eq!(
+            calls("for x in 1 2; do f() { a; }; f; done"),
+            [("a", false), ("f", true)]
+        );
+    }
+
+    #[test]
+    fn opaque_commands_turn_marking_off() {
+        // They can change functions or name lookup in ways the tree does not show; such lines are dynamic anyway.
+        for input in [
+            "f() { a; }; eval x; f",
+            "f() { a; }; trap 'unset -f f' DEBUG; f",
+            "f() { a; }; alias f=rm; f",
+            "f() { a; }; command unset -f f; f",
+            "f() { a; }; source x; f",
+            "f() { a; }; . x; f",
+            "f() { a; }; readonly -f f; f() { b; }; f",
+            "f() { a; }; $cmd; f",
+        ] {
+            assert!(!last_is_function_call(input), "{input:?}");
+        }
+        // Even when the opaque command comes after the call, or inside a body.
+        assert!(!last_is_function_call("f() { a; }; g() { eval x; }; f"));
+    }
+
+    #[test]
+    fn only_plain_identifier_names_that_are_not_special_builtins_are_matched() {
+        // POSIX mode finds special builtins before functions and refuses other names; bash refuses quoted names.
+        assert!(!last_is_function_call("exec() { a; }; exec rm -rf x"));
+        assert!(!last_is_function_call("foo-bar() { a; }; foo-bar"));
+        assert!(!last_is_function_call("x[1]() { a; }; x[1]"));
+        assert!(!last_is_function_call("function \"g\" { a; }; g"));
+        assert!(!last_is_function_call("function \\g { a; }; g"));
+        assert!(last_is_function_call("cd() { a; }; cd x"));
+        // A call spelled with glob characters may expand to another name.
+        assert!(!last_is_function_call("f() { a; }; f*"));
+    }
+
+    #[test]
+    fn unsupported_constructs_that_hide_commands_unsettle_functions() {
+        // `select` and `for ((…))` bodies are opaque and may remove functions; `[[ ]]` and `(( ))` hold expressions only.
+        assert!(!last_is_function_call("f() { a; }; select x; do unset -f f; done; f"));
+        assert!(!last_is_function_call("f() { a; }; for ((;;)); do unset -f f; done; f"));
+        assert!(last_is_function_call("f() { a; }; [[ -n x ]] && (( 1 )) && f"));
+    }
+
+    #[test]
+    fn definitions_skipped_by_a_failed_redirection_or_break_leave_calls_unmarked() {
+        // Checked against /bin/bash 3.2: each runs the program `rm`, since the definition never ran.
+        for input in [
+            "{ rm() { :; }; } >/nonexistent/x; rm -rf x",
+            "if a; then rm() { :; }; fi </nonexistent; rm -rf x",
+            "while break; rm() { :; }; do b; done; rm -rf x",
+            "b() { break; }; until b; rm() { :; }; do c; done; rm -rf x",
+        ] {
+            assert!(!last_is_function_call(input), "{input:?}");
+        }
+        // Calls the skipped part would also skip are still marked.
+        assert!(last_is_function_call("{ f() { a; }; f; } >x"));
+    }
+
+    #[test]
+    fn errors_that_abandon_a_top_level_command_make_its_definitions_uncertain() {
+        // Bash abandons the rest of the top-level command (up to a newline) on these errors and runs the next one, so
+        // `rm` below is the program (checked against /bin/bash 3.2).
+        for input in [
+            "{ echo $((1/0)); rm() { :; }; }\nrm -rf x",
+            "{ echo ${x@Q}; rm() { :; }; }\nrm -rf x",
+            "UID=5; rm() { :; }\nrm -rf x",
+            "shopt -s failglob\n{ echo /none*; rm() { :; }; }\nrm -rf x",
+            "g() { echo $((1/0)); }\ng; rm() { :; }\nrm -rf x",
+            // Possible only in some cases (`failglob` with a pattern in `$x`) or not in bash 3.2, refused anyway.
+            "{ a >$x; rm() { :; }; }\nrm -rf x",
+            "(( 1/0 )); rm() { :; }\nrm -rf x",
+        ] {
+            assert!(!last_is_function_call(input), "{input:?}");
+        }
+        // A top-level command that cannot fail this way keeps its definitions certain, and a call in the same one is
+        // skipped along with the definition.
+        assert!(last_is_function_call("X=1; f() { echo \"$1\"; }\nf x"));
+        assert!(last_is_function_call("echo $((1/0)); f() { a; }; f"));
+        assert!(last_is_function_call("case $x in *) b;; esac; f() { a; }\nf"));
+    }
+
+    #[test]
+    fn case_arms_after_fall_through_name_every_definition_they_may_run() {
+        // After `;&` the second arm runs with the first arm's `f`, so both definitions are named.
+        let input = "f() { a; }; case x in x) f() { b; } ;& y) f ;; esac";
+        let script = parse(input).unwrap();
+        let definitions: Vec<Span> = script
+            .function_definitions()
+            .map(|definition| definition.span)
+            .collect();
+        let call = script.simple_commands().last().unwrap();
+        assert_eq!(call.function_call.as_ref().unwrap().definitions, definitions);
+        let input = "f() { a; }; case x in x) f() { b; } ;;& z) c;; y) f ;; esac";
+        let script = parse(input).unwrap();
+        let call = script.simple_commands().last().unwrap();
+        assert_eq!(call.function_call.as_ref().unwrap().definitions.len(), 2);
+    }
+
+    #[test]
+    fn a_definition_with_an_unsupported_body_unsettles_functions() {
+        // `rm() [[ x ]]` replaces the first `rm`, whose name the opaque node does not give.
+        assert!(!last_is_function_call("rm() { :; }; rm() [[ x ]]; rm -rf x"));
+        assert!(!last_is_function_call(
+            "rm() { :; }; g() { rm() (( 1 )); }; g; rm -rf x"
+        ));
+    }
+
+    #[test]
+    fn too_many_definitions_turn_marking_off() {
+        let line = |count: usize| {
+            let mut line = String::new();
+            for index in 0..count {
+                line.push('f');
+                line.push_str(&index.to_string());
+                line.push_str("() { a; }\n");
+            }
+            line + "f0"
+        };
+        assert!(last_is_function_call(&line(crate::MAX_FUNCTION_DEFINITIONS)));
+        assert!(!last_is_function_call(&line(crate::MAX_FUNCTION_DEFINITIONS + 1)));
+    }
+
+    // ---- Limits ----
+
+    #[test]
+    fn deeply_nested_compound_commands_are_refused() {
+        // KNSH-032: nested compound commands deepen the parser's recursion, which the depth limit bounds.
+        let depth = MAX_NESTING_DEPTH;
+        let ok = "{ ".repeat(depth) + "a" + &"; }".repeat(depth);
+        assert!(parse(&ok).is_ok());
+        let too_deep = "{ ".repeat(depth + 1) + "a" + &"; }".repeat(depth + 1);
+        assert!(matches!(parse(&too_deep), Err(ParseError::NestingTooDeep { .. })));
+        let too_deep = "( ".repeat(10_000) + "a" + &" )".repeat(10_000);
+        assert!(matches!(parse(&too_deep), Err(ParseError::NestingTooDeep { .. })));
+        let too_deep = "f() { ".repeat(depth + 1) + "a" + &"; }".repeat(depth + 1);
+        assert!(matches!(parse(&too_deep), Err(ParseError::NestingTooDeep { .. })));
+    }
+
+    #[test]
+    fn long_compound_lines_do_not_blow_up() {
+        // Many sequential compound commands and conditional regions stay linear, function analysis included.
+        let input = "f() { a; }\n".to_owned() + &"if b; then f; fi && ".repeat(20_000) + "f";
+        let script = parse(&input).unwrap();
+        assert_eq!(script.simple_commands().count(), 1 + 2 * 20_000 + 1);
+        assert!(script.simple_commands().last().unwrap().function_call.is_some());
     }
 }
