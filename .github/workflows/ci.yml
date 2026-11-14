@@ -74,6 +74,24 @@ jobs:
       - name: Agent-command corpus (normalised, licensed, no raw paths or tokens)
         run: scripts/check.sh corpus
 
+      - name: Parser differential against bash (KNSH-034; 95% exact gate enforced on v* tags)
+        run: scripts/check.sh difftest
+
+      - name: Publish parser differential report
+        if: always()
+        run: |
+          if [ -f target/difftest/report.md ]; then
+            cat target/difftest/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload parser differential report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: parser-differential-report
+          path: target/difftest/report.md
+          if-no-files-found: ignore
+
       - name: Dependency checks (licences, advisories, duplicate versions)
         run: scripts/check.sh deny
 

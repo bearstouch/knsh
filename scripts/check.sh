@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the quality gates: format, lint, build, docs, test, corpus, dependency checks.
+# Runs the quality gates: format, lint, build, docs, test, corpus, parser differential, dependency checks.
 #
 #   scripts/check.sh            run every step, in order (the same order as CI)
 #   scripts/check.sh <step>...  run only the named steps (CI runs one step per job step)
@@ -13,7 +13,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-readonly ALL_STEPS=(fmt clippy build doc test corpus deny)
+readonly ALL_STEPS=(fmt clippy build doc test corpus difftest deny)
 
 # Belt and braces with .cargo/config.toml ([net] offline = true): cargo itself never
 # touches the network (NFR-SUP-03).
@@ -52,6 +52,18 @@ step_corpus() {
     # or token, or an entry without a registered source and licence. `cargo test` runs the same check; this step
     # prints the per-source and per-tag counts.
     cargo run --quiet --offline --locked -p knsh-corpus -- check --corpus tests/corpus
+}
+
+step_difftest() {
+    # Parser differential against real bash over the corpus (KNSH-034, NFR-COMPAT-07): every line's accept or reject
+    # verdict must match /bin/bash (3.2) and any Homebrew bash 5.x; a mismatch fails. The report (bash versions,
+    # exact-parse share, mismatches) is written to target/difftest/report.md for CI to publish. The 95% exact gate
+    # is enforced on release runs: a v* tag in CI, or KNSH_RELEASE=1 locally.
+    local flags=(--report target/difftest/report.md)
+    if [[ "${GITHUB_REF:-}" == refs/tags/v* || "${KNSH_RELEASE:-}" == 1 ]]; then
+        flags+=(--enforce-exact)
+    fi
+    cargo run --quiet --offline --locked -p knsh-difftest -- "${flags[@]}"
 }
 
 step_deny() {
