@@ -68,7 +68,7 @@ Outside the subset, and rejected as such: dates and times, floats (including `in
 | `fs.read` | `"all"` or list | Readable paths; `"all"` means everything except `fs.deny` |
 | `fs.write` | list of paths | Write roots |
 | `fs.deny` | list of paths | Never readable or writable |
-| `exec.allow`, `exec.ask`, `exec.deny` | list of patterns | Command rules; names match trusted binaries only |
+| `exec.allow`, `exec.ask`, `exec.deny` | list of patterns | Command rules; names match trusted binaries and builtins only; the first word must not contain `/` |
 | `exec.project_executables` | `allow` \| `ask` \| `deny` | Binaries from agent-writable places |
 | `exec.interpreters.<family>` | table | Adds an interpreter family, or options to a known one, for dynamic-code detection (below). **Proposed** (KNSH-036) |
 | `exec.default` | `allow` \| `ask` \| `deny` | When no rule matches |
@@ -177,3 +177,10 @@ All paths are resolved to canonical form, with symlinks followed, before matchin
 ## Rule IDs
 
 Rules are identified by section and index, e.g. `exec.allow[1]`, `exec.ask[0]`. These appear in records, errors and `decision.requested`.
+
+The index is zero-based and refers to the **resolved** profile's list. Because `extends` replaces a list whole and a
+preset never adds command rules, it is the entry's position in the nearest profile of the chain that sets that list:
+if `web-app` sets `exec.ask` and extends `base`, `exec.ask[0]` is `web-app`'s first entry; if `web-app` leaves
+`exec.ask` unset, it is `base`'s. A decision made by a setting rather than a rule has the setting's key as its ID:
+`exec.project_executables` (a binary outside the trusted folders, FR-POL-14) or `exec.default` (no rule matched,
+FR-POL-17). Matching is described in [policy](../03-functional-requirements/policy.md#resolution-and-matching).

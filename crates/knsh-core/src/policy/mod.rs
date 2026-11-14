@@ -1,4 +1,5 @@
-//! Policy profile model and loader (KNSH-039; FR-POL-01, FR-POL-02, FR-POL-03, FR-POL-10, FR-POL-11, FR-POL-12).
+//! Policy profile model and loader (KNSH-039; FR-POL-01, FR-POL-02, FR-POL-03, FR-POL-10, FR-POL-11, FR-POL-12), and
+//! command rule matching (KNSH-040; FR-POL-13 to FR-POL-17, in the `rules` module: [`evaluate_command`]).
 //!
 //! [`load_profile`] (by name) and [`load_profile_text`] (a snapshot pushed with `policy.set`) turn profile text into
 //! one resolved [`Profile`]:
@@ -31,6 +32,7 @@ mod layer;
 mod model;
 mod paths;
 mod presets;
+mod rules;
 
 #[cfg(test)]
 mod tests;
@@ -44,6 +46,7 @@ pub use model::{
 pub use paths::{LookupError, PathContext, PolicyFs, project_root};
 use paths::{PathTemplate, Variables};
 pub use presets::PRESETS;
+pub use rules::{CommandVerdict, RuleId, evaluate_command};
 
 use crate::error::{ProfileError, ProfileErrorKind, ProfileOrigin};
 use crate::path::CanonicalPath;
