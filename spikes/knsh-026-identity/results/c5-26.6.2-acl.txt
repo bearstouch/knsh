@@ -1,0 +1,43 @@
+## adhoc
+adhoc-1/knshd: id=knsh.spike.knshd flags=0x2(adhoc) team=not set auth= cdhash=afe20b4d6f47
+adhoc-2/knshd: id=knsh.spike.knshd flags=0x2(adhoc) team=not set auth= cdhash=24c29fea0843
+adhoc-other/other: id=knsh.spike.other flags=0x2(adhoc) team=not set auth= cdhash=95ec4e995fef
+acl[0] auth=ACLAuthorizationEncrypt apps=ANY
+acl[1] auth=ACLAuthorizationDecrypt,ACLAuthorizationDerive,ACLAuthorizationExportClear,ACLAuthorizationExportWrapped,ACLAuthorizationMAC,ACLAuthorizationSign apps=list
+  app[0] requirement: cdhash H"afe20b4d6f47fbc8ba372812b2dfab8e7b833b1a"
+acl[2] auth=ACLAuthorizationIntegrity apps=ANY
+acl[3] auth=ACLAuthorizationPartitionID apps=ANY
+  partition list: cdhash:afe20b4d6f47fbc8ba372812b2dfab8e7b833b1a
+acl[4] auth=ACLAuthorizationChangeACL apps=none
+## homebrew
+homebrew-1/knshd: id=knshd flags=0x20002(adhoc,linker-signed) team=not set auth= cdhash=d6509c873042
+homebrew-2/knshd: id=knshd-555549448b66023eef873dba9f5b008a55683dc7 flags=0x2(adhoc) team=not set auth= cdhash=a01cafaf3108
+homebrew-other/other: id=kc-other flags=0x20002(adhoc,linker-signed) team=not set auth= cdhash=3cffdf416494
+acl[0] auth=ACLAuthorizationEncrypt apps=ANY
+acl[1] auth=ACLAuthorizationDecrypt,ACLAuthorizationDerive,ACLAuthorizationExportClear,ACLAuthorizationExportWrapped,ACLAuthorizationMAC,ACLAuthorizationSign apps=list
+  app[0] requirement: cdhash H"d6509c87304288477103ebce211f9191f958522a"
+acl[2] auth=ACLAuthorizationIntegrity apps=ANY
+acl[3] auth=ACLAuthorizationPartitionID apps=ANY
+  partition list: cdhash:d6509c87304288477103ebce211f9191f958522a
+acl[4] auth=ACLAuthorizationChangeACL apps=none
+## devid
+devid-1/knshd: id=knsh.spike.knshd flags=0x10000(runtime) team=TEAMID0000 auth=Developer ID Application: DEVELOPER NAME (TEAMID0000) cdhash=c0687a5df1bd
+devid-2/knshd: id=knsh.spike.knshd flags=0x10000(runtime) team=TEAMID0000 auth=Developer ID Application: DEVELOPER NAME (TEAMID0000) cdhash=532c1bc0cd17
+devid-other/other: id=knsh.spike.other flags=0x10000(runtime) team=TEAMID0000 auth=Developer ID Application: DEVELOPER NAME (TEAMID0000) cdhash=80627092cab2
+acl[0] auth=ACLAuthorizationDecrypt,ACLAuthorizationDerive,ACLAuthorizationExportClear,ACLAuthorizationExportWrapped,ACLAuthorizationMAC,ACLAuthorizationSign apps=list
+  app[0] requirement: identifier "knsh.spike.knshd" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = TEAMID0000
+acl[1] auth=ACLAuthorizationEncrypt apps=ANY
+acl[2] auth=ACLAuthorizationIntegrity apps=ANY
+acl[3] auth=ACLAuthorizationPartitionID apps=ANY
+  partition list: teamid:TEAMID0000
+acl[4] auth=ACLAuthorizationChangeACL apps=none
+## cross: after adhoc overwrote a devid item
+  partition list: cdhash:95ec4e995fefcb88d577dfe7f545a77024aa4331
+## cross: after security-tool overwrote a devid item
+  partition list: apple-tool:
+2026-11-14 14:55:54.228 Df kernel[0:637bcdb] (AppleMobileFileIntegrity) AMFI: When validating /Users/USER/.cache/knsh-spike-026/dp/knshd-adhoc-kag:
+  Code has restricted entitlements, but the validation of its code signature failed.
+Unsatisfied Entitlements:
+2026-11-14 14:55:54.228 Df kernel[0:637bcdb] mac_vnode_check_signature: /Users/USER/.cache/knsh-spike-026/dp/knshd-adhoc-kag: code signature validation failed fatally: When validating /Users/USER/.cache/knsh-spike-026/dp/knshd-adhoc-kag:
+--
+2026-11-14 14:55:54.370 Df kernel[0:637bd17] (AppleMobileFileIntegrity) AMFI: When validating /Users/USER/.cache/knsh-spike-026/dp/knshd-devid-kag:

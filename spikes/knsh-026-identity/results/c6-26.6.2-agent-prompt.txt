@@ -1,0 +1,15 @@
+case=agent-prompt macos=26.6.2 date=2026-11-14T14:19:13Z clamshell_closed=Yes
+reason=approve the agent command: git push --force origin main (cwd ~/src/app, session 01JD3Q9ZKX8M4T2V6B7N5C1H0E)
+session_status=0 session_id=100015 attrs=0x6030 graphic=1 remote=0 tty=1
+pid=74543 ppid=1
+can_evaluate=1 can_error=0 biometry_type=1
+success=1 error_domain=- error_code=0 elapsed_ms=16611
+launchd_domain=gui/501 label=knsh.spike.026.la.agent-prompt
+launchd_state = not running
+launchd_domain = gui/501 [100015]
+launchd_last exit code = 0
+# Human observation (screenshot 4 s after start, not committed; the user confirmed): a password
+# dialog titled "la" read "la is trying to approve the agent command: git push --force origin main
+# (cwd ~/src/app, session 01JD3Q9ZKX8M4T2V6B7N5C1H0E). Enter the password for the user "<full
+# name>" to allow this." The whole reason text was shown, wrapped, not truncated. The user typed
+# the password; no Touch ID option was offered because the lid was closed.

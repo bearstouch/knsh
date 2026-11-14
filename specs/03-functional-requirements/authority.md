@@ -21,6 +21,15 @@ The **authority** is the one client trusted to make decisions: approve or deny, 
 | FR-AUTH-15 | The authority must verify `knshd` the same way, with a peer requirement for `knshd`'s signature, before sending anything. |
 | FR-AUTH-16 | Envelopes must not be able to look up the control service or reach `user.sock`. |
 
+Measured by KNSH-026 ([verification claims C5 and C7](../07-testing/verification-claims.md#code-signed-identity-results-knsh-026-c5-c6-c7)),
+with proposed decisions 11 and 13 (pending acceptance): the trust record lives in the file-based keychain under a
+Developer ID-signed `knshd`, and a failed read of an existing record is treated as tampering (FR-AUTH-11). launchd
+gives the control service name to the first job that declares it, so FR-AUTH-12 holds against agents (which cannot
+create launchd jobs) but not against other software of the user; FR-AUTH-15 is what catches an impostor. An XPC peer
+requirement guards only what the client receives, so the authority's first message carries nothing sensitive, and
+it sends anything else only after a reply has passed its requirement. Peers are identified by the message's audit
+token, never by pid.
+
 ## Decisions
 
 | ID | Requirement |

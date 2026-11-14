@@ -32,3 +32,7 @@ that no agent or impostor can make decisions.
 
 **Notes**
 - Could be split into 255a (XPC transport and framing) and 255b (code-signing verification).
+- From KNSH-026 ([C7 results](../07-testing/verification-claims.md#code-signed-identity-results-knsh-026-c5-c6-c7), proposed decision 13): `xpc_connection_set_peer_code_signing_requirement` on
+  each peer plus `SecCodeCreateWithXPCMessage` for hardened runtime, `CS_GET_TASK_ALLOW`/`CS_DEBUGGED` and
+  `CFBundleVersion`; never the pid (a peer can exec a trusted binary after sending). The tested requirement string is in
+  the results. launchd gives the name to the first job that declares it.

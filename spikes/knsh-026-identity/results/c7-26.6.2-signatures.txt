@@ -1,0 +1,13 @@
+# signatures
+adhoc: id=knsh.spike.authority flags=0x2(adhoc) team=not set auth= cdhash=727408366cd4
+get-task-allow: id=knsh.spike.authority flags=0x10000(runtime) team=TEAMID0000 auth=Developer ID Application: DEVELOPER NAME (TEAMID0000) cdhash=01518c002103
+good: id=knsh.spike.authority flags=0x10000(runtime) team=TEAMID0000 auth=Developer ID Application: DEVELOPER NAME (TEAMID0000) cdhash=1ce8b36b9085
+impostor-adhoc: id=knsh.spike.knshd flags=0x2(adhoc) team=not set auth= cdhash=e8bf535301bc
+impostor-other-id: id=knsh.spike.impostor flags=0x10000(runtime) team=TEAMID0000 auth=Developer ID Application: DEVELOPER NAME (TEAMID0000) cdhash=d01f6ebc4e6a
+knshd: id=knsh.spike.knshd flags=0x10000(runtime) team=TEAMID0000 auth=Developer ID Application: DEVELOPER NAME (TEAMID0000) cdhash=7aced2a896d5
+no-runtime: id=knsh.spike.authority flags=0x0(none) team=TEAMID0000 auth=Developer ID Application: DEVELOPER NAME (TEAMID0000) cdhash=26344d4bf3f8
+no-version: id=knsh.spike.authority flags=0x10000(runtime) team=TEAMID0000 auth=Developer ID Application: DEVELOPER NAME (TEAMID0000) cdhash=ef55e5ded21e
+old-version: id=knsh.spike.authority flags=0x10000(runtime) team=TEAMID0000 auth=Developer ID Application: DEVELOPER NAME (TEAMID0000) cdhash=c150651c0042
+other-id: id=knsh.spike.other flags=0x10000(runtime) team=TEAMID0000 auth=Developer ID Application: DEVELOPER NAME (TEAMID0000) cdhash=edb0c996e490
+# client requirement: anchor apple generic and certificate leaf[subject.OU] = "TEAMID0000" and identifier "knsh.spike.authority" and ((certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists) or certificate leaf[field.1.2.840.113635.100.6.1.9] exists) and !(entitlement["com.apple.security.get-task-allow"] exists)
+# service requirement: anchor apple generic and certificate leaf[subject.OU] = "TEAMID0000" and identifier "knsh.spike.knshd" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists
