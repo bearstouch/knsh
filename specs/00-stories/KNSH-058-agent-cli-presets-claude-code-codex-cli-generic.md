@@ -24,6 +24,11 @@ without hand-tuning.
 - `generic_preset_grants_no_model_host` — FR-AGT-32.
 - `preset_class_allows_git_fetch_to_github` — FR-NET-03.
 
+**Notes**
+- KNSH-027 (C9, proposed decision 14): Claude Code and Codex CLI are Node programs; Node uses the proxy only with
+  `NODE_USE_ENV_PROXY=1` (not in Node 22.20) and only with an HTTP proxy URL, never SOCKS5. Verify each CLI's own HTTP
+  client honours it; if a CLI bundles its own proxy handling, set its setting too.
+
 **Integration tests**
 - **Pending (manual, per release):** run Claude Code and Codex CLI inside an envelope on a sample repo. Confirm that
   shell commands arrive at the supervisor and that model traffic passes the TLS server-name check.

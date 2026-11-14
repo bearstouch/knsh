@@ -30,3 +30,8 @@ decrypting, so that a tunnel opened for one host cannot be used to talk to anoth
 **Notes**
 - Spec gap: Encrypted Client Hello (ECH) hides the real SNI. Propose treating ECH as a missing SNI (refuse), and say
   so in the spec.
+- KNSH-027 (C10) on macOS 26.6: curl, git, npm, pip, cargo and Node each sent a ClientHello that fitted in one record,
+  with the requested host as SNI, offered TLS 1.3 and no ECH. `spikes/knsh-027-proxy/helpers/proxy.py` has a throwaway
+  reference parser, and `results/c9-c10-26.6.2-connections.jsonl` the observed handshakes. For the forged-SNI test,
+  `curl --connect-to example.com:443:github.com:443 https://example.com/` through the proxy sends
+  `CONNECT github.com:443` with SNI `example.com`.

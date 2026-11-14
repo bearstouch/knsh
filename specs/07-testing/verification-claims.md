@@ -12,8 +12,8 @@ The design relies on these platform behaviours. Each must be verified before pha
 | C6 | A launchd user agent can show the Touch ID prompt | LocalAuthentication from `knshd` with and without a logged-in GUI session. **Confirmed on macOS 26.6 with the password fallback (lid closed), custom text shown in full** ([results](#c6-localauthentication-from-a-launchd-agent)); the Touch ID sensor, an SSH login with nobody at the console, cancellation and timeout pending |
 | C7 | XPC peer code-signing requirements work on macOS 14 | Both directions, including after the peer execs. **Confirmed on macOS 26.6 with APIs available since macOS 12 and earlier** ([results](#c7-xpc-peer-code-signing-requirements)); macOS 14 and 15 pending |
 | C8 | Seatbelt can limit process information, signals and Unix-socket connections as specified | One test per rule. **Enforceable on macOS 26.6, partly with different rule forms; gaps listed** ([results](#c8-process-information-signals-sockets-and-services)); macOS 14 and 15 pending |
-| C9 | Common tools honour per-command proxy credentials | curl, git, npm, pip, cargo and Node's HTTP clients |
-| C10 | The proxy can read the TLS server name without decrypting | Check against curl, git and npm |
+| C9 | Common tools honour per-command proxy credentials | curl, git, npm, pip, cargo and Node's HTTP clients. **Confirmed on macOS 26.6 for an HTTP proxy URL with user and password; Node needs `NODE_USE_ENV_PROXY=1` (22.23 and 24.21 observed; 22.20 ignores proxies), git sends credentials only after a `407` challenge; SOCKS5 fails for pip and Node** ([results](#c9-per-command-proxy-credentials)); macOS 14 and 15 and a real envelope pending |
+| C10 | The proxy can read the TLS server name without decrypting | Check against curl, git and npm. **Confirmed on macOS 26.6 for curl, git, npm, pip, cargo and Node: every ClientHello names the requested host, none offers Encrypted Client Hello** ([results](#c10-tls-server-names)); macOS 14 and 15 pending |
 | C11 | Engine directories are kept out of Spotlight (KNSH-011) | **Observed failing on macOS 26.6:** a uniquely named file in a non-hidden directory holding `.metadata_never_index` below the volume root was found by `mdfind`; files under a `*.noindex` directory, a hidden directory and `~/Library/Application Support/` were not. Choose a working mechanism, then check on macOS 14, 15 and current that `mdfind` does not find a file in each engine directory after indexing settles |
 
 ## Seatbelt results (KNSH-025: C1, C2, C8)
@@ -315,6 +315,88 @@ the same user (out of scope); the authority's check of `knshd` is what catches a
 `SecCodeCreateWithXPCMessage` on every message for hardened runtime, live status and version, never the pid. The
 lightweight code requirements of macOS 14.4 and the `xpc_peer_requirement_t` API of macOS 26 were not tested and are
 not needed.
+
+## Proxy results (KNSH-027: C9, C10)
+
+Observed on 2026-11-14 on an Apple M1 Pro, macOS 26.6.2 (25G83), from a normal account; nothing ran as root. Tools:
+the system curl 8.7.1 (LibreSSL 3.3.6, its default TLS backend) and git 2.54.0 (Apple Git-157), npm 10.9.3 on Node
+22.20.0, pip 26.1.1 on Python 3.14, cargo 1.99.0, and Node 22.20.0, 22.23.5 and 24.21.0. A throwaway recording proxy
+(HTTP CONNECT, absolute-URI HTTP and SOCKS5 on one loopback port) required credentials, recorded what each connection
+carried and forwarded to the real host. Each case ran with a clean environment, an empty home and its own user and
+password. The harness and raw results are in [`spikes/knsh-027-proxy/`](../../spikes/knsh-027-proxy/README.md).
+
+**Pending (not observed, not claimed):** macOS 14 and 15; a run inside a real envelope (no sandbox was applied, so a
+tool that ignores the proxy went direct instead of failing); Homebrew curl and git, Yarn, pnpm, Bun, Deno, Go,
+Python `urllib`, Java; credentials that need percent-encoding.
+
+### C9: per-command proxy credentials
+
+"HTTP env" is `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY` and `http_proxy` set to `http://user:pass@127.0.0.1:port`.
+Every credential the proxy received was the case's own user and password.
+
+| Tool | HTTP env | `ALL_PROXY=socks5h://…` | `HTTPS_PROXY=socks5h://…` | Tool's own setting (HTTP / SOCKS5) | Credentials sent |
+| --- | --- | --- | --- | --- | --- |
+| curl | yes | yes | yes | `-x`: yes / yes | Basic, up front; RFC 1929 for SOCKS5 |
+| git (HTTPS) | yes | yes | yes | `http.proxy` (set as `GIT_CONFIG_COUNT`/`KEY`/`VALUE`): yes / yes | Basic **only after a `407` challenge**; up front with `GIT_HTTP_PROXY_AUTHMETHOD=basic`; RFC 1929 |
+| npm | yes | **ignored** (went direct) | yes | `npm_config_https_proxy` and `npm_config_proxy`: yes / yes (`socks5h` and `socks5`) | Basic, up front; RFC 1929 |
+| pip | yes | **fails**: "Missing dependencies for SOCKS support" | **fails** (same) | `PIP_PROXY`: yes / fails | Basic, up front |
+| cargo | yes | yes | yes | `CARGO_HTTP_PROXY`: yes / yes | Basic, up front; RFC 1929 |
+| Node 22.20 `fetch`, `https`, `http` | **ignored** | **ignored** | — | `NODE_USE_ENV_PROXY=1`: **ignored** | none |
+| Node 22.23 and 24.21 `fetch`, `https`, `http` | **ignored** unless `NODE_USE_ENV_PROXY=1` | **ignored** | — | `NODE_USE_ENV_PROXY=1` with HTTP env: yes / SOCKS URL **fails** ("Invalid URL protocol") | Basic, up front |
+
+- **CONNECT vs SOCKS5.** Every tool supports HTTP CONNECT (Node only from 22.23 with the opt-in). SOCKS5 with username and password works for curl, git,
+  npm and cargo; pip lacks the optional PySocks dependency and Node's built-in proxy support takes only `http:` and
+  `https:` proxy URLs. Both fail rather than going direct.
+- **Missing credentials** (`http://127.0.0.1:port`): curl, git, npm, pip and cargo fail on the `407`, none goes
+  direct (Node was not run without credentials). curl and git fail at once, npm reports `E407`, pip retries for
+  about 8 seconds and cargo for about 11.
+- **Name resolution.** With `socks5://` (not `socks5h://`), curl, git and npm resolve the name themselves and send an
+  IPv4 or IPv6 address, which FR-NET-05 refuses; inside a profile, where DNS is denied (FR-NET-08), resolution fails
+  first. HTTP CONNECT and `socks5h` send the name.
+- **Plain HTTP.** curl and Node send `http://` URLs as absolute-URI requests (`GET http://example.com/`) over an HTTP
+  proxy, with a matching `Host` header and Basic credentials; over SOCKS5 curl opens a tunnel to port 80 (Node
+  cannot use SOCKS5). This is the
+  case KNSH-059's spec gap asks about.
+- The first Node release with `NODE_USE_ENV_PROXY` lies between 22.20 and 22.23 on the 22 line; it was not
+  bisected. **Node 22.23** prints "EnvHttpProxyAgent is experimental" on stderr *(ad hoc: seen by hand, not kept in `results/`)* when `NODE_USE_ENV_PROXY=1`.
+
+**Tools that ignore proxy settings, and what a preset can use instead (FR-NET-12):**
+
+| Tool | Ignores | Setting a preset uses |
+| --- | --- | --- |
+| Node `fetch`, `https`, `http` (22.23 and 24.21 observed) | `HTTPS_PROXY`/`HTTP_PROXY` by default; `ALL_PROXY` always | `NODE_USE_ENV_PROXY=1` (or `node --use-env-proxy`) with the HTTP env; HTTP proxy only |
+| Node 22.20 (the first version with `NODE_USE_ENV_PROXY` was not bisected) | every proxy setting | none built in: the program must bring its own agent; blocked inside an envelope |
+| npm | `ALL_PROXY` | `HTTPS_PROXY` (already in the HTTP env), or `npm_config_https_proxy` and `npm_config_proxy` |
+| pip | SOCKS proxies (without PySocks) | the HTTP env or `PIP_PROXY` with an HTTP proxy URL |
+| git over SSH | every proxy setting (not tested here) | none; HTTPS remotes only (already a [known limit](../03-functional-requirements/network-proxy.md#known-limits)) |
+
+**Exit question: which credential transport works across all tools?** The user and password in an **HTTP proxy
+URL** (`http://user:token@127.0.0.1:port`), which every tool turns into `Proxy-Authorization: Basic` on the CONNECT
+(or absolute-URI) request. It is the only transport that worked for all six tools; SOCKS5 usernames fail for pip and
+Node. Two conditions: the proxy must answer a request without credentials with `407` and
+`Proxy-Authenticate: Basic`, because git sends credentials only after that challenge; and Node must be opted in with
+`NODE_USE_ENV_PROXY=1`. A `Proxy-Authorization` header set directly by the user is not a portable transport: no tool
+in scope documents reading one from its environment (not tested). See proposed
+[decision 14](../09-reference/decisions.md).
+
+### C10: TLS server names
+
+For every tunnel to port 443 the proxy read the first TLS record without decrypting and parsed the ClientHello.
+
+- **curl, git and npm** (the story's three), and also **pip, cargo and Node** `fetch`/`https`: every ClientHello
+  carried a server name equal to the CONNECT or SOCKS5 domain target (example.com, github.com, registry.npmjs.org,
+  pypi.org, files.pythonhosted.org, index.crates.io). Each captured name is in
+  `results/c9-c10-26.6.2-connections.jsonl`.
+- Every ClientHello fitted in a single TLS record (`single_record`), offered TLS 1.3, and none offered **Encrypted
+  Client Hello** (extension `0xfe0d`). curl, git and cargo offered ALPN `h2, http/1.1`; pip and Node `fetch` `http/1.1`;
+  npm and Node `https` no ALPN.
+- **Negative control:** curl with `--connect-to example.com:443:github.com:443` sent `CONNECT github.com:443` and a
+  ClientHello naming `example.com`; the proxy saw the mismatch (`sni_matches: false`) before any certificate check.
+- With `socks5://`, the target is an address, so the server name cannot be compared with it; FR-NET-05 already
+  refuses such targets.
+- **Risk:** a client that adopts Encrypted Client Hello sends the provider's public name in the outer ClientHello,
+  which will not match the requested host. KNSH-061 refuses that (fail closed); a preset may need to turn ECH off for
+  such a tool. None in scope offered it here.
 
 ## Endpoint Security (macOS 27+)
 
