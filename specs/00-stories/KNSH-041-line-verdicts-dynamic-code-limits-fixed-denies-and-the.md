@@ -21,19 +21,20 @@ setups fail closed. Scope: a shipped, signed-at-build built-in profile; ask verd
 **Acceptance criteria**
 *Line verdicts, dynamic-code limits and fixed denies*
 
-- [ ] `evaluate_line` returns `LineDecision { verdict, matched_rules, capabilities }`; deny if any part is denied,
+- [x] `evaluate_line` returns `LineDecision { verdict, matched_rules, capabilities }`; deny if any part is denied,
   ask if any part asks (FR-POL-18).
-- [ ] If any part is dynamic, the line's capabilities are clamped: network limited to `hosts`, no secrets, no
+- [x] If any part is dynamic, the line's capabilities are clamped: network limited to `hosts`, no secrets, no
   `approval_hosts`, no classes (FR-POL-20/21).
-- [ ] Engine paths, sockets and the control service are in a fixed deny set compiled into the binary; a profile that
+- [x] Engine paths, sockets and the control service are in a fixed deny set compiled into the binary; a profile that
   tries to allow them fails validation (FR-POL-30).
-- [ ] Any internal error during evaluation yields deny with source `rule` and a reason (fail closed).
+- [x] Any internal error during evaluation yields deny with source `rule` and a reason (fail closed).
 
 *`unattended` profile*
 
 - [ ] A non-interactive `knsh`/`knsh -c` outside any envelope resolves to the `unattended` profile (wiring in part b).
-- [ ] Any `ask` verdict under `unattended` becomes `deny` with a reason that names the profile.
-- [ ] The profile's contents are documented in the specs.
+  **Pending:** `knsh-core` provides `load_unattended`; selecting it for such a session is the supervisor's (part b).
+- [x] Any `ask` verdict under `unattended` becomes `deny` with a reason that names the profile.
+- [x] The profile's contents are documented in the specs.
 
 **Unit tests**
 *Line verdicts, dynamic-code limits and fixed denies*
@@ -55,3 +56,5 @@ setups fail closed. Scope: a shipped, signed-at-build built-in profile; ask verd
 
 — The spec does not define the `unattended` profile's contents; propose them in
 [../03-functional-requirements/policy.md](../03-functional-requirements/policy.md) before implementing.
+Proposed in [policy.md, "The `unattended` profile"](../03-functional-requirements/policy.md#the-unattended-profile)
+(KNSH-041).

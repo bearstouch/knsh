@@ -1,0 +1,44 @@
+# Built-in profile `unattended` (FR-AGT-21, KNSH-041). Documented in
+# specs/03-functional-requirements/policy.md#the-unattended-profile; change both together.
+#
+# It applies to a non-interactive `knsh` or `knsh -c` outside any envelope, such as an agent CLI started with
+# `SHELL=knsh` but not through `knsh agent`. It is compiled into the engine (its integrity is the binary's code
+# signature) and is never read from the policies directory. Lines are supervised and sandboxed, and any line that
+# would ask is denied, because no one can answer: so a misconfigured setup fails closed. Only plain read-only
+# commands run; everything else is asked for and therefore denied.
+name = "unattended"
+
+[fs]
+read = "all"
+write = ["${TMPDIR}"]
+deny = [
+  "~/.ssh", "~/.aws", "~/.gnupg", "~/.kube", "~/.docker", "~/.config/gh", "~/.netrc", "~/.git-credentials",
+  "~/.npmrc", "~/.pypirc", "~/Library/Keychains", "~/Library/Cookies", "~/Library/Mail", "~/Library/Messages",
+]
+
+[exec]
+allow = [
+  "cd", "pwd", "echo", "printf", "true", "false", "test", "[", "type", "command",
+  "ls", "cat", "head", "tail", "wc", "file", "stat", "du", "basename", "dirname", "realpath", "readlink",
+  "grep", "rg", "find", "diff", "cmp", "sort", "uniq", "cut", "tr", "date", "uname", "whoami", "which",
+  "git status", "git log", "git diff", "git show", "git rev-parse", "git ls-files", "git blame",
+]
+# Options of allowed commands that run other programs or delete files, and configuration that makes git run one.
+deny = [
+  "find * -exec* *", "find * -ok* *", "find * -delete *",
+  "rg * --pre* *",
+  "git -c *", "git --config-env* *",
+  "sudo", "su", "security", "launchctl", "osascript", "open",
+]
+project_executables = "ask"
+default = "ask"
+
+[network]
+mode = "none"
+
+[approvals]
+irreversible = "deny"
+
+[recording]
+commands = true
+output = false

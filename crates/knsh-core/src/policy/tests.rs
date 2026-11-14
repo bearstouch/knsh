@@ -464,3 +464,70 @@ fn patterns_that_can_never_match_are_refused() {
     let source = Source::default().with("p", "name = \"p\"\n[exec]\ndeny = [\"  rm  -rf  * \", \"git*\"]");
     assert_eq!(load(&source, "p").unwrap().exec.deny, ["  rm  -rf  * ", "git*"]);
 }
+
+// FR-POL-30: a key that grants access may not name an engine path or one below it, however it is spelled; a path
+// above one, and `fs.deny`, are accepted (the sandbox compiler carves the fixed denies out of the former).
+#[test]
+fn profile_allowing_engine_path_is_rejected() {
+    let mut fs = mac_fs();
+    fs.add("/Users/u/Library/Application Support/knsh/run")
+        .add("/Users/u/.config/knsh")
+        .link("/Users/u/src/app/engine", "/Users/u/Library/Application Support/knsh");
+    let load_text = |text: &str| load_profile_text(text.as_bytes(), &Source::default(), &context(), &fs);
+    for (text, key) in [
+        (
+            "[fs]\nwrite = [\"${PROJECT}\", \"~/Library/Application Support/knsh/run\"]",
+            "fs.write[1]",
+        ),
+        ("[fs]\nwrite = [\"~/.config/knsh\"]", "fs.write[0]"),
+        ("[fs]\nread = [\"~/.config/knsh/policies\"]", "fs.read[0]"),
+        // Through a symlink in the project, and in another case (the home volume ignores case).
+        ("[fs]\nwrite = [\"${PROJECT}/engine\"]", "fs.write[0]"),
+        ("[fs]\nwrite = [\"~/library/application support/KNSH\"]", "fs.write[0]"),
+        (
+            "[fs]\nwrite = [\"~/Library/Application Support/knsh/run/user.sock\"]",
+            "fs.write[0]",
+        ),
+        (
+            "[exec]\ntrusted_folders = [\"~/.config/knsh/bin\"]",
+            "exec.trusted_folders[0]",
+        ),
+        ("[exec]\nbash = \"~/.config/knsh/bash\"", "exec.bash"),
+        (
+            "[checkpoints]\nroots = [\"~/Library/Application Support/knsh\"]",
+            "checkpoints.roots[0]",
+        ),
+    ] {
+        let error = load_text(&format!("name = \"p\"\n{text}")).unwrap_err();
+        assert_eq!(error.kind(), &ProfileErrorKind::FixedDeny, "{text}");
+        assert_eq!(error.key(), Some(key), "{text}");
+    }
+    // A path above the engine paths is accepted (the fixed denies are carved out of it), and `fs.deny` may name them.
+    let profile =
+        load_text("name = \"p\"\n[fs]\nwrite = [\"~\"]\ndeny = [\"~/.config/knsh\"]\nread = [\"~\"]").unwrap();
+    assert_eq!(profile.fs.write, [canonical("/Users/u")]);
+    assert_eq!(profile.fs.deny, [canonical("/Users/u/.config/knsh")]);
+}
+
+// FR-AGT-21: the built-in profile loads from the binary, with no parents, and matches its documented contents.
+#[test]
+fn unattended_profile_is_built_in_and_strict() {
+    let profile = load_unattended(&context(), &mac_fs()).unwrap();
+    assert_eq!(profile.name.as_str(), UNATTENDED_PROFILE);
+    assert_eq!(profile.extends.len(), 0);
+    assert_eq!(profile.preset, None);
+    assert_eq!(profile.fs.read, ReadScope::All);
+    assert_eq!(profile.fs.write, [canonical("/private/var/folders/xy/T")]);
+    assert!(profile.fs.deny.contains(&canonical("/Users/u/.ssh")));
+    assert_eq!(profile.exec.default, RuleAction::Ask);
+    assert_eq!(profile.exec.project_executables, RuleAction::Ask);
+    assert_eq!(profile.network.mode, NetworkMode::None);
+    assert!(profile.network.hosts.is_empty() && profile.network.approval_hosts.is_empty());
+    assert_eq!(profile.network.loopback.len(), 0);
+    assert_eq!(profile.approvals.irreversible, RuleAction::Deny);
+    assert_eq!(profile.secrets.len(), 0);
+    // A file of the same name in the policies directory is never read in its place.
+    let source = Source::default().with("unattended", "name = \"unattended\"\n[exec]\ndefault = \"allow\"\n");
+    assert_eq!(load_unattended(&context(), &mac_fs()).unwrap(), profile);
+    assert_ne!(load(&source, "unattended").unwrap(), profile);
+}

@@ -40,8 +40,8 @@ pub const USER_SOCKET_NAME: &str = "user";
 pub const AGENT_SOCKET_NAME: &str = "agent";
 
 /// The XPC Mach service of the control endpoint (`specs/09-reference/file-locations.md`; the final name is tied to
-/// the signing identity).
-pub const CONTROL_SERVICE: &str = "knsh.control";
+/// the signing identity). Defined in `knsh-core`, which lists it among the fixed denies (FR-POL-30).
+pub const CONTROL_SERVICE: &str = knsh_core::CONTROL_SERVICE;
 
 /// Mode launchd gives each socket file: owner read and write only, so no other user can connect (NFR-SEC-08).
 pub const SOCKET_MODE: u32 = 0o600;

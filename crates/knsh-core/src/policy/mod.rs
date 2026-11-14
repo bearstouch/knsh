@@ -1,5 +1,7 @@
-//! Policy profile model and loader (KNSH-039; FR-POL-01, FR-POL-02, FR-POL-03, FR-POL-10, FR-POL-11, FR-POL-12), and
-//! command rule matching (KNSH-040; FR-POL-13 to FR-POL-17, in the `rules` module: [`evaluate_command`]).
+//! Policy profile model and loader (KNSH-039; FR-POL-01, FR-POL-02, FR-POL-03, FR-POL-10, FR-POL-11, FR-POL-12),
+//! command rule matching (KNSH-040; FR-POL-13 to FR-POL-17, in the `rules` module: [`evaluate_command`]), and line
+//! verdicts, fixed denies and the built-in `unattended` profile (KNSH-041; FR-POL-18, FR-POL-20, FR-POL-21,
+//! FR-POL-30, FR-AGT-21: [`evaluate_line`], [`FixedDenies`], [`load_unattended`]).
 //!
 //! [`load_profile`] (by name) and [`load_profile_text`] (a snapshot pushed with `policy.set`) turn profile text into
 //! one resolved [`Profile`]:
@@ -17,7 +19,8 @@
 //!    `exec.default` is `ask`).
 //! 5. **Paths.** `~`, `${HOME}`, `${TMPDIR}` and `${PROJECT}` (the git root, or the session's start directory,
 //!    FR-POL-10) are expanded and every path is canonicalised with symlinks followed (FR-POL-11), through
-//!    [`PolicyFs`].
+//!    [`PolicyFs`]. A path in a key that grants access may not be, or lie below, a fixed deny (FR-POL-30,
+//!    [`FixedDenies`]).
 //!
 //! Loading is all or nothing: every step works on new values, and the profile is returned only when all succeed, so
 //! an invalid profile is never partially applied. Signature checks (FR-POL-40) are KNSH-065's, in the profile source.
@@ -28,16 +31,21 @@
 //! proposed in the models page: `exec.trusted_folders`, `exec.trusted_tools`, `exec.bash`,
 //! `approvals.irreversible_commands` and `output.mode`.
 
+mod fixed;
 mod layer;
+mod line;
 mod model;
 mod paths;
 mod presets;
 mod rules;
+mod unattended;
 
 #[cfg(test)]
 mod tests;
 
+pub use fixed::{CONTROL_SERVICE, ENGINE_CONFIG_DIR, ENGINE_DATA_DIR, FixedDenies};
 use layer::{Layer, LayerKind, ReadTemplate};
+pub use line::{DecisionSource, LineCapabilities, LineDecision, LineReason, MatchedRule, evaluate_line};
 pub use model::{
     ApprovalsPolicy, CheckpointPolicy, DEFAULT_AGENT_BASH, DEFAULT_CHECKPOINT_EXCLUDES, DEFAULT_RETENTION_DAYS,
     ExecPolicy, FsPolicy, NetworkMode, NetworkPolicy, OutputMode, OutputPolicy, Profile, RETENTION_DAYS_RANGE,
@@ -47,6 +55,7 @@ pub use paths::{LookupError, PathContext, PolicyFs, project_root};
 use paths::{PathTemplate, Variables};
 pub use presets::PRESETS;
 pub use rules::{CommandVerdict, RuleId, evaluate_command};
+pub use unattended::{UNATTENDED_PROFILE, UNATTENDED_PROFILE_TEXT, load_unattended};
 
 use crate::error::{ProfileError, ProfileErrorKind, ProfileOrigin};
 use crate::path::CanonicalPath;
@@ -269,7 +278,10 @@ fn build<F: PolicyFs + ?Sized>(
     fs: &F,
 ) -> Result<Profile, ProfileError> {
     let variables = Variables::resolve(context, fs)?;
-    let paths = |templates: Option<Vec<PathTemplate>>, key: &str| expand_all(templates, key, &variables, fs);
+    // FR-POL-30: no key that grants access may name an engine path. Only `fs.deny` may (it can only take away).
+    let fixed = FixedDenies::for_home(&variables.home);
+    let paths =
+        |templates: Option<Vec<PathTemplate>>, key: &str| expand_all(templates, key, &variables, fs, Some(&fixed));
 
     let read = match layer.fs_read {
         None | Some(ReadTemplate::All) => ReadScope::All,
@@ -280,9 +292,13 @@ fn build<F: PolicyFs + ?Sized>(
         trusted_folders.add(folder);
     }
     let bash = match layer.exec_bash {
-        Some(template) => template
-            .expand(&variables, fs)
-            .map_err(|kind| ProfileError::new(kind).at_key("exec.bash"))?,
+        Some(template) => {
+            let bash = template
+                .expand(&variables, fs)
+                .map_err(|kind| ProfileError::new(kind).at_key("exec.bash"))?;
+            refuse_fixed_deny(&bash, &fixed, "exec.bash")?;
+            bash
+        }
         None => CanonicalPath::new(DEFAULT_AGENT_BASH)
             .map_err(|_| ProfileError::new(ProfileErrorKind::PathUnresolvable).at_key("exec.bash"))?,
     };
@@ -303,7 +319,7 @@ fn build<F: PolicyFs + ?Sized>(
         fs: FsPolicy {
             read,
             write: paths(layer.fs_write, "fs.write")?,
-            deny: paths(layer.fs_deny, "fs.deny")?,
+            deny: expand_all(layer.fs_deny, "fs.deny", &variables, fs, None)?,
         },
         exec: ExecPolicy {
             allow: layer.exec_allow.unwrap_or_default(),
@@ -359,13 +375,14 @@ fn build<F: PolicyFs + ?Sized>(
     })
 }
 
-/// Expands and canonicalises a path list, keeping the first copy of any path two entries resolve to. Errors name
-/// `key[index]`.
+/// Expands and canonicalises a path list, keeping the first copy of any path two entries resolve to. With `fixed`,
+/// a path that is or lies below a fixed deny is refused (FR-POL-30). Errors name `key[index]`.
 fn expand_all<F: PolicyFs + ?Sized>(
     templates: Option<Vec<PathTemplate>>,
     key: &str,
     variables: &Variables,
     fs: &F,
+    fixed: Option<&FixedDenies>,
 ) -> Result<Vec<CanonicalPath>, ProfileError> {
     let mut expanded = Vec::new();
     // A set, not `Vec::contains`: a 1 MiB profile can hold hundreds of thousands of entries, and a quadratic scan
@@ -375,10 +392,22 @@ fn expand_all<F: PolicyFs + ?Sized>(
         let path = template
             .expand(variables, fs)
             .map_err(|kind| ProfileError::new(kind).at_key(&format!("{key}[{index}]")))?;
+        if let Some(fixed) = fixed {
+            refuse_fixed_deny(&path, fixed, &format!("{key}[{index}]"))?;
+        }
         // Two entries can name one place (`~/x` and a symlink to it); the list keeps each canonical path once.
         if seen.insert(path.clone()) {
             expanded.push(path);
         }
     }
     Ok(expanded)
+}
+
+/// Refuses `path` under `key` if it is, or lies below, a fixed deny (FR-POL-30). The check runs on the canonical path,
+/// so a symlink in the project pointing into an engine directory is caught too.
+fn refuse_fixed_deny(path: &CanonicalPath, fixed: &FixedDenies, key: &str) -> Result<(), ProfileError> {
+    if fixed.covers(path) {
+        return Err(ProfileError::new(ProfileErrorKind::FixedDeny).at_key(key));
+    }
+    Ok(())
 }

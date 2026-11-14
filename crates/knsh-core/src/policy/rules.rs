@@ -146,6 +146,14 @@ pub fn evaluate_command(profile: &Profile, command: &ClassifiedCommand) -> Comma
     }
 }
 
+/// Whether `pattern` matches `command` whatever its unknown arguments turn out to be: the test an allow rule must
+/// pass (module documentation). Used for grants of capability, such as a secret's `inject_for` (KNSH-041), where a
+/// match that is only possible must not count. A command no rule may name (a project executable, a function, a name
+/// not found or built from an expansion) never matches.
+pub(crate) fn matches_certainly(pattern: &str, command: &ClassifiedCommand) -> bool {
+    Subject::of(command).is_some_and(|subject| subject.matches(pattern) == Match::Certain)
+}
+
 /// How far a pattern matches a command whose arguments may not all be known. Ordered: `No < Possible < Certain`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Match {

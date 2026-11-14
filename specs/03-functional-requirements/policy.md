@@ -76,6 +76,30 @@ its members. Classes list everything a command may do, so a host rule must allow
 that is not normalised has no classes, so it reaches `approval_hosts` only with an approval. Dynamic code never has
 classes (FR-POL-20).
 
+**Line verdicts (FR-POL-18, FR-LC-09, KNSH-041).** `knsh-core`'s `evaluate_line` decides a whole classified line
+before any of it runs and returns `LineDecision { verdict, source, rule_id, reason, matched_rules, capabilities }`.
+
+- *Parts.* Every entry of the classification (each simple command, wrapper and command a wrapper runs, including those
+  in substitutions and function bodies) is decided by `evaluate_command`, and `matched_rules` lists each part's verdict
+  and rule ID in source order. A dynamic part with no entry of its own (a line the parser could not read, a construct
+  kept whole such as `[[ … ]]`, `coproc`) is decided by `exec.default` (FR-POL-20), even inside a dynamic command:
+  `python3 -c x "$([[ $(rm -rf /) ]])"` is not decided by `python3`'s allow rule alone.
+- *Verdict.* Deny if any part is denied, else ask if any part asks, else allow. `rule_id` is the first part with that
+  verdict. A line with no parts (a comment) runs nothing and is allowed. `source` is `rule`, except under the
+  `unattended` profile (below).
+- *Capabilities.* What the line may receive if it runs: the hosts open to it (`network.hosts`), the approval hosts it
+  may reach once its classes or an approval allow (`network.approval_hosts`; the proxy decides each connection,
+  FR-NET-03), the loopback ports, the classes it presents, and the `secrets.env` variables whose `inject_for` patterns
+  certainly match one of its commands (an upper bound: asking and injecting are FR-SEC-01 – FR-SEC-02's). Under
+  `network.mode = "none"` there are no hosts. A denied line receives nothing.
+- *Line classes.* The proxy identifies a line, not a command within it, so a line presents classes only when every
+  command that can connect through the proxy has them: the union of its normalised commands' classes, or none if any
+  other program runs (a binary not normalised, a project executable, a name built from an expansion). Builtins,
+  function calls, names not found and wrappers are skipped, since their commands are entries of their own. So
+  `cd repo && git fetch` presents `network:fetch`, and `git fetch && curl …` presents nothing.
+- *Fail closed.* Any failure inside the evaluation (a classification that breaks its own invariants, a panic) is a deny
+  with source `rule`, no rule ID, the reason "policy evaluation failed" and no capabilities.
+
 ## Dynamic code
 
 | ID | Requirement |
@@ -83,11 +107,55 @@ classes (FR-POL-20).
 | FR-POL-20 | Dynamic code (`eval`, `sh -c`, `python3 -c`, names from variables) must be allowed or asked as the profile says, but must never inherit classes from what it might run. |
 | FR-POL-21 | Dynamic code's network must be limited to `network.hosts`; it must receive no secrets and can never reach `approval_hosts`. So `python3 -c "subprocess.run(['git','push'])"` cannot reach github.com. |
 
+**Clamp (KNSH-041).** If any part of a line is dynamic, the whole line is clamped, even when it is allowed or later
+approved: its hosts are `network.hosts` only, with no approval hosts, no secrets and no classes. The loopback ports
+stay, being open to every command alike. One dynamic part clamps every part, because the proxy and the injected
+environment are per line.
+
 ## Fixed denies
 
 | ID | Requirement |
 | --- | --- |
 | FR-POL-30 | Engine files, sockets and the control service must be denied to every envelope and command, and no profile can change that. |
+
+**Fixed-deny set (KNSH-041).** The set is compiled into `knsh-core` and is the only source of the engine's location
+names: the engine data directory `~/Library/Application Support/knsh/` (records, grants, pushed policy, checkpoints and
+the sockets in `run/`), the configuration directory `~/.config/knsh/`, and the Mach service `knsh.control`.
+`knsh-platform` builds its engine paths from the same constants. The sandbox compiler denies the set in every profile
+(FR-SBX-05, FR-SBX-10). The loader refuses a profile in which a key that grants access (`fs.read` as a list,
+`fs.write`, `exec.trusted_folders`, `exec.bash`, `checkpoints.roots`) names an engine path or a path below one, after
+canonicalisation (so a symlink into an engine directory is caught) and ignoring ASCII case (the home volume is
+case-insensitive by default). A path above an engine path (`fs.write = ["~"]`) is accepted, because the fixed denies
+are carved out of it; `fs.deny` may name engine paths. No profile key names a socket or a Mach service. `.knsh-checkpoints/`
+folders on other volumes join the set in phase 3.
+
+## The `unattended` profile
+
+**Proposed (KNSH-041), for FR-AGT-21.** A non-interactive `knsh` or `knsh -c` outside any envelope runs under the
+built-in profile `unattended`. It is compiled into the engine (its integrity is the binary's code signature, not
+FR-POL-40's file signature) and read by the same loader, with no `extends` and no preset; a file of the same name in
+the policies directory is never read in its place. Selecting it for such a session is part b's (the supervisor's).
+
+Any `ask` verdict under a profile named `unattended` becomes `deny` with source `standalone` and a reason naming the
+profile and the rule that asked, because no one can answer. So does an allowed line holding dynamic code (the reason
+names the rule of its first dynamic part): an allowed tool given a code variable (`GIT_EXTERNAL_DIFF=./x git diff`,
+`PAGER=./x git log`) runs any program, which is never a plain read-only command. A deny rule still denies with source
+`rule`.
+
+| Setting | Value |
+| --- | --- |
+| `fs.read` | `"all"` |
+| `fs.write` | `${TMPDIR}` only |
+| `fs.deny` | `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.config/gh`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/Library/Keychains`, `~/Library/Cookies`, `~/Library/Mail`, `~/Library/Messages` |
+| `exec.allow` | Builtins `cd`, `pwd`, `echo`, `printf`, `true`, `false`, `test`, `[`, `type`, `command`; read-only tools `ls`, `cat`, `head`, `tail`, `wc`, `file`, `stat`, `du`, `basename`, `dirname`, `realpath`, `readlink`, `grep`, `rg`, `find`, `diff`, `cmp`, `sort`, `uniq`, `cut`, `tr`, `date`, `uname`, `whoami`, `which`; `git status`, `git log`, `git diff`, `git show`, `git rev-parse`, `git ls-files`, `git blame` |
+| `exec.deny` | Options that run programs or delete files: `find * -exec* *`, `find * -ok* *`, `find * -delete *`, `rg * --pre* *`; git configuration that runs programs: `git -c *`, `git --config-env* *`; and `sudo`, `su`, `security`, `launchctl`, `osascript`, `open` |
+| `exec.project_executables`, `exec.default` | `ask` (so denied, with the `unattended` reason) |
+| `network.mode` | `none` (no hosts, approval hosts or loopback ports) |
+| `approvals.irreversible` | `deny` |
+| `recording` | `commands = true`, `output = false` |
+
+Interpreters and programmable tools (`sed`, `awk`, `xargs`, `env`, shells) are left out on purpose. Command rules
+remain intent filters: the sandbox (writes only to `${TMPDIR}`, no network) is the hard limit.
 
 ## Integrity
 
