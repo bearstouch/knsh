@@ -147,13 +147,61 @@ fn shell_mode(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
     }
 }
 
-/// Hosts stock zsh for a human (KNSH-019). Recording is off until KNSH-021 adds the switch, so `knsh` replaces
-/// itself with zsh: no telemetry, no `knshd`, and zsh's own exit status, signals and terminal handling.
+/// Hosts the user's stock shell for a human: their bash when `$SHELL` is one (KNSH-020), zsh otherwise (KNSH-019).
+#[cfg(target_os = "macos")]
+fn human_shell(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
+    use knsh::integration::bash;
+
+    let login_shell = std::env::var_os(bash::SHELL_VAR);
+    match bash::user_bash(login_shell.as_deref()) {
+        // A "bash" that is knsh itself would exec knsh again, forever.
+        Some(bash) if !is_this_program(bash) => human_bash(shell, bash),
+        _ => human_zsh(shell),
+    }
+}
+
+/// Whether `path` resolves to the running `knsh` binary. Unknown counts as no.
+#[cfg(target_os = "macos")]
+fn is_this_program(path: &std::path::Path) -> bool {
+    let this = std::env::current_exe().and_then(std::fs::canonicalize);
+    matches!((this, std::fs::canonicalize(path)), (Ok(this), Ok(path)) if this == path)
+}
+
+/// Hosts the user's bash (KNSH-020). Recording is off until KNSH-021 adds the switch, so `knsh` replaces itself with
+/// plain bash: no file or variable of `knsh`'s, so every startup file runs exactly as under plain bash, and bash's
+/// own exit status, signals and terminal handling.
+///
+/// If that bash cannot be started (for example `$SHELL` names a bash since uninstalled), zsh starts instead after a
+/// one-line warning: a human shell is never refused (FR-SES-22).
+#[cfg(target_os = "macos")]
+fn human_bash(shell: &knsh::cli::args::ShellInvocation, bash: &std::path::Path) -> ExitCode {
+    use knsh::integration::bash::BashLaunch;
+    use knsh::integration::host;
+
+    let plan = BashLaunch {
+        bash,
+        startup_dir: None,
+        login: shell.login,
+        force_interactive: shell.interactive,
+        telemetry: None,
+        user_prompt_command: None,
+    }
+    .plan();
+    let error = host::exec(&plan);
+    report(&format!(
+        "knsh: cannot start {}: {error}; starting zsh\n",
+        bash.display()
+    ));
+    human_zsh(shell)
+}
+
+/// Hosts stock zsh (KNSH-019). Recording is off until KNSH-021 adds the switch, so `knsh` replaces itself with zsh:
+/// no telemetry, no `knshd`, and zsh's own exit status, signals and terminal handling.
 ///
 /// If the startup directory cannot be installed, plain zsh starts without it after a one-line warning: a human
 /// shell is never refused (FR-SES-22).
 #[cfg(target_os = "macos")]
-fn human_shell(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
+fn human_zsh(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
     use std::path::Path;
 
     use knsh::integration::{host, zsh};
@@ -185,9 +233,15 @@ fn human_shell(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
         telemetry_fd: None,
     }
     .plan();
-    let error = host::exec(&plan);
-    // Like a shell that cannot find a command: 127 with the reason on stderr.
-    report(&format!("knsh: cannot start {}: {error}\n", zsh::SYSTEM_ZSH));
+    exec_shell(&plan, Path::new(zsh::SYSTEM_ZSH))
+}
+
+/// Replaces this process with the shell `plan` starts. Returns only on failure, like a shell that cannot find a
+/// command: 127 with the reason on stderr.
+#[cfg(target_os = "macos")]
+fn exec_shell(plan: &knsh::integration::zsh::LaunchPlan, program: &std::path::Path) -> ExitCode {
+    let error = knsh::integration::host::exec(plan);
+    report(&format!("knsh: cannot start {}: {error}\n", program.display()));
     ExitCode::from(EXEC_FAILED_STATUS)
 }
 

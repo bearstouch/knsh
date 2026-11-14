@@ -1,6 +1,6 @@
-//! Process plumbing for hosting a stock shell in integration mode (KNSH-019, FR-SES-20, FR-SES-22).
+//! Process plumbing for hosting a stock shell in integration mode (KNSH-019, KNSH-020, FR-SES-20, FR-SES-22).
 //!
-//! `knsh` keeps the hosted shell's behaviour exactly as plain zsh: it never touches the terminal, and it only needs
+//! `knsh` keeps the hosted shell's behaviour exactly as plain zsh or bash: it never touches the terminal, and it only needs
 //! three small system facilities that the standard library does not offer.
 //!
 //! - [`TelemetryPipe`]: a pipe whose write end the shell inherits (the standard library marks every pipe it creates
@@ -12,7 +12,7 @@
 
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::raw::c_int;
 
 use crate::error::{Operation, PlatformError};
@@ -31,7 +31,8 @@ fn last_os_error(operation: Operation) -> PlatformError {
 
 /// The pipe that carries integration-mode telemetry lines from the hosted shell's hooks to `knsh` (KNSH-019).
 ///
-/// - The **read end** is close-on-exec: only `knsh` holds it.
+/// - The **read end** is close-on-exec: only `knsh` holds it, unless the shell is given a copy that it never reads
+///   ([`TelemetryPipe::inheritable_reader`], for bash).
 /// - The **write end** is inheritable, so the next process started (the hosted shell) receives it under the number
 ///   [`TelemetryPipe::writer_fd`] reports, and non-blocking (`O_NONBLOCK`), so a write to a full pipe fails at once
 ///   instead of waiting. The hooks drop such a line silently (FR-SES-22: never delay or block a human).
@@ -72,10 +73,56 @@ impl TelemetryPipe {
         })
     }
 
+    /// Creates the pipe with its inheritable write end at descriptor `min_fd` or above (KNSH-020).
+    ///
+    /// An interactive login bash 3.2 closes the descriptors 3 to 19 it inherits before it reads any startup file;
+    /// a descriptor at 20 or above survives. The copy keeps the write end non-blocking (the flag belongs to the open
+    /// pipe, not to the descriptor) and inheritable.
+    ///
+    /// # Errors
+    ///
+    /// As [`TelemetryPipe::new`], and [`PlatformError::Os`] with [`Operation::DescriptorFlags`] if the write end
+    /// cannot be moved. Nothing is leaked on error.
+    pub fn new_at_or_above(min_fd: RawFd) -> Result<Self, PlatformError> {
+        let pipe = Self::new()?;
+        if pipe.writer.as_raw_fd() >= min_fd {
+            return Ok(pipe);
+        }
+        let writer = duplicate_at_or_above(&pipe.writer, min_fd)?;
+        Ok(Self {
+            reader: pipe.reader,
+            writer,
+        })
+    }
+
     /// The descriptor number of the write end, as a child started now would inherit it.
     #[must_use]
     pub fn writer_fd(&self) -> RawFd {
         self.writer.as_raw_fd()
+    }
+
+    /// A second, inheritable descriptor for the read end, for a hosted shell that must keep the pipe open itself
+    /// (KNSH-020).
+    ///
+    /// Interactive bash dies of `SIGPIPE`, and stock bash can neither ignore it for one write only without a
+    /// subshell nor learn that the reader has gone. While the shell holds a read end that it never reads, a write
+    /// never meets a pipe without a reader: once `knsh` stops reading, the pipe fills and the non-blocking writes
+    /// fail with `EAGAIN`, which the hooks ignore. End of file for `knsh` depends only on the write ends, so this
+    /// does not change when the forwarder finishes.
+    ///
+    /// The copy is at descriptor `min_fd` or above (at least 3, so never a standard stream); see
+    /// [`TelemetryPipe::new_at_or_above`]. Drop it right after starting the shell, like the write end. The same
+    /// precondition as [`TelemetryPipe::new`] applies: no other thread may start a process while it exists.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Os`] with [`Operation::DescriptorFlags`] if the descriptor cannot be duplicated (for
+    /// example `EMFILE`).
+    pub fn inheritable_reader(&self, min_fd: RawFd) -> Result<OwnedFd, PlatformError> {
+        let reader = self.reader.as_fd().try_clone_to_owned();
+        // `try_clone_to_owned` is close-on-exec; the copy we return is made by `F_DUPFD`, which is not.
+        let reader = reader.map_err(|error| PlatformError::from_io(Operation::DescriptorFlags, &error))?;
+        duplicate_at_or_above(&reader, min_fd.max(3))
     }
 
     /// Splits the pipe into its read end and its write end.
@@ -83,6 +130,18 @@ impl TelemetryPipe {
     pub fn into_parts(self) -> (File, OwnedFd) {
         (self.reader, self.writer)
     }
+}
+
+/// An inheritable copy of `fd` at descriptor `min_fd` or above. `F_DUPFD`, unlike `F_DUPFD_CLOEXEC` and the standard
+/// library's clones, leaves the copy without `FD_CLOEXEC`.
+fn duplicate_at_or_above(fd: &OwnedFd, min_fd: RawFd) -> Result<OwnedFd, PlatformError> {
+    // SAFETY: `fd` is an open descriptor we own; `F_DUPFD` creates a new descriptor and touches no memory of ours.
+    let copy = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD, min_fd) };
+    if copy < 0 {
+        return Err(last_os_error(Operation::DescriptorFlags));
+    }
+    // SAFETY: `fcntl` succeeded, so `copy` is a fresh open descriptor owned by nothing else in this process.
+    Ok(unsafe { OwnedFd::from_raw_fd(copy) })
 }
 
 /// Sets or clears `FD_CLOEXEC` on `fd`.
@@ -220,6 +279,35 @@ mod tests {
         let mut text = String::new();
         reader.read_to_string(&mut text).expect("read");
         assert_eq!(text, "line\n");
+    }
+
+    // KNSH-020: the read end can be handed to the shell (inheritable). While that copy lives, a write after knsh's
+    // own read end is gone fails with EAGAIN once the pipe is full, never with EPIPE (which raises SIGPIPE).
+    #[test]
+    fn inheritable_reader_keeps_writes_from_raising_sigpipe() {
+        let pipe = TelemetryPipe::new_at_or_above(20).expect("pipe");
+        assert!(pipe.writer_fd() >= 20);
+        let keeper = pipe.inheritable_reader(20).expect("dup");
+        assert!(keeper.as_raw_fd() >= 20);
+        assert_eq!(flags(keeper.as_raw_fd(), libc::F_GETFD) & libc::FD_CLOEXEC, 0);
+        assert_eq!(flags(pipe.writer_fd(), libc::F_GETFD) & libc::FD_CLOEXEC, 0);
+        assert_ne!(flags(pipe.writer_fd(), libc::F_GETFL) & libc::O_NONBLOCK, 0);
+        let (reader, writer) = pipe.into_parts();
+        drop(reader);
+        let mut writer = File::from(writer);
+        let chunk = [b'x'; 4096];
+        let error = loop {
+            if let Err(error) = writer.write(&chunk) {
+                break error;
+            }
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        drop(keeper);
+        // Without any read end, the write fails with EPIPE (the test harness ignores SIGPIPE).
+        assert_eq!(
+            writer.write(b"x").expect_err("no reader").kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     // KNSH-019 / FR-SES-22: a full pipe fails the write at once (EAGAIN) instead of delaying the prompt.

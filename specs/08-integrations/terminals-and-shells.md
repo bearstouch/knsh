@@ -43,6 +43,76 @@ implementation choice, not a requirement.
   the hooks. Only telemetry is lost. `/etc/zshenv`, read before the wrapper, still sees the wrapper's `ZDOTDIR`; macOS
   ships no `/etc/zshenv`. A `.zshenv` that itself turns `FUNCTION_ARGZERO` off finds it back on afterwards.
 
+### Hosting bash (implementation choice, KNSH-020)
+
+As for zsh, the spec only requires the user's startup files to run unchanged; this is how `knsh` does it.
+
+- **Which shell:** `knsh` hosts bash when `$SHELL` is an absolute path to a program named `bash`, and runs that very
+  binary (`/bin/bash` 3.2, Homebrew's bash 5, …). Otherwise it hosts zsh. `argv[0]` is `-bash` for a login shell,
+  and `-i` is passed on. When that bash cannot be started, or resolves to `knsh` itself, zsh starts instead (a human
+  shell is never refused).
+- **Recording off:** `knsh` `exec`s plain bash with no file and no variable of its own, so `/etc/profile`,
+  `~/.bash_profile`, `~/.bash_login`, `~/.profile`, `~/.bashrc` and `~/.bash_logout` run exactly as in plain bash,
+  and exit status, signals, job control and terminal ownership are bash's own.
+- **Recording on, non-login shell:** bash starts with `--rcfile` pointing at the static wrapper
+  `~/Library/Application Support/knsh/shell/bash/bashrc` (owner-only, written by atomic replace when missing or
+  outdated). The wrapper takes the knsh variables out of the environment, sources `~/.bashrc` as bash would have, then
+  adds the hooks.
+- **Recording on, login shell:** no option or file can replace a login bash's profile files, and bash 3.2 reads no
+  other file. Bash starts exactly as a plain login shell, with `PROMPT_COMMAND` set to a fixed bootstrap (followed by
+  the inherited `PROMPT_COMMAND`, if any). At the first prompt, after every startup file, the bootstrap sources the
+  wrapper. The wrapper removes the bootstrap from `PROMPT_COMMAND` (string or array) and adds the hooks. A bash
+  started by a startup file inherits the bootstrap but has another parent, so it removes it and adds nothing.
+- **Hooks:** `PROMPT_COMMAND` becomes `_knsh_precmd`, then the user's entries, then `_knsh_arm`. The string form
+  becomes three lines; the array form (bash 5.1+) becomes three or more elements. A `DEBUG` trap runs `_knsh_debug`
+  and then the user's own trap, if there was one. The trap reports a line only for the first command after
+  `_knsh_arm` that is not one of the hooks' own, and not during programmable completion or `bind -x`. So a line gives
+  exactly one started and one finished telemetry line, whatever it contains. The command text is the newest history
+  entry. A line that ran no simple command in the shell itself, such as a subshell or a function definition, is
+  reported by `_knsh_precmd` when it reached history. `_knsh_precmd` moves our entries back to the ends of
+  `PROMPT_COMMAND` if something added entries around them. `knsh` also drops repeated started lines and orphan
+  finished lines (`PromptCycle`).
+- **`$?` and `PIPESTATUS`:** the trap records them before our `PROMPT_COMMAND` entries run. After each entry, a
+  `case` gives them back by rebuilding the pipeline from `(exit n)` subshells, up to 8 commands. A failing pipeline is
+  rebuilt as `… && :`, and an inverted one (`! cmd`) as `! …`, so neither `set -e` nor an `ERR` trap sees a failure.
+  bash 3.2 does not keep `PIPESTATUS` across a `DEBUG` trap. The trap gives it back itself where no pipeline is being
+  built: before the first command of a line, and before the first command of the user's `PROMPT_COMMAND`. Under
+  `extdebug` the trap returns 0, so no command is skipped.
+- **Descriptors:** the inherited write end is non-blocking, and bash also holds a read end that it never reads. A write
+  therefore never blocks and never raises `SIGPIPE`, which kills interactive bash. Once the pipe is full, writes fail
+  silently. Both ends are passed at descriptor 20 or above, because an interactive login bash 3.2 closes the
+  descriptors 3 to 19 that it inherits. Every write first checks that the descriptor is still a pipe.
+- **bash 3.2 quirks handled:** bash 3.2 hides the `DEBUG` trap inside a function and inside a file read with `.`, and
+  puts back the trap it had on entry. So the user's trap is read at the top level: after `~/.bashrc`, or by the
+  bootstrap itself. Our trap is set at the top level of the wrapper. In the login case, a user trap from the profile
+  files makes bash 3.2 undo ours when the bootstrap returns, so the first `PROMPT_COMMAND` entry sets it at the next
+  prompt.
+- **Limits:**
+  - Stock bash cannot make a descriptor close-on-exec, so commands inherit the two telemetry descriptors.
+  - In a recorded login shell, the profile files see the bootstrap `PROMPT_COMMAND` and the variables
+    `KNSH_TELEMETRY_FD`, `KNSH_TELEMETRY_PPID` and `KNSH_BASH_BOOT`. A profile file that assigns `PROMPT_COMMAND`
+    without keeping its value turns telemetry off for the session, and the variables then stay in the environment.
+  - In a recorded login shell, the first line is reported only at the next prompt (start time and directory taken
+    then) when something runs after the bootstrap in the first `PROMPT_COMMAND`, or when the user has a `DEBUG` trap
+    on bash 3.2.
+  - `PROMPT_COMMAND` is no longer exported, so a nested bash does not inherit the user's `PROMPT_COMMAND`.
+  - On bash 3.2, within one line, a command after a pipeline sees a one-element `PIPESTATUS`, as with any `DEBUG`
+    trap in bash 3.2. The prompt, the next line and the user's `PROMPT_COMMAND` see the right value. Pipelines of
+    more than 8 commands give back `$?` only. `$_` is not given back after a pipeline. In a recorded non-login
+    shell, the first prompt sees `$?` but not the `PIPESTATUS` that `~/.bashrc` left, because bash 3.2 resets
+    `PIPESTATUS` after a file read with `.`.
+  - A line that never reaches history (`HISTCONTROL=ignorespace`, history off) is reported as the command bash is
+    about to run, or as the newest entry when that entry starts with it (a repeat under `ignoredups`).
+  - Assigning `PROMPT_COMMAND` interactively removes the hooks. Replacing the `DEBUG` trap leaves lines reported at the
+    prompt only. On bash 3.2, a `bind -x` command may be reported as a line. Under `set -x` the hooks' commands are
+    traced.
+  - The user's own `DEBUG` trap also runs before the hooks' own `PROMPT_COMMAND` commands, so it runs more often per
+    prompt than in plain bash (visible only for traps with side effects, such as `return 1` under `extdebug`).
+  - The trap function runs before every simple command, which costs a few microseconds per command. Each typed line
+    and each prompt fork once, for `$(history 1)`.
+- **Verified:** bash 3.2 (`/bin/bash`) end to end. Homebrew bash 5 still needs to be verified: the tests run under
+  it whenever one is installed.
+
 ## Terminal markup
 
 In every mode the engine emits:

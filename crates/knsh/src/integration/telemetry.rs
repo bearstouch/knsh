@@ -1,7 +1,8 @@
-//! The telemetry line format between the hosted shell's hooks and `knsh` (KNSH-019, FR-SES-21).
+//! The telemetry line format between the hosted shell's hooks and `knsh` (KNSH-019, KNSH-020, FR-SES-21).
 //!
-//! The hooks run inside the user's shell, so the format is chosen to be cheap to produce with zsh builtins alone
-//! (no external process, no module beyond `zsh/system`): one line per event, fields separated by a tab.
+//! The hooks run inside the user's shell, so the format is chosen to be cheap to produce with shell builtins alone
+//! (no external process; for zsh no module beyond `zsh/system`): one line per event, fields separated by a tab. zsh
+//! and bash write the same lines; bash strings never hold a NUL, so its hooks never need `\0`.
 //!
 //! ```text
 //! knsh1 TAB preexec TAB <cwd> TAB <command> LF     a command line is about to run
@@ -195,6 +196,39 @@ fn parse_status(field: &[u8]) -> Result<u8, TelemetryError> {
         .ok_or(TelemetryError::BadStatus)
 }
 
+/// Keeps the telemetry of a session to one started/finished pair per command line, in that order (KNSH-020).
+///
+/// The hooks already report each line once: zsh calls `preexec` once per line, and the bash hooks report only the
+/// first command of a line from their `DEBUG` trap, which fires before every simple command. This is the second
+/// line of defence, applied to whatever arrives:
+///
+/// - A finished line without a started one before it is dropped (its started line was lost, or never sent).
+/// - A started line identical to the one still running (same directory and command) is a repeat for the same command
+///   line and is dropped.
+/// - A different started line while one is running is a new command line whose predecessor's finished line was
+///   lost (a full pipe): it is kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptCycle {
+    /// The started line of the command line now running, if any.
+    running: Option<TelemetryLine>,
+}
+
+impl PromptCycle {
+    /// Whether `line` is delivered; updates the state.
+    pub fn accept(&mut self, line: &TelemetryLine) -> bool {
+        match line {
+            TelemetryLine::CommandStarted { .. } => {
+                if self.running.as_ref() == Some(line) {
+                    return false;
+                }
+                self.running = Some(line.clone());
+                true
+            }
+            TelemetryLine::CommandFinished { .. } => self.running.take().is_some(),
+        }
+    }
+}
+
 /// Splits a byte stream into lines without ever buffering more than [`MAX_LINE_LEN`] bytes of one line.
 ///
 /// The hooks write into a pipe that anything holding the descriptor could also write to, so the stream is
@@ -352,6 +386,50 @@ mod tests {
         }
         let long = vec![b'x'; MAX_LINE_LEN + 1];
         assert_eq!(TelemetryLine::decode(&long), Err(TelemetryError::TooLong));
+    }
+
+    fn finished(exit_code: u8) -> TelemetryLine {
+        TelemetryLine::CommandFinished {
+            exit_code,
+            cwd: b"/".to_vec(),
+        }
+    }
+
+    // KNSH-020 unit test (AC "One telemetry record per command line typed at the prompt, not one per simple command
+    // inside it"): a DEBUG trap fires before every simple command; repeats of the running line's started report are
+    // dropped, so `a; b | c` yields one started and one finished line.
+    #[test]
+    fn debug_trap_fires_once_per_interactive_line() {
+        let line = started(b"/", b"a; b | c");
+        let mut cycle = PromptCycle::default();
+        let delivered: Vec<_> = [
+            line.clone(),
+            line.clone(),
+            line.clone(),
+            finished(1),
+            // The next prompt's own commands send nothing; an empty line sends nothing either.
+            started(b"/", b"true"),
+            finished(0),
+        ]
+        .into_iter()
+        .filter(|candidate| cycle.accept(candidate))
+        .collect();
+        assert_eq!(delivered, [line, finished(1), started(b"/", b"true"), finished(0)]);
+    }
+
+    // A finished line with no command running is dropped; a new command line after a lost finished line is kept.
+    #[test]
+    fn prompt_cycle_drops_orphans_and_keeps_new_lines() {
+        let mut cycle = PromptCycle::default();
+        assert!(!cycle.accept(&finished(0)), "nothing was running");
+        assert!(cycle.accept(&started(b"/", b"one")));
+        // The finished line of `one` was lost (full pipe): `two` is a different line, so it is kept.
+        assert!(cycle.accept(&started(b"/", b"two")));
+        assert!(!cycle.accept(&started(b"/", b"two")));
+        // The same command in another directory is another line.
+        assert!(cycle.accept(&started(b"/tmp", b"two")));
+        assert!(cycle.accept(&finished(3)));
+        assert!(!cycle.accept(&finished(3)));
     }
 
     fn read_all(input: &[u8], capacity: usize) -> Vec<Result<TelemetryLine, TelemetryError>> {
