@@ -22,8 +22,7 @@ differently (inside `<( … )`, or not after a blank inside `$( … )`) is refus
 - [x] Unterminated quotes return `LexError::Unterminated` with the span, never a guess.
 - [x] Input larger than the configured limit is rejected before tokenising (limit defined in KNSH-032).
 - [x] Reserved words are recognised only in command position (left to the parser; the lexer marks candidates).
-- [ ] A fuzz target `bash_lex` exists in `fuzz/` and runs in CI smoke mode. *(Target exists and is in `scripts/fuzz.sh`; a
-  60 s local smoke run passed. Pending: first observed CI run.)*
+- [x] A fuzz target `bash_lex` exists in `fuzz/` and runs in CI smoke mode.
 - [x] Crate `//!` header cites decision 6 and FR-LC-02.
 
 **Unit tests**
