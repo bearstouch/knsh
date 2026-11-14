@@ -128,9 +128,46 @@ Any terminal that supports them can mark commands.
 
 `knsh` can be added to `/etc/shells`, with the user's permission, so it works as a login shell with `chsh`. Login and startup-file behaviour follow the hosted shell.
 
+## Recording a human session
+
+Recording is off by default (FR-SES-04). The user turns it on in `~/.config/knsh/config.toml`:
+
+```toml
+[recording]
+human = true
+```
+
+- Only an explicit `human = true` turns it on. No file, `human = false`, or anything unclear (a file that cannot be
+  read, TOML outside the [configuration subset](../05-models/policy-profile.md#toml-subset), a `human` that is not a
+  boolean, any other key inside `[recording]`) keeps it off; an unclear file is reported once on stderr, and the shell
+  starts either way. Other top-level tables are left to other settings. There is no command-line flag: `knsh`'s shell
+  invocation follows bash's syntax.
+- **Off:** `knsh` `exec`s the shell and never connects to `knshd` (FR-SES-23).
+- **On (KNSH-021):** the shell runs as a child with the hooks. Once it has started, a worker thread in `knsh`
+  connects to `user.sock` and calls [`session.start_human`](../06-api/user-socket.md#human-sessions); the session is
+  bound to that connection and ends (`session.ended`) when it closes, so when `knsh` exits. Each command line becomes
+  one `telemetry.command` when its prompt returns (`command`, `cwd` where it started, `started_at` and `ended_at`
+  stamped by `knsh` when the hook lines arrive, `exit_code`), a different working directory at the start or end of a
+  line becomes `telemetry.cwd`, and a prompt that has waited 5 s for the next line becomes `telemetry.idle`, once,
+  and again only after the next line (FR-SES-24). "Waiting for input" means no line was submitted: `knsh` cannot see
+  keystrokes. The prompt counts as shown when the session starts and after each line. `exit` and a line still running
+  when the shell exits produce no record.
+- **Never in the way (NFR-REL-02):** the hooks never wait (KNSH-019, KNSH-020), and nothing between them and `knshd`
+  makes the shell wait: `knsh` queues up to 1024 lines for the worker and drops the rest. A failed connection or call
+  drops the telemetry silently; the worker tries again at the next line, at most once every 30 s, in a new session.
+  Starting the session may take up to 5 s (launchd starts `knshd` on demand), and each later call up to 1 s, on the
+  worker only. When the shell exits, `knsh` waits at most 500 ms for queued lines to be sent.
+- Not recorded: a line over 64 KiB, or one whose working directory is not an absolute, resolved path. Bytes that are
+  not UTF-8 are recorded as U+FFFD.
+- The connection is made only after the shell has started, so no command run from the shell can inherit it.
+
 ## Recording indicator
 
-A recording session sets `KNSH_RECORDING=1`, so prompts can show that recording is on.
+A recording session sets `KNSH_RECORDING=1` in the shell's environment, so prompts can show that recording is on
+(FR-SES-25). It is set only when the hooks are installed and telemetry flows to `knsh`; it reflects the setting, not
+whether `knshd` is reachable at that moment (telemetry is then dropped, NFR-REL-02). A shell that is not recorded never
+has it, even when `knsh` inherited it from a recorded parent. `session.info` reports `recording` for the caller's
+session ([user socket](../06-api/user-socket.md#human-sessions)).
 
 ## Startup files
 

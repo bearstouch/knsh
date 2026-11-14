@@ -60,6 +60,8 @@ const CONFIG_DIR: [&str; 2] = [".config", "knsh"];
 const RUN_DIR: &str = "run";
 /// Checkpoints for the home volume, inside the data directory.
 const CHECKPOINTS_DIR: &str = "checkpoints";
+/// The user settings file in the configuration directory (KNSH-021).
+const CONFIG_FILE: &str = "config.toml";
 /// Policy files, inside the configuration directory.
 const POLICIES_DIR: &str = "policies";
 /// The zsh startup directory of integration mode, below the data directory (KNSH-019).
@@ -146,6 +148,13 @@ impl EnginePaths {
     #[must_use]
     pub fn config_dir(&self) -> &Path {
         &self.config
+    }
+
+    /// `~/.config/knsh/config.toml`: user settings, such as recording human sessions (`[recording] human`,
+    /// KNSH-021). Written by the user; `knsh` only reads it.
+    #[must_use]
+    pub fn config_file(&self) -> PathBuf {
+        self.config.join(CONFIG_FILE)
     }
 
     /// `~/.config/knsh/policies/`. Created by the policy stories, not by [`ensure_engine_dirs`].
@@ -574,6 +583,7 @@ mod tests {
             paths.bash_startup_dir(),
             Path::new("/Users/u/Library/Application Support/knsh/shell/bash")
         );
+        assert_eq!(paths.config_file(), Path::new("/Users/u/.config/knsh/config.toml"));
     }
 
     // "No path literals elsewhere": engine path components appear in no other Rust source of the workspace.

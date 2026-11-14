@@ -10,7 +10,7 @@ Reachable by processes inside envelopes. Every method is scoped to the caller's 
 | `records.query`, `records.output` | The session's own records and output ranges ([parameters](user-socket.md#records)) |
 | `events.subscribe`, `events.unsubscribe` | The session's own events, optionally from `since_seq` |
 | `checkpoint.list`, `checkpoint.diff`, `checkpoint.undo`, `checkpoint.redo` | The session's own changes, without `force` |
-| `session.info` | Actor, profile, state, recording settings |
+| `session.info` | Actor, profile, state, recording settings ([result](user-socket.md#sessioninfo)); `-32003` until sessions are bound to `agent.sock` connections (KNSH-048) |
 
 ## `exec.run`
 

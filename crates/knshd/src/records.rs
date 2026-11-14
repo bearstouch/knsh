@@ -357,6 +357,7 @@ mod tests {
             stream: stream(),
             request,
             subscriber: crate::dispatch::tests::subscriber(),
+            binding: crate::dispatch::tests::binding(),
         }
     }
 
@@ -717,8 +718,8 @@ mod tests {
         assert_eq!(error.code, ErrorCode::NotAllowed);
 
         let probed = crate::probe::probe(&crate::probe::tests::Machine::working().probes());
-        let mut handlers = records.handlers();
-        handlers.extend(crate::events::tests::hub().handlers());
+        let mut handlers = crate::hello::tests::handlers();
+        handlers.extend(records.handlers());
         let dispatcher = crate::hello::phase1_dispatcher(probed, handlers).unwrap();
         let error = dispatcher.call(&agent_call).unwrap_err();
         assert_eq!(error.code, ErrorCode::NotAllowed);

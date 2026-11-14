@@ -41,6 +41,7 @@ use knsh_proto::{
 
 use crate::dispatch::{Answer, Call, Dispatcher, Endpoint, HELLO, Reply};
 use crate::events::Subscriber;
+use crate::sessions::SessionBinding;
 
 /// Deliveries the pump writes per turn of the writer lock, so a busy subscription never starves the answers to
 /// requests for long.
@@ -124,6 +125,8 @@ struct Session<'a> {
     dispatcher: &'a Dispatcher,
     /// The connection's event subscriptions.
     subscriber: &'a Subscriber,
+    /// The human session bound to the connection, if any (KNSH-021).
+    binding: &'a SessionBinding,
     /// Whether `hello` has succeeded.
     greeted: bool,
     /// How raw bytes reach this client: binary frames until a `hello` opts out.
@@ -216,6 +219,7 @@ impl Session<'_> {
             stream: self.next_stream,
             request,
             subscriber: self.subscriber,
+            binding: self.binding,
         })
     }
 
@@ -266,10 +270,12 @@ pub(crate) fn serve<R: Read, W: Write + Send>(
     let mut reader = FrameReader::new(reader);
     let writer = Mutex::new(FrameWriter::new(writer));
     let subscriber = Subscriber::new();
+    let binding = SessionBinding::new();
     let mut session = Session {
         endpoint,
         dispatcher,
         subscriber: &subscriber,
+        binding: &binding,
         greeted: false,
         bytes: ByteTransport::BinaryFrames,
         next_stream: FIRST_STREAM,
@@ -324,8 +330,10 @@ pub(crate) fn serve<R: Read, W: Write + Send>(
                 }
             }
         };
-        // Every subscription ends with the connection; the pump wakes, sees the close and returns.
+        // Every subscription ends with the connection; the pump wakes, sees the close and returns. A human session
+        // bound to the connection ends too (`session.ended`, KNSH-021): `knsh` went away, whether it exited or not.
         subscriber.close();
+        binding.release();
         let Some(pump) = pump else {
             return closed;
         };

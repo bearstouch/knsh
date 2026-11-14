@@ -220,7 +220,12 @@ impl ZshLaunch<'_> {
             Vec::new()
         };
         // Our own variables never pass through from knsh's environment: a stale value would mislead the wrapper.
-        let mut remove_env = vec![OsString::from(ORIGINAL_ZDOTDIR_VAR), OsString::from(TELEMETRY_FD_VAR)];
+        // `KNSH_RECORDING` too: only a shell that is recorded right now may claim it (FR-SES-25).
+        let mut remove_env = vec![
+            OsString::from(ORIGINAL_ZDOTDIR_VAR),
+            OsString::from(TELEMETRY_FD_VAR),
+            OsString::from(super::RECORDING_VAR),
+        ];
         let mut set_env = Vec::new();
         if let Some(startup_dir) = self.startup_dir {
             remove_env.push(OsString::from(ZDOTDIR_VAR));
@@ -230,6 +235,8 @@ impl ZshLaunch<'_> {
             }
             if let Some(fd) = self.telemetry_fd {
                 set_env.push((OsString::from(TELEMETRY_FD_VAR), OsString::from(fd.to_string())));
+                // Hooks installed and telemetry flowing: the shell is recorded (KNSH-021).
+                set_env.push((OsString::from(super::RECORDING_VAR), OsString::from("1")));
             }
         }
         LaunchPlan {

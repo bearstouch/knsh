@@ -3,6 +3,7 @@
 | Data | Path or name |
 | --- | --- |
 | Configuration, hooks and policy files | `~/.config/knsh/` (policies in `~/.config/knsh/policies/`; integrity-protected) |
+| User settings | `~/.config/knsh/config.toml` (`[recording] human`; written by the user, read by `knsh`) |
 | Records, grants, pushed policy | `~/Library/Application Support/knsh/` (records in `records.db`, owner-only `0600`) |
 | Checkpoints, home volume | `~/Library/Application Support/knsh/checkpoints/` |
 | Checkpoints, other APFS volumes | `.knsh-checkpoints/` on that volume, when writable; otherwise plain copies in the home store |
@@ -28,7 +29,7 @@
 | `PATH` | Envelopes | Shim directory first |
 | Session token | Envelopes | Authenticates `agent.sock` requests |
 | Proxy settings | Envelopes and supervised lines | Per-envelope or per-command proxy credentials |
-| `KNSH_RECORDING` | Recording sessions | `1` when recording |
+| `KNSH_RECORDING` | Recording sessions | `1` when recording; removed from a shell that is not recorded |
 | `KNSH_ZSH_ZDOTDIR`, `KNSH_TELEMETRY_FD` | Only between `knsh` and its zsh startup wrapper | The user's `ZDOTDIR` and the telemetry descriptor; removed before any user file runs |
 | `KNSH_TELEMETRY_FD`, `KNSH_TELEMETRY_PPID`, `KNSH_BASH_BOOT` | Only between `knsh` and its bash startup wrapper, while recording | The telemetry descriptor, `knsh`'s process ID and (login shells) the wrapper's path; removed before `~/.bashrc` runs (non-login) or at the first prompt (login) |
 | Secret variables | Matching supervised lines | As named in `[secrets.env]` |

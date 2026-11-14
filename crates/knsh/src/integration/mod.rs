@@ -11,9 +11,20 @@
 //! - [`telemetry`]: the line format between the hooks and `knsh`.
 //! - [`host`]: installing the wrappers and starting the shell, by `exec` (recording off) or as a child with a
 //!   forwarder (recording on).
+//! - [`config`]: the recording switch, `[recording] human` in the user's `config.toml` (KNSH-021).
+//! - [`recorder`]: forwarding the telemetry of a recorded session to `knshd`, with the idle prompt event (KNSH-021).
+//!
+//! A recorded shell gets [`RECORDING_VAR`] set to `1` so that prompts can show it (FR-SES-25); an unrecorded one never
+//! has it, even when `knsh` inherited it.
+
+/// Set to `1` in a recorded shell's environment (FR-SES-25, NFR-PRIV-05), and removed otherwise.
+pub const RECORDING_VAR: &str = "KNSH_RECORDING";
 
 pub mod bash;
+pub mod config;
 #[cfg(unix)]
 pub mod host;
+#[cfg(unix)]
+pub mod recorder;
 pub mod telemetry;
 pub mod zsh;
