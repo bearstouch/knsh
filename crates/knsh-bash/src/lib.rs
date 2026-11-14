@@ -36,6 +36,9 @@
 //! unsupported construct, `eval`, `source` or `.`, a command name built from an expansion, or a here-document fed to
 //! an interpreter. Only [`parse_line`] can build a `ParseOutcome`, so no parser error reaches [`Exact`].
 //!
+//! Builtins (KNSH-035): [`is_builtin`] names the commands bash 3.2 runs itself, so the supervisor does not resolve
+//! them on `PATH` (FR-LC-03). Later bash builtins are left out, so a program of the same name is never hidden.
+//!
 //! # Boundaries
 //!
 //! No workspace or third-party dependencies, no I/O, no global state, no `unsafe`. Input is untrusted (NFR-SEC-05):
@@ -60,6 +63,7 @@
 #![forbid(unsafe_code)]
 
 mod ast;
+mod builtins;
 mod error;
 mod functions;
 mod interpreters;
@@ -76,6 +80,7 @@ pub use ast::{
     Redirect, Script, Separator, SeparatorKind, SimpleCommand, Subshell, Substitution, SubstitutionKind,
     UnsupportedCommand,
 };
+pub use builtins::is_builtin;
 pub use error::{CompoundStart, Construct, LexError, ParseError, Unexpected, UnsupportedConstruct};
 pub use lex::lex;
 pub use limits::{MAX_FUNCTION_DEFINITIONS, MAX_INPUT_LEN, MAX_NESTING_DEPTH, MAX_TOKENS};

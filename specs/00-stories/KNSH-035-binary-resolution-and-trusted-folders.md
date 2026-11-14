@@ -13,14 +13,14 @@ trusted folders `/usr/bin`, `/bin`, `/usr/sbin`, `/opt/homebrew/bin`, `/usr/loca
 symlinks followed; bash builtins and keywords recognised.
 
 **Acceptance criteria**
-- [ ] `resolve(name, env_path, cwd, trusted, fs) -> Resolution` returns `Trusted(CanonicalPath)`,
+- [x] `resolve(name, env_path, cwd, trusted, fs) -> Resolution` returns `Trusted(CanonicalPath)`,
   `ProjectExecutable(CanonicalPath)`, `Builtin`, `Function`, or `NotFound`.
-- [ ] A binary whose canonical path is outside trusted folders (e.g. `node_modules/.bin/x`, `./scripts/x`) is
+- [x] A binary whose canonical path is outside trusted folders (e.g. `node_modules/.bin/x`, `./scripts/x`) is
   `ProjectExecutable` even if invoked by bare name (FR-POL-14).
-- [ ] A symlink in a trusted folder pointing outside is classified by its canonical target.
-- [ ] Names containing `/` are resolved relative to cwd and canonicalised.
-- [ ] `NotFound` is carried through so the line fails as bash would (127), not allowed as unknown.
-- [ ] Fake `Fs` from KNSH-007 used in tests; no real filesystem in unit tests.
+- [x] A symlink in a trusted folder pointing outside is classified by its canonical target.
+- [x] Names containing `/` are resolved relative to cwd and canonicalised.
+- [x] `NotFound` is carried through so the line fails as bash would (127), not allowed as unknown.
+- [x] Fake `Fs` from KNSH-007 used in tests; no real filesystem in unit tests.
 
 **Unit tests**
 - `resolves_git_from_usr_bin_as_trusted` — FR-POL-13.

@@ -37,6 +37,9 @@
 //! | --- | --- | --- | --- |
 //! | [`SystemProbe`] | OS major version; start and stop a file-event stream | `SystemProbes` | `FakeSystemProbe` |
 //!
+//! The `lookup` module (KNSH-035) implements [`knsh_core::BinaryLookup`] for every [`Fs`], so the supervisor
+//! resolves command names with [`knsh_core::resolve`] against the real filesystem and tests do so against `MemFs`.
+//!
 //! Later stories add Keychain, `LocalAuthentication`, XPC, `FSEvents` and APFS clones to the same interface.
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
@@ -66,6 +69,7 @@
 //! - `specs/05-models/capabilities.md`, NFR-SEC-10, NFR-REL-08 (capability probe, KNSH-014)
 //! - `specs/08-integrations/terminals-and-shells.md`, FR-SES-22 (telemetry pipe, job-control signals and signal
 //!   re-raising for a hosted shell, `macos::shell_host`, KNSH-019)
+//! - FR-LC-03, FR-POL-13, FR-POL-14 (binary lookup for command resolution, KNSH-035)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
@@ -78,6 +82,7 @@ mod error;
 mod fs;
 pub mod launchd;
 mod log;
+mod lookup;
 pub mod probe;
 mod process;
 mod random;
