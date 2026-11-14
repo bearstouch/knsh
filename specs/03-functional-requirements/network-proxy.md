@@ -22,3 +22,9 @@
 
 - An allowlisted host that accepts uploads (a package registry, a git host) can receive data. Keep upload-capable hosts in `approval_hosts`, and let irreversible flags gate publishing commands.
 - Tools that ignore proxy settings (ssh git remotes, some Node and Java HTTP clients) are blocked, not leaked.
+- Credentials travel as the user and password of an HTTP proxy URL and arrive as `Proxy-Authorization: Basic`. git
+  sends them only after a `407` with `Proxy-Authenticate: Basic`, so the challenge is required; Node uses the proxy
+  only with `NODE_USE_ENV_PROXY=1`; pip (without PySocks) and Node cannot use SOCKS5 (C9, proposed
+  [decision 14](../09-reference/decisions.md)).
+- A client that uses Encrypted Client Hello shows a public name in its handshake, not the requested host, and is
+  refused by FR-NET-06. None of curl, git, npm, pip, cargo or Node did on macOS 26.6 (C10).

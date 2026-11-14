@@ -54,8 +54,13 @@ so that my traffic is checked like everything else.
 **Notes**
 *Proxy core: HTTP CONNECT and per-command credentials*
 
+- KNSH-027 (C9, proposed decision 14): the `407` must carry `Proxy-Authenticate: Basic`, because git sends
+  credentials only after that challenge; accept only the Basic scheme. The client matrix for the integration tests is
+  the one in `spikes/knsh-027-proxy/`: curl, git, npm, pip, cargo and Node (`NODE_USE_ENV_PROXY=1`) over CONNECT;
+  curl, git, npm and cargo over SOCKS5.
 - Spec gap: plain-HTTP requests in absolute-URI form (not CONNECT) are not specified. Propose supporting them with a
-  Host-header check equivalent to the TLS server-name check. Otherwise refuse them.
+  Host-header check equivalent to the TLS server-name check. Otherwise refuse them. KNSH-027 observed curl and Node
+  sending `http://` URLs this way, with a matching `Host` header.
 
 *SOCKS5 support*
 

@@ -1,0 +1,74 @@
+id	tool	transport	exit	seconds	used_proxy	http_auth	socks_auth	creds_ok	targets	sni	ech	stderr
+c01	curl	env-http	0	0.1	yes	preemptive	-	yes	example.com:443	ok	no	-
+c02	curl	env-http-nocreds	56	0.0	yes	none	-	-	-	-	-	curl: (56) CONNECT tunnel failed, response 407
+c03	curl	env-socks5h-all	0	0.1	yes	-	userpass	yes	example.com:443	ok	no	-
+c04	curl	env-socks5-all	0	0.1	yes	-	userpass	yes	2606:4700:10::ac42:93f3:443(ipv6)	name-vs-ip:example.com	no	-
+c05	curl	env-socks5h-https	0	0.1	yes	-	userpass	yes	example.com:443	ok	no	-
+c06	curl	tool-http	0	0.1	yes	preemptive	-	yes	example.com:443	ok	no	-
+c07	curl	tool-socks5h	0	0.2	yes	-	userpass	yes	example.com:443	ok	no	-
+c08	curl-plain	env-http	0	0.1	yes	preemptive	-	yes	GET example.com:80 host-header=ok	-	-	-
+c09	curl-plain	env-socks5h-all	0	0.1	yes	-	userpass	yes	example.com:80	-	-	-
+c10	curl-fronted	env-http	60	0.2	yes	preemptive	-	yes	github.com:443	MISMATCH	no	curl failed to verify the legitimacy of the server and therefore could not
+c11	git	env-http	0	1.2	yes	after-407	-	yes	github.com:443	ok	no	-
+c12	git	env-http-nocreds	128	0.2	yes	none	-	-	-	-	-	fatal: unable to access 'https://github.com/octocat/Hello-World.git/': CONNECT tunnel failed, response 407
+c13	git	env-socks5h-all	0	1.2	yes	-	userpass	yes	github.com:443	ok	no	-
+c14	git	env-socks5-all	0	1.1	yes	-	userpass	yes	74.161.79.192:443(ipv4)	name-vs-ip:github.com	no	-
+c15	git	env-socks5h-https	0	1.1	yes	-	userpass	yes	github.com:443	ok	no	-
+c16	git	tool-http	0	1.0	yes	after-407	-	yes	github.com:443	ok	no	-
+c17	git	tool-socks5h	0	1.2	yes	-	userpass	yes	github.com:443	ok	no	-
+c18	git	tool-http-basic	0	0.9	yes	preemptive	-	yes	github.com:443	ok	no	-
+c19	npm	env-http	0	0.5	yes	preemptive	-	yes	registry.npmjs.org:443	ok	no	-
+c20	npm	env-http-nocreds	1	0.3	yes	none	-	-	-	-	-	npm error code E407
+c21	npm	env-socks5h-all	0	0.5	no-direct	-	-	-	-	-	-	-
+c22	npm	env-socks5h-https	0	0.5	yes	-	userpass	yes	registry.npmjs.org:443	ok	no	-
+c23	npm	tool-http	0	0.5	yes	preemptive	-	yes	registry.npmjs.org:443	ok	no	-
+c24	npm	tool-socks5h	0	0.5	yes	-	userpass	yes	registry.npmjs.org:443	ok	no	-
+c25	npm	tool-socks5	0	0.5	yes	-	userpass	yes	2606:4700::6810:222:443(ipv6)	name-vs-ip:registry.npmjs.org	no	-
+c26	pip	env-http	0	0.6	yes	preemptive	-	yes	pypi.org:443 files.pythonhosted.org:443	ok	no	-
+c27	pip	env-http-nocreds	1	7.8	yes	none	-	-	-	-	-	WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) after connection broken by 'OSError('Tunnel connection failed: 407 Proxy
+c28	pip	env-socks5h-all	2	0.3	no	-	-	-	-	-	-	ERROR: Exception:
+c29	pip	env-socks5h-https	2	0.3	no	-	-	-	-	-	-	ERROR: Exception:
+c30	pip	tool-http	0	0.4	yes	preemptive	-	yes	pypi.org:443 files.pythonhosted.org:443	ok	no	-
+c31	pip	tool-socks5h	2	0.3	no	-	-	-	-	-	-	ERROR: Exception:
+c32	cargo	env-http	0	0.3	yes	preemptive	-	yes	index.crates.io:443	ok	no	Locking 1 package to highest compatible version
+c33	cargo	env-http-nocreds	101	11.4	yes	none	-	-	-	-	-	warning: spurious network error (3 tries remaining): [56] Failure when receiving data from the peer (CONNECT tunnel failed, response 407)
+c34	cargo	env-socks5h-all	0	0.1	yes	-	userpass	yes	index.crates.io:443	ok	no	Locking 1 package to highest compatible version
+c35	cargo	env-socks5h-https	0	0.1	yes	-	userpass	yes	index.crates.io:443	ok	no	Locking 1 package to highest compatible version
+c36	cargo	tool-http	0	0.2	yes	preemptive	-	yes	index.crates.io:443	ok	no	Locking 1 package to highest compatible version
+c37	cargo	tool-socks5h	0	0.1	yes	-	userpass	yes	index.crates.io:443	ok	no	Locking 1 package to highest compatible version
+c38	node22-fetch	env-http	0	0.2	no-direct	-	-	-	-	-	-	-
+c39	node22-fetch	env-socks5h-all	0	0.2	no-direct	-	-	-	-	-	-	-
+c40	node22-fetch	tool-http	0	0.2	no-direct	-	-	-	-	-	-	-
+c41	node22-fetch	tool-socks5h	0	0.2	no-direct	-	-	-	-	-	-	-
+c42	node22-https	env-http	0	0.1	no-direct	-	-	-	-	-	-	-
+c43	node22-https	env-socks5h-all	0	0.2	no-direct	-	-	-	-	-	-	-
+c44	node22-https	tool-http	0	0.1	no-direct	-	-	-	-	-	-	-
+c45	node22-https	tool-socks5h	0	0.1	no-direct	-	-	-	-	-	-	-
+c46	node22-http	env-http	0	0.1	no-direct	-	-	-	-	-	-	-
+c47	node22-http	env-socks5h-all	0	0.1	no-direct	-	-	-	-	-	-	-
+c48	node22-http	tool-http	0	0.1	no-direct	-	-	-	-	-	-	-
+c49	node22-http	tool-socks5h	0	0.2	no-direct	-	-	-	-	-	-	-
+c50	node2223-fetch	env-http	0	0.3	no-direct	-	-	-	-	-	-	-
+c51	node2223-fetch	env-socks5h-all	0	0.2	no-direct	-	-	-	-	-	-	-
+c52	node2223-fetch	tool-http	0	0.2	yes	preemptive	-	yes	registry.npmjs.org:443	ok	no	(Use `node --trace-warnings ...` to show where the warning was created)
+c53	node2223-fetch	tool-socks5h	1	0.1	no	-	-	-	-	-	-	throw new InvalidArgumentError("Invalid URL protocol: the URL must start with `http:` or `https:`.");
+c54	node2223-https	env-http	0	0.1	no-direct	-	-	-	-	-	-	-
+c55	node2223-https	env-socks5h-all	0	0.1	no-direct	-	-	-	-	-	-	-
+c56	node2223-https	tool-http	0	0.2	yes	preemptive	-	yes	registry.npmjs.org:443	ok	no	(Use `node --trace-warnings ...` to show where the warning was created)
+c57	node2223-https	tool-socks5h	1	0.1	no	-	-	-	-	-	-	throw new InvalidArgumentError("Invalid URL protocol: the URL must start with `http:` or `https:`.");
+c58	node2223-http	env-http	0	0.1	no-direct	-	-	-	-	-	-	-
+c59	node2223-http	env-socks5h-all	0	0.2	no-direct	-	-	-	-	-	-	-
+c60	node2223-http	tool-http	0	0.1	yes	preemptive	-	yes	GET example.com:80 host-header=ok	-	-	(Use `node --trace-warnings ...` to show where the warning was created)
+c61	node2223-http	tool-socks5h	1	0.1	no	-	-	-	-	-	-	throw new InvalidArgumentError("Invalid URL protocol: the URL must start with `http:` or `https:`.");
+c62	node24-fetch	env-http	0	0.3	no-direct	-	-	-	-	-	-	-
+c63	node24-fetch	env-socks5h-all	0	0.2	no-direct	-	-	-	-	-	-	-
+c64	node24-fetch	tool-http	0	0.2	yes	preemptive	-	yes	registry.npmjs.org:443	ok	no	-
+c65	node24-fetch	tool-socks5h	1	0.1	no	-	-	-	-	-	-	throw new InvalidArgumentError("Invalid URL protocol: the URL must start with `http:` or `https:`.");
+c66	node24-https	env-http	0	0.1	no-direct	-	-	-	-	-	-	-
+c67	node24-https	env-socks5h-all	0	0.2	no-direct	-	-	-	-	-	-	-
+c68	node24-https	tool-http	0	0.1	yes	preemptive	-	yes	registry.npmjs.org:443	ok	no	-
+c69	node24-https	tool-socks5h	1	0.1	no	-	-	-	-	-	-	throw new InvalidArgumentError("Invalid URL protocol: the URL must start with `http:` or `https:`.");
+c70	node24-http	env-http	0	0.1	no-direct	-	-	-	-	-	-	-
+c71	node24-http	env-socks5h-all	0	0.1	no-direct	-	-	-	-	-	-	-
+c72	node24-http	tool-http	0	0.1	yes	preemptive	-	yes	GET example.com:80 host-header=ok	-	-	-
+c73	node24-http	tool-socks5h	1	0.1	no	-	-	-	-	-	-	throw new InvalidArgumentError("Invalid URL protocol: the URL must start with `http:` or `https:`.");
