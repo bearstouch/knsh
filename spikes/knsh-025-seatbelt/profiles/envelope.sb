@@ -1,0 +1,94 @@
+;; KNSH-025 spike: hand-written envelope profile (throwaway; not the KNSH-044/045 compiler output).
+;;
+;; Placeholders, substituted by the harness with canonical paths (Seatbelt matches canonical
+;; paths only: /private/etc, /private/var, /private/tmp):
+;;   @SESSION@   session tag     @WORK@     project/work directory   @HOME@  home directory
+;;   @TMPDIR@    per-user $TMPDIR (confstr DARWIN_USER_TEMP_DIR, canonical)
+;;   @CACHEDIR@  per-user DARWIN_USER_CACHE_DIR (canonical)
+;;   @AGENTSOCK@ agent.sock path @USERSOCK@ user.sock path
+;;
+;; Shape follows the spec table (sandbox-profiles.md): deny by default, read everything,
+;; write only to roots, services denied, process info and signals limited to the sandbox.
+;; Network is left open here on purpose: C1 isolates sandbox nesting; network limits are C9/C10.
+
+(version 1)
+
+;; FR-SBX-06: every deny carries a tag. The default deny carries one too (observed to work).
+(deny default (with message "knsh:@SESSION@:env:default"))
+
+;; --- Processes ---------------------------------------------------------------------------
+(allow process-exec process-fork)
+;; "Own process group" (spec) is implemented as same-sandbox: (target pgrp) can be escaped
+;; with setpgid(2) into another group of the same session (observed).
+(allow signal (target same-sandbox))
+(deny process-info* (with message "knsh:@SESSION@:env:process-info"))
+(allow process-info* (target same-sandbox))
+(allow sysctl-read)
+
+;; --- Files -------------------------------------------------------------------------------
+(allow file-read*)
+(allow file-ioctl)
+(allow file-write*
+    (subpath "@WORK@")
+    (subpath "@TMPDIR@")
+    (subpath "@CACHEDIR@")
+    (subpath "/private/tmp")
+    (subpath "@HOME@/Library/Caches")
+    (subpath "@HOME@/.cache")
+    (subpath "@HOME@/.npm")
+    (subpath "@HOME@/.claude")
+    (literal "@HOME@/.claude.json")
+    (regex #"^@HOME@/\.claude\.json\.")
+    (subpath "@HOME@/.codex")
+    (subpath "@HOME@/Library/org.swift.swiftpm")
+    (subpath "@HOME@/Library/Developer/Xcode/DerivedData")
+    (literal "/dev/null") (literal "/dev/zero") (literal "/dev/dtracehelper")
+    (literal "/dev/tty") (regex #"^/dev/ttys[0-9]+$") (literal "/dev/ptmx"))
+(allow pseudo-tty)
+
+;; Fixed write denies (sandbox-profiles.md): planting code that runs outside the sandbox.
+(deny file-write*
+    (regex #"/\.git/hooks(/|$)") (regex #"/\.git/config$")
+    (literal "@HOME@/.zshrc") (literal "@HOME@/.zprofile") (literal "@HOME@/.bashrc")
+    (literal "@HOME@/.bash_profile") (literal "@HOME@/.profile")
+    (subpath "@HOME@/Library/LaunchAgents") (subpath "@HOME@/.ssh")
+    (with message "knsh:@SESSION@:env:fixed-write"))
+
+;; --- IPC and devices ---------------------------------------------------------------------
+(allow ipc-posix-shm* ipc-posix-sem)
+(allow iokit-open)
+(allow user-preference-read)
+(allow mach-lookup)
+(allow mach-register)
+
+;; --- System services denied (sandbox-profiles.md, FR-NET-08) ------------------------------
+;; BEGIN launchservices (the c1 harness removes this block for its "+ls" variant)
+(deny mach-lookup
+    (global-name "com.apple.coreservices.launchservicesd" "com.apple.lsd.mapdb"
+                 "com.apple.lsd.modifydb" "com.apple.CoreServices.coreservicesd")
+    (with message "knsh:@SESSION@:env:launchservices"))
+;; END launchservices
+(deny mach-lookup (global-name "com.apple.coreservices.appleevents")
+    (with message "knsh:@SESSION@:env:appleevents"))
+(deny job-creation (with message "knsh:@SESSION@:env:launchd-job"))
+(deny mach-lookup (global-name "com.knsh.control")
+    (with message "knsh:@SESSION@:env:control"))
+;; DNS resolver: the envelope reaches the network through the proxy, which resolves names.
+;; Left allowed in this C1 profile so agents can reach their APIs without a proxy (C9/C10
+;; cover the proxy); the C8 harness tests the deny form on its own. Without this line Claude
+;; Code fails with ENOTFOUND (observed).
+(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
+
+;; --- Network ----------------------------------------------------------------------------
+(allow network-inbound (local ip "localhost:*"))
+(allow network-bind (local ip "localhost:*"))
+(allow network-outbound (remote ip))
+(allow system-socket)
+;; Binding (serving) a Unix socket under the envelope's own temp and work roots: Chrome's
+;; ProcessSingleton needs it (observed). Only *connecting* is security-relevant (FR-SBX-05).
+(allow network-bind network-inbound
+    (local unix-socket (subpath "@TMPDIR@")) (local unix-socket (subpath "@WORK@")))
+;; Unix sockets: agent.sock only; user.sock is a fixed deny (FR-SBX-05).
+(allow network-outbound (remote unix-socket (path-literal "@AGENTSOCK@")))
+(deny network-outbound (remote unix-socket (path-literal "@USERSOCK@"))
+    (with message "knsh:@SESSION@:env:user-sock"))

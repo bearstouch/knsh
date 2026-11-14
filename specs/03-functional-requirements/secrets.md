@@ -10,7 +10,7 @@ A **secret** is a named value stored in the Keychain (service `knsh`), or suppli
 | FR-SEC-02 | Lines that would receive a secret must ask unless a grant covers them. |
 | FR-SEC-03 | A line that receives a secret must have its network narrowed to that secret's `hosts`, so the value can only be sent where it is meant to go. |
 | FR-SEC-04 | Dynamic code must never receive secrets. |
-| FR-SEC-05 | Profiles must limit process information to the command's own process group, so other processes cannot read the injected environment. |
+| FR-SEC-05 | Profiles must limit process information to the command's own sandbox (proposed by decision 8, pending acceptance; a process group cannot be enforced safely), so other processes cannot read the injected environment or arguments. |
 | FR-SEC-06 | `secret.injected` must report the secret's name and the command, never the value; the record's `secrets_injected` lists names only. |
 | FR-SEC-07 | Authority-supplied secrets must be held only in memory, for the time given, and must be lost when `knshd` exits. `secrets.revoke` must remove them at once. |
 
