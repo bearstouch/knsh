@@ -42,6 +42,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "knsh-difftest"
+version = "0.0.0"
+dependencies = [
+ "knsh-bash",
+ "knsh-corpus",
+]
+
+[[package]]
 name = "knsh-exec"
 version = "0.0.0"
 

@@ -58,6 +58,8 @@ const LAYOUT: &[(&str, &[&str])] = &[
     ("xtask", &[]),
     // Dev-only corpus tool (KNSH-033): reads trajectory JSON; nothing may depend on it.
     ("knsh-corpus", &["knsh-json"]),
+    // Dev-only differential harness (KNSH-034): parses corpus lines and compares with bash; nothing may depend on it.
+    ("knsh-difftest", &["knsh-bash", "knsh-corpus"]),
 ];
 
 /// One `[[package]]` entry of `Cargo.lock`.

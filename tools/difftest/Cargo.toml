@@ -1,0 +1,17 @@
+[package]
+name = "knsh-difftest"
+description = "Dev-only differential harness: our bash parser against real bash over the agent-command corpus (KNSH-034); never shipped"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+# Dev-only tool: it reads the corpus with knsh-corpus and parses each line with knsh-bash. It adds no third-party
+# crate, and no shipped crate may depend on it (xtask/tests/dependency_policy.rs).
+[dependencies]
+knsh-bash = { path = "../../crates/knsh-bash" }
+knsh-corpus = { path = "../corpus" }
+
+[lints]
+workspace = true

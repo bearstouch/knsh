@@ -20,6 +20,8 @@ members = [
     "xtask",
     # Dev-only agent-command corpus tool (KNSH-033); never shipped.
     "tools/corpus",
+    # Dev-only differential parser harness against real bash (KNSH-034); never shipped.
+    "tools/difftest",
 ]
 # Test-only fuzz targets (KNSH-005, NFR-SUP-05): a separate workspace with its own lockfile, so the
 # fuzzing crates never enter the shipped dependency graph.
