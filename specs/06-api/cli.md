@@ -20,6 +20,15 @@ The `knsh` binary wraps the API. Every command takes `--json` for machine-readab
 | `knsh shell install` | — (`/etc/shells`) | Add `knsh` to `/etc/shells` after asking, so `chsh` accepts it (see below) |
 | `knsh daemon install` | — (launchd) | Install and load the `knshd` launch agent (see below) |
 | `knsh daemon uninstall` | — (launchd) | Unload the `knshd` launch agent and remove its property list; engine data is kept |
+| `knsh --version` | — | Print the version and, in an advisory build, the advisory label (see below) |
+
+## Version and the advisory label
+
+`knsh --version` prints `knsh <version>` on the first line and exits with 0. Every phase 1 build is advisory
+([roadmap](../01-overview/roadmap.md)) and prints a second line saying so: no security guarantees, and not for running
+agents unattended. `hello` reports the same with `advisory: true` ([handshake](handshake.md)), and the repository
+README carries the same warning (KNSH-024). `--version` is a root option and must be the only argument: anything after
+it is a usage error (exit 2), and `knsh <command> --version` is an unknown option.
 
 ## Daemon installation
 

@@ -6,3 +6,5 @@ fuzz/artifacts/
 fuzz/coverage/
 # Temporary home directories of engine-directory integration tests (KNSH-011), removed when the tests end.
 crates/*/.knsh-test-home-*/
+# Benchmark results (KNSH-024): written by scripts/startup-bench.sh, recorded in the specs by hand.
+.build/

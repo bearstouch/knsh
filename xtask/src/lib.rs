@@ -6,12 +6,14 @@
 //!
 //! # Boundaries
 //!
-//! No runtime code and no dependencies. Nothing here may be depended on by a shipped crate.
+//! No runtime code and no dependencies. Nothing here may be depended on by a shipped crate. The one binary,
+//! `startup_bench` (`src/bin/startup_bench.rs`), is a dev-only benchmark run by `scripts/startup-bench.sh`.
 //!
 //! # Specification
 //!
 //! - `specs/04-non-functional-requirements/supply-chain.md` (NFR-SUP-01, NFR-SUP-02)
 //! - `specs/00-stories/KNSH-001-workspace-toolchain-lint-baseline-and-ci.md`
+//! - `specs/07-testing/performance-validation.md`, NFR-PERF-04 (`startup_bench`, KNSH-024)
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]

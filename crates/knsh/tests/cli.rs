@@ -113,3 +113,23 @@ fn shell_install_without_a_terminal_changes_nothing() {
     assert_eq!(output.stdout, b"");
     assert_eq!(std::fs::read("/etc/shells").unwrap_or_default(), before);
 }
+
+// KNSH-024 acceptance: `knsh --version` exits with 0 and states that phase 1 is advisory.
+#[test]
+fn version_prints_advisory_label_and_exits_0() {
+    let output = knsh(&["--version"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    assert!(stdout.starts_with("knsh "), "{stdout}");
+    for phrase in [
+        "advisory",
+        "no security guarantees",
+        "not for running agents unattended",
+    ] {
+        assert!(stdout.contains(phrase), "missing {phrase:?} in {stdout}");
+    }
+
+    let output = knsh(&["--version", "extra"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("extra"));
+}
