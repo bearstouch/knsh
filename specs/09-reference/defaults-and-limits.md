@@ -34,6 +34,8 @@
 | Frame payload | 1 MB | — | [wire format](../06-api/wire-format.md) |
 | JSON nesting | 32 levels | — | [wire format](../06-api/wire-format.md) |
 | JSON integers | ±2^53 | — | [wire format](../06-api/wire-format.md) |
+| Agent command line (bash lexer) | 1 MiB (macOS `ARG_MAX`), rejected before tokenising | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md) (KNSH-028; final parser limits in KNSH-032) |
+| Bash quote and substitution nesting | 32 levels | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md) (KNSH-028; final parser limits in KNSH-032) |
 | Content hash in post-image identity | Files under 64 MB | — | [checkpoints](../03-functional-requirements/checkpoints.md) |
 | Checkpoint retention | 5 GB per volume, 200 per root, or 7 days | — | [checkpoints](../03-functional-requirements/checkpoints.md) |
 | Sensitive-file pre-images | 24 hours at most | — | [checkpoints](../03-functional-requirements/checkpoints.md) |

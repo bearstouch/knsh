@@ -10,16 +10,21 @@
 spans, so that the parser can classify every part of the line. Scope: words, operators (`|`, `||`, `&&`, `;`, `&`,
 `(`, `)`, `{`, `}`, redirection operators including `<<`, `<<-`, `<<<`, `>|`, `&>`, `n>&m`), comments, newlines, and
 every quoting form: single quotes, double quotes, `$'…'`, `$"…"`, backslash escapes, line continuation. Words keep
-their quoted structure (segments). Out of scope: expansion semantics, here-document bodies (KNSH-031).
+their quoted structure (segments). Out of scope: expansion semantics, here-document bodies (KNSH-031). `{` and `}` are
+reserved words in bash, not operators (`echo {}` is one word), so the lexer emits them as words marked as
+reserved-word candidates. Until KNSH-031 reads here-document bodies, a line whose here-document body follows is
+rejected (`LexError::HereDocumentBody`) rather than lexed as commands. A `#` comment that bash 3.2 would read
+differently (inside `<( … )`, or not after a blank inside `$( … )`) is refused (`LexError::AmbiguousComment`).
 
 **Acceptance criteria**
-- [ ] Pure function `lex(&str) -> Result<Vec<Token>, LexError>`; no I/O, no global state; `#![forbid(unsafe_code)]`.
-- [ ] Every token carries a byte span into the input; concatenating spans reproduces the input exactly.
-- [ ] Unterminated quotes return `LexError::Unterminated` with the span, never a guess.
-- [ ] Input larger than the configured limit is rejected before tokenising (limit defined in KNSH-032).
-- [ ] Reserved words are recognised only in command position (left to the parser; the lexer marks candidates).
-- [ ] A fuzz target `bash_lex` exists in `fuzz/` and runs in CI smoke mode.
-- [ ] Crate `//!` header cites decision 6 and FR-LC-02.
+- [x] Pure function `lex(&str) -> Result<Vec<Token>, LexError>`; no I/O, no global state; `#![forbid(unsafe_code)]`.
+- [x] Every token carries a byte span into the input; concatenating spans reproduces the input exactly.
+- [x] Unterminated quotes return `LexError::Unterminated` with the span, never a guess.
+- [x] Input larger than the configured limit is rejected before tokenising (limit defined in KNSH-032).
+- [x] Reserved words are recognised only in command position (left to the parser; the lexer marks candidates).
+- [ ] A fuzz target `bash_lex` exists in `fuzz/` and runs in CI smoke mode. *(Target exists and is in `scripts/fuzz.sh`; a
+  60 s local smoke run passed. Pending: first observed CI run.)*
+- [x] Crate `//!` header cites decision 6 and FR-LC-02.
 
 **Unit tests**
 - `lexes_single_quoted_word_without_escapes` — `'a\b'` is literal (decision 6, quoting forms).
