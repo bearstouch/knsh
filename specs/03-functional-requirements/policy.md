@@ -24,6 +24,23 @@ A policy profile says what an agent may read, write, run and reach, and what nee
 | FR-POL-17 | Precedence across all matching rules must be deny, then ask, then allow. No match uses `exec.default`. |
 | FR-POL-18 | For a whole line, the verdict is deny if any part is denied, ask if any part asks. |
 
+**Subcommand normalisation (FR-POL-15).** The classifier's table (`knsh-bash`, `SUBCOMMAND_TABLE`: git, npm, pnpm,
+yarn, cargo, docker, kubectl, gh, terraform, pip, go) lists, per tool, the global options accepted before the
+subcommand and the subcommands. Only a binary resolved in a trusted folder whose base name is in the table is
+normalised, to `[tool, subcommand, …remaining arguments]`, with each skipped option recorded by name (never its value).
+The subcommand is never guessed: an option the table does not know, an argument built from an expansion before the
+subcommand, a value option followed by a word that looks like an option, a first operand the table does not list
+(`git co`, a package script, cargo's built-in aliases, which a project's `[alias]` can override), an option that runs
+nothing (`--version`), or arguments that are incomplete (a command run by `xargs`, which appends or replaces words)
+keeps the raw argv, and rules match on that.
+
+**Network-intent classes (FR-LC-06, FR-NET-03).** Each listed subcommand carries one or more of `network:none`,
+`network:fetch` (downloads or reads remote state: `git fetch`, `npm install`, `kubectl get`) and `network:publish`
+(uploads or changes remote state: `git push`, `npm publish`, `kubectl apply`); a group (`gh pr`) carries the union of
+its members. Classes list everything a command may do, so a host rule must allow every class of a command. A command
+that is not normalised has no classes, so it reaches `approval_hosts` only with an approval. Dynamic code never has
+classes (FR-POL-20).
+
 ## Dynamic code
 
 | ID | Requirement |
