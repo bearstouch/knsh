@@ -17,7 +17,7 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 | `secrets_injected` | array | Secret names only, never values |
 | `started_at`, `ended_at` | timestamp | UTC, microseconds |
 | `exit_code` | int or null | Exit code of the line; null when denied or still running |
-| `pipestatus` | array | Exit code of each command in the last pipeline |
+| `pipestatus` | array | Exit code of each command in the last pipeline. Empty until the supervisor reads `PIPESTATUS` back from the line's bash (KNSH-100); `exit_code` is always filled for a line that exited |
 | `signal` | string or null | e.g. `SIGKILL` |
 | `stdout`, `stderr` | blob reference | Only when output recording is on; capped at 1 MB each by default, then head and tail kept |
 | `children` | array | Processes seen in the command's process groups, best effort |
@@ -62,6 +62,27 @@ summaries. Denials arriving after the record was written are appended to it, mer
 they repeat one. A record keeps at most 256 distinct elements. A denial is never attached to a record its tag does
 not name exactly (another session's record, an unknown record, a human record). Some denials are never reported by
 the system (signals, `ENOENT` cases, dropped entries, built-in refusals: [verification claims](../07-testing/verification-claims.md#c2-denials-in-the-unified-log)).
+
+## `argv`
+
+One element per entry of the line's classification (KNSH-036), in source order: each wrapper before the command it
+runs, each command before those in its substitutions (KNSH-052). Arguments are not repeated here: they are in
+`command`, which is redacted as a whole.
+
+| Field | Values |
+| --- | --- |
+| `name` | The command name as written, after quote removal and redaction; `null` when it is built from an expansion |
+| `path` | The canonical absolute path the name resolved to, for a binary; `null` for a builtin, a function defined in the line, a name not found, or a name not known from the line. A path that is not valid UTF-8 is shown with U+FFFD replacements |
+| `class` | `static`, `wrapper`, `dynamic` or `project_executable` (below) |
+| `reason` | The dynamic reason code for a `dynamic` entry, otherwise `null` |
+| `wrapper` | Index of the wrapper entry that runs this one, or `null` |
+| `arguments_complete` | `false` when the command receives arguments only known at run time (the command `xargs` runs) |
+
+A line the parser could not read has no entries of its own; it is recorded as one `dynamic` entry with `name`,
+`path` and `wrapper` `null` and the parser's whole-line reason (`syntax_error`, `input_too_large`, …). A line refused
+before it was parsed (the supervisor could not load its profile), or denied because the supervisor itself failed
+while deciding it (an internal error, NFR-REL-07), has an empty `argv`.
+Denied lines carry `argv` like lines that ran.
 
 ## `argv[].class`
 

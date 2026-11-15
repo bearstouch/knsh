@@ -4,9 +4,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use knsh_core::{
-    Actor, AgentId, CanonicalPath, CheckpointId, DecisionSource, DecisionVerdict, DenialReport, DenialTag,
-    ExecutionRecord, OutputStream, ProfileName, RecordDecision, RecordDetails, RecordId, Redacted, SandboxViolation,
-    Session, SessionId, SessionSpec, TaggedCommand, Timestamp, Ulid, encode_decision,
+    Actor, AgentId, ArgvClass, ArgvEntry, CanonicalPath, CheckpointId, DecisionSource, DecisionVerdict, DenialReport,
+    DenialTag, ExecutionRecord, OutputStream, ProfileName, RecordDecision, RecordDetails, RecordId, Redacted,
+    SandboxViolation, Session, SessionId, SessionSpec, TaggedCommand, Timestamp, Ulid, encode_decision,
 };
 use knsh_platform::macos::{RealFs, effective_uid};
 use knsh_platform::sqlite::{Connection, DEFAULT_BUSY_TIMEOUT, Step, Value};
@@ -85,6 +85,23 @@ fn record(n: u64, session: SessionId, actor: Actor, command: &str) -> ExecutionR
     }
 }
 
+/// `(name, path, class, wrapper)` of one `argv` entry.
+type ArgvSummary = (Option<String>, Option<String>, ArgvClass, Option<usize>);
+
+/// The summary of each `argv` entry: `ArgvEntry` has no `PartialEq`, as its name is redacted.
+fn argv_summary(argv: &[ArgvEntry]) -> Vec<ArgvSummary> {
+    argv.iter()
+        .map(|entry| {
+            (
+                entry.name.as_ref().map(|name| name.expose().clone()),
+                entry.path.clone(),
+                entry.class.clone(),
+                entry.wrapper,
+            )
+        })
+        .collect()
+}
+
 fn full_details() -> RecordDetails {
     RecordDetails {
         rewritten_from: Some(Redacted::new(String::from("npm  test"))),
@@ -101,6 +118,31 @@ fn full_details() -> RecordDetails {
             decided_by: Some(String::from("Example Authority")),
             latency_ms: 1200,
         }),
+        argv: vec![
+            ArgvEntry {
+                name: Some(Redacted::new(String::from("env"))),
+                path: Some(String::from("/usr/bin/env")),
+                class: ArgvClass::Wrapper,
+                wrapper: None,
+                arguments_complete: true,
+            },
+            ArgvEntry {
+                name: Some(Redacted::new(String::from("npm"))),
+                path: Some(String::from("/opt/homebrew/bin/npm")),
+                class: ArgvClass::Static,
+                wrapper: Some(0),
+                arguments_complete: true,
+            },
+            ArgvEntry {
+                name: None,
+                path: None,
+                class: ArgvClass::Dynamic {
+                    reason: String::from("expanded_command_name"),
+                },
+                wrapper: None,
+                arguments_complete: true,
+            },
+        ],
     }
 }
 
@@ -223,6 +265,8 @@ fn human_record_drops_non_telemetry_fields() {
     assert!(details.sandbox_violations[0].same_denial(&violation(2, 2, 7)));
     // KNSH-050: the decision object reads back exactly as written.
     assert_eq!(details.decision, full_details().decision);
+    // KNSH-052: each argv entry reads back with its path, class, reason and wrapper link.
+    assert_eq!(argv_summary(&details.argv), argv_summary(&full_details().argv));
     assert_eq!(stored.stdout.map(|info| info.stored), Some(3));
     assert_eq!(stored.stderr.map(|info| info.stored), Some(0));
 }
@@ -800,6 +844,45 @@ fn denials_and_approvals_follow_the_same_retention() {
     set_days_after_base(&clock, 31, 0);
     assert_eq!(store.run_retention().unwrap().expired, 2);
     assert_eq!(count(&dir, "SELECT count(*) FROM records"), 0);
+}
+
+// KNSH-052: a stored `argv` the engine could not have written (not JSON, an unknown class, a reason on a static
+// entry, a dynamic entry without one, a wrapper link that does not point back) is reported as corrupt, never repaired
+// or guessed at.
+#[test]
+fn corrupt_argv_is_reported_not_repaired() {
+    let dir = TempDir::new("corrupt-argv");
+    let store = open(&dir);
+    let agent_record = ExecutionRecord {
+        details: full_details(),
+        ..record(1, session_id(1), agent(), "npm test")
+    };
+    store.write_record(agent_record, RecordedOutput::default()).unwrap();
+    let entry = |class: &str, reason: &str, wrapper: &str| {
+        format!(
+            r#"[{{"name":null,"path":null,"class":"{class}","reason":{reason},"wrapper":{wrapper},"arguments_complete":true}}]"#
+        )
+    };
+    for bad in [
+        "not json".to_owned(),
+        "{}".to_owned(),
+        entry("magic", "null", "null"),
+        entry("static", r#""eval""#, "null"),
+        entry("dynamic", "null", "null"),
+        entry("dynamic", r#""""#, "null"),
+        entry("static", "null", "0"),
+    ] {
+        {
+            let raw = Connection::open(&RealFs::new(), &dir.db(), DEFAULT_BUSY_TIMEOUT).unwrap();
+            raw.execute(
+                "UPDATE records SET argv = ?1 WHERE record_id = ?2",
+                &[Value::Text(&bad), Value::Text(&record_id(1).to_string())],
+            )
+            .unwrap();
+        }
+        let read = store.query(Scope::All, RecordQuery::default());
+        assert!(matches!(read, Err(StoreError::Corrupt)), "{bad}");
+    }
 }
 
 // FR-REC-07, configurability: each record is kept for the period of its own session's profile; profiles without an

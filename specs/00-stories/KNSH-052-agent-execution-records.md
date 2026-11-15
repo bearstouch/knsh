@@ -10,16 +10,18 @@
 gets its reply, so that every decision and execution is auditable even if the client dies.
 
 **Acceptance criteria**
-- [ ] Every line that reaches lifecycle step 2 produces exactly one record: ran, denied or rewritten.
-- [ ] The record is committed before the reply is sent to the client.
-- [ ] `command` holds the executed line after any rewrite, and `rewritten_from` holds the original.
-- [ ] `argv` lists each simple command with its absolute path and class (`static`, `wrapper`, `dynamic`,
+- [x] Every line that reaches lifecycle step 2 produces exactly one record: ran, denied or rewritten.
+- [x] The record is committed before the reply is sent to the client.
+- [x] `command` holds the executed line after any rewrite, and `rewritten_from` holds the original.
+- [x] `argv` lists each simple command with its absolute path and class (`static`, `wrapper`, `dynamic`,
       `project_executable`).
-- [ ] `decision` holds `verdict`, `source`, `rule_id`, `decided_by` and `latency_ms`.
+- [x] `decision` holds `verdict`, `source`, `rule_id`, `decided_by` and `latency_ms`.
 - [ ] `exit_code`, `pipestatus`, `signal`, `started_at`, `ended_at` (UTC, microseconds) and `sandbox_profile`
       (name and hash) are filled for lines that ran. `exit_code` is null for denied lines.
-- [ ] Denials and approvals are recorded even when command recording is off, and without output.
-- [ ] `secrets_injected` is an empty list in phase 2 and never contains values.
+      **Pending:** `pipestatus` stays empty until the supervisor reads `PIPESTATUS` back from the line's bash
+      (KNSH-100); the other fields are filled and tested.
+- [x] Denials and approvals are recorded even when command recording is off, and without output.
+- [x] `secrets_injected` is an empty list in phase 2 and never contains values.
 
 **Unit tests**
 - `writes_one_record_per_line_reaching_parse` — FR-REC-01.

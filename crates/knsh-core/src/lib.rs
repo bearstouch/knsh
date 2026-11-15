@@ -153,8 +153,8 @@ pub use policy::{
     load_profile, load_profile_text, load_unattended, project_root,
 };
 pub use record::{
-    DecisionVerdict, ExecutionRecord, OutputInfo, OutputStream, RecordDecision, RecordDetails, decode_decision,
-    encode_decision,
+    ArgvClass, ArgvEntry, DecisionVerdict, ExecutionRecord, OutputInfo, OutputStream, RecordDecision, RecordDetails,
+    argv_of, decode_argv, decode_decision, encode_argv, encode_decision,
 };
 pub use redacted::{REDACTED_MARKER, Redacted};
 pub use registry::{EqualProfileOnly, ProfileOrder, SessionRegistry};

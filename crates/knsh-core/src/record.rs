@@ -7,9 +7,9 @@
 //! The fields every record has (the human telemetry set of FR-REC-09: `command`, `cwd`, times and `exit_code`) are
 //! plain members; the fields only agent records carry are grouped in [`RecordDetails`], so the store can drop them
 //! as one unit for human sessions. `sandbox_violations` is filled by the violation reader (KNSH-047), and `decision`
-//! ([`RecordDecision`]) by the supervisor (KNSH-050). Fields that later phases fill (`argv`, `children`,
-//! `files_changed`, `network`, …) have columns in the store's schema but no member here yet: they are always empty
-//! in phase 1.
+//! ([`RecordDecision`]) and `argv` ([`ArgvEntry`], from the line's classification) by the supervisor (KNSH-050,
+//! KNSH-052). Fields that later phases fill (`children`, `files_changed`, `network`, …) have columns in the store's
+//! schema but no member here yet: they are always empty in phase 2.
 
 use std::fmt;
 use std::str::FromStr;
@@ -188,6 +188,211 @@ pub fn decode_decision(text: &str) -> Result<RecordDecision, CoreError> {
         .map_err(|_| CoreError::InvalidDecision)
 }
 
+/// The class of one `argv` entry, as its record shows it (`specs/05-models/execution-record.md#argvclass`).
+///
+/// The record's own copy of [`knsh_bash::CommandClass`]: the dynamic reason is kept as its stable code, so a stored
+/// record reads back whatever reasons later parser versions add.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ArgvClass {
+    /// A binary from a trusted folder; also builtins, functions defined in the line and names not found.
+    Static,
+    /// A known wrapper that was unwrapped; the command it runs is a separate entry linked to it.
+    Wrapper,
+    /// A binary from an agent-writable place, governed by `exec.project_executables`.
+    ProjectExecutable,
+    /// Dynamic code, with its reason code (`eval`, `interpreter_code`, a whole-line reason such as `syntax_error`, …).
+    Dynamic {
+        /// The [`knsh_bash::DynamicReason::code`] of why.
+        reason: String,
+    },
+}
+
+impl ArgvClass {
+    /// The record spelling: `static`, `wrapper`, `project_executable` or `dynamic`.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Wrapper => "wrapper",
+            Self::ProjectExecutable => "project_executable",
+            Self::Dynamic { .. } => "dynamic",
+        }
+    }
+
+    /// The dynamic reason code, or `None` for a class that is not dynamic.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Dynamic { reason } => Some(reason),
+            Self::Static | Self::Wrapper | Self::ProjectExecutable => None,
+        }
+    }
+}
+
+impl From<knsh_bash::CommandClass> for ArgvClass {
+    fn from(class: knsh_bash::CommandClass) -> Self {
+        match class {
+            knsh_bash::CommandClass::Static => Self::Static,
+            knsh_bash::CommandClass::Wrapper => Self::Wrapper,
+            knsh_bash::CommandClass::ProjectExecutable => Self::ProjectExecutable,
+            knsh_bash::CommandClass::Dynamic { reason } => Self::Dynamic {
+                reason: reason.code().to_owned(),
+            },
+        }
+    }
+}
+
+/// One entry of a record's `argv` (`specs/05-models/execution-record.md`): a simple command, a wrapper, or the
+/// command a wrapper runs, with what it resolved to and its class.
+///
+/// Arguments are deliberately not kept: they are in `command` already, redacted as a whole line, and a copy here
+/// would be a second place for a secret to leak from.
+///
+/// # Invariants
+///
+/// - `path` is set only for a binary (static, wrapper or project executable resolved to a file): never for a
+///   builtin, a function, a name not found, or a name not known from the line.
+/// - `wrapper` indexes an earlier entry of the same `argv`.
+#[derive(Debug, Clone)]
+pub struct ArgvEntry {
+    /// The command name as written (after quote removal), redacted; `None` when it is built from an expansion.
+    pub name: Option<Redacted<String>>,
+    /// The canonical absolute path it resolved to. A path that is not valid UTF-8 is kept with U+FFFD replacements,
+    /// as `cwd` is shown.
+    pub path: Option<String>,
+    /// Its class.
+    pub class: ArgvClass,
+    /// The index of the wrapper entry that runs it, if any.
+    pub wrapper: Option<usize>,
+    /// `false` when it receives more arguments at run time (the command `xargs` runs): rules that depend on its
+    /// arguments treated them as unknown.
+    pub arguments_complete: bool,
+}
+
+/// The record's `argv` for a classified line (FR-LC-05, KNSH-052): one entry per classified command, in source
+/// order. A line the parser could not read has no commands, and is recorded as a single dynamic entry carrying the
+/// parser's whole-line reason, so the record never shows an empty `argv` for a line that was dynamic as a whole.
+#[must_use]
+pub fn argv_of(classification: &knsh_bash::Classification) -> Vec<ArgvEntry> {
+    if classification.is_whole_line() {
+        // The parser always gives a whole-line rejection a reason; `syntax_error` covers the impossible case without
+        // ever presenting the line as anything but dynamic.
+        let reason = classification
+            .dynamic_parts()
+            .first()
+            .map_or("syntax_error", |part| part.reason.code());
+        return vec![ArgvEntry {
+            name: None,
+            path: None,
+            class: ArgvClass::Dynamic {
+                reason: reason.to_owned(),
+            },
+            wrapper: None,
+            arguments_complete: false,
+        }];
+    }
+    classification
+        .commands()
+        .iter()
+        .map(|command| ArgvEntry {
+            // Through the same redaction as `command` (FR-REC-04, FR-REC-11): a name is line text, and must never
+            // show what the redacted line hides.
+            name: command.name.as_deref().map(crate::lifecycle::redact),
+            path: command
+                .program
+                .as_ref()
+                .and_then(knsh_bash::Program::path)
+                .map(|path| path.to_string_lossy().into_owned()),
+            class: command.class.into(),
+            wrapper: command.wrapper,
+            arguments_complete: command.arguments_complete,
+        })
+        .collect()
+}
+
+impl ToJson for ArgvEntry {
+    /// `{name, path, class, reason, wrapper, arguments_complete}`, with `null` for what is not set.
+    fn to_json(&self) -> Result<Value, JsonError> {
+        Ok(Value::Object(
+            Object::new()
+                .with("name", self.name.as_ref().map(|name| name.expose().clone()).to_json()?)?
+                .with("path", self.path.to_json()?)?
+                .with("class", self.class.code())?
+                .with("reason", self.class.reason().map(str::to_owned).to_json()?)?
+                .with("wrapper", self.wrapper.to_json()?)?
+                .with("arguments_complete", self.arguments_complete)?,
+        ))
+    }
+}
+
+impl FromJson for ArgvEntry {
+    /// Reads the object [`ToJson`] writes: every member present, nothing else, and a reason exactly when the class
+    /// is `dynamic`.
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let invalid = |field| JsonError::OutOfRange { field: Some(field) };
+        let mut fields = Fields::new(value)?;
+        let name: Option<String> = fields.required("name")?;
+        let path: Option<String> = fields.required("path")?;
+        let class: String = fields.required("class")?;
+        let reason: Option<String> = fields.required("reason")?;
+        let wrapper: Option<usize> = fields.required("wrapper")?;
+        let arguments_complete: bool = fields.required("arguments_complete")?;
+        fields.finish_closed()?;
+        let class = match (class.as_str(), reason) {
+            ("static", None) => ArgvClass::Static,
+            ("wrapper", None) => ArgvClass::Wrapper,
+            ("project_executable", None) => ArgvClass::ProjectExecutable,
+            ("dynamic", Some(reason)) if !reason.is_empty() => ArgvClass::Dynamic { reason },
+            _ => return Err(invalid("class")),
+        };
+        Ok(Self {
+            name: name.map(Redacted::new),
+            path,
+            class,
+            wrapper,
+            arguments_complete,
+        })
+    }
+}
+
+/// The stored form of a record's `argv`: its JSON array as text.
+///
+/// # Errors
+///
+/// [`CoreError::InvalidArgv`] only if the array cannot be written, which entries built here always can.
+pub fn encode_argv(argv: &[ArgvEntry]) -> Result<String, CoreError> {
+    let values = argv
+        .iter()
+        .map(ToJson::to_json)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CoreError::InvalidArgv)?;
+    knsh_json::write(&Value::Array(values)).map_err(|_| CoreError::InvalidArgv)
+}
+
+/// Reads the stored form written by [`encode_argv`].
+///
+/// # Errors
+///
+/// [`CoreError::InvalidArgv`] for text that is not such an array, or whose `wrapper` links do not point to an
+/// earlier entry.
+pub fn decode_argv(text: &str) -> Result<Vec<ArgvEntry>, CoreError> {
+    let value = knsh_json::parse(text.as_bytes(), text.len()).map_err(|_| CoreError::InvalidArgv)?;
+    let Value::Array(items) = value else {
+        return Err(CoreError::InvalidArgv);
+    };
+    let argv: Vec<ArgvEntry> = items
+        .iter()
+        .map(ArgvEntry::from_json)
+        .collect::<Result<_, _>>()
+        .map_err(|_| CoreError::InvalidArgv)?;
+    // The classifier lists each wrapper before the command it runs; any other link was not written by the engine.
+    let linked = argv
+        .iter()
+        .enumerate()
+        .all(|(index, entry)| entry.wrapper.is_none_or(|wrapper| wrapper < index));
+    if linked { Ok(argv) } else { Err(CoreError::InvalidArgv) }
+}
+
 /// The fields of an execution record that only agent records carry.
 ///
 /// A human telemetry record keeps none of them (FR-REC-09): the store replaces them with
@@ -211,6 +416,9 @@ pub struct RecordDetails {
     pub sandbox_violations: Vec<SandboxViolation>,
     /// How the line was decided (KNSH-050). Every agent line that reaches lifecycle step 2 has one (FR-REC-01).
     pub decision: Option<RecordDecision>,
+    /// Each simple command of the line with what it resolved to and its class (KNSH-052). Empty only for a line
+    /// refused before it was parsed.
+    pub argv: Vec<ArgvEntry>,
 }
 
 impl RecordDetails {
@@ -226,6 +434,7 @@ impl RecordDetails {
             checkpoint_id,
             sandbox_violations,
             decision,
+            argv,
         } = self;
         rewritten_from.is_none()
             && pipestatus.is_empty()
@@ -235,6 +444,7 @@ impl RecordDetails {
             && checkpoint_id.is_none()
             && sandbox_violations.is_empty()
             && decision.is_none()
+            && argv.is_empty()
     }
 }
 
@@ -341,6 +551,100 @@ mod tests {
         ] {
             let value = knsh_json::parse(bad.as_bytes(), bad.len()).unwrap();
             assert!(RecordDecision::from_json(&value).is_err(), "{bad}");
+        }
+    }
+
+    /// Resolves every name in `/usr/bin`, except `./tool`, a project executable, and `cd`, a builtin.
+    struct Resolver;
+
+    impl knsh_bash::Resolver for Resolver {
+        fn resolve(&self, name: &str, _lookup: knsh_bash::Lookup) -> knsh_bash::Program {
+            match name {
+                "./tool" => knsh_bash::Program::ProjectExecutable("/p/tool".into()),
+                "cd" => knsh_bash::Program::Builtin,
+                _ => knsh_bash::Program::Trusted(std::path::Path::new("/usr/bin").join(name)),
+            }
+        }
+
+        fn source_file(&self, _path: &str) -> knsh_bash::SourceFile {
+            knsh_bash::SourceFile::Unresolved
+        }
+    }
+
+    fn argv_for(line: &str) -> Vec<ArgvEntry> {
+        let parsed = knsh_bash::parse_line(line);
+        argv_of(&knsh_bash::classify(
+            &parsed,
+            line,
+            &Resolver,
+            &knsh_bash::Interpreters::defaults(),
+        ))
+    }
+
+    /// `(name, path, class, wrapper)` of one entry.
+    type Summary<'a> = (Option<&'a str>, Option<&'a str>, ArgvClass, Option<usize>);
+
+    fn summary(argv: &[ArgvEntry]) -> Vec<Summary<'_>> {
+        argv.iter()
+            .map(|entry| {
+                (
+                    entry.name.as_ref().map(|name| name.expose().as_str()),
+                    entry.path.as_deref(),
+                    entry.class.clone(),
+                    entry.wrapper,
+                )
+            })
+            .collect()
+    }
+
+    // KNSH-052: one entry per classified command, with its path, class and wrapper link; a builtin has no path; a
+    // dynamic entry keeps its reason code; a line the parser could not read is a single dynamic entry.
+    #[test]
+    fn argv_follows_the_classification() {
+        let dynamic = |reason: &str| ArgvClass::Dynamic {
+            reason: reason.to_owned(),
+        };
+        assert_eq!(
+            summary(&argv_for("cd /p && nice -n 5 ./tool | sh -c \"$x\"")),
+            [
+                (Some("cd"), None, ArgvClass::Static, None),
+                (Some("nice"), Some("/usr/bin/nice"), ArgvClass::Wrapper, None),
+                (Some("./tool"), Some("/p/tool"), ArgvClass::ProjectExecutable, Some(1)),
+                (Some("sh"), Some("/usr/bin/sh"), dynamic("interpreter_code"), None),
+            ]
+        );
+        assert_eq!(
+            summary(&argv_for("$cmd arg")),
+            [(None, None, dynamic("expanded_command_name"), None)]
+        );
+        let unread = argv_for("echo 'open");
+        assert_eq!(summary(&unread), [(None, None, dynamic("syntax_error"), None)]);
+        assert!(!unread[0].arguments_complete);
+        assert!(argv_for("ls | xargs rm").iter().any(|entry| !entry.arguments_complete));
+    }
+
+    // KNSH-052: the stored form of `argv` reads back as written; anything the engine could not have written is
+    // refused, including a wrapper link that does not point to an earlier entry.
+    #[test]
+    fn argv_round_trips_its_stored_form() {
+        let argv = argv_for("env A=1 git status && eval ls");
+        let decoded = decode_argv(&encode_argv(&argv).unwrap()).unwrap();
+        assert_eq!(summary(&decoded), summary(&argv));
+        assert_eq!(decode_argv("[]").unwrap().len(), 0);
+        for bad in [
+            "",
+            "{}",
+            r#"[{"name":null,"path":null,"class":"static","reason":null,"wrapper":0,"arguments_complete":true}]"#,
+            r#"[{"name":null,"path":null,"class":"static","reason":null,"wrapper":null}]"#,
+            r#"[{"name":null,"path":null,"class":"wrapper","reason":"eval","wrapper":null,"arguments_complete":true}]"#,
+            r#"[{"name":null,"path":null,"class":"dynamic","reason":null,"wrapper":null,"arguments_complete":true}]"#,
+            r#"[{"name":null,"path":null,"class":"static","reason":null,"wrapper":null,"arguments_complete":true,"x":1}]"#,
+        ] {
+            assert_eq!(
+                decode_argv(bad).map(|argv| argv.len()),
+                Err(CoreError::InvalidArgv),
+                "{bad}"
+            );
         }
     }
 

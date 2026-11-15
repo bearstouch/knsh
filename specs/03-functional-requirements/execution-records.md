@@ -16,6 +16,13 @@ Each agent command line becomes a structured record. Fields are defined in [../0
 | FR-REC-10 | `knsh forget --session <id>` or `--since <date>` must delete records; `--with-checkpoints` deletes their checkpoints too. |
 | FR-REC-11 | Secret values must never be stored in records; `secrets_injected` holds names only. |
 
+## Recording settings and agent records
+
+For an agent session, `recording.commands = false` (or the session's `recording` false) never suppresses a record:
+every line that reaches step 2 is recorded (FR-REC-01), denials and approvals included (FR-REC-03). What the
+settings withhold from an agent record is its output only (FR-REC-06). A denied line never has output, whatever the
+settings (KNSH-052).
+
 ## Retention
 
 How FR-REC-07 applies (KNSH-017):

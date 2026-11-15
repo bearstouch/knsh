@@ -286,6 +286,8 @@ impl ToJson for RecordEntry<'_> {
             // How the line was decided (KNSH-050, `execution-record.md#decision`), or null for a record written
             // before decisions were recorded.
             object.insert("decision", details.decision.to_json()?)?;
+            // Each simple command with what it resolved to and its class (KNSH-052, `execution-record.md`).
+            object.insert("argv", details.argv.to_json()?)?;
         }
         object.insert("stdout", self.stdout.as_ref().map(output_info).transpose()?.to_json()?)?;
         object.insert("stderr", self.stderr.as_ref().map(output_info).transpose()?.to_json()?)?;
@@ -561,6 +563,39 @@ mod tests {
         assert!(text.contains(r#""pipestatus":[0,1]"#), "{text}");
         assert!(text.contains(r#""sandbox_violations":[]"#), "{text}");
         assert!(text.contains(r#""decision":null"#), "{text}");
+        // KNSH-052: secret names only, and an empty list in phase 2 (FR-REC-11); `argv` is always an array.
+        assert!(text.contains(r#""secrets_injected":[]"#), "{text}");
+        assert!(text.contains(r#""argv":[]"#), "{text}");
+        let mut classified = record(Actor::Agent(AgentId::new("codex").unwrap()));
+        classified.details.argv = vec![
+            knsh_core::ArgvEntry {
+                name: Some(Redacted::new("env".to_owned())),
+                path: Some("/usr/bin/env".to_owned()),
+                class: knsh_core::ArgvClass::Wrapper,
+                wrapper: None,
+                arguments_complete: true,
+            },
+            knsh_core::ArgvEntry {
+                name: Some(Redacted::new("sh".to_owned())),
+                path: Some("/bin/sh".to_owned()),
+                class: knsh_core::ArgvClass::Dynamic {
+                    reason: "interpreter_code".to_owned(),
+                },
+                wrapper: Some(0),
+                arguments_complete: true,
+            },
+        ];
+        let text_argv = json(&RecordEntry {
+            record: &classified,
+            stdout: None,
+            stderr: None,
+        });
+        assert!(
+            text_argv.contains(
+                r#""argv":[{"name":"env","path":"/usr/bin/env","class":"wrapper","reason":null,"wrapper":null,"arguments_complete":true},{"name":"sh","path":"/bin/sh","class":"dynamic","reason":"interpreter_code","wrapper":0,"arguments_complete":true}]"#
+            ),
+            "{text_argv}"
+        );
         let mut decided = record(Actor::Agent(AgentId::new("codex").unwrap()));
         decided.details.decision = Some(knsh_core::RecordDecision {
             verdict: knsh_core::DecisionVerdict::Deny,

@@ -383,6 +383,9 @@ pub struct Refusal {
     pub reason: Option<String>,
     /// How the refusal is answered.
     pub kind: RefusalKind,
+    /// How the refused line was classified (step 2), for the record's `argv` (KNSH-052); `None` when it was refused
+    /// before it was parsed.
+    pub classification: Option<Classification>,
 }
 
 /// What [`decide`] returns.
@@ -424,6 +427,8 @@ pub fn decide(input: &LineInput<'_>, effects: &Effects<'_>) -> Outcome {
             rewritten_from: None,
             reason: Some(INTERNAL_ERROR.to_owned()),
             kind: RefusalKind::Denied,
+            // Nothing of the pipeline's work survives a panic.
+            classification: None,
         }))
     })
 }
@@ -454,6 +459,8 @@ enum Step {
     /// Lifecycle step 7: `from`, the line of the pass, is to be replaced by `to`.
     Rewrite {
         from: String,
+        /// How `from` was classified: its record's `argv` if the rewrite is refused.
+        classification: Classification,
         to: String,
         rewriter: Rewriter,
     },
@@ -482,7 +489,12 @@ impl<'i, 'e> Pipeline<'i, 'e> {
         loop {
             match self.pass(line) {
                 Step::Done(outcome) => return outcome,
-                Step::Rewrite { from, to, rewriter } => match self.accept_rewrite(from, to, &rewriter) {
+                Step::Rewrite {
+                    from,
+                    classification,
+                    to,
+                    rewriter,
+                } => match self.accept_rewrite(from, classification, to, &rewriter) {
                     Ok(next) => line = next,
                     Err(refusal) => return refusal,
                 },
@@ -530,6 +542,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
                 };
                 return Step::Rewrite {
                     from: pass.command.clone(),
+                    classification: pass.classification.clone(),
                     to: command,
                     rewriter,
                 };
@@ -638,6 +651,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
             AskReply::Deny { reason } => Step::Done(self.refuse(pass, answered_by, rule_id, answer.decided_by, reason)),
             AskReply::Rewrite { command } => Step::Rewrite {
                 from: pass.command.clone(),
+                classification: pass.classification.clone(),
                 to: command,
                 rewriter: Rewriter {
                     source: answered_by,
@@ -646,6 +660,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
             },
             AskReply::TimedOut => Step::Done(self.refusal(
                 pass.command.clone(),
+                Some(pass.classification.clone()),
                 Decision::deny(unanswered, rule_id, None),
                 Some(ASK_TIMED_OUT.to_owned()),
                 RefusalKind::TimedOut { request_id },
@@ -661,7 +676,13 @@ impl<'i, 'e> Pipeline<'i, 'e> {
 
     /// Step 7: accepts `to` as the next pass's line in place of `from`, or refuses the line (FR-AUTH-31,
     /// FR-AUTH-32).
-    fn accept_rewrite(&mut self, from: String, to: String, rewriter: &Rewriter) -> Result<String, Outcome> {
+    fn accept_rewrite(
+        &mut self,
+        from: String,
+        classification: Classification,
+        to: String,
+        rewriter: &Rewriter,
+    ) -> Result<String, Outcome> {
         let refused = if self.rewritten_from.is_some() {
             Some(SECOND_REWRITE)
         } else if redact(&from).expose().contains(REDACTED_MARKER) || to.contains(REDACTED_MARKER) {
@@ -676,6 +697,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
             // Refused as the line that was being evaluated when the rewrite came.
             return Err(self.refusal(
                 from,
+                Some(classification),
                 Decision::deny(rewriter.source, None, rewriter.by.clone()),
                 Some(reason.to_owned()),
                 RefusalKind::Denied,
@@ -725,7 +747,13 @@ impl<'i, 'e> Pipeline<'i, 'e> {
         reason: Option<String>,
     ) -> Outcome {
         let decision = Decision::deny(source, rule_id, decided_by);
-        self.refusal(pass.command.clone(), decision, reason, RefusalKind::Denied)
+        self.refusal(
+            pass.command.clone(),
+            Some(pass.classification.clone()),
+            decision,
+            reason,
+            RefusalKind::Denied,
+        )
     }
 
     /// The pass's line, cancelled because its caller went away (FR-LC-41). Recorded as a deny by standalone rules:
@@ -733,20 +761,30 @@ impl<'i, 'e> Pipeline<'i, 'e> {
     fn cancelled(&self, pass: &Pass, request_id: Option<RequestId>) -> Outcome {
         self.refusal(
             pass.command.clone(),
+            Some(pass.classification.clone()),
             Decision::deny(DecisionSource::Standalone, None, None),
             Some(CALLER_GONE.to_owned()),
             RefusalKind::Cancelled { request_id },
         )
     }
 
-    /// A refusal of `command`, carrying the received line as `rewritten_from` once a rewrite was accepted.
-    fn refusal(&self, command: String, decision: Decision, reason: Option<String>, kind: RefusalKind) -> Outcome {
+    /// A refusal of `command` (classified as `classification`), carrying the received line as `rewritten_from` once
+    /// a rewrite was accepted.
+    fn refusal(
+        &self,
+        command: String,
+        classification: Option<Classification>,
+        decision: Decision,
+        reason: Option<String>,
+        kind: RefusalKind,
+    ) -> Outcome {
         Outcome::Refused(Box::new(Refusal {
             decision,
             command,
             rewritten_from: self.rewritten_from.clone(),
             reason,
             kind,
+            classification,
         }))
     }
 }

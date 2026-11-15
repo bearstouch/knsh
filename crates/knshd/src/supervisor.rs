@@ -37,7 +37,7 @@ use knsh_core::{
     Actor, Allowed, AskAnswer, AskReply, AskRequest, Authority, BinaryLookup, Caller, CancelReason, CanonicalPath,
     Decision, DecisionSource, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR, LineInput, LocalApprovals,
     Observer, Outcome, Profile, ProfileName, Proposal, RecordDetails, RecordId, Redacted, Refusal, RefusalKind,
-    RequestId, SessionId, Timestamp, Ulid, decide, redact,
+    RequestId, SessionId, Timestamp, Ulid, argv_of, decide, redact,
 };
 use knsh_json::{Object, ToJson, Value};
 use knsh_platform::{Clock, Random};
@@ -312,6 +312,7 @@ impl Lifecycle {
                 rewritten_from: allowed.rewritten_from,
                 reason: Some(GONE_BEFORE_SPAWN.to_owned()),
                 kind: RefusalKind::Cancelled { request_id: None },
+                classification: Some(allowed.classification),
             },
             Outcome::Run(allowed) => {
                 return Ok(Ready {
@@ -364,6 +365,8 @@ impl Lifecycle {
             rewritten_from: None,
             reason: Some(reason.to_owned()),
             kind: RefusalKind::Denied,
+            // Refused before step 2: the line was never parsed, so its record has no `argv`.
+            classification: None,
         };
         // Without a record ID (no clock or random bytes) nothing can be recorded; the denial is still reported.
         let Some((record_id, received_at)) = record else {
@@ -396,7 +399,8 @@ impl Lifecycle {
             let data = EventData::DecisionCancelled { request_id, reason };
             let _ = self.parts.events.publish(session_id, actor, data);
         }
-        // FR-REC-03: always recorded, without output, whatever the recording settings.
+        // FR-REC-03: always recorded, without output, whatever the recording settings (`recording.commands` and the
+        // session's `recording` never suppress an agent record, FR-REC-01).
         let record = ExecutionRecord {
             record_id,
             session_id,
@@ -409,6 +413,7 @@ impl Lifecycle {
             details: RecordDetails {
                 rewritten_from: refusal.rewritten_from.as_deref().map(redact),
                 decision: Some(refusal.decision.to_record(latency_ms)),
+                argv: refusal.classification.as_ref().map(argv_of).unwrap_or_default(),
                 ..RecordDetails::default()
             },
         };
@@ -443,8 +448,9 @@ impl Lifecycle {
     }
 
     /// Step 11 for a line handed to the spawner (FR-LC-19): its record, then `command.finished`. Returns whether the
-    /// record was written. A line that did not run to its end is recorded too, with neither exit code nor signal
-    /// (NFR-REL-08). The full record (argv, output, file changes) is KNSH-052's.
+    /// record was written; the caller answers only after this returns, so the reply never precedes the commit
+    /// (FR-REC-02, NFR-REL-05). A line that did not run to its end is recorded too, with neither exit code nor signal
+    /// (NFR-REL-08). Output (KNSH-053) and file changes (checkpoints) are not recorded yet.
     #[allow(clippy::too_many_arguments)]
     fn finished(
         &self,
@@ -486,8 +492,11 @@ impl Lifecycle {
             details: RecordDetails {
                 rewritten_from: allowed.rewritten_from.as_deref().map(redact),
                 decision: Some(allowed.decision.to_record(latency_ms)),
+                argv: argv_of(&allowed.classification),
                 signal,
                 sandbox_profile: report.sandbox_profile.clone(),
+                // `pipestatus` stays empty: the line runs in a separate bash whose `PIPESTATUS` is not reported back
+                // yet (KNSH-100). `secrets_injected` stays empty: no secret is injected in phase 2 (FR-REC-11).
                 ..RecordDetails::default()
             },
         };

@@ -87,6 +87,8 @@ pub enum CoreError {
     InvalidDenialTag,
     /// A stored list of sandbox violations is not in the form the engine writes (KNSH-047).
     InvalidViolation,
+    /// A record's stored `argv` is not in the form the engine writes (KNSH-052).
+    InvalidArgv,
 }
 
 impl fmt::Display for CoreError {
@@ -133,6 +135,7 @@ impl fmt::Display for CoreError {
             Self::TooManyGrants => f.write_str("too many live grants"),
             Self::InvalidDenialTag => f.write_str("not a knsh sandbox tag"),
             Self::InvalidViolation => f.write_str("not a stored list of sandbox violations"),
+            Self::InvalidArgv => f.write_str("not a stored record argv"),
         }
     }
 }
