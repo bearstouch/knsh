@@ -115,6 +115,14 @@
 //! repeats that arrive within [`MERGE_WINDOW`] into one [`SandboxViolation`], with bounded memory, and
 //! [`merge_into`] appends late ones to a finished record's bounded list (FR-SBX-08).
 //!
+//! # Rate limiting of repeated denials (KNSH-055)
+//!
+//! [`DenialLimiter`] counts denials per session and per normalised line ([`LineKey`]: the line re-serialised with
+//! absolute paths). [`LIMIT_DENIALS`] denials within [`LIMIT_WINDOW`] limit the line for [`LIMIT_DURATION`]
+//! (FR-HOOK-20), and [`Counted::Started`] says, once per limit, that `command.denied_repeatedly` is due (FR-HOOK-21).
+//! [`decide`] asks [`RateLimits`] right after the parse and denies a limited line with source `rate_limit`, before
+//! hooks or asks. Time comes from the caller's injected clock.
+//!
 //! Failures are reported through [`CoreError`], except the profile loader's, which are [`ProfileError`] because they
 //! must name the key at fault.
 
@@ -129,6 +137,7 @@ mod lifecycle;
 mod output;
 mod path;
 mod policy;
+mod ratelimit;
 mod record;
 mod redacted;
 mod registry;
@@ -146,8 +155,8 @@ pub use event::{
 pub use id::{CheckpointId, EventId, GrantId, RecordId, RequestId, SessionId};
 pub use lifecycle::{
     Allowed, AskAnswer, AskReply, AskRequest, Authority, Caller, Decision, Effects, HookOutcome, HookVerdict, Hooks,
-    INTERNAL_ERROR, LineInput, LineProfile, LocalApprovals, MAX_LINE_LEN, MAX_REWRITES, NoAuthority, NoHooks, Observer,
-    Outcome, Proposal, Refusal, RefusalKind, StillWaiting, decide, redact,
+    INTERNAL_ERROR, LineInput, LineProfile, LocalApprovals, MAX_LINE_LEN, MAX_REWRITES, NoAuthority, NoHooks,
+    NoRateLimits, Observer, Outcome, Proposal, RateLimits, Refusal, RefusalKind, StillWaiting, decide, redact,
 };
 pub use output::{
     CappedOutput, CapturedStream, DEFAULT_HEAD_TAIL_LINES, DEFAULT_OUTPUT_CAP, DEFAULT_TRUNCATE_BYTES,
@@ -164,6 +173,10 @@ pub use policy::{
     RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy, RuleAction, RuleId, SecretInjection, UNATTENDED_PROFILE,
     UNATTENDED_PROFILE_TEXT, USER_SOCKET, check_line, evaluate_command, evaluate_line, evaluate_line_with_grants,
     load_profile, load_profile_text, load_unattended, project_root,
+};
+pub use ratelimit::{
+    Counted, DenialLimiter, LIMIT_DENIALS, LIMIT_DURATION, LIMIT_WINDOW, LineKey, MAX_TRACKED_LINES,
+    MAX_TRACKED_SESSIONS,
 };
 pub use record::{
     ArgvClass, ArgvEntry, DecisionVerdict, ExecutionRecord, OutputInfo, OutputStream, RecordDecision, RecordDetails,

@@ -10,12 +10,12 @@
 not flooded with asks.
 
 **Acceptance criteria**
-- [ ] When the same normalised line is denied **5 times within 60 s** in one session, further attempts are denied
+- [x] When the same normalised line is denied **5 times within 60 s** in one session, further attempts are denied
       without asking anyone for **10 minutes**, with `decision.source = rate_limit`.
-- [ ] `command.denied_repeatedly` is emitted once when limiting starts, not on every later denial.
-- [ ] The limit is per session. Other sessions are unaffected.
-- [ ] Limited attempts still produce records (FR-REC-03).
-- [ ] Time comes from the injected clock.
+- [x] `command.denied_repeatedly` is emitted once when limiting starts, not on every later denial.
+- [x] The limit is per session. Other sessions are unaffected.
+- [x] Limited attempts still produce records (FR-REC-03).
+- [x] Time comes from the injected clock.
 
 **Unit tests**
 - `limits_after_five_denials_within_sixty_seconds` — FR-HOOK-20.
@@ -25,5 +25,6 @@ not flooded with asks.
 - `limits_are_per_session` — FR-HOOK-20.
 
 **Notes**
-- Spec gap: "normalised line" is not defined. Propose the re-serialised line with resolved paths and normalised
-  subcommand options (KNSH-037, KNSH-038).
+- Spec gap closed in [hooks.md](../03-functional-requirements/hooks.md#rate-limiting): the normalised line is the
+  re-serialised line with resolved paths (KNSH-038). Subcommand options are deliberately not merged, so one denied
+  line never limits a different one.

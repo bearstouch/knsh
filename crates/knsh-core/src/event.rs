@@ -125,6 +125,17 @@ pub enum EventData {
         /// Why, in words, when the engine has a reason.
         reason: Option<Redacted<String>>,
     },
+    /// `command.denied_repeatedly`: the same normalised line was denied often enough in its session that it is now
+    /// denied without asking anyone until `until` (FR-HOOK-20, FR-HOOK-21, KNSH-055). Published once when limiting
+    /// starts, right after the `command.denied` of the denial that started it.
+    CommandDeniedRepeatedly {
+        /// The line that is limited, redacted: the one whose denial started the limit.
+        command: Redacted<String>,
+        /// The working directory of that denial.
+        cwd: CanonicalPath,
+        /// When the limit lifts.
+        until: Timestamp,
+    },
     /// `command.started`: an allowed line was spawned through `knsh-exec` (FR-LC-17, KNSH-051).
     CommandStarted {
         /// The record the line is written to when it ends.
@@ -205,6 +216,7 @@ impl EventData {
             | Self::SandboxViolation(_)
             | Self::CommandProposed { .. }
             | Self::CommandDenied { .. }
+            | Self::CommandDeniedRepeatedly { .. }
             | Self::DecisionCancelled { .. }
             | Self::CommandStarted { .. }
             | Self::CommandLongRunning { .. } => None,
@@ -224,6 +236,7 @@ impl EventData {
             Self::SandboxViolation(_) => "sandbox.violation",
             Self::CommandProposed { .. } => "command.proposed",
             Self::CommandDenied { .. } => "command.denied",
+            Self::CommandDeniedRepeatedly { .. } => "command.denied_repeatedly",
             Self::DecisionCancelled { .. } => "decision.cancelled",
             Self::CommandStarted { .. } => "command.started",
             Self::CommandLongRunning { .. } => "command.long_running",

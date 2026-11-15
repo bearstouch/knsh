@@ -11,7 +11,9 @@
 //!
 //! 2. **Parse and classify** (FR-LC-02 to FR-LC-06): [`parse_line`], names resolved on the caller's `PATH` from its
 //!    working directory ([`LineResolver`]), [`classify`] with the profile's interpreter table. A line the parser cannot
-//!    read is dynamic code and decided as such (decision 6).
+//!    read is dynamic code and decided as such (decision 6). The pass's normalised line ([`LineKey`]) is checked
+//!    against [`RateLimits`]: a line that was denied too often is denied here with source `rate_limit`, without
+//!    hooks, events or asks (FR-HOOK-20, KNSH-055).
 //! 3. **Emit** `command.proposed` through [`Observer::proposed`] (FR-LC-07), before any hook runs.
 //! 4. **Hooks** (FR-LC-08) through [`Hooks::run`]: the chain's combined verdict. A failed or timed-out hook denies
 //!    (FR-HOOK-04, NFR-REL-07); a hook `deny` denies with source `hook`.
@@ -58,6 +60,7 @@ use crate::policy::{
     DecisionSource, GrantSet, LineCapabilities, LineDecision, LineResolver, Profile, RuleAction, UNATTENDED_PROFILE,
     evaluate_line, evaluate_line_with_grants,
 };
+use crate::ratelimit::LineKey;
 use crate::record::{DecisionVerdict, RecordDecision};
 use crate::redacted::{REDACTED_MARKER, Redacted};
 use crate::resolve::BinaryLookup;
@@ -247,6 +250,23 @@ pub trait LocalApprovals {
     fn ask(&self, request: &AskRequest<'_>, caller: &dyn Caller) -> AskAnswer;
 }
 
+/// Which lines are rate limited after repeated denials (FR-HOOK-20, KNSH-055). The driver counts denials into its
+/// [`DenialLimiter`](crate::DenialLimiter) after recording them; the pipeline only asks.
+pub trait RateLimits {
+    /// Whether `line` is limited in `session_id` now: denied without hooks or asks, with source `rate_limit`.
+    fn limited(&self, session_id: SessionId, line: LineKey) -> bool;
+}
+
+/// No rate limiting: no line is ever limited.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoRateLimits;
+
+impl RateLimits for NoRateLimits {
+    fn limited(&self, _session_id: SessionId, _line: LineKey) -> bool {
+        false
+    }
+}
+
 /// A line received by the supervisor, with everything its decision depends on. Deliberately without the interpreter
 /// it will run with (FR-LC-14).
 #[derive(Debug, Clone, Copy)]
@@ -282,6 +302,8 @@ pub struct Effects<'a> {
     pub approvals: &'a dyn LocalApprovals,
     /// The client waiting for the answer.
     pub caller: &'a dyn Caller,
+    /// Lines limited after repeated denials.
+    pub limits: &'a dyn RateLimits,
 }
 
 /// Who made a decision and on what grounds: the record's `decision` object without its latency, which the driver
@@ -386,6 +408,9 @@ pub struct Refusal {
     /// How the refused line was classified (step 2), for the record's `argv` (KNSH-052); `None` when it was refused
     /// before it was parsed.
     pub classification: Option<Classification>,
+    /// The refused line's normalised form (`crate::ratelimit`), the key its denial is counted under for rate limiting
+    /// (FR-HOOK-20); `None` when it was refused before it was parsed.
+    pub line_key: Option<LineKey>,
 }
 
 /// What [`decide`] returns.
@@ -429,6 +454,7 @@ pub fn decide(input: &LineInput<'_>, effects: &Effects<'_>) -> Outcome {
             kind: RefusalKind::Denied,
             // Nothing of the pipeline's work survives a panic.
             classification: None,
+            line_key: None,
         }))
     })
 }
@@ -443,6 +469,8 @@ struct Pass {
     redacted: Redacted<String>,
     outcome: ParseOutcome,
     classification: Classification,
+    /// The normalised line, for rate limiting (FR-HOOK-20).
+    key: LineKey,
 }
 
 /// Who asked to rewrite a line.
@@ -461,6 +489,8 @@ enum Step {
         from: String,
         /// How `from` was classified: its record's `argv` if the rewrite is refused.
         classification: Classification,
+        /// `from`'s normalised line: the key its denial is counted under if the rewrite is refused.
+        key: LineKey,
         to: String,
         rewriter: Rewriter,
     },
@@ -492,9 +522,10 @@ impl<'i, 'e> Pipeline<'i, 'e> {
                 Step::Rewrite {
                     from,
                     classification,
+                    key,
                     to,
                     rewriter,
-                } => match self.accept_rewrite(from, classification, to, &rewriter) {
+                } => match self.accept_rewrite(from, classification, key, to, &rewriter) {
                     Ok(next) => line = next,
                     Err(refusal) => return refusal,
                 },
@@ -505,6 +536,12 @@ impl<'i, 'e> Pipeline<'i, 'e> {
     /// Steps 2 to 8 on `command`.
     fn pass(&self, command: String) -> Step {
         let pass = self.classify(command);
+        // FR-HOOK-20: a line denied too often is denied before anyone is asked or any hook runs. Nothing is
+        // published for it but its `command.denied`, so a looping agent cannot flood the authority either.
+        if self.effects.limits.limited(self.input.session_id, pass.key) {
+            let reason = Some(RATE_LIMITED.to_owned());
+            return Step::Done(self.refuse(&pass, DecisionSource::RateLimit, None, None, reason));
+        }
         let redacted_from = self.rewritten_from.as_deref().map(redact);
         let proposal = Proposal {
             session_id: self.input.session_id,
@@ -543,6 +580,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
                 return Step::Rewrite {
                     from: pass.command.clone(),
                     classification: pass.classification.clone(),
+                    key: pass.key,
                     to: command,
                     rewriter,
                 };
@@ -585,7 +623,12 @@ impl<'i, 'e> Pipeline<'i, 'e> {
         );
         let outcome = parse_line(&command);
         let classification = classify(&outcome, &command, &resolver, &profile.exec.interpreters);
+        // The rate-limit key: the line with every command's absolute path, or the line itself when it cannot be
+        // re-serialised (`crate::ratelimit`, "The normalised line").
+        let key = reserialise(&command, &outcome, &classification)
+            .map_or_else(|_| LineKey::of(&command), |line| LineKey::of(&line));
         Pass {
+            key,
             redacted: redact(&command),
             command,
             outcome,
@@ -652,6 +695,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
             AskReply::Rewrite { command } => Step::Rewrite {
                 from: pass.command.clone(),
                 classification: pass.classification.clone(),
+                key: pass.key,
                 to: command,
                 rewriter: Rewriter {
                     source: answered_by,
@@ -659,8 +703,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
                 },
             },
             AskReply::TimedOut => Step::Done(self.refusal(
-                pass.command.clone(),
-                Some(pass.classification.clone()),
+                pass,
                 Decision::deny(unanswered, rule_id, None),
                 Some(ASK_TIMED_OUT.to_owned()),
                 RefusalKind::TimedOut { request_id },
@@ -680,6 +723,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
         &mut self,
         from: String,
         classification: Classification,
+        key: LineKey,
         to: String,
         rewriter: &Rewriter,
     ) -> Result<String, Outcome> {
@@ -695,13 +739,15 @@ impl<'i, 'e> Pipeline<'i, 'e> {
         };
         if let Some(reason) = refused {
             // Refused as the line that was being evaluated when the rewrite came.
-            return Err(self.refusal(
-                from,
-                Some(classification),
-                Decision::deny(rewriter.source, None, rewriter.by.clone()),
-                Some(reason.to_owned()),
-                RefusalKind::Denied,
-            ));
+            return Err(Outcome::Refused(Box::new(Refusal {
+                decision: Decision::deny(rewriter.source, None, rewriter.by.clone()),
+                command: from,
+                rewritten_from: self.rewritten_from.clone(),
+                reason: Some(reason.to_owned()),
+                kind: RefusalKind::Denied,
+                classification: Some(classification),
+                line_key: Some(key),
+            })));
         }
         // Only the first rewrite gets here, so `from` is the received line.
         self.rewritten_from = Some(from);
@@ -747,44 +793,30 @@ impl<'i, 'e> Pipeline<'i, 'e> {
         reason: Option<String>,
     ) -> Outcome {
         let decision = Decision::deny(source, rule_id, decided_by);
-        self.refusal(
-            pass.command.clone(),
-            Some(pass.classification.clone()),
-            decision,
-            reason,
-            RefusalKind::Denied,
-        )
+        self.refusal(pass, decision, reason, RefusalKind::Denied)
     }
 
     /// The pass's line, cancelled because its caller went away (FR-LC-41). Recorded as a deny by standalone rules:
     /// nobody decided, and the line never runs.
     fn cancelled(&self, pass: &Pass, request_id: Option<RequestId>) -> Outcome {
         self.refusal(
-            pass.command.clone(),
-            Some(pass.classification.clone()),
+            pass,
             Decision::deny(DecisionSource::Standalone, None, None),
             Some(CALLER_GONE.to_owned()),
             RefusalKind::Cancelled { request_id },
         )
     }
 
-    /// A refusal of `command` (classified as `classification`), carrying the received line as `rewritten_from` once
-    /// a rewrite was accepted.
-    fn refusal(
-        &self,
-        command: String,
-        classification: Option<Classification>,
-        decision: Decision,
-        reason: Option<String>,
-        kind: RefusalKind,
-    ) -> Outcome {
+    /// A refusal of the pass's line, carrying the received line as `rewritten_from` once a rewrite was accepted.
+    fn refusal(&self, pass: &Pass, decision: Decision, reason: Option<String>, kind: RefusalKind) -> Outcome {
         Outcome::Refused(Box::new(Refusal {
             decision,
-            command,
+            command: pass.command.clone(),
             rewritten_from: self.rewritten_from.clone(),
             reason,
             kind,
-            classification,
+            classification: Some(pass.classification.clone()),
+            line_key: Some(pass.key),
         }))
     }
 }
@@ -799,4 +831,8 @@ const SECOND_REWRITE: &str = "a rewritten line may not be rewritten again, so th
 const REWRITE_OF_REDACTED: &str = "a line holding redacted text cannot be rewritten, so the line was denied";
 const REWRITE_INVALID: &str = "the rewritten line is too long or holds a NUL byte, so the line was denied";
 const RESERIALISE_FAILED: &str = "the line could not be re-serialised with absolute paths, so it was denied";
+// The reason below names the limit's length; this fails the build if the two drift apart.
+const _: () = assert!(crate::ratelimit::LIMIT_DURATION.as_secs() == 600);
+const RATE_LIMITED: &str =
+    "the same line was denied repeatedly, so it is denied without asking for the next 10 minutes";
 const CALLER_GONE: &str = "the caller disconnected while the line was being decided, so it was cancelled";

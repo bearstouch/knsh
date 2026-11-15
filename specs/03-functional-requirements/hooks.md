@@ -41,3 +41,15 @@ A hook is an executable registered in the user's configuration for `command.prop
 | FR-HOOK-21 | `command.denied_repeatedly` must be emitted once when rate limiting starts. |
 
 Rate limiting keeps a looping agent from flooding the authority with asks.
+
+- **Normalised line.** The line re-serialised with every resolved command's canonical absolute path (FR-LC-13),
+  without leading or trailing whitespace; a line that cannot be re-serialised counts as its text as received.
+  Subcommand options are not merged: `git -c a=b push` and `git push` are different lines.
+- **Counted denials.** Every refusal of a parsed line by a rule, hook, the authority, the user or standalone rules,
+  timeouts included. Not counted: cancellations (the caller left), lines refused before they were parsed, and the
+  denials rate limiting itself makes. A line rewritten and then denied is counted under the line that was denied.
+- **Window.** Five denials whose first and last are less than 60 seconds apart. Time comes from the injected clock.
+- **While limited.** The line is denied right after it is parsed: no `command.proposed`, no hook and no ask. It is
+  recorded (FR-REC-03) and reported with `command.denied`, with `source = rate_limit`. Once the 10 minutes pass,
+  counting starts afresh, and a new limit emits `command.denied_repeatedly` again.
+- **Memory.** Bounded per session and across sessions; dropping state can only lift a limit early.
