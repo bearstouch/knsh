@@ -13,6 +13,15 @@
 //!   line is checked against its caller once more (FR-LC-41), handed to the [`Spawner`] (KNSH-051), recorded, and
 //!   `command.finished` is published (FR-LC-19).
 //!
+//! # Repeated denials (KNSH-055)
+//!
+//! The orchestrator owns the daemon's [`DenialLimiter`]. The pipeline asks it, at the time of each pass, whether
+//! the line is limited ([`RateLimits`]), and denies a limited line with source `rate_limit` before any hook
+//! or ask (FR-HOOK-20). After a refusal is recorded and `command.denied` published, the denial is counted unless the
+//! limiter itself caused it, the line was cancelled, or it was refused before it was parsed; the denial that starts a
+//! limit publishes `command.denied_repeatedly` right after its `command.denied` (FR-HOOK-21). Time comes from the
+//! injected clock. The limiter's lock is a leaf: nothing else is locked or called while it is held.
+//!
 //! # Output (KNSH-053)
 //!
 //! A line's output is captured when the caller did not pass its stdio (`exec.run` and `exec.start` from an agent
@@ -45,15 +54,16 @@
 
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use knsh_core::{
     Actor, Allowed, AskAnswer, AskReply, AskRequest, Authority, BinaryLookup, Caller, CancelReason, CanonicalPath,
-    Decision, DecisionSource, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR, LineInput, LocalApprovals,
-    Observer, Outcome, OutputRedaction, OutputStream, Profile, ProfileName, Proposal, RecordDetails, RecordId,
-    Redacted, Refusal, RefusalKind, RequestId, SessionId, Timestamp, Ulid, argv_of, decide, redact,
+    Counted, Decision, DecisionSource, DenialLimiter, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR,
+    LineInput, LineKey, LocalApprovals, Observer, Outcome, OutputRedaction, OutputStream, Profile, ProfileName,
+    Proposal, RateLimits, RecordDetails, RecordId, Redacted, Refusal, RefusalKind, RequestId, SessionId, Timestamp,
+    Ulid, argv_of, decide, redact,
 };
 use knsh_json::{Object, ToJson, Value};
 use knsh_platform::{Clock, ProcessGroupId, Processes, Random};
@@ -306,6 +316,8 @@ impl OutputSink for OutputEvents {
 /// The orchestrator: the [`Supervisor`] behind `exec.run`.
 pub(crate) struct Lifecycle {
     parts: Parts,
+    /// Denials counted per session and line (KNSH-055). A leaf lock (module documentation, "Repeated denials").
+    limiter: Mutex<DenialLimiter>,
 }
 
 /// A line that may be spawned: everything its record needs once it ends. A line that may not is an `Err` holding
@@ -324,7 +336,10 @@ struct Ready {
 impl Lifecycle {
     /// The orchestrator over `parts`.
     pub(crate) fn new(parts: Parts) -> Arc<Self> {
-        Arc::new(Self { parts })
+        Arc::new(Self {
+            parts,
+            limiter: Mutex::new(DenialLimiter::new()),
+        })
     }
 
     /// Steps 1 to 8 and the handling of a refusal, for `line` from `caller` (module documentation).
@@ -359,6 +374,11 @@ impl Lifecycle {
             authority: &*parts.authority,
             approvals: &*parts.approvals,
             caller,
+            limits: &Limits {
+                limiter: &self.limiter,
+                clock: &*parts.clock,
+                received_at,
+            },
         };
         let input = LineInput {
             session_id,
@@ -381,6 +401,7 @@ impl Lifecycle {
                 reason: Some(GONE_BEFORE_SPAWN.to_owned()),
                 kind: RefusalKind::Cancelled { request_id: None },
                 classification: Some(allowed.classification),
+                line_key: None,
             },
             // The session was paused or taken over while the line was decided (module documentation, "Held lines"):
             // recorded as a deny so the decision is not lost, and answered with the hold so the client retries.
@@ -400,6 +421,8 @@ impl Lifecycle {
                     ),
                     kind: RefusalKind::Denied,
                     classification: Some(allowed.classification),
+                    // The line was allowed; a hold is not a denial of it, so it is not counted (FR-HOOK-20).
+                    line_key: None,
                 };
                 let _ = self.refused(line, &actor, record_id, received_at, latency_ms, &refusal);
                 return Err(hold);
@@ -455,8 +478,9 @@ impl Lifecycle {
             rewritten_from: None,
             reason: Some(reason.to_owned()),
             kind: RefusalKind::Denied,
-            // Refused before step 2: the line was never parsed, so its record has no `argv`.
+            // Refused before step 2: the line was never parsed, so its record has no `argv` and no rate-limit key.
             classification: None,
+            line_key: None,
         };
         // Without a record ID (no clock or random bytes) nothing can be recorded; the denial is still reported.
         let Some((record_id, received_at)) = record else {
@@ -509,10 +533,37 @@ impl Lifecycle {
         };
         let written = self.write(record, RecordedOutput::default());
         self.publish_denied(line, actor, written.then_some(record_id), refusal);
+        self.count_denial(line, actor, refusal, received_at);
         match refusal.kind {
             RefusalKind::Denied => denial_error(refusal),
             RefusalKind::TimedOut { request_id } => request_error(ErrorCode::DecisionTimeout, request_id),
             RefusalKind::Cancelled { request_id } => request_error(ErrorCode::Cancelled, request_id),
+        }
+    }
+
+    /// Counts `refusal` towards rate limiting its line (FR-HOOK-20), and publishes `command.denied_repeatedly` when
+    /// this denial starts a limit (FR-HOOK-21). Not counted: a denial by the limit itself (it would only prolong it),
+    /// a cancellation (nobody denied the line), and a line refused before it was parsed (it has no key).
+    fn count_denial(&self, line: &ForwardedLine, actor: &Actor, refusal: &Refusal, received_at: Timestamp) {
+        let Some(key) = refusal.line_key else { return };
+        let counts = match refusal.kind {
+            RefusalKind::Denied | RefusalKind::TimedOut { .. } => refusal.decision.source != DecisionSource::RateLimit,
+            RefusalKind::Cancelled { .. } => false,
+        };
+        if !counts {
+            return;
+        }
+        // The time of the denial; the line's receipt time if the clock cannot be read now.
+        let now = self.parts.clock.now().unwrap_or(received_at);
+        let counted = lock(&self.limiter).record_denial(line.session_id, key, now);
+        if let Counted::Started { until } = counted {
+            let data = EventData::CommandDeniedRepeatedly {
+                command: redact(&refusal.command),
+                cwd: line.proposal.cwd.clone(),
+                until,
+            };
+            // Best effort (FR-EVT-04): the limit applies whether or not the event is delivered.
+            let _ = self.parts.events.publish(line.session_id, actor, data);
         }
     }
 
@@ -724,6 +775,31 @@ impl Supervisor for Lifecycle {
     fn session_live(&self, session_id: SessionId) -> bool {
         self.parts.sessions.agent_of(session_id).is_ok()
     }
+}
+
+/// The limiter as the pipeline sees it for one line: read at the time of each check, from the injected clock.
+///
+/// Not at the line's receipt time: a pass after a rewrite is checked after the ask, possibly minutes later, and a
+/// limit started since then would end more than [`knsh_core::LIMIT_DURATION`] after the receipt time, which the
+/// limiter takes for a clock step back and ignores.
+struct Limits<'a> {
+    limiter: &'a Mutex<DenialLimiter>,
+    clock: &'a dyn Clock,
+    /// The fallback when the clock cannot be read.
+    received_at: Timestamp,
+}
+
+impl RateLimits for Limits<'_> {
+    fn limited(&self, session_id: SessionId, line: LineKey) -> bool {
+        let now = self.clock.now().unwrap_or(self.received_at);
+        lock(self.limiter).limited(session_id, line, now)
+    }
+}
+
+/// Locks the limiter. A panic while it was held cannot leave it inconsistent in a way that matters: at worst one
+/// line's count is off, which only moves when a limit starts.
+fn lock(limiter: &Mutex<DenialLimiter>) -> MutexGuard<'_, DenialLimiter> {
+    limiter.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Binary lookups through the platform filesystem, as a sized value the pipeline can hold as `&dyn BinaryLookup`.

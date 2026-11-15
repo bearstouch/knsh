@@ -1365,3 +1365,179 @@ fn returns_executed_command_after_rewrite() {
     assert_eq!(finished.decision.verdict, DecisionVerdict::Rewrite);
     assert_eq!(finished.default_mode, knsh_core::OutputMode::Full);
 }
+
+// FR-HOOK-20, FR-HOOK-21, FR-REC-03 (KNSH-055): five denials of one line within 60 s limit it. The sixth attempt is
+// denied with source `rate_limit` without hooks or an ask (the authority's script is empty: an ask would panic), it
+// is still recorded and reported, and `command.denied_repeatedly` follows only the denial that started the limit.
+#[test]
+fn limits_repeated_denials_without_asking() {
+    let daemon = Daemon::new();
+    let lifecycle = daemon.lifecycle(Setup {
+        authority: Some(vec![AskReply::Deny { reason: None }; 5]),
+        ..Setup::default()
+    });
+    for _ in 0..5 {
+        daemon.clock.advance(Duration::from_secs(10));
+        let error = lifecycle.run(daemon.line("git push"), &StillWaiting).unwrap_err();
+        assert_eq!(Denial::from_error(&error).unwrap().source.as_deref(), Some("authority"));
+    }
+    let events = daemon.events();
+    let published = names(&events);
+    assert_eq!(
+        published
+            .iter()
+            .filter(|name| **name == "command.denied_repeatedly")
+            .count(),
+        1
+    );
+    // Right after the fifth denial.
+    assert_eq!(
+        published[published.len() - 2..],
+        ["command.denied", "command.denied_repeatedly"]
+    );
+    let EventData::CommandDeniedRepeatedly { command, until, .. } = &events.last().unwrap().data else {
+        panic!("{:?}", events.last());
+    };
+    assert_eq!(command.expose(), "git push");
+    let fifth = daemon.clock.now().unwrap();
+    assert_eq!(until.as_unix_micros(), fifth.as_unix_micros() + 600_000_000);
+
+    for _ in 0..3 {
+        daemon.clock.advance(Duration::from_secs(1));
+        let error = lifecycle.run(daemon.line("git push"), &StillWaiting).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied);
+        let denial = Denial::from_error(&error).unwrap();
+        assert_eq!(denial.source.as_deref(), Some("rate_limit"));
+        assert!(denial.reason.is_some());
+    }
+    // Only `command.denied` for the limited attempts: no proposal, no second `command.denied_repeatedly`.
+    assert_eq!(names(&daemon.events()), ["command.denied"; 3]);
+    assert_eq!(
+        daemon.journal.entries().iter().filter(|e| e.starts_with("ask")).count(),
+        5
+    );
+    let records = daemon.records();
+    assert_eq!(records.len(), 8);
+    let limited = records
+        .iter()
+        .filter(|record| record.details.decision.as_ref().unwrap().source == DecisionSource::RateLimit)
+        .count();
+    assert_eq!(limited, 3);
+    // Another line is decided as usual.
+    lifecycle.run(daemon.line("git status"), &StillWaiting).unwrap();
+}
+
+// FR-HOOK-20: denials spread over more than 60 s do not limit the line.
+#[test]
+fn does_not_limit_denials_spread_over_a_minute() {
+    let daemon = Daemon::new();
+    let lifecycle = daemon.lifecycle(Setup::default());
+    for _ in 0..6 {
+        daemon.clock.advance(Duration::from_secs(15));
+        let error = lifecycle.run(daemon.line("rm -rf build"), &StillWaiting).unwrap_err();
+        assert_eq!(Denial::from_error(&error).unwrap().source.as_deref(), Some("rule"));
+    }
+    assert!(!names(&daemon.events()).contains(&"command.denied_repeatedly"));
+}
+
+// FR-HOOK-20: the limit lifts 10 minutes after it started, on the injected clock, and the line is asked about again.
+#[test]
+fn lifts_limit_after_ten_minutes_on_the_injected_clock() {
+    let daemon = Daemon::new();
+    let mut script = vec![AskReply::Deny { reason: None }; 5];
+    script.push(AskReply::Allow);
+    let lifecycle = daemon.lifecycle(Setup {
+        authority: Some(script),
+        ..Setup::default()
+    });
+    for _ in 0..5 {
+        lifecycle.run(daemon.line("git push"), &StillWaiting).unwrap_err();
+    }
+    daemon.clock.advance(Duration::from_secs(599));
+    let error = lifecycle.run(daemon.line("git push"), &StillWaiting).unwrap_err();
+    assert_eq!(
+        Denial::from_error(&error).unwrap().source.as_deref(),
+        Some("rate_limit")
+    );
+    daemon.clock.advance(Duration::from_secs(1));
+    let finished = lifecycle.run(daemon.line("git push"), &StillWaiting).unwrap();
+    assert_eq!(finished.decision.source, DecisionSource::Authority);
+}
+
+// FR-HOOK-20: the limit is per session; another session's same line is still asked about.
+#[test]
+fn limits_are_per_session() {
+    let daemon = Daemon::new();
+    let mut script = vec![AskReply::Deny { reason: None }; 5];
+    script.push(AskReply::Allow);
+    let lifecycle = daemon.lifecycle(Setup {
+        authority: Some(script),
+        ..Setup::default()
+    });
+    for _ in 0..5 {
+        lifecycle.run(daemon.line("git push"), &StillWaiting).unwrap_err();
+    }
+    let other = daemon
+        .fixture
+        .sessions
+        .open_agent(
+            Actor::Agent(knsh_core::AgentId::new("claude-code").unwrap()),
+            ProfileName::new("web").unwrap(),
+        )
+        .unwrap()
+        .session_id;
+    let finished = lifecycle.run(forwarded(other, "git push"), &StillWaiting).unwrap();
+    assert_eq!(finished.decision.source, DecisionSource::Authority);
+    let error = lifecycle.run(daemon.line("git push"), &StillWaiting).unwrap_err();
+    assert_eq!(
+        Denial::from_error(&error).unwrap().source.as_deref(),
+        Some("rate_limit")
+    );
+}
+
+// FR-HOOK-20: a cancelled line is not a denial and is not counted.
+#[test]
+fn cancellations_are_not_counted() {
+    let daemon = Daemon::new();
+    let lifecycle = daemon.lifecycle(Setup::default());
+    for _ in 0..6 {
+        let error = lifecycle
+            .run(daemon.line("git push"), &LeavingCaller(AtomicUsize::new(0)))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Cancelled);
+    }
+    assert!(!names(&daemon.events()).contains(&"command.denied_repeatedly"));
+}
+
+// FR-HOOK-20: the rewritten line of a second pass is checked too. A rewrite into a limited line is denied with source
+// `rate_limit`, after the one ask that produced the rewrite and no other.
+#[test]
+fn limits_a_rewrite_into_a_limited_line() {
+    let daemon = Daemon::new();
+    let lifecycle = daemon.lifecycle(Setup {
+        authority: Some(vec![AskReply::Rewrite {
+            command: "rm -rf build".to_owned(),
+        }]),
+        ..Setup::default()
+    });
+    for _ in 0..5 {
+        lifecycle.run(daemon.line("rm -rf build"), &StillWaiting).unwrap_err();
+    }
+    // Minutes pass while the authority considers the ask: the limit is judged at the clock's time, not the receipt.
+    daemon.clock.advance(Duration::from_secs(300));
+    let error = lifecycle.run(daemon.line("git push"), &StillWaiting).unwrap_err();
+    assert_eq!(
+        Denial::from_error(&error).unwrap().source.as_deref(),
+        Some("rate_limit")
+    );
+    assert_eq!(
+        daemon.journal.entries().iter().filter(|e| e.starts_with("ask")).count(),
+        1
+    );
+    let record = daemon
+        .records()
+        .into_iter()
+        .find(|r| r.details.rewritten_from.is_some())
+        .unwrap();
+    assert_eq!(record.command.expose(), "rm -rf build");
+}

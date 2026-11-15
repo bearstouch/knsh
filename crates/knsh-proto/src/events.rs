@@ -311,6 +311,11 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
             .with("source", source.code())?
             .with("rule_id", redacted(rule_id.as_ref()).to_json()?)?
             .with("reason", redacted(reason.as_ref()).to_json()?),
+        // KNSH-055; `command` was redacted before it was published.
+        EventData::CommandDeniedRepeatedly { command, cwd, until } => Object::new()
+            .with("command", command.expose().as_str())?
+            .with("cwd", path(cwd))?
+            .with("until", until.to_string()),
         EventData::DecisionCancelled { request_id, reason } => Object::new()
             .with("request_id", request_id.map(|id| id.to_string()).to_json()?)?
             .with("reason", reason.as_str()),
@@ -576,6 +581,23 @@ mod tests {
                 r#""data":{{"record_id":"{record}","command":"rm -rf build","cwd":"/Users/me/app","source":"rule","rule_id":"exec.deny[0]","reason":null}}"#
             )),
             "{denied}"
+        );
+        // KNSH-055 (FR-HOOK-21).
+        let until = Timestamp::from_unix_micros(1_700_000_600_000_000).unwrap();
+        let repeated = data(EventData::CommandDeniedRepeatedly {
+            command: Redacted::new("rm -rf build".to_owned()),
+            cwd: cwd(),
+            until,
+        });
+        assert!(
+            repeated.contains(r#""method":"command.denied_repeatedly""#),
+            "{repeated}"
+        );
+        assert!(
+            repeated.contains(&format!(
+                r#""data":{{"command":"rm -rf build","cwd":"/Users/me/app","until":"{until}"}}"#
+            )),
+            "{repeated}"
         );
         let cancelled = data(EventData::DecisionCancelled {
             request_id: None,

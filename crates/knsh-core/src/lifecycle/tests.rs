@@ -180,6 +180,16 @@ struct Harness {
     approvals: Vec<Option<AskReply>>,
     caller_checks: usize,
     profile: Profile,
+    limited: Vec<LineKey>,
+}
+
+/// Rate limits that limit exactly the listed lines, in any session.
+struct Limited<'a>(&'a [LineKey]);
+
+impl RateLimits for Limited<'_> {
+    fn limited(&self, _session_id: SessionId, line: LineKey) -> bool {
+        self.0.contains(&line)
+    }
 }
 
 impl Harness {
@@ -191,6 +201,7 @@ impl Harness {
             approvals: Vec::new(),
             caller_checks: usize::MAX,
             profile: profile(),
+            limited: Vec::new(),
         }
     }
 
@@ -211,6 +222,11 @@ impl Harness {
 
     fn caller_leaves_after(mut self, checks: usize) -> Self {
         self.caller_checks = checks;
+        self
+    }
+
+    fn limited(mut self, lines: &[&str]) -> Self {
+        self.limited = lines.iter().map(|line| LineKey::of(line)).collect();
         self
     }
 
@@ -257,6 +273,7 @@ impl Harness {
             authority: &authority,
             approvals: &approvals,
             caller: &caller,
+            limits: &Limited(&self.limited),
         };
         decide(&input, &effects)
     }
@@ -630,4 +647,36 @@ fn decision_source_matches_deciding_component() {
         );
         assert_eq!(record.latency_ms, 7);
     }
+}
+
+// FR-HOOK-20: a limited line is denied with source `rate_limit` before anything is published, any hook runs or anyone
+// is asked; the key is the line with absolute paths, so `git push` reached through `PATH` is the limited
+// `/usr/bin/git push`.
+#[test]
+fn denies_limited_line_without_hooks_or_asks() {
+    let harness = Harness::new()
+        .hooks(vec![Some(HookVerdict::Ask)])
+        .authority(vec![Some(AskReply::Allow)])
+        .limited(&["/usr/bin/git push"]);
+    let refusal = refused(harness.decide("git push"));
+    assert_eq!(
+        refusal.decision,
+        decision(DecisionVerdict::Deny, DecisionSource::RateLimit, None, None)
+    );
+    assert_eq!(refusal.kind, RefusalKind::Denied);
+    assert_eq!(refusal.line_key, Some(LineKey::of("/usr/bin/git push")));
+    assert!(refusal.reason.is_some());
+    assert!(refusal.classification.is_some());
+    assert_eq!(harness.journal.entries(), Vec::<String>::new());
+    // Another line is decided as usual.
+    allowed(harness.decide("git status"));
+}
+
+// FR-HOOK-20: every refusal after the parse carries its line's key, so the driver can count it.
+#[test]
+fn refusals_carry_the_normalised_line_key() {
+    let harness = Harness::new().authority(vec![Some(AskReply::Deny { reason: None })]);
+    let refusal = refused(harness.decide("  git push "));
+    assert_eq!(refusal.decision.source, DecisionSource::Authority);
+    assert_eq!(refusal.line_key, Some(LineKey::of("/usr/bin/git push")));
 }
