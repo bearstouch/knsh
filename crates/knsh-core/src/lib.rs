@@ -101,6 +101,13 @@
 //! running it (FR-POL-70), for `policy.check`. It reads the filesystem only through [`BinaryLookup`]; hooks, the
 //! authority and grants are not consulted.
 //!
+//! # Sandbox violations (KNSH-047)
+//!
+//! [`DenialTag`] parses the tag every deny rule carries (`knsh:<session>:<command>:<rule>`, FR-SBX-06), so a
+//! denial the system reports is attributed only when its tag names a session exactly. [`ViolationMerger`] folds
+//! repeats that arrive within [`MERGE_WINDOW`] into one [`SandboxViolation`], with bounded memory, and
+//! [`merge_into`] appends late ones to a finished record's bounded list (FR-SBX-08).
+//!
 //! Failures are reported through [`CoreError`], except the profile loader's, which are [`ProfileError`] because they
 //! must name the key at fault.
 
@@ -120,6 +127,7 @@ mod resolve;
 mod session;
 mod time;
 mod ulid;
+mod violation;
 
 pub use error::{CoreError, MAX_KEY_DISPLAY_LEN, ProfileError, ProfileErrorKind, ProfileOrigin};
 pub use event::{
@@ -150,3 +158,7 @@ pub use session::{
 };
 pub use time::Timestamp;
 pub use ulid::{MAX_MILLIS, Ulid};
+pub use violation::{
+    DenialReport, DenialTag, ENVELOPE_COMMAND, MAX_PENDING, MAX_RULE_LEN, MERGE_WINDOW, RuleName, SandboxViolation,
+    TAG_PREFIX, TaggedCommand, ViolationMerger, decode_violations, encode_violations, merge_into,
+};

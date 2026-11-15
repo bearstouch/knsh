@@ -1,0 +1,1 @@
+{"timestamp": "2026-11-14 12:37:06.883082+0000", "messageType": "Error", "eventType": "logEvent", "processID": 0, "processImagePath": "/kernel", "senderImagePath": "/System/Library/Extensions/Sandbox.kext/Contents/MacOS/Sandbox", "subsystem": "", "category": "", "formatString": "%s", "eventMessage": "Sandbox: launchctl(49244) deny(1) job-creation", "userID": 0}

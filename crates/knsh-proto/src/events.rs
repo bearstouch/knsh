@@ -237,6 +237,8 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
             .with("ended_at", ended_at.to_string())?
             .with("exit_code", exit_code.to_json()?),
         EventData::CwdChanged { cwd } => Object::new().with("cwd", path(cwd)),
+        // The violation's own object (`specs/05-models/event.md#phase-2-payloads`, KNSH-047).
+        EventData::SandboxViolation(violation) => violation.to_object(),
     }
 }
 
@@ -427,6 +429,39 @@ mod tests {
             started
                 .contains(r#""data":{"profile":"default","envelope":false,"recording":true,"parent_session_id":null}"#),
             "{started}"
+        );
+    }
+
+    // KNSH-047 (FR-SBX-08): `sandbox.violation` carries the violation's own object.
+    #[test]
+    fn sandbox_violation_payload() {
+        let session = sid(1);
+        let record: RecordId = RecordId::from_ulid(Ulid::from_u128(2));
+        let tag: knsh_core::DenialTag = format!("knsh:{session}:{record}:fixed.engine").parse().unwrap();
+        let violation = knsh_core::SandboxViolation {
+            at: Timestamp::UNIX_EPOCH,
+            report: knsh_core::DenialReport {
+                tag,
+                process: Redacted::new(String::from("cat")),
+                pid: 71_295,
+                operation: String::from("file-read-data"),
+                argument: Some(Redacted::new(String::from("/private/etc/hosts"))),
+                count: 9,
+            },
+        };
+        let text = written(
+            event_notification(
+                SubscriptionId::new(1),
+                &event(EventData::SandboxViolation(Box::new(violation)), Actor::Human),
+            )
+            .unwrap(),
+        );
+        assert!(text.contains(r#""method":"sandbox.violation""#), "{text}");
+        assert!(
+            text.contains(&format!(
+                r#""data":{{"session_id":"{session}","record_id":"{record}","rule":"fixed.engine","operation":"file-read-data","argument":"/private/etc/hosts","process":"cat","pid":71295,"count":9,"at":"1970-01-01T00:00:00.000000Z"}}"#
+            )),
+            "{text}"
         );
     }
 

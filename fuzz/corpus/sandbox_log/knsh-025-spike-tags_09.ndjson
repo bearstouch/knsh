@@ -1,0 +1,1 @@
+{"timestamp": "2026-11-14 12:36:56.379794+0000", "messageType": "Error", "eventType": "logEvent", "processID": 0, "processImagePath": "/kernel", "senderImagePath": "/System/Library/Extensions/Sandbox.kext/Contents/MacOS/Sandbox", "subsystem": "", "category": "", "formatString": "%s", "eventMessage": "Sandbox: sandbox-exec(48932) deny(1) forbidden-exec-sugid", "userID": 0}

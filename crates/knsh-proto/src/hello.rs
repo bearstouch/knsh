@@ -282,6 +282,7 @@ mod tests {
             file_events: FileEvents::FsEvents,
             secrets: Secrets::None,
             checkpoints: BTreeMap::new(),
+            sandbox_violations: crate::capability::SandboxViolations::None,
         };
         let result = HelloResult {
             engine_version: "0.1.0",
@@ -299,7 +300,7 @@ mod tests {
             concat!(
                 r#"{"engine_version":"0.1.0","protocol":1,"platform":"macos-15-arm64","advisory":true,"#,
                 r#""binary_frames":false,"capabilities":{"sandbox":"none","network_filter":"none","#,
-                r#""file_events":"fsevents","secrets":"none","checkpoints":{},"methods":["hello","records.old"],"#,
+                r#""file_events":"fsevents","secrets":"none","checkpoints":{},"sandbox_violations":"none","methods":["hello","records.old"],"#,
                 r#""deprecated":{"records.old":{"since":"0.3","earliest_removal":"0.6"}}}}"#
             )
         );

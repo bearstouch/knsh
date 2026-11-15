@@ -15,6 +15,9 @@ testing = []
 [dependencies]
 # `CanonicalPath`, `Timestamp` and `Ulid` (KNSH-002). knsh-core is pure, so this edge points downwards.
 knsh-core = { path = "../knsh-core" }
+# Reads the `log stream --style ndjson` entries of the sandbox violation reader (KNSH-047). A parser crate with no
+# dependencies of its own, so this edge points downwards too.
+knsh-json = { path = "../knsh-json" }
 libc = { workspace = true }
 
 [lints]

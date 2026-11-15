@@ -6,7 +6,8 @@
 //!
 //! The fields every record has (the human telemetry set of FR-REC-09: `command`, `cwd`, times and `exit_code`) are
 //! plain members; the fields only agent records carry are grouped in [`RecordDetails`], so the store can drop them
-//! as one unit for human sessions. Fields that later phases fill (`argv`, `decision`, `children`,
+//! as one unit for human sessions. `sandbox_violations` is filled by the violation reader (KNSH-047). Fields that
+//! later phases fill (`argv`, `decision`, `children`,
 //! `files_changed`, `network`, …) have columns in the store's schema but no member here yet: they are always empty
 //! in phase 1.
 
@@ -19,6 +20,7 @@ use crate::path::CanonicalPath;
 use crate::redacted::Redacted;
 use crate::session::Actor;
 use crate::time::Timestamp;
+use crate::violation::SandboxViolation;
 
 /// One of a command's two recorded output streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -84,6 +86,9 @@ pub struct RecordDetails {
     pub secrets_injected: Vec<String>,
     /// The checkpoint holding the line's pre-images.
     pub checkpoint_id: Option<CheckpointId>,
+    /// Denials the system reported for the line, best effort (FR-SBX-08, KNSH-047). Late ones are appended after
+    /// the record is written.
+    pub sandbox_violations: Vec<SandboxViolation>,
 }
 
 impl RecordDetails {
@@ -97,6 +102,7 @@ impl RecordDetails {
             sandbox_profile,
             secrets_injected,
             checkpoint_id,
+            sandbox_violations,
         } = self;
         rewritten_from.is_none()
             && pipestatus.is_empty()
@@ -104,6 +110,7 @@ impl RecordDetails {
             && sandbox_profile.is_none()
             && secrets_injected.is_empty()
             && checkpoint_id.is_none()
+            && sandbox_violations.is_empty()
     }
 }
 

@@ -26,6 +26,7 @@
 //!   sessions, telemetry and `session.info`, KNSH-021)
 //! - `specs/06-api/agent-socket.md#policycheck`, FR-POL-70 (`policy.check` dry runs, KNSH-043)
 //! - FR-SBX-07 (compiled profile files named by hash, collected when unused, KNSH-045)
+//! - FR-SBX-06, FR-SBX-08, decision 9 (sandbox violation reader, KNSH-047)
 //!
 //! On start it prepares the engine directories (KNSH-011) and takes its sockets from launchd ([`endpoints`],
 //! KNSH-012). It then serves them ([`server`], KNSH-013): a kqueue accept loop hands each connection to its own
@@ -40,7 +41,9 @@
 //! telemetry becomes records and events, and a recording session keeps `knshd` alive. `policy.check` ([`policy`],
 //! KNSH-043) answers what a profile would decide for a line, reading profiles and binaries but writing, publishing and
 //! running nothing. Compiled sandbox profiles are written to private files named by their hash ([`profiles`],
-//! KNSH-045), and the ones an earlier run left behind are removed at start. It exits after ten idle minutes ([`lifetime`]) or when launchd stops it, finishing in-flight
+//! KNSH-045), and the ones an earlier run left behind are removed at start. The sandbox violation reader
+//! ([`violations`], KNSH-047) streams the system's sandbox denials, publishes them as `sandbox.violation` and
+//! attaches them to the records their tags name; `hello` reports whether it is live. It exits after ten idle minutes ([`lifetime`]) or when launchd stops it, finishing in-flight
 //! requests and committing pending writes first.
 //! The supervisor arrives in later stories.
 
@@ -79,6 +82,9 @@ mod server;
 // Writes records, so built where the record store is.
 #[cfg(target_os = "macos")]
 mod sessions;
+// The reader is platform-neutral; its record sink is built where the record store is.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod violations;
 
 use std::fmt;
 use std::process::ExitCode;
@@ -175,6 +181,7 @@ fn start() -> Result<(), StartError> {
     use crate::records::Records;
     use crate::server::{Config, Exit, Server, Services};
     use crate::sessions::Sessions;
+    use crate::violations::{Reader, ReaderStatus};
 
     let log: Arc<dyn SystemLog> = Arc::new(UnifiedLog::new(c"daemon"));
     let uid = effective_uid();
@@ -221,6 +228,9 @@ fn start() -> Result<(), StartError> {
         let random = Arc::new(SystemRandom::new());
         let events = EventHub::new(knsh_core::EventBus::default(), clock.clone(), random.clone());
         // The live sessions: recorded human sessions (KNSH-021); agent sessions arrive with `knsh agent` (KNSH-056).
+        // Sandbox denials the system reports, attributed by tag to sessions and records (KNSH-047). Best effort:
+        // a reader that cannot start is reported as `sandbox_violations: none` and never blocks anything.
+        let reader = start_violation_reader(&paths, clock.clone(), random.clone(), &log, store.clone(), &events);
         let sessions = Sessions::new(store, Arc::clone(&events), clock.clone(), random);
         // Dry runs read profiles and binaries through the real filesystem. `TMPDIR` is set by launchd for the agent;
         // without it `${TMPDIR}` is the system's `/tmp`.
@@ -239,8 +249,10 @@ fn start() -> Result<(), StartError> {
         // Probed once, before serving: every hello of this process reports the same result, and a restarted knshd
         // probes again (KNSH-014).
         let probed = probe_this_machine(&paths, clock.clone(), Arc::clone(&log));
+        let violation_status = reader.as_ref().map_or_else(ReaderStatus::stopped, Reader::status);
         let services = Services {
-            dispatcher: hello::phase1_dispatcher(probed, handlers).map_err(StartError::Dispatch)?,
+            dispatcher: hello::dispatcher_with_violations(probed, handlers, violation_status)
+                .map_err(StartError::Dispatch)?,
             credentials: Arc::new(SystemPeerCredentials::new()),
             log: Arc::clone(&log),
             own_uid: uid,
@@ -252,12 +264,17 @@ fn start() -> Result<(), StartError> {
         };
         let server = Server::new(listeners, services, Config::DEFAULT).map_err(StartError::Serve)?;
         server.stop_on_termination_signals().map_err(StartError::Serve)?;
-        Ok(server)
+        Ok((server, reader))
     };
-    let server = prepare().map_err(fail)?;
+    let (server, mut reader) = prepare().map_err(fail)?;
 
     log.log(Level::Notice, "knshd started", &[]);
-    let exit = server.run().map_err(|error| fail(StartError::Serve(error)))?;
+    let exit = server.run().map_err(|error| fail(StartError::Serve(error)));
+    // The `log stream` child must not outlive knshd; pending violations are released to the store first.
+    if let Some(reader) = reader.as_mut() {
+        reader.stop();
+    }
+    let exit = exit?;
     let reason = match exit {
         Exit::Idle => "idle",
         Exit::Stopped => "stopped",
@@ -299,6 +316,41 @@ fn probe_this_machine(
             random: Arc::new(SystemRandom::new()),
         },
     })
+}
+
+/// Starts the sandbox violation reader (KNSH-047): `log stream` as this user, its canary file in the private run
+/// directory, violations published to `events` and attached to records in `store`. `None`, logged, if it cannot
+/// start; `hello` then reports `sandbox_violations: none`.
+#[cfg(target_os = "macos")]
+fn start_violation_reader(
+    paths: &knsh_platform::EnginePaths,
+    clock: std::sync::Arc<knsh_platform::macos::SystemClock>,
+    random: std::sync::Arc<knsh_platform::macos::SystemRandom>,
+    log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+    store: Option<knsh_store::RecordStore>,
+    events: &std::sync::Arc<events::EventHub>,
+) -> Option<violations::Reader> {
+    use std::sync::Arc;
+
+    use knsh_platform::macos::UnifiedLogDenials;
+
+    let unavailable = || log.log(knsh_platform::Level::Error, "sandbox violation reader unavailable", &[]);
+    let Ok(source) = UnifiedLogDenials::new(&paths.run_dir()) else {
+        unavailable();
+        return None;
+    };
+    let effects = violations::Effects {
+        source: Arc::new(source),
+        clock,
+        random,
+        log: Arc::clone(log),
+    };
+    let sink = violations::RecordViolations::new(store, Arc::clone(events), Arc::clone(log));
+    let reader = violations::Reader::start(effects, sink, violations::Config::DEFAULT).ok();
+    if reader.is_none() {
+        unavailable();
+    }
+    reader
 }
 
 /// Removes the compiled profile files an earlier run left behind: no line runs yet, so none is in use (FR-SBX-07). A

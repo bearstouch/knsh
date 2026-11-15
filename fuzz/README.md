@@ -14,6 +14,8 @@ everything else.
 | `bash_lex` | No panic; deterministic; accepted lines are tiled exactly by token spans, words by their segments and quoted bodies by their inner segments, all on character boundaries; operator tokens spell their operator; rejections point inside the input and unterminated constructs run to its end (KNSH-028) |
 | `bash_parse` | No panic; deterministic; fails exactly when the lexer fails, with the same error; on success every word and redirection token outside an unsupported construct is claimed exactly once by the tree, each part lies inside its command, simple commands come in source order, and every function call names earlier definitions (KNSH-029, KNSH-030) |
 
+| `sandbox_log` | No panic; deterministic; an attributed entry is within its size limit, has exactly a report line and a tag line, its tag is that last line and reads back to itself, and its process, operation and argument are bounded and free of control characters with a count of at least 1 (KNSH-047) |
+
 ## Running
 
 Needs a nightly toolchain and `cargo install --locked cargo-fuzz@0.13.2`. From the repository root:
@@ -42,6 +44,10 @@ local runs.
   rule-breaking frame sequences; `json_writer_roundtrip` holds byte strings that build interesting values; `toml_parser` holds the policy-profile and hook
   examples from the spec byte for byte (a test checks they match) plus accept and reject samples for each subset rule; `bash_lex` holds agent-style lines covering every quoting form,
   operator and substitution (`accept_`) and each rejection (`reject_`; a test checks the prefixes match).
+- `src/sandbox_log_checks.rs` — the sandbox denial log property. Also compiled on stable by
+  `crates/knsh-platform/tests/fuzz_regressions.rs`, so it depends only on `knsh-platform`, `knsh-core` and `std`.
+  Its seeds in `corpus/sandbox_log/` are the captured log lines of `crates/knsh-platform/fixtures/sandbox-log/`, one per
+  file.
 - `regressions/<target>/` — crashing inputs kept forever. When a run fails, libFuzzer saves the input in
   `artifacts/<target>/` (CI uploads it as the `fuzz-crashes` artefact); fix the bug, copy the input here, and
   `cargo test` replays it on stable (`fuzz_regressions_replay`).

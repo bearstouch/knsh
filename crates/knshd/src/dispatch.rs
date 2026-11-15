@@ -302,6 +302,7 @@ pub(crate) mod tests {
             file_events: FileEvents::None,
             secrets: Secrets::None,
             checkpoints: BTreeMap::new(),
+            sandbox_violations: knsh_proto::SandboxViolations::None,
         }
     }
 

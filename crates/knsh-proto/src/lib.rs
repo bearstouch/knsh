@@ -90,7 +90,8 @@ mod records;
 mod session;
 
 pub use capability::{
-    Backend, Capabilities, CheckpointBackend, FileEvents, NONE, NetworkFilter, Platform, Sandbox, Secrets,
+    Backend, Capabilities, CheckpointBackend, FileEvents, NONE, NetworkFilter, Platform, Sandbox, SandboxViolations,
+    Secrets,
 };
 pub use catalogue::{
     Availability, Catalogue, CatalogueError, DEPRECATION_WINDOW, Deprecation, Endpoint, Endpoints, Lookup, MethodSpec,

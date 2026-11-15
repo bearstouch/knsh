@@ -28,7 +28,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryR
 use std::thread;
 use std::time::Duration;
 
-use knsh_core::{ExecutionRecord, Session, Timestamp};
+use knsh_core::{ExecutionRecord, RecordId, SandboxViolation, Session, SessionId, Timestamp};
 use knsh_platform::{Clock, Fs, Monotonic};
 
 use crate::db::{Database, RecordedOutput};
@@ -64,6 +64,10 @@ enum Job {
     WriteRecord(
         Box<(ExecutionRecord, RecordedOutput)>,
         SyncSender<Result<(), StoreError>>,
+    ),
+    AppendViolations(
+        Box<(SessionId, RecordId, Vec<SandboxViolation>)>,
+        SyncSender<Result<bool, StoreError>>,
     ),
     Query(Scope, Box<RecordQuery>, SyncSender<Result<Page, StoreError>>),
     Output(Scope, OutputRequest, SyncSender<Result<OutputRange, StoreError>>),
@@ -138,6 +142,24 @@ impl RecordStore {
     /// (for example a duplicate `record_id`), in which case nothing was written; [`StoreError::Closed`].
     pub fn write_record(&self, record: ExecutionRecord, output: RecordedOutput) -> Result<(), StoreError> {
         self.ask(|answer| Job::WriteRecord(Box::new((record, output)), answer))
+    }
+
+    /// Appends sandbox violations reported after the agent record `record_id` of `session_id` was written
+    /// (FR-SBX-08, KNSH-047). Repeats merge into the violations the record holds; at most
+    /// [`MAX_VIOLATIONS_PER_RECORD`](crate::MAX_VIOLATIONS_PER_RECORD) distinct ones are kept. Returns whether the
+    /// record exists: `false` (nothing written) for an unknown record, another session's, or a human one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupt`] if the stored list cannot be read; [`StoreError::Platform`] if SQLite fails, in
+    /// which case nothing was written; [`StoreError::Closed`].
+    pub fn append_sandbox_violations(
+        &self,
+        session_id: SessionId,
+        record_id: RecordId,
+        violations: Vec<SandboxViolation>,
+    ) -> Result<bool, StoreError> {
+        self.ask(|answer| Job::AppendViolations(Box::new((session_id, record_id, violations)), answer))
     }
 
     /// One page of records visible in `scope`, ordered by `record_id`.
@@ -283,6 +305,10 @@ impl Worker {
             Job::WriteRecord(boxed, answer) => {
                 let (record, output) = *boxed;
                 let _ = answer.send(database.write_record(record, output));
+            }
+            Job::AppendViolations(boxed, answer) => {
+                let (session_id, record_id, violations) = *boxed;
+                let _ = answer.send(database.append_violations(session_id, record_id, violations));
             }
             Job::Query(scope, query, answer) => {
                 let _ = answer.send(database.query(scope, &query));

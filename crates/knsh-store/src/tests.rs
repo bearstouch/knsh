@@ -4,8 +4,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use knsh_core::{
-    Actor, AgentId, CanonicalPath, CheckpointId, ExecutionRecord, OutputStream, ProfileName, RecordDetails, RecordId,
-    Redacted, Session, SessionId, SessionSpec, Timestamp, Ulid,
+    Actor, AgentId, CanonicalPath, CheckpointId, DenialReport, DenialTag, ExecutionRecord, OutputStream, ProfileName,
+    RecordDetails, RecordId, Redacted, SandboxViolation, Session, SessionId, SessionSpec, TaggedCommand, Timestamp,
+    Ulid,
 };
 use knsh_platform::macos::{RealFs, effective_uid};
 use knsh_platform::sqlite::{Connection, DEFAULT_BUSY_TIMEOUT, Step, Value};
@@ -13,8 +14,8 @@ use knsh_platform::testing::FakeClock;
 
 use crate::testing::TempDir;
 use crate::{
-    ForgetSelector, OutputRequest, PageSize, RecordQuery, RecordStore, RecordedOutput, Retention, RetentionDays,
-    RetentionReport, Scope, StoreConfig, StoreError, schema_version,
+    ForgetSelector, MAX_VIOLATIONS_PER_RECORD, OutputRequest, PageSize, RecordQuery, RecordStore, RecordedOutput,
+    Retention, RetentionDays, RetentionReport, Scope, StoreConfig, StoreError, schema_version,
 };
 
 const BASE_MILLIS: u64 = 1_794_506_531_000;
@@ -92,7 +93,41 @@ fn full_details() -> RecordDetails {
         sandbox_profile: Some(String::from("default:abc123")),
         secrets_injected: vec![String::from("NPM_TOKEN")],
         checkpoint_id: Some(CheckpointId::from_ulid(Ulid::from_u128(9))),
+        sandbox_violations: vec![violation(2, 2, 7)],
     }
+}
+
+/// A violation of record `n` of `session`, from process `pid`.
+fn violation(session: u128, n: u64, pid: u32) -> SandboxViolation {
+    SandboxViolation {
+        at: at(n),
+        report: DenialReport {
+            tag: DenialTag {
+                session_id: session_id(session),
+                command: TaggedCommand::Line(record_id(n)),
+                rule: "fs.deny[0]".parse().unwrap(),
+            },
+            process: Redacted::new(String::from("cat")),
+            pid,
+            operation: String::from("file-read-data"),
+            argument: Some(Redacted::new(String::from("/private/etc/hosts"))),
+            count: 1,
+        },
+    }
+}
+
+/// The violations stored with record `n`.
+fn stored_violations(store: &RecordStore, n: u64) -> Vec<SandboxViolation> {
+    store
+        .query(Scope::All, RecordQuery::default())
+        .unwrap()
+        .records
+        .into_iter()
+        .find(|stored| stored.record.record_id == record_id(n))
+        .unwrap()
+        .record
+        .details
+        .sandbox_violations
 }
 
 fn output(stdout: &[u8], stderr: &[u8]) -> RecordedOutput {
@@ -177,6 +212,8 @@ fn human_record_drops_non_telemetry_fields() {
     assert_eq!(details.sandbox_profile.as_deref(), Some("default:abc123"));
     assert_eq!(details.secrets_injected, ["NPM_TOKEN"]);
     assert_eq!(details.checkpoint_id, full_details().checkpoint_id);
+    assert_eq!(details.sandbox_violations.len(), 1);
+    assert!(details.sandbox_violations[0].same_denial(&violation(2, 2, 7)));
     assert_eq!(stored.stdout.map(|info| info.stored), Some(3));
     assert_eq!(stored.stderr.map(|info| info.stored), Some(0));
 }
@@ -1005,4 +1042,67 @@ fn retention_runs_periodically() {
     // The store still takes writes after its passes.
     write_records(&store, session_id(1), [100]);
     assert_eq!(all_ids(&store), [record_id(100)]);
+}
+
+// KNSH-047 (FR-SBX-08): a denial reported after a record was written is appended to it; a repeat only adds to the
+// count, and the list stays bounded.
+#[test]
+fn appends_late_violations_to_a_finished_record() {
+    let dir = TempDir::new("violations");
+    let store = open(&dir);
+    store
+        .write_record(record(1, session_id(1), agent(), "cat x"), RecordedOutput::default())
+        .unwrap();
+    assert!(stored_violations(&store, 1).is_empty());
+
+    assert!(
+        store
+            .append_sandbox_violations(session_id(1), record_id(1), vec![violation(1, 1, 7)])
+            .unwrap()
+    );
+    let mut repeat = violation(1, 1, 7);
+    repeat.report.count = 4;
+    assert!(
+        store
+            .append_sandbox_violations(session_id(1), record_id(1), vec![repeat, violation(1, 1, 8)])
+            .unwrap()
+    );
+    let kept = stored_violations(&store, 1);
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept[0].report.count, 5);
+    assert_eq!(kept[1].report.pid, 8);
+
+    let many = (0..u32::try_from(MAX_VIOLATIONS_PER_RECORD).unwrap() + 10)
+        .map(|pid| violation(1, 1, 1_000 + pid))
+        .collect();
+    assert!(
+        store
+            .append_sandbox_violations(session_id(1), record_id(1), many)
+            .unwrap()
+    );
+    assert_eq!(stored_violations(&store, 1).len(), MAX_VIOLATIONS_PER_RECORD);
+}
+
+// KNSH-047: a violation is attached only to the agent record of the session its tag names, never elsewhere.
+#[test]
+fn refuses_violations_for_records_the_tag_does_not_name() {
+    let dir = TempDir::new("violations-scope");
+    let store = open(&dir);
+    store
+        .write_record(record(1, session_id(1), agent(), "cat x"), RecordedOutput::default())
+        .unwrap();
+    store
+        .write_record(record(2, session_id(1), Actor::Human, "ls"), RecordedOutput::default())
+        .unwrap();
+    // Another session's record, a human record and an unknown record.
+    for (session, n) in [(2, 1), (1, 2), (1, 3)] {
+        assert!(
+            !store
+                .append_sandbox_violations(session_id(session), record_id(n), vec![violation(session, n, 7)])
+                .unwrap(),
+            "session {session} record {n}"
+        );
+    }
+    assert!(stored_violations(&store, 1).is_empty());
+    assert!(stored_violations(&store, 2).is_empty());
 }

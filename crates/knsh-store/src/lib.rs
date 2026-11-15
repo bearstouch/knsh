@@ -40,6 +40,13 @@
 //!   transaction: on error nothing is deleted (FR-REC-10, NFR-PRIV-03). Deleted content is overwritten
 //!   (`secure_delete`) and the write-ahead log truncated, so forgotten text does not stay on disk.
 //!
+//! # Sandbox violations (KNSH-047)
+//!
+//! A record's `sandbox_violations` (FR-SBX-08) are stored as the JSON array of
+//! [`encode_violations`](knsh_core::encode_violations). Denials reported after a record was written are added by
+//! [`RecordStore::append_sandbox_violations`], only to the agent record of the session the tag names; repeats merge
+//! and at most [`MAX_VIOLATIONS_PER_RECORD`] distinct ones are kept.
+//!
 //! The store is built on macOS only until the Linux SQLite backend exists.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -65,7 +72,7 @@ mod testing;
 mod tests;
 
 #[cfg(target_os = "macos")]
-pub use db::RecordedOutput;
+pub use db::{MAX_VIOLATIONS_PER_RECORD, RecordedOutput};
 pub use error::StoreError;
 pub use output::DEFAULT_OUTPUT_CAP;
 pub use query::{
