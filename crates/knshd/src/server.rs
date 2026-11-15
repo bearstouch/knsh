@@ -381,13 +381,12 @@ impl Server {
             self.log_refusal(endpoint, refusal);
             return;
         }
-        // agent.sock: the peer's audit token, taken now (the kernel's record of who connected), so `hello` can match
-        // a caller without a session token to its envelope (KNSH-048). If it cannot be read the caller is still
-        // served, but only a valid session token can bind it: the fallback fails closed.
-        let peer = match endpoint {
-            Endpoint::User => None,
-            Endpoint::Agent => credentials.peer_audit_token(&stream).ok(),
-        };
+        // The peer's audit token, taken now (the kernel's record of who connected). On agent.sock `hello` matches a
+        // caller without a session token to its envelope with it (KNSH-048); on user.sock `session.start_agent`
+        // finds the session a nested `knsh agent` runs inside (FR-SES-03, KNSH-056). If it cannot be read the caller
+        // is still served: on agent.sock only a valid session token can bind it, and on user.sock the session
+        // token in the caller's environment is the remaining way to find its parent.
+        let peer = credentials.peer_audit_token(&stream).ok();
         let Some(registration) = self.register(&stream) else {
             self.shared.log(
                 Level::Error,

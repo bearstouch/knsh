@@ -24,7 +24,7 @@
 //! # Agent sessions
 //!
 //! An agent session is opened with a session token and registers the root process of each of its envelopes
-//! ([`Sessions::open_agent`], [`Sessions::register_envelope`]); both are kept in [`AgentAccess`]. An `agent.sock`
+//! ([`Sessions::open_agent_in`], [`Sessions::register_envelope`]); both are kept in [`AgentAccess`]. An `agent.sock`
 //! connection is bound to one of them at `hello` ([`Sessions::bind_agent`], KNSH-048), and unlike a human session it
 //! does not end with the connection: it ends with its envelope ([`Sessions::end_agent`]), which revokes its token
 //! and envelopes first, so nothing can bind to it, or keep acting through a binding, once it is ending.
@@ -54,8 +54,8 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use knsh_core::{
-    Actor, CoreError, EventData, ExecutionRecord, ProfileName, RecordDetails, RecordId, Redacted, SessionId,
-    SessionRegistry, SessionSpec, SessionState, Timestamp, Transition, Ulid,
+    Actor, CoreError, EventData, ExecutionRecord, ProfileName, ProfileOrder, RecordDetails, RecordId, Redacted,
+    SessionId, SessionRegistry, SessionSpec, SessionState, Timestamp, Transition, Ulid,
 };
 use knsh_json::{Object, Value};
 use knsh_platform::{AuditToken, Clock, ProcessGroupId, ProcessIdentity, ProcessTree, Processes, Random};
@@ -128,8 +128,9 @@ impl StateChange {
 #[derive(Default)]
 pub(crate) struct SessionBinding {
     bound: Mutex<Option<Bound>>,
-    /// The peer's audit token, read when the connection was accepted. Only `agent.sock` connections have one; it is
-    /// how a caller without a session token is matched to its envelope (FR-AGT-23).
+    /// The peer's audit token, read when the connection was accepted (`None` if the kernel could not report it).
+    /// On `agent.sock` it is how a caller without a session token is matched to its envelope (FR-AGT-23); on
+    /// `user.sock`, how `session.start_agent` finds the session a nested `knsh agent` runs inside (FR-SES-03).
     peer: Option<AuditToken>,
 }
 
@@ -161,6 +162,12 @@ impl SessionBinding {
             bound: Mutex::new(None),
             peer,
         }
+    }
+
+    /// The peer's audit token, if the kernel reported one: how `session.start_agent` finds the envelope a caller
+    /// runs in (FR-SES-03).
+    pub(crate) fn peer(&self) -> Option<AuditToken> {
+        self.peer
     }
 
     /// Ends the bound human session, if any: the connection closed. Called once, after the last call of the
@@ -196,9 +203,8 @@ impl SessionBinding {
     }
 }
 
-/// An agent session just opened, with the token its envelope's environment will carry. Read by
-/// `session.start_agent` (KNSH-056); until then only tests open agent sessions.
-#[cfg_attr(not(test), allow(dead_code))]
+/// An agent session just opened, with the token its envelope's environment will carry (`session.start_agent`,
+/// KNSH-056).
 pub(crate) struct OpenedAgent {
     /// The new session.
     pub(crate) session_id: SessionId,
@@ -415,29 +421,60 @@ impl Sessions {
         })
     }
 
-    /// Opens an agent session running `profile` for `actor`, with its envelope flag set, and issues its session
-    /// token: writes its row, publishes `session.started`, and returns the token for the envelope's environment.
-    /// The caller (`session.start_agent`, KNSH-056, on `user.sock` only) then registers the envelope's root
-    /// process with [`Sessions::register_envelope`].
+    /// Opens a top-level agent session running `profile` for `actor` ([`Sessions::open_agent_in`] with no parent).
     ///
     /// # Errors
     ///
-    /// `-32603` if the registry, the store, the clock or the random source fails; nothing is left behind then.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// As [`Sessions::open_agent_in`].
+    #[cfg(test)]
     pub(crate) fn open_agent(&self, actor: Actor, profile: ProfileName) -> Result<OpenedAgent, RpcError> {
+        self.open_agent_in(actor, profile, None, &knsh_core::EqualProfileOnly)
+    }
+
+    /// Opens an agent session running `profile` for `actor`, with its envelope flag set, and issues its session
+    /// token: writes its row, publishes `session.started`, and returns the token for the envelope's environment.
+    /// The caller (`session.start_agent`, KNSH-056, on `user.sock` only) then registers the envelope's root
+    /// process with [`Sessions::register_envelope_leader`].
+    ///
+    /// A session started from inside another one records it as `parent` (FR-SES-03); `order` decides whether
+    /// `profile` is equal to or stricter than the parent's. The registry checks this under its lock, against the
+    /// parent as it is then, so a parent that ended in the meantime is refused rather than recorded.
+    ///
+    /// # Errors
+    ///
+    /// Nothing is left behind on any of these.
+    ///
+    /// - `-32006` naming `parent` if it is no longer a live session.
+    /// - `-32003` if `profile` is looser than the parent's, or the parent cannot have an agent child.
+    /// - `-32603` if the registry, the store, the clock or the random source fails.
+    pub(crate) fn open_agent_in(
+        &self,
+        actor: Actor,
+        profile: ProfileName,
+        parent: Option<SessionId>,
+        order: &dyn ProfileOrder,
+    ) -> Result<OpenedAgent, RpcError> {
         let now = self.clock.now().map_err(|_| internal_error())?;
         let session_id = SessionId::from_ulid(self.ulid(now)?);
+        let spec = SessionSpec {
+            session_id,
+            actor,
+            profile,
+            envelope: true,
+            recording: None,
+            parent_session_id: parent,
+        };
         let session = lock(&self.registry)
-            .create(SessionSpec {
-                session_id,
-                actor,
-                profile,
-                envelope: true,
-                recording: None,
-                parent_session_id: None,
-            })
+            .create_with(spec, order)
             .cloned()
-            .map_err(|_| internal_error())?;
+            .map_err(|error| match (error, parent) {
+                (CoreError::ParentNotFoundOrEnded, Some(parent)) => session_gone(parent),
+                // FR-SES-03: a looser profile than the parent's is not this caller's to choose.
+                (CoreError::ProfileNotStricter | CoreError::HumanChildOfAgent, _) => {
+                    RpcError::new(ErrorCode::NotAllowed)
+                }
+                _ => internal_error(),
+            })?;
         let undo = || {
             let _ = lock(&self.registry).transition(session_id, Transition::End);
         };
@@ -458,6 +495,24 @@ impl Sessions {
         Ok(OpenedAgent { session_id, token })
     }
 
+    /// The live agent session a caller runs inside, if any: the one whose token is `token` (taken from the caller's
+    /// environment), else the one whose envelope the `peer` descends from (FR-SES-03). The same matching as
+    /// [`Sessions::bind_agent`], without binding anything.
+    pub(crate) fn enclosing(&self, token: Option<&Redacted<String>>, peer: Option<AuditToken>) -> Option<SessionId> {
+        self.agents.bind(token, peer).ok()?.session_id().ok()
+    }
+
+    /// Registers the envelope whose leader is the unreaped child `pid` as one of `session_id`'s
+    /// ([`Sessions::register_envelope`]). The caller holds the child unreaped, so `pid` still names it.
+    ///
+    /// # Errors
+    ///
+    /// `-32006` if the session is not live or the process cannot be read.
+    pub(crate) fn register_envelope_leader(&self, session_id: SessionId, pid: i32) -> Result<(), RpcError> {
+        let root = self.agents.identity(pid).ok_or_else(|| session_gone(session_id))?;
+        self.register_envelope(session_id, root)
+    }
+
     /// Registers `root`, the first process of an envelope of the agent session `session_id`: callers without a
     /// token that descend from it are bound to the session (FR-AGT-23), even after `root` execs. The supervisor
     /// reads `root` while it holds the unreaped child, so its pid cannot have been reused.
@@ -466,7 +521,6 @@ impl Sessions {
     ///
     /// `-32006` if `session_id` is not a live agent session, or if `root` is no longer the live process at that pid
     /// version (nothing is registered then).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn register_envelope(&self, session_id: SessionId, root: ProcessIdentity) -> Result<(), RpcError> {
         if self.agents.register_envelope(session_id, root) {
             Ok(())
@@ -477,7 +531,6 @@ impl Sessions {
 
     /// Ends the agent session `session_id`: its envelope is gone. Its token and envelopes are revoked before
     /// anything else, then it ends as every session does.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn end_agent(&self, session_id: SessionId) {
         self.end(session_id);
     }
@@ -804,13 +857,13 @@ pub(crate) mod tests {
         "ended_at":"2027-01-15T08:00:02Z","exit_code":1}"#;
 
     /// Subscribes to every session's events on a fresh connection subscriber.
-    fn watch(hub: &Arc<EventHub>) -> Subscriber {
+    pub(crate) fn watch(hub: &Arc<EventHub>) -> Subscriber {
         let watcher = Subscriber::new();
         watcher.subscribe(hub, knsh_core::EventScope::All, None).unwrap();
         watcher
     }
 
-    fn event_names(watcher: &Subscriber) -> Vec<String> {
+    pub(crate) fn event_names(watcher: &Subscriber) -> Vec<String> {
         watcher
             .take(100)
             .into_iter()

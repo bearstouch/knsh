@@ -406,7 +406,7 @@ fn child_stdio(
 }
 
 /// The child's stdin, stdout and stderr, in that order.
-fn passed(stdin: OwnedFd, stdout: OwnedFd, stderr: OwnedFd) -> Stdio {
+pub(crate) fn passed(stdin: OwnedFd, stdout: OwnedFd, stderr: OwnedFd) -> Stdio {
     Stdio::Passed(Box::new([
         SharedFd::new(stdin),
         SharedFd::new(stdout),
@@ -424,7 +424,7 @@ fn start_failure(error: &std::io::Error) -> SpawnFailure {
 
 /// What the status pipe says once every write end is closed: `None` at end of file (`sandbox-exec` started), the
 /// trampoline's exit code if it failed. `EINTR` is retried.
-fn read_status(status: &mut impl Read) -> Result<Option<u8>, PlatformError> {
+pub(crate) fn read_status(status: &mut impl Read) -> Result<Option<u8>, PlatformError> {
     let mut reported = [0u8; 1];
     loop {
         match status.read(&mut reported) {
@@ -450,7 +450,7 @@ const EMPTY_LINE: &str = ":";
 /// unsandboxed until it becomes `sandbox-exec`, and the environment comes from the agent: a library injected into
 /// it would run outside the line's profile. The interpreters in `/bin` and `sandbox-exec` drop these variables
 /// anyway (System Integrity Protection), so the line loses nothing it would have had.
-fn read_by_dynamic_linker(name: &str) -> bool {
+pub(crate) fn read_by_dynamic_linker(name: &str) -> bool {
     name.starts_with("DYLD_")
 }
 
@@ -492,7 +492,7 @@ fn request(
 }
 
 /// The status `exec.run` reports for a reaped leader, or `None` for one outside the shell's range.
-fn line_status(exit: ExitStatus) -> Option<LineStatus> {
+pub(crate) fn line_status(exit: ExitStatus) -> Option<LineStatus> {
     match exit {
         ExitStatus::Exited(code) => u8::try_from(code).ok().map(LineStatus::Exited),
         ExitStatus::Signalled(signal) => u8::try_from(signal)

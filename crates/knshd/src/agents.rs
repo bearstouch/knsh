@@ -67,8 +67,6 @@ impl SessionToken {
 
     /// The token as it travels: lowercase hex, [`TOKEN_BYTES`] × 2 characters. Kept redacted, so the only way to
     /// print it is to [`Redacted::expose`] it, which only the code that writes the envelope's environment does.
-    // The envelope's environment is written by `session.start_agent` (KNSH-056); until then only tests encode.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn encode(&self) -> Redacted<String> {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut text = String::with_capacity(TOKEN_BYTES * 2);
@@ -222,6 +220,11 @@ impl AgentAccess {
             }
             None => false,
         }
+    }
+
+    /// The identity of the live process `pid`, read from the process table, or `None` if it cannot be read.
+    pub(crate) fn identity(&self, pid: i32) -> Option<ProcessIdentity> {
+        self.tree.identity(pid).ok()
     }
 
     /// Revokes everything of `session_id`: it ended. Its token stops matching, its envelopes stop binding, and

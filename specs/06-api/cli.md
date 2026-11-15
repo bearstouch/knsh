@@ -22,6 +22,28 @@ The `knsh` binary wraps the API. Every command takes `--json` for machine-readab
 | `knsh daemon uninstall` | — (launchd) | Unload the `knshd` launch agent and remove its property list; engine data is kept |
 | `knsh --version` | — | Print the version and, in an advisory build, the advisory label (see below) |
 
+## Agent
+
+`knsh agent [--profile <p>] [--agent <name>] [--json] -- <cmd…>` (KNSH-056, FR-AGT-01) calls
+[`session.start_agent`](user-socket.md#sessionstart_agent) on `user.sock` with the command after `--`, its working
+directory and its whole environment, its own stdin, stdout and stderr passed as descriptors, and waits. `knshd` runs
+the CLI in an envelope on those streams; `knsh agent` runs nothing itself.
+
+- It exits as the CLI did: its exit code, or 128 + `n` when signal `n` ended it. The session has ended by then.
+- `--json` prints one line once the CLI has exited: `{"session_id", "agent_id", "profile", "parent_session_id",
+  "exit_code", "signal"}`. Without it nothing is printed besides the CLI's own output.
+- The actor is `--agent`, or derived by `knshd` from the command (`claude` → `claude-code`, FR-AGT-02).
+- `--profile` or `--agent` outside `[A-Za-z0-9._-]{1,64}` is a usage error (status 2). A command that cannot be found
+  (a path with `/`, or a name on `PATH`) exits with 127 (`command not found`). A command, directory or environment
+  that is not UTF-8 or holds NUL exits with 1. Nothing is sent in these cases.
+- A refusal exits with 1 and says why on stderr: no sandbox (`-32005`), a profile looser than the enclosing session's
+  (`-32003`), an unknown profile or a command `knshd` cannot run (`-32602`), or a CLI that could not be started or
+  whose `knshd` connection was lost (`-32603`).
+- Killing `knsh agent` closes its connection, and `knshd` then stops the CLI's process group.
+- **Limit (KNSH-057):** the CLI runs in a process group of `knshd`, not in the terminal's foreground group.
+  Terminal-generated signals (Ctrl-C with `ISIG` on, `SIGWINCH`) reach `knsh agent`, not the CLI; agent CLIs run the
+  terminal in raw mode and read Ctrl-C as input.
+
 ## Version and the advisory label
 
 `knsh --version` prints `knsh <version>` on the first line and exits with 0. Every phase 1 build is advisory

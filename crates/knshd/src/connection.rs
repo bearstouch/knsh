@@ -331,8 +331,9 @@ pub(crate) fn serve<R: Read, W: Write + Send>(
 
 /// Serves one connection until it ends, and says why it ended.
 ///
-/// `peer` is the peer's audit token on `agent.sock` (or `None` on `user.sock`, or when the kernel could not report
-/// it); `hello` there uses it to match a caller without a session token to its envelope (KNSH-048).
+/// `peer` is the peer's audit token (`None` when the kernel could not report it): `hello` on `agent.sock` uses it to
+/// match a caller without a session token to its envelope (KNSH-048), and `session.start_agent` on `user.sock` to
+/// find the session a nested `knsh agent` runs inside (KNSH-056).
 ///
 /// `on_greeted` runs once, right after `hello` succeeds and before its answer is written; the server uses it to lift
 /// the handshake read timeout. `shutdown` closes the underlying connection in both directions: the pump calls it when

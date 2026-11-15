@@ -50,12 +50,37 @@ impl AgentId {
         }
     }
 
+    /// The actor of an agent session started without `--agent` (FR-AGT-02): derived from the command's program,
+    /// `program` being `argv[0]` as given (a name or a path). Its last path component is looked up in
+    /// [`DERIVED_AGENT_IDS`] (`claude` becomes `claude-code`); a program the table does not name is its own
+    /// identifier (`/opt/bin/aider` becomes `aider`).
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidAgentId`] if that component is not a valid identifier (empty, too long, or holding a
+    /// character outside `[A-Za-z0-9._-]`): the caller must name the agent with `--agent` then, rather than have a
+    /// name made up for it.
+    pub fn derive_from_program(program: &str) -> Result<Self, CoreError> {
+        // `rsplit` always yields at least one item; a trailing `/` leaves it empty, which is refused below.
+        let name = program.rsplit('/').next().unwrap_or_default();
+        let derived = DERIVED_AGENT_IDS
+            .iter()
+            .find_map(|(binary, agent_id)| (*binary == name).then_some(*agent_id))
+            .unwrap_or(name);
+        Self::new(derived)
+    }
+
     /// The identifier text.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
+
+/// Agent CLIs whose actor is not their binary's name: `(binary, agent_id)` (FR-AGT-02,
+/// `specs/08-integrations/agent-clis.md#starting`). Only Claude Code is specified so far; the Codex CLI's entry
+/// arrives with its preset (KNSH-058).
+pub const DERIVED_AGENT_IDS: &[(&str, &str)] = &[("claude", "claude-code")];
 
 impl fmt::Display for AgentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -437,6 +462,26 @@ mod tests {
 
     fn agent() -> Actor {
         Actor::Agent(AgentId::new("claude-code").unwrap())
+    }
+
+    // FR-AGT-02: `claude` (by name or by path) is the `claude-code` actor.
+    #[test]
+    fn derives_claude_code_actor_from_claude() {
+        for program in ["claude", "/opt/homebrew/bin/claude", "./claude"] {
+            assert_eq!(AgentId::derive_from_program(program).unwrap().as_str(), "claude-code");
+        }
+    }
+
+    // FR-AGT-02: a program the table does not name is its own actor; one that is not a valid name is refused.
+    #[test]
+    fn derives_other_actors_from_the_program_name() {
+        assert_eq!(
+            AgentId::derive_from_program("/usr/local/bin/aider").unwrap().as_str(),
+            "aider"
+        );
+        for program in ["", "/opt/bin/", "my agent", "agent\u{e9}"] {
+            assert_eq!(AgentId::derive_from_program(program), Err(CoreError::InvalidAgentId));
+        }
     }
 
     fn spec(actor: Actor) -> SessionSpec {

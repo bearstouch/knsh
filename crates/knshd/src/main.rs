@@ -104,6 +104,8 @@ mod supervisor;
 // The spawner behind the orchestrator (KNSH-051): lines through `knsh-exec`, process groups, timeouts.
 #[cfg(target_os = "macos")]
 mod spawn;
+#[cfg(target_os = "macos")]
+mod start_agent;
 // The record store is built on macOS only until the Linux SQLite backend exists.
 #[cfg(target_os = "macos")]
 mod records;
@@ -276,7 +278,7 @@ fn start() -> Result<(), StartError> {
             clock: clock.clone(),
             random,
         };
-        handlers.extend(supervision.exec_run_handlers());
+        handlers.extend(supervision.handlers());
         // Probed once, before serving: every hello of this process reports the same result, and a restarted knshd
         // probes again (KNSH-014).
         let probed = probe_this_machine(&paths, clock.clone(), Arc::clone(&log));
@@ -486,6 +488,67 @@ impl Supervision<'_> {
             redaction: Arc::new(knsh_core::NoOutputRedaction),
         });
         exec::ExecRun::new(lifecycle, self.paths.shim_dir()).handlers()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Supervision<'_> {
+    /// `session.start_agent` (KNSH-056) and `exec.*` (KNSH-050 to KNSH-053), over the same paths, sessions,
+    /// profiles and clock.
+    fn handlers(self) -> dispatch::Handlers {
+        let mut handlers = self.start_agent_handlers();
+        handlers.extend(self.exec_run_handlers());
+        handlers
+    }
+
+    /// The `session.start_agent` handler (KNSH-056), launching envelopes through the `knsh-exec` beside `knshd`
+    /// with the `knsh` beside it as their `SHELL`. Without either binary or a canonical home it is logged, and every
+    /// call is `-32005` for the sandbox ([`start_agent::unserved_handlers`]).
+    fn start_agent_handlers(&self) -> dispatch::Handlers {
+        use std::sync::Arc;
+
+        use knsh_core::CanonicalPath;
+        use knsh_platform::macos::{RealFs, SystemProcesses, sha256};
+
+        use crate::probe::SandboxProbe;
+        use crate::start_agent::{AgentStarter, TrampolineLauncher};
+
+        let exe = std::env::current_exe().ok();
+        let trampoline = exe.as_deref().and_then(SandboxProbe::trampoline_beside);
+        let canonical = |path: &std::path::Path| {
+            std::fs::canonicalize(path)
+                .ok()
+                .and_then(|path| CanonicalPath::new(path).ok())
+        };
+        let knsh = exe
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .and_then(|dir| canonical(&dir.join("knsh")));
+        let home = canonical(self.paths.home());
+        let (Some(trampoline), Some(knsh), Some(home)) = (trampoline, knsh, home) else {
+            self.log.log(
+                knsh_platform::Level::Error,
+                "envelope launcher unavailable: session.start_agent not served",
+                &[],
+            );
+            return start_agent::unserved_handlers();
+        };
+        let launcher = TrampolineLauncher {
+            processes: Arc::new(SystemProcesses::new()),
+            files: profiles::ProfileFiles::new(Arc::new(RealFs::new()), self.paths.profiles_dir(), self.uid, sha256),
+            trampoline,
+            home,
+            knsh: knsh.clone(),
+        };
+        AgentStarter::new(
+            Arc::clone(self.sessions),
+            self.profiles.clone(),
+            Arc::new(launcher),
+            self.clock.clone(),
+            self.paths.shim_dir(),
+            knsh.into_path_buf(),
+        )
+        .handlers()
     }
 }
 

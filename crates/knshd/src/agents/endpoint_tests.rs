@@ -38,6 +38,7 @@ pub(crate) fn dispatcher(fixture: &Fixture) -> Dispatcher {
         crate::policy::tests::service(Arc::clone(&fixture.sessions), knsh_platform::testing::MemFs::new()).handlers(),
     );
     handlers.extend(crate::exec::unserved_handlers());
+    handlers.extend(crate::start_agent::unserved_handlers());
     crate::hello::dispatcher_with_violations(
         crate::probe::probe(&crate::probe::tests::Machine::working().probes()),
         handlers,

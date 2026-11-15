@@ -46,6 +46,7 @@ fn main() -> ExitCode {
         }
         Ok(Invocation::Shell(shell)) => shell_mode(&shell, interpreter),
         Ok(Invocation::Command(parsed)) => match parsed.path.as_slice() {
+            ["agent"] => agent(&parsed),
             ["daemon", action @ ("install" | "uninstall")] => daemon(action, parsed.json()),
             ["forget"] => forget(&parsed),
             ["history"] => history(&parsed),
@@ -134,6 +135,58 @@ fn forget(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
 #[cfg(not(unix))]
 fn forget(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
     not_implemented("'knsh forget' on this platform")
+}
+
+/// Runs `knsh agent` (KNSH-056): checks the command line, asks `knshd` over `user.sock` to start the agent CLI on
+/// this process's terminal, waits, and exits as the CLI did. A malformed option is a usage error (exit 2) and a
+/// command that cannot be found exits with 127, both before anything is sent; a refusal or a lost `knshd` exits with
+/// 1 and the reason on stderr.
+#[cfg(target_os = "macos")]
+fn agent(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    use knsh::cli::agent;
+
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            report(&format!("knsh: agent: cannot read the working directory: {error}\n"));
+            return ExitCode::FAILURE;
+        }
+    };
+    let env: Vec<_> = std::env::vars_os().collect();
+    let executable = |path: &std::path::Path| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    };
+    let params = match agent::params(parsed, &cwd, &env, &executable) {
+        Ok(params) => params,
+        Err(refusal) => {
+            report(&format!("knsh: agent: {refusal}\n"));
+            return ExitCode::from(refusal.status());
+        }
+    };
+    let socket = match user_socket() {
+        Ok(socket) => socket,
+        Err(code) => return code,
+    };
+    match agent::run(&socket, &params) {
+        Ok(result) => {
+            let (status, line) = agent::finished(&result, parsed.json());
+            if let Some(line) = line {
+                let _ = std::io::stdout().write_all(line.as_bytes());
+            }
+            ExitCode::from(status)
+        }
+        Err(error) => {
+            report(&agent::failure_message(&error));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Envelopes need the macOS sandbox; no other platform has one yet.
+#[cfg(not(target_os = "macos"))]
+fn agent(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    not_implemented("'knsh agent' on this platform")
 }
 
 /// The path of `user.sock` under `HOME`. On failure the reason is already on stderr and the exit code (1) is returned.

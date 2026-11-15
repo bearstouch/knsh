@@ -157,6 +157,7 @@ pub(crate) mod tests {
         handlers.extend(sessions.handlers());
         handlers.extend(crate::policy::tests::service(sessions, knsh_platform::testing::MemFs::new()).handlers());
         handlers.extend(crate::exec::unserved_handlers());
+        handlers.extend(crate::start_agent::unserved_handlers());
         handlers
     }
 

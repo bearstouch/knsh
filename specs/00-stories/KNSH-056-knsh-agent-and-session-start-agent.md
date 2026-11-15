@@ -11,13 +11,14 @@ agent CLI runs under supervision with one command.
 
 **Acceptance criteria**
 - [ ] `knsh agent [--profile <p>] [--agent <name>] -- <cmd…>` calls `session.start_agent` over `user.sock`.
-- [ ] The actor is `--agent` if given, otherwise derived from the command (`claude` becomes `claude-code`).
-- [ ] An agent session refuses to start with `-32005` when the capability probe reports `sandbox: none`.
-- [ ] A session started from inside another one records `parent_session_id` and gets the parent's profile or a
+      (Request building and the handler are tested; the binary against a launchd-started `knshd` is pending.)
+- [x] The actor is `--agent` if given, otherwise derived from the command (`claude` becomes `claude-code`).
+- [x] An agent session refuses to start with `-32005` when the capability probe reports `sandbox: none`.
+- [x] A session started from inside another one records `parent_session_id` and gets the parent's profile or a
       stricter one. A looser profile is refused.
-- [ ] `session.start_agent` is unavailable on `agent.sock`.
-- [ ] `knsh agent` exits with the agent CLI's exit code, and the session ends (`session.ended`) when the CLI exits.
-- [ ] `--json` prints the session ID and profile.
+- [x] `session.start_agent` is unavailable on `agent.sock`.
+- [x] `knsh agent` exits with the agent CLI's exit code, and the session ends (`session.ended`) when the CLI exits.
+- [x] `--json` prints the session ID and profile.
 
 **Unit tests**
 - `derives_claude_code_actor_from_claude` — FR-AGT-02.
@@ -31,3 +32,9 @@ agent CLI runs under supervision with one command.
   for KNSH-058.
 - Spec gap: "stricter profile" needs a comparison rule. Propose: a child profile is stricter if every allow is
   allowed by the parent and every parent deny stays denied. Otherwise use the parent's profile.
+- Resolved: the derivation table is `claude → claude-code`, any other command its own file name
+  ([agent CLIs](../08-integrations/agent-clis.md#starting)); the Codex CLI row is still KNSH-058's.
+- Resolved: strictness is the proposed rule, key by key ([session model](../05-models/session.md#profile-strictness)).
+  Without `--profile` a nested session gets the parent's profile; a looser `--profile` is refused with `-32003`.
+- Implemented with a minimal real launch (session profile compiled for an envelope, `SHELL`, shims on `PATH`, token)
+  so the CLI actually runs; the preset, proxy and confinement checks of the envelope remain KNSH-057 and KNSH-058.

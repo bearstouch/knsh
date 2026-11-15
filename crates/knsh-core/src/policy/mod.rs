@@ -3,7 +3,7 @@
 //! verdicts, fixed denies and the built-in `unattended` profile (KNSH-041; FR-POL-18, FR-POL-20, FR-POL-21,
 //! FR-POL-30, FR-AGT-21: [`evaluate_line`], [`FixedDenies`], [`load_unattended`]), and grants (KNSH-042; FR-POL-60,
 //! FR-POL-61: [`Grant`], [`GrantSet`], [`evaluate_line_with_grants`]), and dry runs (KNSH-043; FR-POL-70:
-//! [`check_line`]).
+//! [`check_line`]), and profile strictness for nested sessions (KNSH-056; FR-SES-03: [`at_least_as_strict`]).
 //!
 //! [`load_profile`] (by name) and [`load_profile_text`] (a snapshot pushed with `policy.set`) turn profile text into
 //! one resolved [`Profile`]:
@@ -42,6 +42,7 @@ mod model;
 pub(crate) mod paths;
 mod presets;
 mod rules;
+mod strictness;
 mod unattended;
 
 #[cfg(test)]
@@ -65,6 +66,7 @@ pub use paths::{LookupError, PathContext, PolicyFs, project_root};
 use paths::{PathTemplate, Variables};
 pub use presets::PRESETS;
 pub use rules::{CommandVerdict, RuleId, evaluate_command};
+pub use strictness::{LoadedProfiles, at_least_as_strict};
 pub use unattended::{UNATTENDED_PROFILE, UNATTENDED_PROFILE_TEXT, load_unattended};
 
 use crate::error::{ProfileError, ProfileErrorKind, ProfileOrigin};

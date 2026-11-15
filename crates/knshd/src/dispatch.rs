@@ -29,9 +29,15 @@ use crate::sessions::SessionBinding;
 /// The name of the handshake method, which every connection must call first.
 pub(crate) const HELLO: &str = "hello";
 
-/// The only method whose request may carry descriptors: `exec.run` from `knsh -c`, with the caller's stdio
-/// (KNSH-049). Descriptors on any other request are closed unused and the request is refused (`-32602`).
+/// `exec.run`, whose request from `knsh -c` carries the caller's stdio (KNSH-049).
 pub(crate) const EXEC_RUN: &str = "exec.run";
+
+/// `session.start_agent`, whose request from `knsh agent` carries the caller's stdio (KNSH-056).
+pub(crate) const START_AGENT: &str = "session.start_agent";
+
+/// The only methods whose requests may carry descriptors, each the caller's stdin, stdout and stderr. Descriptors on
+/// any other request are closed unused and the request is refused (`-32602`).
+pub(crate) const TAKES_DESCRIPTORS: &[&str] = &[EXEC_RUN, START_AGENT];
 
 /// Descriptors that arrived with a request (`SCM_RIGHTS`, KNSH-049). A handler takes them at most once; whatever it
 /// does not take is closed when the call ends.
@@ -101,7 +107,7 @@ pub(crate) struct Call<'a> {
     pub(crate) subscriber: &'a Subscriber,
     /// The human session bound to this connection (`session.start_human`, KNSH-021). Ended with the connection.
     pub(crate) binding: &'a SessionBinding,
-    /// Descriptors that arrived with the request: only `exec.run` sees any (KNSH-049).
+    /// Descriptors that arrived with the request: only [`TAKES_DESCRIPTORS`] see any (KNSH-049, KNSH-056).
     pub(crate) descriptors: &'a Passed,
     /// Whether the client that sent the request is still connected, for a handler that waits on a decision
     /// (FR-LC-41, KNSH-050).
@@ -301,10 +307,10 @@ impl Dispatcher {
 
     /// Calls the handler for `call` on its endpoint, or answers why it cannot be called.
     ///
-    /// A request that carries descriptors is refused (`-32602`) unless it is [`EXEC_RUN`]: descriptors are never
-    /// handed to a handler that does not expect them, and dropping the call closes them.
+    /// A request that carries descriptors is refused (`-32602`) unless its method is one of [`TAKES_DESCRIPTORS`]:
+    /// descriptors are never handed to a handler that does not expect them, and dropping the call closes them.
     pub(crate) fn call(&self, call: &Call<'_>) -> Reply {
-        if !call.descriptors.is_empty() && call.request.method.as_str() != EXEC_RUN {
+        if !call.descriptors.is_empty() && !TAKES_DESCRIPTORS.contains(&call.request.method.as_str()) {
             return Err(RpcError::new(ErrorCode::InvalidParams));
         }
         match self.route(call.endpoint, &call.request.method) {
