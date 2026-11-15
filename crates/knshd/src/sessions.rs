@@ -29,6 +29,16 @@
 //! does not end with the connection: it ends with its envelope ([`Sessions::end_agent`]), which revokes its token
 //! and envelopes first, so nothing can bind to it, or keep acting through a binding, once it is ending.
 //!
+//! # Pause, resume and human control (KNSH-054)
+//!
+//! [`Sessions::change_state`] pauses, resumes, takes control of or hands back a session: the registry applies the
+//! transition, [`Holds`] sends the signals it calls for to the session's kept process groups (FR-SES-10), the
+//! session's row is rewritten and `session.state_changed` is published (FR-SES-14). A transition the state diagram
+//! does not have, or one on a session that is not live, is `-32006` and changes nothing. While a session is paused or
+//! under human control, [`Sessions::runnable`] answers `-32007` with `data.state` for each new line (FR-SES-10,
+//! FR-SES-12); the client retries (`specs/03-functional-requirements/sessions.md`, "Holding a line"). The control
+//! methods that call these arrive with KNSH-071.
+//!
 //! # Errors
 //!
 //! A telemetry call or `session.info` on a connection without a session is `-32003`; a second `session.start_human`
@@ -37,18 +47,18 @@
 //!
 //! # Locks
 //!
-//! Lock order: a connection's [`SessionBinding`], then the registry, then [`AgentAccess`], then the event hub's own
-//! lock. The registry lock is never held while waiting for the record store, and the agent table is never held while
-//! reading the process table.
+//! Lock order: a connection's [`SessionBinding`], then the registry, then [`AgentAccess`] or [`Holds`] (never both),
+//! then the event hub's own lock. The registry lock is never held while waiting for the record store, and the agent
+//! table is never held while reading the process table.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use knsh_core::{
     Actor, CoreError, EventData, ExecutionRecord, ProfileName, RecordDetails, RecordId, Redacted, SessionId,
-    SessionRegistry, SessionSpec, Timestamp, Transition, Ulid,
+    SessionRegistry, SessionSpec, SessionState, Timestamp, Transition, Ulid,
 };
 use knsh_json::{Object, Value};
-use knsh_platform::{AuditToken, Clock, ProcessIdentity, ProcessTree, Random};
+use knsh_platform::{AuditToken, Clock, ProcessGroupId, ProcessIdentity, ProcessTree, Processes, Random};
 use knsh_proto::{
     ErrorCode, RpcError, SessionInfoResult, SessionStartHumanParams, SessionStartHumanResult, TelemetryCommandParams,
     TelemetryCommandResult, TelemetryCwdParams, TelemetryIdleParams,
@@ -58,6 +68,7 @@ use knsh_store::RecordStore;
 use crate::agents::{AgentAccess, Grant, SessionToken, invalid_session_token};
 use crate::dispatch::{Answer, Call, Endpoint, Handler, Handlers, Reply, answer, params};
 use crate::events::EventHub;
+use crate::holds::{GroupKind, Holds, Kept};
 use crate::lifetime::Activity;
 
 /// The profile recorded for human sessions. Nothing in a human session is enforced (FR-SES-22); profiles are loaded
@@ -80,6 +91,36 @@ pub(crate) struct Sessions {
     random: Arc<dyn Random>,
     /// Live agent sessions' tokens and envelopes (KNSH-048).
     agents: AgentAccess,
+    /// Agent sessions' kept process groups, stopped while paused (KNSH-054).
+    holds: Holds,
+}
+
+/// A state change asked of a live session (KNSH-054): the edges of the state diagram other than ending, which has its
+/// own path ([`Sessions::end_agent`]) because it also revokes the session's token and envelopes.
+// Called by the control methods (KNSH-071); until then only tests change states.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StateChange {
+    /// `active → paused` (FR-SES-10).
+    Pause,
+    /// `paused → active` (FR-SES-10).
+    Resume,
+    /// `active → human_control` (FR-SES-12).
+    TakeControl,
+    /// `human_control → active` (FR-SES-12).
+    HandBack,
+}
+
+impl StateChange {
+    /// The registry's transition for this change.
+    const fn transition(self) -> Transition {
+        match self {
+            Self::Pause => Transition::Pause,
+            Self::Resume => Transition::Resume,
+            Self::TakeControl => Transition::TakeControl,
+            Self::HandBack => Transition::HandBack,
+        }
+    }
 }
 
 /// The session bound to one connection, if any, and who is at its other end. Created by the connection, released
@@ -189,6 +230,7 @@ impl Sessions {
             clock,
             random,
             agents: AgentAccess::new(processes),
+            holds: Holds::new(),
         })
     }
 
@@ -488,6 +530,77 @@ impl Sessions {
             .map_err(|_| session_gone(session_id))
     }
 
+    /// The actor and profile of the live agent session `session_id` if it may start a new line now: the hold
+    /// check of the supervisor (FR-SES-10, FR-SES-12). Reads the registry only.
+    ///
+    /// # Errors
+    ///
+    /// - `-32006` naming the session if it is not live.
+    /// - `-32007` with `data.state` (`paused` or `human_control`) if the session holds its lines. Nothing about the
+    ///   line is recorded: it was never proposed, and the client sends it again.
+    pub(crate) fn runnable(&self, session_id: SessionId) -> Result<(Actor, ProfileName), RpcError> {
+        let registry = lock(&self.registry);
+        let session = registry.get(session_id).map_err(|_| session_gone(session_id))?;
+        match session.state() {
+            SessionState::Active => Ok((session.actor().clone(), session.profile().clone())),
+            state @ (SessionState::Paused | SessionState::HumanControl) => Err(held(state)),
+            // Never in the registry (it drops ended sessions); refused like an unknown session all the same.
+            SessionState::Ended => Err(session_gone(session_id)),
+        }
+    }
+
+    /// Pauses, resumes, takes control of or hands back the live session `session_id` (module documentation,
+    /// "Pause, resume and human control"). Returns the new state.
+    ///
+    /// The signals are sent while the registry is still locked, so a line kept by [`Sessions::keep_group`] is either
+    /// kept before the move (and signalled by it) or after it (and stopped at once if the session is now paused).
+    ///
+    /// # Errors
+    ///
+    /// `-32006` naming the session if it is not live, or if the state diagram has no such edge from its state
+    /// (pausing a paused session, resuming an active one, taking control of a paused one…): the state is unchanged
+    /// and no event is published.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn change_state(&self, session_id: SessionId, change: StateChange) -> Result<SessionState, RpcError> {
+        let (session, change) = {
+            let mut registry = lock(&self.registry);
+            let change = registry
+                .transition(session_id, change.transition())
+                .map_err(|_| session_gone(session_id))?;
+            self.holds.moved(session_id, change.from, change.to);
+            let session = registry
+                .get(session_id)
+                .cloned()
+                .map_err(|_| session_gone(session_id))?;
+            (session, change)
+        };
+        // Best effort, like every event and like `end`: the move happened and holds lines whatever the store says.
+        if let (Some(store), Ok(now)) = (&self.store, self.clock.now()) {
+            let _ = store.write_session(&session, now);
+        }
+        let _ = self.events.state_changed(&change);
+        Ok(change.to)
+    }
+
+    /// Keeps `group`, spawned by `processes`, as one of `session_id`'s process groups until the returned handle is
+    /// dropped (FR-SES-10): a pause stops it, a resume continues it. A group kept while the session is paused is
+    /// stopped at once. For a session that is no longer live the handle is detached and never signalled.
+    ///
+    /// Drop the handle before reaping the group's leader ([`Kept`]).
+    pub(crate) fn keep_group(
+        &self,
+        session_id: SessionId,
+        group: ProcessGroupId,
+        processes: Arc<dyn Processes>,
+        kind: GroupKind,
+    ) -> Kept {
+        let registry = lock(&self.registry);
+        match registry.get(session_id) {
+            Ok(session) => self.holds.keep(session_id, session.state(), group, processes, kind),
+            Err(_) => Holds::detached(),
+        }
+    }
+
     /// Ends `session_id`: its connection closed. Writes the ended state and publishes `session.state_changed` to
     /// `ended`, then `session.ended`.
     fn end(&self, session_id: SessionId) {
@@ -502,6 +615,8 @@ impl Sessions {
             let Ok(change) = registry.transition(session_id, Transition::End) else {
                 return;
             };
+            // A session ending while paused continues its kept groups: nothing it started may stay stopped.
+            self.holds.moved(session_id, change.from, change.to);
             // The registry dropped the session; the copy follows it to `ended` for the store row.
             let _ = session.apply(Transition::End);
             (session, change)
@@ -545,6 +660,15 @@ fn user_only(endpoint: Endpoint) -> Result<(), RpcError> {
 /// `-32603`, without the reason (see the module docs).
 fn internal_error() -> RpcError {
     RpcError::new(ErrorCode::InternalError)
+}
+
+/// `-32007` with `data.state`: the session holds its lines (FR-SES-10, FR-SES-12).
+fn held(state: SessionState) -> RpcError {
+    let error = RpcError::new(ErrorCode::SessionHeld);
+    match Object::new().with("state", state.as_str()) {
+        Ok(data) => error.with_data(Value::Object(data)),
+        Err(_) => error,
+    }
 }
 
 /// `-32006` naming the session.

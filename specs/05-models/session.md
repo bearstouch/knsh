@@ -23,7 +23,7 @@ A session has exactly one actor, fixed at start. Behaviour is specified in [../0
 | `ended` | Session exited | Refused (`-32006`) |
 
 Only the edges in the [state diagram](../03-functional-requirements/sessions.md#states) are allowed; any other
-request (pausing a paused session, leaving `ended`) is refused and the state is unchanged. Every allowed edge,
+request (pausing a paused session, leaving `ended`) is refused with `-32006` and the state is unchanged. Every allowed edge,
 including the one into `ended`, emits `session.state_changed`. An ended session is dropped from the live registry,
 so later lookups answer "not found or ended" (`-32006`), the same as an unknown ID.
 
