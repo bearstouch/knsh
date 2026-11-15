@@ -39,7 +39,7 @@ mod grant;
 mod layer;
 mod line;
 mod model;
-mod paths;
+pub(crate) mod paths;
 mod presets;
 mod rules;
 mod unattended;

@@ -118,6 +118,7 @@
 mod error;
 mod event;
 mod id;
+mod lifecycle;
 mod path;
 mod policy;
 mod record;
@@ -131,10 +132,15 @@ mod violation;
 
 pub use error::{CoreError, MAX_KEY_DISPLAY_LEN, ProfileError, ProfileErrorKind, ProfileOrigin};
 pub use event::{
-    BusLimits, Delivery, EVENT_BUFFER_LEN, Event, EventBus, EventData, EventScope, Lost, MAX_ENDED_BUFFERS, Published,
-    Subscribed, SubscriptionId,
+    BusLimits, CancelReason, Delivery, EVENT_BUFFER_LEN, Event, EventBus, EventData, EventScope, Lost,
+    MAX_ENDED_BUFFERS, Published, Subscribed, SubscriptionId,
 };
 pub use id::{CheckpointId, EventId, GrantId, RecordId, RequestId, SessionId};
+pub use lifecycle::{
+    Allowed, AskAnswer, AskReply, AskRequest, Authority, Caller, Decision, Effects, HookOutcome, HookVerdict, Hooks,
+    INTERNAL_ERROR, LineInput, LineProfile, LocalApprovals, MAX_LINE_LEN, MAX_REWRITES, NoAuthority, NoHooks, Observer,
+    Outcome, Proposal, Refusal, RefusalKind, StillWaiting, decide, redact,
+};
 pub use path::CanonicalPath;
 pub use policy::{
     AGENT_SOCKET, ApprovalsPolicy, CONTROL_SERVICE, CheckpointPolicy, CommandVerdict, DEFAULT_AGENT_BASH,
@@ -146,7 +152,10 @@ pub use policy::{
     UNATTENDED_PROFILE_TEXT, USER_SOCKET, check_line, evaluate_command, evaluate_line, evaluate_line_with_grants,
     load_profile, load_profile_text, load_unattended, project_root,
 };
-pub use record::{ExecutionRecord, OutputInfo, OutputStream, RecordDetails};
+pub use record::{
+    DecisionVerdict, ExecutionRecord, OutputInfo, OutputStream, RecordDecision, RecordDetails, decode_decision,
+    encode_decision,
+};
 pub use redacted::{REDACTED_MARKER, Redacted};
 pub use registry::{EqualProfileOnly, ProfileOrder, SessionRegistry};
 pub use resolve::{

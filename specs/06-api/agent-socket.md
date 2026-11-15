@@ -63,8 +63,9 @@ supervised line runs outside the envelope and has no use for its credential). Na
 `/usr/bin:/bin:/usr/sbin:/sbin` without one. Policy decides on the line, `cwd` and `PATH` only: the interpreter is not
 an input to the decision (FR-LC-14).
 
-`exec.run` stays `planned` in the method catalogue until the supervisor that decides and runs lines exists (KNSH-050):
-until then `hello` does not list it and a call is `-32601`.
+`exec.run` stays `planned` in the method catalogue until lines can be spawned (KNSH-051): until then `hello` does not
+list it and a call is `-32601`. The supervisor that decides each line exists (KNSH-050) and is tested end to end
+through `agent.sock` with a fake spawner.
 
 ### Example
 
@@ -99,6 +100,10 @@ code, or with 128 plus the signal (NFR-COMPAT-09).
 ### Errors
 
 `-32001` denied, `-32002` no decision before timeout, `-32007` session held, `-32008` killed at timeout, `-32010` checkpoint not ready, `-32011` cancelled. See [errors.md](errors.md).
+
+`-32002` and `-32011` carry `request_id`, which is `null` when no request had been made yet (for example a line
+cancelled while its hooks ran). `-32011` is only ever seen by a caller that is still reading: it is the answer to a
+line whose caller disconnected (FR-LC-41).
 
 ## `policy.check`
 

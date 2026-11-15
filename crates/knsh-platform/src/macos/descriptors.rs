@@ -169,6 +169,44 @@ pub fn recv_with_descriptors(stream: &UnixStream, buf: &mut [u8], received: &mut
     }
 }
 
+/// Whether the peer of `stream` has closed its end (FR-LC-41): the supervisor asks this while a line it received on
+/// `stream` waits for its decision, and cancels the line when the answer is yes.
+///
+/// Looks at the next byte without taking it and without waiting (`recv` with `MSG_PEEK | MSG_DONTWAIT`): end of
+/// stream or a connection error means closed; a byte waiting, or nothing yet, means the peer is still there. Nothing
+/// is consumed and the socket's blocking mode is not changed, so the connection's reader is unaffected. A peer that
+/// sent more bytes before closing reads as still there until those bytes are read; `knsh -c` sends one request and
+/// waits, so its disconnect is always seen.
+#[must_use]
+pub fn peer_closed(stream: &UnixStream) -> bool {
+    let mut byte = [0_u8; 1];
+    loop {
+        // SAFETY: `byte` is valid and writable for its one byte for the duration of the call; the descriptor is
+        // borrowed from `stream`, which outlives the call.
+        let rc = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                byte.as_mut_ptr().cast(),
+                byte.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if rc > 0 {
+            return false;
+        }
+        if rc == 0 {
+            return true;
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock => return false,
+            // Reset, not connected, or anything else: the caller cannot receive an answer.
+            _ => return true,
+        }
+    }
+}
+
 /// The descriptors in the control data `header` received, owned. `Err` (after closing every descriptor found) if
 /// the control data holds a message other than `SCM_RIGHTS`.
 fn take_descriptors(header: &libc::msghdr) -> Result<Vec<OwnedFd>, ()> {
@@ -366,5 +404,20 @@ mod tests {
         let (data, count) = reader.join().unwrap();
         assert_eq!(data, bytes);
         assert_eq!(count, 1);
+    }
+
+    // FR-LC-41: a peer that is waiting reads as present, whether or not bytes are queued, and nothing it sent is
+    // consumed; once it closes (or shuts down its writing side, as a closed client does), it reads as closed.
+    #[test]
+    fn peer_closed_sees_a_disconnect_without_consuming_bytes() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        assert!(!super::peer_closed(&server), "connected and silent");
+        client.write_all(b"x").unwrap();
+        assert!(!super::peer_closed(&server), "a byte waiting");
+        let mut byte = [0_u8; 1];
+        (&server).read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x", "the peek took nothing");
+        drop(client);
+        assert!(super::peer_closed(&server));
     }
 }

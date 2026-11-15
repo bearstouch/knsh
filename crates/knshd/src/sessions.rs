@@ -474,6 +474,19 @@ impl Sessions {
             .map_err(|_| session_gone(session_id))
     }
 
+    /// The actor and profile of the live agent session `session_id`, for the supervisor (KNSH-050). Reads the
+    /// registry only.
+    ///
+    /// # Errors
+    ///
+    /// `-32006` naming the session if it is not live.
+    pub(crate) fn agent_of(&self, session_id: SessionId) -> Result<(Actor, ProfileName), RpcError> {
+        lock(&self.registry)
+            .get(session_id)
+            .map(|session| (session.actor().clone(), session.profile().clone()))
+            .map_err(|_| session_gone(session_id))
+    }
+
     /// Ends `session_id`: its connection closed. Writes the ended state and publishes `session.state_changed` to
     /// `ended`, then `session.ended`.
     fn end(&self, session_id: SessionId) {
@@ -650,6 +663,7 @@ pub(crate) mod tests {
             subscriber: subscriber(),
             binding,
             descriptors: crate::dispatch::tests::no_descriptors(),
+            caller: &knsh_core::StillWaiting,
         })
     }
 

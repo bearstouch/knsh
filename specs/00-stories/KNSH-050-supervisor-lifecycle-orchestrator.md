@@ -18,17 +18,17 @@ In scope:
 Out of scope: implementations of hooks (KNSH-062), the authority (KNSH-069) and spawning (KNSH-051).
 
 **Acceptance criteria**
-- [ ] Every received line passes the steps in order. No spawn happens before the final verdict is allow.
-- [ ] `command.proposed` is emitted once per line, before hooks run.
-- [ ] Policy is evaluated on the whole (possibly rewritten) line. Deny if any part denies, ask if any part asks.
-- [ ] An ask with no authority connected goes to standalone handling (local approval, or deny at the timeout).
-- [ ] A rewrite triggers exactly one re-run of steps 2 to 5. A second rewrite denies the line (FR-AUTH-31).
-- [ ] Any error in any step (parse failure, hook error, store failure before the decision, internal panic caught at
+- [x] Every received line passes the steps in order. No spawn happens before the final verdict is allow.
+- [x] `command.proposed` is emitted once per line, before hooks run.
+- [x] Policy is evaluated on the whole (possibly rewritten) line. Deny if any part denies, ask if any part asks.
+- [x] An ask with no authority connected goes to standalone handling (local approval, or deny at the timeout).
+- [x] A rewrite triggers exactly one re-run of steps 2 to 5. A second rewrite denies the line (FR-AUTH-31).
+- [x] Any error in any step (parse failure, hook error, store failure before the decision, internal panic caught at
       the boundary) results in **deny**, never a spawn.
-- [ ] A denied line emits `command.denied` with the rule ID, writes a record (FR-REC-03), and makes the client exit 126.
-- [ ] If the caller disconnects while a decision is pending, the request is cancelled (`decision.cancelled`) and the
+- [x] A denied line emits `command.denied` with the rule ID, writes a record (FR-REC-03), and makes the client exit 126.
+- [x] If the caller disconnects while a decision is pending, the request is cancelled (`decision.cancelled`) and the
       line never runs (FR-LC-41).
-- [ ] The pipeline's decision and the record's `decision` object match (`verdict`, `source`, `rule_id`,
+- [x] The pipeline's decision and the record's `decision` object match (`verdict`, `source`, `rule_id`,
       `decided_by`, `latency_ms`).
 
 **Unit tests**
@@ -51,3 +51,11 @@ Out of scope: implementations of hooks (KNSH-062), the authority (KNSH-069) and 
 - Panics are denied by lint outside tests. A `catch_unwind` boundary exists only as defence in depth, and any panic
   it catches is a deny.
 - Could be split into KNSH-050a (pure pipeline in core) and KNSH-050b (daemon driver and events) if the seam is clean.
+
+**Status (implemented).** The pipeline is `knsh_core::decide` (`crates/knsh-core/src/lifecycle/`); the driver is
+`Lifecycle` in `crates/knshd/src/supervisor.rs`. All checks above were observed in unit tests and in
+`supervisor/socket_tests.rs` (a real `agent.sock`, including a real disconnect). Rules settled while implementing are
+in [command lifecycle](../03-functional-requirements/command-lifecycle.md#the-decision-pipeline-knsh-050). Pending:
+`exec.run` stays `planned` until a real spawner exists (KNSH-051); grants are not consulted until the grant store
+exists (KNSH-073); local approvals are "deny at the timeout" until KNSH-066; a held session is not yet refused with
+`-32007` (KNSH-054).

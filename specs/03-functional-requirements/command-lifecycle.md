@@ -58,6 +58,36 @@ shape. Known effects: a program run by its canonical path sees that path as `arg
 through a symlink (`clang++` linking to `clang-18`, `view` to `vim`) behaves as its target; and a call the parser is
 not certain reaches a function of the line is resolved and replaced as a program.
 
+## The decision pipeline (KNSH-050)
+
+Steps 2 to 8 are one pure function in `knsh-core` (`decide`); a driver in `knshd` performs the effects around it
+(events, the record, the spawn). Hooks, the authority, standalone approvals and the spawner are interfaces, so the
+whole lifecycle is tested with fakes. How the steps combine:
+
+- **One pass per line.** Each line evaluated (the received one, then a rewritten one) is parsed and classified, gets
+  its own `command.proposed` (published before its hooks run), its hooks and its policy evaluation. A rewritten line's
+  `command.proposed` carries `rewritten_from`.
+- **Rewrites.** A rewrite from a hook or from the authority starts the second pass; it is the line's one rewrite.
+  Policy is never evaluated on the line a hook rewrote, only on the new one (FR-HOOK-11). A second rewrite, from
+  either, denies the line (FR-AUTH-31), as does a rewrite of a line holding a redaction marker, or one carrying the
+  marker (FR-AUTH-32), or one longer than 65536 bytes or holding NUL.
+- **Combining.** A hook `deny` or failure denies with source `hook` before policy runs. Otherwise the strictest of the
+  hooks' verdict and policy's wins (FR-HOOK-12): a hook `ask` on a line the rules allow is asked about with no
+  `rule_id`. Under the `unattended` profile any ask, a hook's included, is a deny with source `standalone`.
+- **Asks.** With an authority connected the source of the answer is `authority`, including its timeout. Without one,
+  standalone handling holds the request: approved locally (source `user`) or denied at the timeout (source
+  `standalone`, `-32002`).
+- **Failures deny.** A hook failure, an ask that fails, a line that cannot be re-serialised (FR-LC-13), and a panic
+  anywhere in the pipeline are denials. Before the pipeline runs, the driver also denies a line it cannot record (no
+  record store, no clock), and one whose session profile cannot be loaded.
+- **Cancellation (FR-LC-41).** The caller is checked after the hooks, while an ask waits, after the ask, and once more
+  right before the spawn. A cancelled line is answered `-32011`, publishes `decision.cancelled` (`caller_gone`), is
+  recorded as a deny with source `standalone`, and publishes `command.denied`. A line whose ask timed out publishes
+  `decision.cancelled` (`timed_out`) the same way and is answered `-32002`.
+- **Every line is recorded.** Denied, cancelled and timed-out lines are recorded before `command.denied` is published
+  (FR-REC-03); an allowed line is recorded after it ends, then `command.finished` is published (FR-LC-19). The
+  record's `decision` is the pipeline's decision with its latency.
+
 ## Denial
 
 | ID | Requirement |

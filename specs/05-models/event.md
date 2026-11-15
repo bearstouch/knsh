@@ -39,6 +39,9 @@ A `cwd` that is not valid UTF-8 is shown with U+FFFD replacements, as in records
 
 | Event | `data` |
 | --- | --- |
+| `command.proposed` | `command` (redacted), `cwd`, `rewritten_from` (the line before a rewrite, redacted, or `null`). Published once for each line the supervisor evaluates, before that line's hooks run: once for the line received, and once more for the line a rewrite produced (KNSH-050) |
+| `command.denied` | `record_id` (the denial's record, or `null` if it could not be written), `command` (redacted), `cwd`, `source` (as the record's `decision.source`), `rule_id` (or `null`), `reason` (or `null`). Published after the denial's record is written (KNSH-050) |
+| `decision.cancelled` | `request_id` (the pending request, or `null` when the line had not reached the ask step), `reason`: `caller_gone` (the caller disconnected, FR-LC-41) or `timed_out` (no answer before the timeout, FR-AUTH-23). Always followed by the line's `command.denied` (KNSH-050) |
 | `sandbox.violation` | A [sandbox violation](execution-record.md#sandbox_violations): `session_id`, `record_id` (ULID, or `null` for a denial inside an envelope), `rule`, `operation`, `argument` (string or `null`), `process`, `pid`, `count`, `at`. Published only for a live session named by the denial's tag; repeats within 3 s are one event with their `count` (KNSH-047) |
 
 ## Catalog

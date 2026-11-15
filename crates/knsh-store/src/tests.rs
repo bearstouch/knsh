@@ -4,9 +4,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use knsh_core::{
-    Actor, AgentId, CanonicalPath, CheckpointId, DenialReport, DenialTag, ExecutionRecord, OutputStream, ProfileName,
-    RecordDetails, RecordId, Redacted, SandboxViolation, Session, SessionId, SessionSpec, TaggedCommand, Timestamp,
-    Ulid,
+    Actor, AgentId, CanonicalPath, CheckpointId, DecisionSource, DecisionVerdict, DenialReport, DenialTag,
+    ExecutionRecord, OutputStream, ProfileName, RecordDecision, RecordDetails, RecordId, Redacted, SandboxViolation,
+    Session, SessionId, SessionSpec, TaggedCommand, Timestamp, Ulid, encode_decision,
 };
 use knsh_platform::macos::{RealFs, effective_uid};
 use knsh_platform::sqlite::{Connection, DEFAULT_BUSY_TIMEOUT, Step, Value};
@@ -94,6 +94,13 @@ fn full_details() -> RecordDetails {
         secrets_injected: vec![String::from("NPM_TOKEN")],
         checkpoint_id: Some(CheckpointId::from_ulid(Ulid::from_u128(9))),
         sandbox_violations: vec![violation(2, 2, 7)],
+        decision: Some(RecordDecision {
+            verdict: DecisionVerdict::Rewrite,
+            source: DecisionSource::Authority,
+            rule_id: Some(String::from("exec.ask[0]")),
+            decided_by: Some(String::from("Example Authority")),
+            latency_ms: 1200,
+        }),
     }
 }
 
@@ -214,6 +221,8 @@ fn human_record_drops_non_telemetry_fields() {
     assert_eq!(details.checkpoint_id, full_details().checkpoint_id);
     assert_eq!(details.sandbox_violations.len(), 1);
     assert!(details.sandbox_violations[0].same_denial(&violation(2, 2, 7)));
+    // KNSH-050: the decision object reads back exactly as written.
+    assert_eq!(details.decision, full_details().decision);
     assert_eq!(stored.stdout.map(|info| info.stored), Some(3));
     assert_eq!(stored.stderr.map(|info| info.stored), Some(0));
 }
@@ -763,16 +772,28 @@ fn denials_and_approvals_follow_the_same_retention() {
     let store = open_settled(&dir, &clock, StoreConfig::default());
     write_records(&store, session_id(1), 1..=2);
     {
-        // Phase 1 writes no decisions yet; mark the records as a denial and an approval directly.
+        // Mark the records as a denial and an approval directly, in the stored form the supervisor writes.
+        let decided = |verdict, source| {
+            encode_decision(&RecordDecision {
+                verdict,
+                source,
+                rule_id: None,
+                decided_by: None,
+                latency_ms: 1,
+            })
+            .unwrap()
+        };
+        let deny = decided(DecisionVerdict::Deny, DecisionSource::Rule);
+        let approved = decided(DecisionVerdict::Allow, DecisionSource::User);
         let raw = Connection::open(&RealFs::new(), &dir.db(), DEFAULT_BUSY_TIMEOUT).unwrap();
         raw.execute(
             "UPDATE records SET decision = ?1 WHERE record_id = ?2",
-            &[Value::Text("deny"), Value::Text(&record_id(1).to_string())],
+            &[Value::Text(&deny), Value::Text(&record_id(1).to_string())],
         )
         .unwrap();
         raw.execute(
             "UPDATE records SET decision = ?1 WHERE record_id = ?2",
-            &[Value::Text("approved"), Value::Text(&record_id(2).to_string())],
+            &[Value::Text(&approved), Value::Text(&record_id(2).to_string())],
         )
         .unwrap();
     }

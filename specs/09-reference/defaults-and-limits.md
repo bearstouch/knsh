@@ -44,7 +44,8 @@
 | Sensitive-file pre-images | 24 hours at most | — | [checkpoints](../03-functional-requirements/checkpoints.md) |
 | Plain-copy checkpoints (non-APFS) | 50 MB per change | — | [checkpoints](../03-functional-requirements/checkpoints.md) |
 | Checkpoint excludes | `node_modules`, `target`, `.venv`, `dist`, `build` | `checkpoints.exclude` | [checkpoints](../03-functional-requirements/checkpoints.md) |
-| Rewrites per line | 1 | — | [authority](../03-functional-requirements/authority.md) |
+| Rewrites per line | 1, by a hook or the authority alike; a second is a deny | — | [authority](../03-functional-requirements/authority.md) |
+| Caller check while an ask waits | Every 100 ms, so a disconnected caller cancels its line at once (FR-LC-41) | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md#the-decision-pipeline-knsh-050) |
 | Deprecated method lifetime | 2 engine minor releases | — | [API](../06-api/README.md) |
 | Human recording | Off | Per session | [privacy](../04-non-functional-requirements/privacy.md) |
 | Agent recording | Commands on, output off | Per profile, `recording.set` | [privacy](../04-non-functional-requirements/privacy.md) |

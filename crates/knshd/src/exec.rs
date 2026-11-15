@@ -21,9 +21,9 @@
 //!   bash. The session token is removed too: a supervised line runs outside the envelope and has no use for the
 //!   envelope's credential.
 //!
-//! `exec.run` stays `planned` in the method catalogue until the supervisor exists (KNSH-050): `hello` does not list
-//! it and a call is `-32601`, so no line can reach a supervisor that would not decide it. The handler is complete
-//! and tested against a fake supervisor.
+//! `exec.run` stays `planned` in the method catalogue until lines can be spawned (KNSH-051): `hello` does not list
+//! it and a call is `-32601`, so no line can reach a supervisor that could not run it. The handler is complete and
+//! tested against a fake supervisor and, end to end, against the lifecycle orchestrator (`supervisor.rs`, KNSH-050).
 
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -96,13 +96,14 @@ pub(crate) struct Finished {
 /// The contract the handler relies on: a line is run only after its whole [`Proposal`] has been allowed, and every
 /// failure to decide is a denial (`-32001`), never a run. A held session is `-32007`, answered at once.
 pub(crate) trait Supervisor: Send + Sync {
-    /// Decides `line`, runs it if allowed, and waits for it to end.
+    /// Decides `line`, runs it if allowed, and waits for it to end. If `caller` goes away while the decision is
+    /// pending, the line is cancelled and never runs (FR-LC-41).
     ///
     /// # Errors
     ///
     /// The answer for a line that did not run to its end: `-32001` denied (with `rule_id`, `reason` and `source`),
     /// `-32007` held, `-32008` timed out, and the other codes of `specs/06-api/agent-socket.md#execrun`.
-    fn run(&self, line: ForwardedLine) -> Result<Finished, RpcError>;
+    fn run(&self, line: ForwardedLine, caller: &dyn knsh_core::Caller) -> Result<Finished, RpcError>;
 }
 
 /// The `exec.run` service.
@@ -137,7 +138,7 @@ impl ExecRun {
         let session_id = call.binding.agent_session()?;
         let stdio = stdio(params.stdio, descriptors)?;
         let line = forwarded(session_id, params, stdio, &self.shim_dir);
-        let finished = self.supervisor.run(line)?;
+        let finished = self.supervisor.run(line, call.caller)?;
         answer(&ExecRunResult {
             record_id: finished.record_id,
             status: finished.status,
@@ -271,7 +272,7 @@ mod tests {
     }
 
     impl Supervisor for FakeSupervisor {
-        fn run(&self, mut line: ForwardedLine) -> Result<Finished, RpcError> {
+        fn run(&self, mut line: ForwardedLine, _caller: &dyn knsh_core::Caller) -> Result<Finished, RpcError> {
             if let (Some(bytes), Some(stdio)) = (self.write, line.stdio.as_mut()) {
                 let mut stdout = std::fs::File::from(stdio.stdout.try_clone().unwrap());
                 stdout.write_all(bytes).unwrap();
@@ -336,6 +337,7 @@ mod tests {
             subscriber: subscriber(),
             binding,
             descriptors: &passed,
+            caller: &knsh_core::StillWaiting,
         })
     }
 

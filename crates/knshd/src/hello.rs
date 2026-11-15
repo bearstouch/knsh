@@ -174,6 +174,7 @@ pub(crate) mod tests {
                 subscriber: crate::dispatch::tests::subscriber(),
                 binding: &binding,
                 descriptors: crate::dispatch::tests::no_descriptors(),
+                caller: &knsh_core::StillWaiting,
             })
             .map(|answer| answer.result.as_object().cloned().unwrap())
     }

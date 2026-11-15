@@ -367,6 +367,7 @@ fn subscribe_error(error: SubscribeError, session_id: Option<SessionId>) -> RpcE
             | CoreError::TimestampOutOfRange
             | CoreError::InvalidTimestamp
             | CoreError::InvalidOutputStream
+            | CoreError::InvalidDecision
             | CoreError::InvalidAgentId
             | CoreError::InvalidProfileName
             | CoreError::AgentIdRequired
@@ -556,6 +557,7 @@ pub(crate) mod tests {
             subscriber,
             binding: crate::dispatch::tests::binding(),
             descriptors: crate::dispatch::tests::no_descriptors(),
+            caller: &knsh_core::StillWaiting,
         })
     }
 

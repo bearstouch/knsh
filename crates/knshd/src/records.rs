@@ -358,6 +358,7 @@ mod tests {
             subscriber: crate::dispatch::tests::subscriber(),
             binding: crate::dispatch::tests::binding(),
             descriptors: crate::dispatch::tests::no_descriptors(),
+            caller: &knsh_core::StillWaiting,
         }
     }
 
