@@ -12,10 +12,10 @@ approval fatigue drops and agents can plan. Scope: `policy.check` on `agent.sock
 authority are not consulted.
 
 **Acceptance criteria**
-- [ ] Result includes `verdict`, `rule_id`s, per-command classes and `dynamic` reasons.
-- [ ] No record is written, no event is emitted and no process is spawned (verified by fakes).
-- [ ] Listed in `hello` methods on both sockets.
-- [ ] Malformed params → JSON-RPC invalid params; never a partial answer.
+- [x] Result includes `verdict`, `rule_id`s, per-command classes and `dynamic` reasons.
+- [x] No record is written, no event is emitted and no process is spawned (verified by fakes).
+- [x] Listed in `hello` methods on both sockets.
+- [x] Malformed params → JSON-RPC invalid params; never a partial answer.
 
 **Unit tests**
 - `policy_check_returns_ask_for_git_push`.

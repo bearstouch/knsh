@@ -102,8 +102,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every phase 1 handler besides `hello`: records without a store, events on an empty bus, and sessions that
-    /// cannot record (no store).
+    /// Every handler besides `hello`: records without a store, events on an empty bus, sessions that cannot record
+    /// (no store), and `policy.check` over an empty filesystem.
     pub(crate) fn handlers() -> Handlers {
         let mut handlers = crate::records::Records::unavailable().handlers();
         let hub = crate::events::tests::hub();
@@ -115,6 +115,7 @@ pub(crate) mod tests {
             std::sync::Arc::new(knsh_platform::testing::SeededRandom::new(1)),
         );
         handlers.extend(sessions.handlers());
+        handlers.extend(crate::policy::tests::service(sessions, knsh_platform::testing::MemFs::new()).handlers());
         handlers
     }
 
@@ -188,6 +189,8 @@ pub(crate) mod tests {
                     .map(|spec| spec.name)
                     .collect();
                 assert_eq!(listed, from_catalogue, "{}", endpoint.name());
+                // KNSH-043: dry runs are listed on both sockets.
+                assert!(listed.contains(&"policy.check"), "{}", endpoint.name());
                 listed.sort_unstable();
                 assert_eq!(listed, dispatcher.methods(endpoint), "{}", endpoint.name());
             }

@@ -52,6 +52,9 @@ pub enum CommandName<'a> {
     /// A call the parser marked as certainly reaching a function defined earlier in the line
     /// ([`knsh_bash::SimpleCommand::function_call`]). It runs the function's body, which policy decides separately.
     Function(&'a str),
+    /// A program run by a wrapper program or `exec`, looked up as `execvp` does: on `PATH`, or as a path if it
+    /// contains `/`, but never as a builtin (`env echo` runs `/bin/echo`, not the shell's `echo`).
+    Program(&'a str),
 }
 
 impl<'a> From<&'a str> for CommandName<'a> {
@@ -158,9 +161,10 @@ pub fn resolve<L: BinaryLookup + ?Sized>(
     trusted: &TrustedFolders,
     fs: &L,
 ) -> Resolution {
-    let name = match name {
+    let (name, builtins) = match name {
         CommandName::Function(_) => return Resolution::Function,
-        CommandName::Lookup(name) => name,
+        CommandName::Lookup(name) => (name, true),
+        CommandName::Program(name) => (name, false),
     };
     // Bash reports `""` as "command not found" rather than searching for it.
     if name.is_empty() {
@@ -169,7 +173,7 @@ pub fn resolve<L: BinaryLookup + ?Sized>(
     let found = if name.contains('/') {
         // Bash runs a name with `/` directly, never through PATH; `Path::join` keeps an absolute name as it is.
         fs.canonicalise(&cwd.as_path().join(name))
-    } else if knsh_bash::is_builtin(name) {
+    } else if builtins && knsh_bash::is_builtin(name) {
         return Resolution::Builtin;
     } else {
         search_path(name, env_path, cwd, fs)

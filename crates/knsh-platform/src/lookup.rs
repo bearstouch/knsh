@@ -171,6 +171,26 @@ mod tests {
         }
     }
 
+    // FR-LC-03: a program run by a wrapper or `exec` is looked up as `execvp` does, so a builtin's name finds the
+    // binary on PATH (`env echo` runs `/bin/echo`), and a name with no binary is not found rather than a builtin.
+    #[test]
+    fn program_lookup_skips_builtins() {
+        let fs = fs();
+        add_binary(&fs, "/bin/echo");
+        let fs: &dyn Fs = &fs;
+        let program = |name| {
+            resolve(
+                CommandName::Program(name),
+                PATH,
+                &canonical("/work/project"),
+                &TrustedFolders::defaults(),
+                fs,
+            )
+        };
+        assert_eq!(program("echo"), Resolution::Trusted(canonical("/bin/echo")));
+        assert_eq!(program("cd"), Resolution::NotFound);
+    }
+
     // FR-POL-13: folders the profile adds are trusted like the defaults; without them the same binary is not.
     #[test]
     fn profile_added_trusted_folder_is_honoured() {

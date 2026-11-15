@@ -95,6 +95,12 @@
 //! `ask` into `allow` (source [`DecisionSource::Grant`]) when grants cover every asking part, never overrides a deny,
 //! and leaves the dynamic-code clamps in place.
 //!
+//! # Dry runs (KNSH-043)
+//!
+//! [`check_line`] parses, resolves ([`LineResolver`]), classifies and decides a line against a profile without
+//! running it (FR-POL-70), for `policy.check`. It reads the filesystem only through [`BinaryLookup`]; hooks, the
+//! authority and grants are not consulted.
+//!
 //! Failures are reported through [`CoreError`], except the profile loader's, which are [`ProfileError`] because they
 //! must name the key at fault.
 
@@ -125,12 +131,12 @@ pub use path::CanonicalPath;
 pub use policy::{
     ApprovalsPolicy, CONTROL_SERVICE, CheckpointPolicy, CommandVerdict, DEFAULT_AGENT_BASH,
     DEFAULT_CHECKPOINT_EXCLUDES, DEFAULT_RETENTION_DAYS, DecisionSource, ENGINE_CONFIG_DIR, ENGINE_DATA_DIR,
-    ExecPolicy, FixedDenies, FsPolicy, Grant, GrantScope, GrantSet, LineCapabilities, LineDecision, LineReason,
-    LookupError, MAX_EXTENDS_DEPTH, MAX_GRANTS, MAX_PROFILE_LEN, MatchedRule, NetworkMode, NetworkPolicy, OutputMode,
-    OutputPolicy, PRESETS, PathContext, PolicyFs, Profile, ProfileSource, RETENTION_DAYS_RANGE, ReadScope,
-    RecordingPolicy, RuleAction, RuleId, SecretInjection, UNATTENDED_PROFILE, UNATTENDED_PROFILE_TEXT,
-    evaluate_command, evaluate_line, evaluate_line_with_grants, load_profile, load_profile_text, load_unattended,
-    project_root,
+    ExecPolicy, FixedDenies, FsPolicy, Grant, GrantScope, GrantSet, LineCapabilities, LineCheck, LineDecision,
+    LineReason, LineResolver, LookupError, MAX_EXTENDS_DEPTH, MAX_GRANTS, MAX_PROFILE_LEN, MatchedRule, NetworkMode,
+    NetworkPolicy, OutputMode, OutputPolicy, PRESETS, PathContext, PolicyFs, Profile, ProfileSource,
+    RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy, RuleAction, RuleId, SecretInjection, UNATTENDED_PROFILE,
+    UNATTENDED_PROFILE_TEXT, check_line, evaluate_command, evaluate_line, evaluate_line_with_grants, load_profile,
+    load_profile_text, load_unattended, project_root,
 };
 pub use record::{ExecutionRecord, OutputInfo, OutputStream, RecordDetails};
 pub use redacted::{REDACTED_MARKER, Redacted};

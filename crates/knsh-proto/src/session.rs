@@ -218,7 +218,7 @@ impl ToJson for SessionInfoResult {
 }
 
 /// A working directory field: bounded, then checked to be absolute and resolved.
-fn cwd(text: String) -> Result<CanonicalPath, JsonError> {
+pub(crate) fn cwd(text: String) -> Result<CanonicalPath, JsonError> {
     if text.len() > MAX_TELEMETRY_CWD_LEN {
         return Err(out_of_range("cwd"));
     }
@@ -227,17 +227,17 @@ fn cwd(text: String) -> Result<CanonicalPath, JsonError> {
 
 /// A canonical path as JSON text. Paths built by [`cwd`] came from JSON strings, so they are UTF-8; any other path
 /// shows its non-UTF-8 bytes as U+FFFD, as in records.
-fn path_text(path: &CanonicalPath) -> String {
+pub(crate) fn path_text(path: &CanonicalPath) -> String {
     path.as_path().to_string_lossy().into_owned()
 }
 
 /// Parses a string field with `T`'s strict `FromStr`; a malformed value is out of range for `field`.
-fn parse<T: std::str::FromStr>(text: &str, field: &'static str) -> Result<T, JsonError> {
+pub(crate) fn parse<T: std::str::FromStr>(text: &str, field: &'static str) -> Result<T, JsonError> {
     text.parse().map_err(|_| out_of_range(field))
 }
 
 /// The error for a field whose value has the right JSON type but is not valid.
-const fn out_of_range(field: &'static str) -> JsonError {
+pub(crate) const fn out_of_range(field: &'static str) -> JsonError {
     JsonError::OutOfRange { field: Some(field) }
 }
 

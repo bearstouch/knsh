@@ -10,7 +10,8 @@ Reachable by the user's processes outside envelopes. Every envelope and command 
 | `records.query`, `records.output`, `events.subscribe`, `events.unsubscribe` | Read-only access to all sessions, for observers and the CLI |
 | `checkpoint.*` | All checkpoint operations, including `restore` and `force` |
 | `approval.list`, `approval.approve`, `approval.deny` | Pending asks; approving needs Touch ID or password, checked by `knshd` |
-| `policy.check`, `policy.edit`, `profile.use`, `policy.grant` | Policy changes and grants need Touch ID or password |
+| `policy.check` | Dry run of a line against a named session's or profile's policy ([parameters](agent-socket.md#policycheck)); no authentication |
+| `policy.edit`, `profile.use`, `policy.grant` | Policy changes and grants need Touch ID or password |
 | `records.forget` | Delete records, optionally with checkpoints (`knsh forget`) |
 
 ## Authentication
