@@ -6,6 +6,7 @@
 | User settings | `~/.config/knsh/config.toml` (`[recording] human`, `[shell] hosted`; written by the user, read by `knsh`) |
 | Records, grants, pushed policy | `~/Library/Application Support/knsh/` (records in `records.db`, owner-only `0600`) |
 | Checkpoints, home volume | `~/Library/Application Support/knsh/checkpoints/` |
+| Compiled sandbox profiles | `~/Library/Application Support/knsh/profiles/<sha256>.sb` (directory `0700`, files `0600`, written atomically; removed when no running envelope or line uses them, and swept at `knshd` start; FR-SBX-07) |
 | Checkpoints, other APFS volumes | `.knsh-checkpoints/` on that volume, when writable; otherwise plain copies in the home store |
 | zsh startup wrapper (integration mode) | `~/Library/Application Support/knsh/shell/zsh/.zshenv` (owner-only; rewritten by `knsh` when outdated) |
 | bash startup wrapper (integration mode, when recording or with terminal marks) | `~/Library/Application Support/knsh/shell/bash/bashrc` (owner-only; rewritten by `knsh` when outdated) |

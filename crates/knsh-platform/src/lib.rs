@@ -44,6 +44,10 @@
 //! the policies directory ([`PolicyDirectory`], a [`knsh_core::ProfileSource`]), so the supervisor loads profiles
 //! with [`knsh_core::load_profile`] from the real filesystem and tests do so from `MemFs`.
 //!
+//! For compiled sandbox profiles (KNSH-045), [`Fs::list_dir`] lists a directory (sweeping unused profile files),
+//! [`EnginePaths::profiles_dir`] is their private directory, and `macos::sha256` hashes them with `CommonCrypto`, so a
+//! record names exactly the profile that ran (FR-SBX-07).
+//!
 //! Later stories add Keychain, `LocalAuthentication`, XPC, `FSEvents` and APFS clones to the same interface.
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
@@ -74,6 +78,7 @@
 //! - `specs/08-integrations/terminals-and-shells.md`, FR-SES-22 (telemetry pipe, job-control signals and signal
 //!   re-raising for a hosted shell, `macos::shell_host`, KNSH-019)
 //! - FR-LC-03, FR-POL-13, FR-POL-14 (binary lookup for command resolution, KNSH-035)
+//! - FR-SBX-07 (profile files: directory listing, profiles directory, SHA-256, KNSH-045)
 //! - FR-POL-01, FR-POL-10, FR-POL-11 (profile source and path canonicalisation for the policy loader, KNSH-039)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)

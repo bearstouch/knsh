@@ -129,14 +129,14 @@ pub use event::{
 pub use id::{CheckpointId, EventId, GrantId, RecordId, RequestId, SessionId};
 pub use path::CanonicalPath;
 pub use policy::{
-    ApprovalsPolicy, CONTROL_SERVICE, CheckpointPolicy, CommandVerdict, DEFAULT_AGENT_BASH,
+    AGENT_SOCKET, ApprovalsPolicy, CONTROL_SERVICE, CheckpointPolicy, CommandVerdict, DEFAULT_AGENT_BASH,
     DEFAULT_CHECKPOINT_EXCLUDES, DEFAULT_RETENTION_DAYS, DecisionSource, ENGINE_CONFIG_DIR, ENGINE_DATA_DIR,
-    ExecPolicy, FixedDenies, FsPolicy, Grant, GrantScope, GrantSet, LineCapabilities, LineCheck, LineDecision,
-    LineReason, LineResolver, LookupError, MAX_EXTENDS_DEPTH, MAX_GRANTS, MAX_PROFILE_LEN, MatchedRule, NetworkMode,
-    NetworkPolicy, OutputMode, OutputPolicy, PRESETS, PathContext, PolicyFs, Profile, ProfileSource,
+    ENGINE_RUN_DIR, ExecPolicy, FixedDenies, FsPolicy, Grant, GrantScope, GrantSet, LineCapabilities, LineCheck,
+    LineDecision, LineReason, LineResolver, LookupError, MAX_EXTENDS_DEPTH, MAX_GRANTS, MAX_PROFILE_LEN, MatchedRule,
+    NetworkMode, NetworkPolicy, OutputMode, OutputPolicy, PRESETS, PathContext, PolicyFs, Profile, ProfileSource,
     RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy, RuleAction, RuleId, SecretInjection, UNATTENDED_PROFILE,
-    UNATTENDED_PROFILE_TEXT, check_line, evaluate_command, evaluate_line, evaluate_line_with_grants, load_profile,
-    load_profile_text, load_unattended, project_root,
+    UNATTENDED_PROFILE_TEXT, USER_SOCKET, check_line, evaluate_command, evaluate_line, evaluate_line_with_grants,
+    load_profile, load_profile_text, load_unattended, project_root,
 };
 pub use record::{ExecutionRecord, OutputInfo, OutputStream, RecordDetails};
 pub use redacted::{REDACTED_MARKER, Redacted};

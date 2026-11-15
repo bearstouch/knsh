@@ -1,6 +1,6 @@
 //! The real filesystem, through the standard library's safe wrappers over the POSIX calls.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -225,6 +225,19 @@ impl Fs for RealFs {
         require_absolute(path)?;
         // `unlink(2)`: removes a final symlink itself, and refuses a directory.
         fs::remove_file(path).map_err(os(Operation::RemoveFile))
+    }
+
+    fn list_dir(&self, path: &Path, limit: usize) -> Result<Vec<OsString>, PlatformError> {
+        require_absolute(path)?;
+        let mut names = Vec::new();
+        for entry in fs::read_dir(path).map_err(os(Operation::ReadDirectory))? {
+            if names.len() == limit {
+                return Err(PlatformError::TooLarge { limit: limit as u64 });
+            }
+            names.push(entry.map_err(os(Operation::ReadDirectory))?.file_name());
+        }
+        names.sort();
+        Ok(names)
     }
 
     fn xattr(&self, path: &Path, name: &str, limit: usize) -> Result<Option<Vec<u8>>, PlatformError> {
@@ -505,5 +518,22 @@ mod tests {
         assert!(real.remove_file(&file).unwrap_err().is_not_found());
         assert!(real.remove_file(&dir.0).is_err());
         assert!(dir.0.exists());
+    }
+
+    #[test]
+    fn list_dir_names_entries_sorted_and_bounded() {
+        let dir = TempDir::new("list");
+        for name in ["b", "a", "c"] {
+            fs::write(dir.0.join(name), b"x").unwrap();
+        }
+        let real = RealFs::new();
+        assert_eq!(real.list_dir(&dir.0, 3).unwrap(), ["a", "b", "c"]);
+        assert_eq!(
+            real.list_dir(&dir.0, 2).unwrap_err(),
+            PlatformError::TooLarge { limit: 2 }
+        );
+        assert!(real.list_dir(&dir.0.join("a"), 3).is_err());
+        assert!(real.list_dir(&dir.0.join("missing"), 3).unwrap_err().is_not_found());
+        assert_eq!(real.list_dir(Path::new("rel"), 3), Err(PlatformError::InvalidPath));
     }
 }

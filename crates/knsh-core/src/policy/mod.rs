@@ -48,7 +48,9 @@ mod unattended;
 mod tests;
 
 pub use check::{LineCheck, LineResolver, check_line};
-pub use fixed::{CONTROL_SERVICE, ENGINE_CONFIG_DIR, ENGINE_DATA_DIR, FixedDenies};
+pub use fixed::{
+    AGENT_SOCKET, CONTROL_SERVICE, ENGINE_CONFIG_DIR, ENGINE_DATA_DIR, ENGINE_RUN_DIR, FixedDenies, USER_SOCKET,
+};
 pub use grant::{Grant, GrantScope, GrantSet, MAX_GRANTS};
 use layer::{Layer, LayerKind, ReadTemplate};
 pub use line::{
