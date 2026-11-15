@@ -1,4 +1,4 @@
-//! Golden-file test (KNSH-044): the example profile of `specs/05-models/policy-profile.md`, compiled, is byte for byte
+//! Golden-file test (KNSH-044, KNSH-045): the example profile of `specs/05-models/policy-profile.md`, compiled, is byte for byte
 //! `tests/golden/web-app.sb`. A change to the compiler's output shows up as a diff of that file in review.
 //!
 //! To accept a deliberate change, run the test with `KNSH_BLESS=1` and review the rewritten file.
@@ -63,6 +63,9 @@ fn example_profile_matches_golden_file() {
         command: CommandTag::Line(RecordId::from_ulid(Ulid::from_u128(2))),
         profile: &profile,
         home: &home,
+        // A line that resolved `node` through Homebrew's link, with the proxy on port 41000 (KNSH-045).
+        executables: &[CanonicalPath::new("/opt/homebrew/Cellar/node/25.9.0/bin/node").unwrap()],
+        proxy_port: std::num::NonZeroU16::new(41_000),
     });
 
     let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/web-app.sb");

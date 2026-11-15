@@ -465,6 +465,30 @@ impl Fs for MemFs {
         }
     }
 
+    fn list_dir(&self, path: &Path, limit: usize) -> Result<Vec<OsString>, PlatformError> {
+        let mut state = lock(&self.state);
+        require_absolute(path)?;
+        state.check_fault(Operation::ReadDirectory)?;
+        // Like `opendir`: a final symlink is followed.
+        let resolved = resolve(&state.nodes, path, true, Operation::ReadDirectory)?;
+        match state.nodes.get(&resolved) {
+            Some(Node::Directory { .. }) => {}
+            Some(_) => return Err(os(Operation::ReadDirectory, libc::ENOTDIR)),
+            None => return Err(os(Operation::ReadDirectory, libc::ENOENT)),
+        }
+        // `nodes` is sorted by path, so the direct children come out sorted by name.
+        let names: Vec<OsString> = state
+            .nodes
+            .keys()
+            .filter(|child| child.parent() == Some(resolved.as_path()))
+            .filter_map(|child| child.file_name().map(OsString::from))
+            .collect();
+        if names.len() > limit {
+            return Err(PlatformError::TooLarge { limit: limit as u64 });
+        }
+        Ok(names)
+    }
+
     fn xattr(&self, path: &Path, name: &str, limit: usize) -> Result<Option<Vec<u8>>, PlatformError> {
         let mut state = lock(&self.state);
         require_absolute(path)?;
@@ -689,5 +713,25 @@ mod tests {
         fs.create_dir(Path::new("/d"), 0o700).unwrap();
         assert_eq!(fs.remove_file(Path::new("/d")).unwrap_err().errno(), Some(libc::EPERM));
         assert_eq!(fs.remove_file(Path::new("rel")), Err(PlatformError::InvalidPath));
+    }
+
+    #[test]
+    fn list_dir_names_direct_children_only() {
+        let fs = MemFs::new();
+        fs.add_dir_all(Path::new("/d/sub")).unwrap();
+        fs.write(Path::new("/d/b"), b"x", 0o600).unwrap();
+        fs.write(Path::new("/d/sub/deep"), b"x", 0o600).unwrap();
+        assert_eq!(fs.list_dir(Path::new("/d"), 8).unwrap(), ["b", "sub"]);
+        assert_eq!(
+            fs.list_dir(Path::new("/d"), 1).unwrap_err(),
+            PlatformError::TooLarge { limit: 1 }
+        );
+        assert_eq!(
+            fs.list_dir(Path::new("/d/b"), 8).unwrap_err().errno(),
+            Some(libc::ENOTDIR)
+        );
+        assert!(fs.list_dir(Path::new("/nope"), 8).unwrap_err().is_not_found());
+        fs.inject_fault(Operation::ReadDirectory, libc::EIO);
+        assert_eq!(fs.list_dir(Path::new("/d"), 8).unwrap_err().errno(), Some(libc::EIO));
     }
 }

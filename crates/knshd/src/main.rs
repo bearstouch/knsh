@@ -25,6 +25,7 @@
 //! - `specs/06-api/user-socket.md#human-sessions`, FR-SES-21, FR-SES-24, FR-SES-25, FR-REC-09, NFR-PRIV-05 (human
 //!   sessions, telemetry and `session.info`, KNSH-021)
 //! - `specs/06-api/agent-socket.md#policycheck`, FR-POL-70 (`policy.check` dry runs, KNSH-043)
+//! - FR-SBX-07 (compiled profile files named by hash, collected when unused, KNSH-045)
 //!
 //! On start it prepares the engine directories (KNSH-011) and takes its sockets from launchd ([`endpoints`],
 //! KNSH-012). It then serves them ([`server`], KNSH-013): a kqueue accept loop hands each connection to its own
@@ -38,7 +39,8 @@
 //! recorded human sessions, each bound to the `knsh` connection that started it and ended when it closes; their
 //! telemetry becomes records and events, and a recording session keeps `knshd` alive. `policy.check` ([`policy`],
 //! KNSH-043) answers what a profile would decide for a line, reading profiles and binaries but writing, publishing and
-//! running nothing. It exits after ten idle minutes ([`lifetime`]) or when launchd stops it, finishing in-flight
+//! running nothing. Compiled sandbox profiles are written to private files named by their hash ([`profiles`],
+//! KNSH-045), and the ones an earlier run left behind are removed at start. It exits after ten idle minutes ([`lifetime`]) or when launchd stops it, finishing in-flight
 //! requests and committing pending writes first.
 //! The supervisor arrives in later stories.
 
@@ -64,6 +66,11 @@ mod lifetime;
 mod policy;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod probe;
+// Hashes with CommonCrypto, so built on macOS. Only the start-up sweep uses it until the supervisor (KNSH-050)
+// writes a profile for each envelope and line.
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(test), allow(dead_code))]
+mod profiles;
 // The record store is built on macOS only until the Linux SQLite backend exists.
 #[cfg(target_os = "macos")]
 mod records;
@@ -187,6 +194,7 @@ fn start() -> Result<(), StartError> {
         let home = std::env::var_os("HOME").ok_or(StartError::NoHome)?;
         let paths = EnginePaths::for_home(Path::new(&home)).map_err(StartError::BadHome)?;
         ensure_engine_dirs(&RealFs::new(), &paths, uid).map_err(StartError::EngineDirs)?;
+        sweep_profiles(&paths, uid, log.as_ref());
         // Never a fallback bind: without launchd's sockets, knshd does not run (KNSH-012).
         let listeners = endpoints::activate(&LaunchdSockets::new()).map_err(StartError::NoLaunchdSockets)?;
         let clock = Arc::new(SystemClock::new());
@@ -268,6 +276,20 @@ fn start() -> Result<(), StartError> {
         &[Field::new("reason", Value::Static(reason))],
     );
     Ok(())
+}
+
+/// Removes the compiled profile files an earlier run left behind: no line runs yet, so none is in use (FR-SBX-07). A
+/// failed sweep only leaves files behind and never blocks a human session, so it is logged, not fatal.
+#[cfg(target_os = "macos")]
+fn sweep_profiles(paths: &knsh_platform::EnginePaths, uid: u32, log: &dyn knsh_platform::SystemLog) {
+    use std::sync::Arc;
+
+    use knsh_platform::macos::{RealFs, sha256};
+
+    let files = profiles::ProfileFiles::new(Arc::new(RealFs::new()), paths.profiles_dir(), uid, sha256);
+    if files.sweep().is_err() {
+        log.log(knsh_platform::Level::Error, "stale sandbox profiles not removed", &[]);
+    }
 }
 
 /// Everything `knshd` does. Only macOS has a backend so far (Linux later).

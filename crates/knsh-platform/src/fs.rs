@@ -4,6 +4,7 @@
 //! [`Fs::atomic_replace`], so a crash or error leaves either the old or the new contents, never a mix (CLAUDE.md
 //! "Persistence"). Policy matches only canonical paths (FR-POL-11), which [`Fs::canonicalise`] produces.
 
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
 
@@ -161,6 +162,18 @@ pub trait Fs: Send + Sync {
     /// [`PlatformError::InvalidPath`]; [`PlatformError::Os`] with [`Operation::RemoveFile`](crate::Operation::RemoveFile)
     /// (`ENOENT` if nothing exists there, `EPERM` for a directory).
     fn remove_file(&self, path: &Path) -> Result<(), PlatformError>;
+
+    /// The names of the entries of the directory `path` (not `.` or `..`), sorted bytewise, so callers see the same
+    /// order on every backend. A final symlink is followed, as `opendir` does: callers that must not follow one
+    /// check [`Fs::metadata`] first. At most `limit` names are returned; a larger directory is refused rather than
+    /// read in part (untrusted-input rule). Used to sweep compiled profiles no line uses (KNSH-045).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::InvalidPath`]; [`PlatformError::TooLarge`] if the directory holds more than `limit`
+    /// entries; [`PlatformError::Os`] with [`Operation::ReadDirectory`](crate::Operation::ReadDirectory)
+    /// (`ENOENT`, `ENOTDIR`).
+    fn list_dir(&self, path: &Path, limit: usize) -> Result<Vec<OsString>, PlatformError>;
 }
 
 /// Refuses relative paths, which every [`Fs`] method rejects.

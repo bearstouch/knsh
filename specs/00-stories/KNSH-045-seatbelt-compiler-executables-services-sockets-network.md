@@ -18,22 +18,22 @@ content hash, so that `knsh-exec` can apply it with `-f` and records can name ex
 **Acceptance criteria**
 *Seatbelt compiler: executables, services, sockets, network, process info*
 
-- [ ] `process-exec` allowed only for trusted folders, profile-named paths and (if allowed) project executables
+- [x] `process-exec` allowed only for trusted folders, profile-named paths and (if allowed) project executables
   (FR-SBX-04, FR-LC-15).
-- [ ] LaunchServices, Apple Events, launchd job submission, the knsh control service and the DNS resolver are denied
+- [x] LaunchServices, Apple Events, launchd job submission, the knsh control service and the DNS resolver are denied
   (FR-NET-08).
-- [ ] Envelope profiles allow connecting to `agent.sock` only; command profiles allow no Unix socket; `user.sock` is
+- [x] Envelope profiles allow connecting to `agent.sock` only; command profiles allow no Unix socket; `user.sock` is
   always denied (FR-SBX-05); Docker and SSH agent sockets only when the profile allows.
-- [ ] Outbound network allowed only to `127.0.0.1:<proxy port>` and `network.loopback` ports.
-- [ ] Process info and signals limited to the own sandbox (decision 8; rule forms in KNSH-025's C8 results); any gap
+- [x] Outbound network allowed only to `127.0.0.1:<proxy port>` and `network.loopback` ports.
+- [x] Process info and signals limited to the own sandbox (decision 8; rule forms in KNSH-025's C8 results); any gap
   is documented in the profile header comment and the spec.
 
 *Compiled profile files and hashes*
 
-- [ ] Files are created with mode 0600 in a 0700 engine directory, written atomically, named by hash.
-- [ ] `sandbox_profile` value is `<profile name>@<sha256 prefix>` (format documented).
-- [ ] Old profile files are garbage-collected when no running line references them.
-- [ ] Write failures deny the line (fail closed).
+- [x] Files are created with mode 0600 in a 0700 engine directory, written atomically, named by hash.
+- [x] `sandbox_profile` value is `<profile name>@<sha256 prefix>` (format documented).
+- [x] Old profile files are garbage-collected when no running line references them.
+- [x] Write failures deny the line (fail closed).
 
 **Unit tests**
 *Seatbelt compiler: executables, services, sockets, network, process info*
@@ -55,6 +55,13 @@ content hash, so that `knsh-exec` can apply it with `-f` and records can name ex
 **Integration tests**
 *Seatbelt compiler: executables, services, sockets, network, process info*
 
-- Under a compiled command profile: `open -a Safari` fails, `osascript -e 1` fails, `nc` to a non-loopback address
-  fails, connecting to a fake `user.sock` fails, executing a binary copied into the project fails when
-  `project_executables = "deny"`.
+- Under a compiled command profile: `open -a Safari` fails, `osascript` sending an Apple Event to another application
+  fails (`osascript -e 1` sends none and succeeds, observed on macOS 26.6.2, so the test sends one to Finder), `nc` to a
+  non-loopback address fails, connecting to a fake `user.sock` fails, executing a binary copied into the project fails
+  when `project_executables = "deny"`.
+
+**Verified** (macOS 26.6.2, `knsh-sandbox` unit, golden and `sandbox-exec` integration tests; `knshd` `profiles`
+tests): every criterion above. **Pending:** macOS 14 and 15; the measured short list of Mach services (all but the
+denied ones are allowed, a gap listed in each profile header); Homebrew tools a child starts by name (their `Cellar`
+targets lie outside the trusted folder); wiring the file store into the supervisor (KNSH-050), which calls it for each
+envelope and line and denies on error.

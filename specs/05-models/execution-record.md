@@ -13,7 +13,7 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 | `argv` | array | Each simple command with resolved absolute path and class (`static`, `wrapper`, `dynamic`, `project_executable`). A wrapper and the command it runs are separate entries, the inner one linked to its wrapper; a dynamic entry carries its reason code |
 | `cwd` | path | Working directory at start |
 | `decision` | object | See below |
-| `sandbox_profile` | string | Profile name and a hash of the compiled profile |
+| `sandbox_profile` | string | Profile name and a hash of the compiled profile: `<profile name>@<first 16 lower-case hex digits of the SHA-256 of the compiled profile bytes>`, for example `web-app@ba7816bf8f01cfea`. The profile file `knsh-exec` applied is named by the full hash (FR-SBX-07, KNSH-045) |
 | `secrets_injected` | array | Secret names only, never values |
 | `started_at`, `ended_at` | timestamp | UTC, microseconds |
 | `exit_code` | int or null | Exit code of the line; null when denied or still running |

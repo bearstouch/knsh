@@ -176,6 +176,33 @@ below answer KNSH-045's question of which operations and filters to use for each
 | The knsh control service and named Mach lookups denied | **Enforceable.** `bootstrap_look_up` returns 1100 (permission denied) instead of 1102 (unknown service) | `(deny mach-lookup (global-name "<service>") (with message …))` |
 | DNS resolver denied | **Enforceable for the system resolver:** `curl` and `dscacheutil` cannot resolve. `getaddrinfo("localhost")` and numeric hosts still work. **Gap:** a tool that sends DNS over UDP itself (`host(1)`) bypasses it, and is stopped only by the network rule (outbound to the proxy port only), which was observed to deny `remote:*:53` | `(deny mach-lookup (global-name "com.apple.dnssd.service") (with message …))` `(deny network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")) (with message …))` |
 
+#### Compiled profiles (KNSH-045)
+
+Observed on the same machine (macOS 26.6.2) while compiling the rest of the table; the cases marked *(integration)* are
+in the `knsh-sandbox` integration tests, which run the compiled profiles through `sandbox-exec -f`:
+
+- **Exec rules match the resolved path** *(ad hoc)*: `(allow process-exec (subpath "/opt/homebrew/bin"))` does not
+  let `/opt/homebrew/bin/python3` run (a link into `/opt/homebrew/Cellar`), and `/usr/bin/git`, `python3`, `clang`
+  fail with `can't exec '/Applications/Xcode.app/Contents/Developer/usr/bin/…'` until the developer directory is
+  allowed. With the system tool folders, `git status`, `clang --version`, `xcrun --find clang`, `make` and `python3`
+  subprocesses run *(git: integration)*.
+- **Project executables** *(integration)*: a script and an ad-hoc-signed binary in the project do not run, directly or
+  from a child shell, with `project_executables = "deny"`, and run with `"allow"`. A plain copy of a platform binary
+  (`cp /bin/echo`) is killed by the system (`SIGKILL`) even outside any sandbox, so it is no test. `sh x.sh` still runs
+  a project script under `deny`: the script is read, not executed *(ad hoc)*.
+- **Services** *(integration)*: `open -g -a Safari` fails (`Unable to find application`) and `osascript` sending an
+  Apple Event to Finder hangs and is killed. `osascript -e 1` **succeeds**: it sends no Apple Event, so the story's
+  check uses an event to Finder. `launchctl submit` fails; `curl` cannot resolve a name *(ad hoc)*.
+- **Sockets** *(integration)*: under `(deny file-read* file-write* (subpath <engine data dir>))`, an envelope still
+  connects to `run/agent.sock` through its `(remote unix-socket (path-literal …))` allow, while `user.sock` is refused;
+  a command reaches neither. Binding a socket in an engine directory fails with `EPERM` *(ad hoc)*.
+- **Network** *(integration)*: `nc -z` reaches the proxy's port on `127.0.0.1` (`(remote ip "localhost:<port>")`),
+  but not another loopback port or `1.1.1.1:443`.
+- **Signals and settings**: `kill -0` of an unsandboxed process fails *(integration)*; `defaults read` works and
+  `defaults write` fails *(ad hoc)*.
+- **Pending:** macOS 14 and 15; which Mach services command-line tools need (the profile allows all but the denied
+  ones); Homebrew binaries started by a child by name (their Cellar targets are not covered by the trusted folder).
+
 Proposed spec and decision changes from these results are in [decisions](../09-reference/decisions.md) (decisions 8 to
 10) and the [sandbox profiles](../03-functional-requirements/sandbox-profiles.md) notes.
 

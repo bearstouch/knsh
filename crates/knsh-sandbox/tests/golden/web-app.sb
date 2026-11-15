@@ -1,8 +1,29 @@
 (version 1)
+;; knsh command profile web-app, compiled by knsh-sandbox. Known gaps:
+;; - signals and process information are limited to this sandbox instance, not a process group (decision 8)
+;; - the system-wide process list is denied as a whole: proc_listpids has no per-target filter
+;; - signal denials are never logged
+;; - Mach services: all are allowed but the named denies; the short list command-line tools need is not measured
+;; - a tool that sends DNS over UDP itself bypasses the resolver deny; only the network rules stop it
+;; - setuid binaries (ps) cannot run under any profile
+;; - a script given to an interpreter (sh x.sh, node x.js) is read, not executed: exec rules do not stop it
 (deny default (with message "knsh:00000000000000000000000001:00000000000000000000000002:default"))
 (allow file-read*)
 (allow file-write* (subpath "/Users/u/src/app") (subpath "/private/var/folders/xy/T") (subpath "/Users/u/.claude"))
 (allow file-write* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/stdout") (literal "/dev/stderr") (regex #"^/dev/fd/[0-9]+$"))
+(allow process-fork)
+(allow process-exec (subpath "/usr/bin") (subpath "/bin") (subpath "/usr/sbin") (subpath "/opt/homebrew/bin") (subpath "/usr/local/bin") (subpath "/usr/libexec") (subpath "/Library/Developer/CommandLineTools") (subpath "/Applications/Xcode.app/Contents/Developer") (literal "/bin/bash") (literal "/opt/homebrew/Cellar/node/25.9.0/bin/node") (subpath "/Users/u/src/app") (subpath "/private/var/folders/xy/T") (subpath "/Users/u/.claude"))
+(allow mach-lookup)
+(allow ipc-posix-shm* ipc-posix-sem)
+(allow file-ioctl)
+(allow sysctl-read)
+(allow user-preference-read)
+(allow signal (target same-sandbox))
+(deny process-info* (with message "knsh:00000000000000000000000001:00000000000000000000000002:process.info"))
+(allow process-info* (target same-sandbox))
+(allow network-outbound (remote ip "localhost:41000") (remote ip "localhost:3000") (remote ip "localhost:5432"))
+(allow network-bind network-inbound (local ip "localhost:3000") (local ip "localhost:5432"))
+(allow network-bind network-inbound (local unix-socket (subpath "/Users/u/src/app")) (local unix-socket (subpath "/private/var/folders/xy/T")) (local unix-socket (subpath "/Users/u/.claude")))
 (deny file-read* file-write* (subpath "/Users/u/.ssh") (with message "knsh:00000000000000000000000001:00000000000000000000000002:fs.deny[0]"))
 (deny file-read* file-write* (subpath "/Users/u/.aws") (with message "knsh:00000000000000000000000001:00000000000000000000000002:fs.deny[1]"))
 (deny file-read* file-write* (subpath "/Users/u/.gnupg") (with message "knsh:00000000000000000000000001:00000000000000000000000002:fs.deny[2]"))
@@ -13,5 +34,15 @@
 (deny file-write* (literal "/Users/u/.zshenv") (literal "/Users/u/.zprofile") (literal "/Users/u/.zshrc") (literal "/Users/u/.zlogin") (literal "/Users/u/.zlogout") (literal "/Users/u/.bash_profile") (literal "/Users/u/.bash_login") (literal "/Users/u/.bashrc") (literal "/Users/u/.bash_logout") (literal "/Users/u/.profile") (with message "knsh:00000000000000000000000001:00000000000000000000000002:fixed.shell-startup"))
 (deny file-write* (subpath "/Users/u/Library/LaunchAgents") (with message "knsh:00000000000000000000000001:00000000000000000000000002:fixed.launch-agents"))
 (deny file-write* (subpath "/Users/u/.ssh") (with message "knsh:00000000000000000000000001:00000000000000000000000002:fixed.ssh"))
+(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd" "com.apple.lsd.mapdb" "com.apple.lsd.modifydb" "com.apple.CoreServices.coreservicesd") (with message "knsh:00000000000000000000000001:00000000000000000000000002:services.launch-services"))
+(deny mach-lookup (global-name "com.apple.coreservices.appleevents") (with message "knsh:00000000000000000000000001:00000000000000000000000002:services.apple-events"))
+(deny job-creation (with message "knsh:00000000000000000000000001:00000000000000000000000002:services.launchd-jobs"))
+(deny mach-lookup (global-name "com.apple.dnssd.service") (with message "knsh:00000000000000000000000001:00000000000000000000000002:services.dns"))
+(deny network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")) (with message "knsh:00000000000000000000000001:00000000000000000000000002:services.dns"))
+(deny mach-lookup (global-name "knsh.control") (with message "knsh:00000000000000000000000001:00000000000000000000000002:fixed.control"))
+(deny sysctl-read (sysctl-name-prefix "kern.procargs") (sysctl-name-prefix "kern.proc.") (with message "knsh:00000000000000000000000001:00000000000000000000000002:process.sysctl"))
+(deny network-outbound (remote unix-socket (path-literal "/private/var/run/docker.sock")) (remote unix-socket (path-literal "/Users/u/.docker/run/docker.sock")) (with message "knsh:00000000000000000000000001:00000000000000000000000002:sockets.docker"))
 (deny file-write* (literal "/") (literal "/Users") (literal "/Users/u") (literal "/Users/u/.config") (literal "/Users/u/Library") (literal "/Users/u/Library/Application Support") (with message "knsh:00000000000000000000000001:00000000000000000000000002:fixed.ancestors"))
-(deny file-read* file-write* (subpath "/Users/u/Library/Application Support/knsh") (subpath "/Users/u/.config/knsh") (with message "knsh:00000000000000000000000001:00000000000000000000000002:fixed.engine"))
+(deny network-bind (local unix-socket (subpath "/Users/u/Library/Application Support/knsh")) (local unix-socket (subpath "/Users/u/.config/knsh")) (with message "knsh:00000000000000000000000001:00000000000000000000000002:fixed.engine-bind"))
+(deny network-outbound (remote unix-socket (path-literal "/Users/u/Library/Application Support/knsh/run/user.sock")) (with message "knsh:00000000000000000000000001:00000000000000000000000002:fixed.user-sock"))
+(deny file-read* file-write* process-exec* (subpath "/Users/u/Library/Application Support/knsh") (subpath "/Users/u/.config/knsh") (with message "knsh:00000000000000000000000001:00000000000000000000000002:fixed.engine"))

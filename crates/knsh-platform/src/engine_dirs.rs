@@ -59,7 +59,9 @@ const DATA_DIR: [&str; 3] = knsh_core::ENGINE_DATA_DIR;
 /// Configuration, hooks and policy files, relative to the home directory.
 const CONFIG_DIR: [&str; 2] = knsh_core::ENGINE_CONFIG_DIR;
 /// Socket directory, inside the data directory.
-const RUN_DIR: &str = "run";
+const RUN_DIR: &str = knsh_core::ENGINE_RUN_DIR;
+/// Compiled sandbox profiles, inside the data directory (FR-SBX-07, KNSH-045).
+const PROFILES_DIR: &str = "profiles";
 /// Checkpoints for the home volume, inside the data directory.
 const CHECKPOINTS_DIR: &str = "checkpoints";
 /// The user settings file in the configuration directory (KNSH-021).
@@ -70,10 +72,10 @@ const POLICIES_DIR: &str = "policies";
 const ZSH_STARTUP_DIR: [&str; 2] = ["shell", "zsh"];
 /// The bash startup directory of integration mode, below the data directory (KNSH-020).
 const BASH_STARTUP_DIR: [&str; 2] = ["shell", "bash"];
-/// Agent socket, inside the run directory.
-const AGENT_SOCKET: &str = "agent.sock";
-/// User socket, inside the run directory.
-const USER_SOCKET: &str = "user.sock";
+/// Agent socket, inside the run directory. Named in `knsh-core`, whose fixed denies every profile compiles in.
+const AGENT_SOCKET: &str = knsh_core::AGENT_SOCKET;
+/// User socket, inside the run directory. Named in `knsh-core`, like [`AGENT_SOCKET`].
+const USER_SOCKET: &str = knsh_core::USER_SOCKET;
 
 /// Every engine path for one home directory (`specs/09-reference/file-locations.md`).
 ///
@@ -134,6 +136,13 @@ impl EnginePaths {
         self.data.join(CHECKPOINTS_DIR)
     }
 
+    /// `~/Library/Application Support/knsh/profiles/`: compiled sandbox profiles, each named by its hash, which
+    /// `knsh-exec` applies with `sandbox-exec -f` (FR-SBX-07, KNSH-045).
+    #[must_use]
+    pub fn profiles_dir(&self) -> PathBuf {
+        self.data.join(PROFILES_DIR)
+    }
+
     /// `~/Library/Application Support/knsh/run/agent.sock`.
     #[must_use]
     pub fn agent_socket(&self) -> PathBuf {
@@ -181,11 +190,12 @@ impl EnginePaths {
 
     /// The directories [`ensure_engine_dirs`] creates, each listed after its parent.
     #[must_use]
-    pub fn private_dirs(&self) -> [PathBuf; 4] {
+    pub fn private_dirs(&self) -> [PathBuf; 5] {
         [
             self.data.clone(),
             self.run_dir(),
             self.checkpoints_dir(),
+            self.profiles_dir(),
             self.config.clone(),
         ]
     }
@@ -558,6 +568,7 @@ mod tests {
             paths.data_dir().to_path_buf(),
             paths.run_dir(),
             paths.checkpoints_dir(),
+            paths.profiles_dir(),
             paths.agent_socket(),
             paths.user_socket(),
             paths.config_dir().to_path_buf(),
@@ -576,6 +587,14 @@ mod tests {
             paths.agent_socket(),
             Path::new("/Users/u/Library/Application Support/knsh/run/agent.sock")
         );
+        assert_eq!(
+            paths.profiles_dir(),
+            Path::new("/Users/u/Library/Application Support/knsh/profiles")
+        );
+        // The sockets every profile names (KNSH-045) are the sockets the engine binds.
+        let fixed = knsh_core::FixedDenies::for_home(&CanonicalPath::new(HOME).unwrap());
+        assert_eq!(paths.agent_socket(), fixed.agent_socket().as_path());
+        assert_eq!(paths.user_socket(), fixed.user_socket().as_path());
         assert_eq!(paths.policies_dir(), Path::new("/Users/u/.config/knsh/policies"));
         assert_eq!(
             paths.zsh_startup_dir(),
@@ -696,6 +715,9 @@ mod tests {
         }
         fn remove_file(&self, path: &Path) -> Result<(), PlatformError> {
             self.0.remove_file(path)
+        }
+        fn list_dir(&self, path: &Path, limit: usize) -> Result<Vec<std::ffi::OsString>, PlatformError> {
+            self.0.list_dir(path, limit)
         }
     }
 }

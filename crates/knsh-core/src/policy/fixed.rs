@@ -32,6 +32,15 @@ pub const ENGINE_DATA_DIR: [&str; 3] = ["Library", "Application Support", "knsh"
 /// The engine configuration directory, relative to the home directory: configuration, hooks and policy files.
 pub const ENGINE_CONFIG_DIR: [&str; 2] = [".config", "knsh"];
 
+/// The endpoint socket directory, inside [`ENGINE_DATA_DIR`].
+pub const ENGINE_RUN_DIR: &str = "run";
+
+/// The agent endpoint socket, inside [`ENGINE_RUN_DIR`]: the only Unix socket an envelope may connect to (FR-SBX-05).
+pub const AGENT_SOCKET: &str = "agent.sock";
+
+/// The user endpoint socket, inside [`ENGINE_RUN_DIR`]: denied to every envelope and command (FR-SBX-05).
+pub const USER_SOCKET: &str = "user.sock";
+
 /// The XPC Mach service of the control endpoint (`specs/09-reference/file-locations.md`; the final name is tied to
 /// the signing identity).
 pub const CONTROL_SERVICE: &str = "knsh.control";
@@ -46,14 +55,19 @@ const FIXED_SERVICES: [&str; 1] = [CONTROL_SERVICE];
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FixedDenies {
     paths: [CanonicalPath; 2],
+    agent_socket: CanonicalPath,
+    user_socket: CanonicalPath,
 }
 
 impl FixedDenies {
     /// The fixed denies below `home`, the user's canonical home directory.
     #[must_use]
     pub fn for_home(home: &CanonicalPath) -> Self {
+        let data = join(home, &ENGINE_DATA_DIR);
         Self {
-            paths: [join(home, &ENGINE_DATA_DIR), join(home, &ENGINE_CONFIG_DIR)],
+            agent_socket: join(&data, &[ENGINE_RUN_DIR, AGENT_SOCKET]),
+            user_socket: join(&data, &[ENGINE_RUN_DIR, USER_SOCKET]),
+            paths: [data, join(home, &ENGINE_CONFIG_DIR)],
         }
     }
 
@@ -61,6 +75,19 @@ impl FixedDenies {
     #[must_use]
     pub fn paths(&self) -> &[CanonicalPath] {
         &self.paths
+    }
+
+    /// `run/agent.sock` in the engine data directory: the socket an envelope connects to. It lies below
+    /// [`FixedDenies::paths`], so files cannot reach it; only a Unix-socket connection rule can (KNSH-045).
+    #[must_use]
+    pub fn agent_socket(&self) -> &CanonicalPath {
+        &self.agent_socket
+    }
+
+    /// `run/user.sock` in the engine data directory: denied to every envelope and command (FR-SBX-05).
+    #[must_use]
+    pub fn user_socket(&self) -> &CanonicalPath {
+        &self.user_socket
     }
 
     /// The Mach services denied to every envelope and command: the control service.
@@ -79,13 +106,14 @@ impl FixedDenies {
     }
 }
 
-/// `home` joined with each of `components`. A canonical path joined with plain names (no `/`, `.` or `..`) stays
+/// `base` joined with each of `components`. A canonical path joined with plain names (no `/`, `.` or `..`) stays
 /// canonical, so the constructor's check cannot fail; it is still checked rather than assumed.
-fn join(home: &CanonicalPath, components: &[&str]) -> CanonicalPath {
-    let mut path = home.as_path().to_path_buf();
+fn join(base: &CanonicalPath, components: &[&str]) -> CanonicalPath {
+    let mut path = base.as_path().to_path_buf();
     path.extend(components);
-    // Unreachable with the constants above; should it ever happen, denying the whole home fails closed.
-    CanonicalPath::new(path).unwrap_or_else(|_| home.clone())
+    // Unreachable with the constants above; should it ever happen, the base (the home, or the engine data
+    // directory, itself denied) stands in, which fails closed: denying it denies more, and no socket rule allows it.
+    CanonicalPath::new(path).unwrap_or_else(|_| base.clone())
 }
 
 /// Whether `path` equals `prefix` or lies below it, comparing whole components with ASCII case ignored.
@@ -122,6 +150,15 @@ mod tests {
             ]
         );
         assert_eq!(denies.services(), ["knsh.control"]);
+        assert_eq!(
+            denies.agent_socket(),
+            &canonical("/Users/u/Library/Application Support/knsh/run/agent.sock")
+        );
+        assert_eq!(
+            denies.user_socket(),
+            &canonical("/Users/u/Library/Application Support/knsh/run/user.sock")
+        );
+        assert!(denies.covers(denies.agent_socket()) && denies.covers(denies.user_socket()));
         for covered in [
             "/Users/u/Library/Application Support/knsh",
             "/Users/u/Library/Application Support/knsh/run/user.sock",
