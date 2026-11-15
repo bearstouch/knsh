@@ -25,29 +25,31 @@ I get exit codes, decisions and only as much output as my context can afford.
 **Acceptance criteria**
 *Output capture and `command.output`*
 
-- [ ] With `recording.output = false` (the default), no output is stored and no `command.output` is emitted.
-- [ ] With output recording on, stdout and stderr are stored up to 1 MB each. Beyond that, head and tail are kept
+- [x] With `recording.output = false` (the default), no output is stored and no `command.output` is emitted.
+- [x] With output recording on, stdout and stderr are stored up to 1 MB each. Beyond that, head and tail are kept
       and the skipped size is recorded.
-- [ ] `command.output` chunks are emitted in order, as binary stream frames on the sockets.
-- [ ] For `knsh -c`, output still goes directly to the caller's descriptors. Capture for storage tees without
+- [x] `command.output` chunks are emitted in order, as binary stream frames on the sockets (base64 for a client
+      that opted out of binary frames).
+- [x] For `knsh -c`, output still goes directly to the caller's descriptors. Capture for storage tees without
       changing what the caller sees.
-- [ ] Every chunk passes through the redaction hook before it is stored or emitted.
+- [x] Every chunk passes through the redaction hook before it is stored or emitted.
 
 *`exec.run`, `exec.start`, `exec.wait`, `exec.kill` and output modes*
 
-- [ ] `exec.run` accepts `command`, `cwd`, `timeout_s` and `output {mode, max_bytes, lines}`, and returns
+- [x] `exec.run` accepts `command`, `cwd`, `timeout_s` and `output {mode, max_bytes, lines}`, and returns
       `record_id`, `executed_command`, `exit_code`, `duration_ms`, mode-dependent output, `decision`,
-      `files_changed` and `checkpoint_id`.
-- [ ] Mode `full` returns everything up to 1 MB per stream. `truncate` returns the first `max_bytes`. `head_tail`
+      `files_changed` and `checkpoint_id`. Both are `null` until checkpoints exist (phase 3): a count of 0 would
+      claim something was measured.
+- [x] Mode `full` returns everything up to 1 MB per stream. `truncate` returns the first `max_bytes`. `head_tail`
       returns the first and last `lines` lines with a skipped count. `errors_only` returns stderr, the exit code and
       the last 20 stdout lines. `ref` returns sizes, line counts and the `record_id`.
-- [ ] With no mode given, the profile's default mode applies.
-- [ ] `exec.start` returns once the line is spawned (or denied). `exec.wait` returns the same result as `exec.run`.
+- [x] With no mode given, the profile's default mode applies.
+- [x] `exec.start` returns once the line is spawned (or denied). `exec.wait` returns the same result as `exec.run`.
       `exec.kill` kills the line's process group.
-- [ ] Errors: `-32001` denied, `-32002` decision timeout, `-32007` held, `-32008` killed at timeout, `-32011`
+- [x] Errors: `-32001` denied, `-32002` decision timeout, `-32007` held, `-32008` killed at timeout, `-32011`
       cancelled.
-- [ ] `executed_command` equals the line actually spawned, after any rewrite.
-- [ ] The engine never summarises output.
+- [x] `executed_command` equals the line actually spawned, after any rewrite.
+- [x] The engine never summarises output.
 
 **Unit tests**
 *Output capture and `command.output`*
@@ -72,9 +74,15 @@ I get exit codes, decisions and only as much output as my context can afford.
 *Output capture and `command.output`*
 
 - Teeing `knsh -c` output means `knshd` must sit in the data path when output recording is on (a pipe pair instead of
-  a direct descriptor). Confirm the latency effect in KNSH-076.
+  a direct descriptor). Confirm the latency effect in KNSH-076. **Pending** (not measured here). The line's stdout and
+  stderr are then pipes, so `isatty` is false for them.
+- `session.info` still reports `output_recording: false` for agent sessions: it would need the session's profile,
+  which the registry does not load yet. **Pending** follow-up.
 
 *`exec.run`, `exec.start`, `exec.wait`, `exec.kill` and output modes*
 
-- Spec gap: the params of `exec.start`, `exec.wait` and `exec.kill` (the handle name, whether `exec.wait` takes a
-  timeout) are not specified. Define them in [agent socket](../06-api/agent-socket.md) before implementing.
+- Spec gap resolved in [agent socket](../06-api/agent-socket.md#execstart-execwait-execkill): the handle is the
+  `record_id` `exec.start` returns; `exec.wait` takes no timeout (the line's `timeout_s` bounds it, `exec.kill` ends it
+  sooner); the first `exec.wait` collects the result; at most 64 uncollected lines per session.
+- Spec gap resolved: a `full` answer of two 1 MB streams cannot fit in one 1 MB frame, so output text is cut to fit
+  (`cut_to_fit`), and output that is not UTF-8 is shown with U+FFFD ([result](../06-api/agent-socket.md#result)).

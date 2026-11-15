@@ -485,7 +485,7 @@ pub struct ExecutionRecord {
 /// # Invariants
 ///
 /// `stored + skipped == original` and `skipped_at <= stored`; `skipped == 0` implies `skipped_at == stored`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct OutputInfo {
     /// Bytes kept, the range `records.output` can read.
     pub stored: u64,

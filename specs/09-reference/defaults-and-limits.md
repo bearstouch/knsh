@@ -33,6 +33,12 @@
 | `records.output` inline base64 | 512 KiB per call | No | [user socket](../06-api/user-socket.md#records) |
 | `full` output mode | 1 MB per stream | — | [output modes](../03-functional-requirements/output-modes.md) |
 | `errors_only` stdout lines | Last 20 | — | [output modes](../03-functional-requirements/output-modes.md) |
+| `truncate` bytes | 64 KiB by default, 1 to 1 MiB (`output.max_bytes`) | Per call | [output modes](../03-functional-requirements/output-modes.md) |
+| `head_tail` lines | 20 by default, 1 to 10,000 (`output.lines`) | Per call | [output modes](../03-functional-requirements/output-modes.md) |
+| Captured `exec.run` answer | One frame: output text is cut to fit (`cut_to_fit`) | — | [agent socket](../06-api/agent-socket.md#result) |
+| `command.output` chunk | At most 8 KiB; published only for the first 1 MB of each stream | — | [event](../05-models/event.md) |
+| Output drain after the line ends | 250 ms for a leftover writer, then the capture is final | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md#output-capture-knsh-053) |
+| Started lines per session (`exec.start`) | 64 not yet collected by `exec.wait` | — | [agent socket](../06-api/agent-socket.md#execstart-execwait-execkill) |
 | Frame payload | 1 MB | — | [wire format](../06-api/wire-format.md) |
 | JSON nesting | 32 levels | — | [wire format](../06-api/wire-format.md) |
 | JSON integers | ±2^53 | — | [wire format](../06-api/wire-format.md) |

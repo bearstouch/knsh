@@ -283,9 +283,12 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("exec.run", Endpoints::AGENT)
         .requires(Backend::Sandbox)
         .available(),
-    MethodSpec::planned("exec.start", Endpoints::AGENT).requires(Backend::Sandbox),
-    MethodSpec::planned("exec.wait", Endpoints::AGENT),
-    MethodSpec::planned("exec.kill", Endpoints::AGENT),
+    // KNSH-053: long-running lines; their output is captured and returned in the requested mode.
+    MethodSpec::planned("exec.start", Endpoints::AGENT)
+        .requires(Backend::Sandbox)
+        .available(),
+    MethodSpec::planned("exec.wait", Endpoints::AGENT).available(),
+    MethodSpec::planned("exec.kill", Endpoints::AGENT).available(),
     // The caller's own session (KNSH-021): on user.sock the human session bound to the connection; on agent.sock
     // the agent session the connection was bound to at hello (KNSH-048).
     MethodSpec::planned("session.info", Endpoints::SOCKETS).available(),
@@ -539,7 +542,8 @@ mod tests {
     // Phase 1 implements the handshake, the record reads (KNSH-016), on user.sock only `records.forget` (KNSH-017),
     // the event subscriptions (KNSH-018), and `session.info` with, on user.sock only, the human session and telemetry
     // methods (KNSH-021); phase 2 adds `policy.check` on both sockets (KNSH-043, AC "listed in hello methods on both
-    // sockets") and `exec.run` on agent.sock with a sandbox (KNSH-051): no method is claimed before it exists.
+    // sockets"), `exec.run` on agent.sock with a sandbox (KNSH-051), and `exec.start`, `exec.wait` and `exec.kill`
+    // (KNSH-053): no method is claimed before it exists.
     #[test]
     fn lists_only_the_implemented_methods() {
         let caps = capabilities(Sandbox::Seatbelt);
@@ -562,6 +566,9 @@ mod tests {
                 Endpoint::Agent => &[
                     "hello",
                     "exec.run",
+                    "exec.start",
+                    "exec.wait",
+                    "exec.kill",
                     "session.info",
                     "policy.check",
                     "records.query",

@@ -15,10 +15,15 @@
 //!    removed, KNSH-049) minus the dynamic linker's `DYLD_*` variables, and nothing else. An empty line runs as
 //!    `:` (`knsh-exec` refuses an empty `--line`). `knshd` never applies a sandbox itself: `knsh-exec` does, after the exec
 //!    (CLAUDE.md "One process starts agent commands").
+//!    With output captured (KNSH-053: `exec.run` and `exec.start` without passed stdio, or any line of a session
+//!    that records output), stdout and stderr are instead pipes read by `knshd` ([`crate::capture`]), stdin is the
+//!    caller's or `/dev/null`, and what the line writes is teed to the caller's descriptors when there are any.
 //! 4. **Watch (FR-LC-17, FR-LC-40).** `command.started` once spawned, `command.long_running` once after
-//!    [`Limits::long_running`]. At `timeout_s` the whole group gets `SIGTERM`, then `SIGKILL` after
-//!    [`Limits::kill_grace`]. The group is held (its leader unreaped) the whole time, so no reused process id is ever
-//!    signalled; after a timeout the group is killed once more, before the leader is reaped, so no member outlives it.
+//!    [`Limits::long_running`]. At `timeout_s`, or when `exec.kill` asks ([`LineControl::kill_requested`]), the whole
+//!    group gets `SIGTERM`, then `SIGKILL` after [`Limits::kill_grace`]. The group is held (its leader unreaped) the
+//!    whole time, so no reused process id is ever signalled; after a timeout or a kill the group is killed once more,
+//!    before the leader is reaped, so no member outlives it. Captured output is then collected, waiting at most
+//!    [`DRAIN_GRACE`] for a leftover writer.
 //! 5. **Did it start? (NFR-REL-08).** `knsh-exec` writes its exit code to the status pipe when it fails (bad
 //!    arguments, unsafe profile file, setup, a failed exec of `sandbox-exec`), and the pipe is closed on exec
 //!    otherwise. A byte there means the profile was never applied and the line never ran: the spawn is reported as a
@@ -33,9 +38,11 @@
 //!   kills the group. A process that leaves the group (`setsid`) is out of reach, as for any process group.
 //! - No proxy is wired yet (KNSH-059): lines are compiled without a proxy port, so the network is closed except the
 //!   profile's loopback ports, and no per-command proxy credentials are given.
-//! - Output capture (`exec.run` without `"stdio": "passed"`) is KNSH-053: such a line runs on `/dev/null`.
+//! - Teeing `knsh -c` output (a session that records output) puts `knshd` in the data path: the line's stdout and
+//!   stderr are pipes, not the caller's terminal, so `isatty` is false for them (stdin stays the caller's).
 
 use std::ffi::OsString;
+use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -50,7 +57,9 @@ use knsh_platform::{
 use knsh_proto::{Interpreter, LineStatus};
 use knsh_sandbox::{CommandTag, ProfileInput, compile};
 
+use crate::capture::{CapturePlan, DRAIN_GRACE, LineCapture, Source};
 use crate::exec::Stdio as LineStdio;
+use crate::jobs::LineControl;
 use crate::profiles::ProfileFiles;
 use crate::supervisor::{LineEvents, Ran, SpawnFailure, SpawnPlan, SpawnReport, Spawner};
 
@@ -127,10 +136,14 @@ pub(crate) struct LineToRun<'a> {
     pub(crate) env: &'a [(String, String)],
     /// The working directory.
     pub(crate) cwd: &'a CanonicalPath,
-    /// The caller's descriptors, or `None` (`/dev/null`, until KNSH-053 captures output).
+    /// The caller's descriptors, or `None` (output captured, stdin `/dev/null`).
     pub(crate) stdio: Option<LineStdio>,
     /// `timeout_s`.
     pub(crate) timeout: Option<Duration>,
+    /// How output is captured, or `None` when it goes straight to the caller's descriptors.
+    pub(crate) capture: Option<CapturePlan>,
+    /// The line's handle: its kill flag is read while it runs (`exec.kill`).
+    pub(crate) control: &'a LineControl,
 }
 
 /// The [`Spawner`] that runs lines through `knsh-exec` (module documentation).
@@ -158,6 +171,7 @@ impl Spawner for TrampolineSpawner {
             line,
             allowed,
             profile,
+            capture,
         } = plan;
         let binaries = resolved_binaries(&allowed);
         self.run(
@@ -173,6 +187,8 @@ impl Spawner for TrampolineSpawner {
                 cwd: &line.proposal.cwd,
                 stdio: line.stdio,
                 timeout: line.timeout_s.map(Duration::from_secs),
+                capture,
+                control: &line.control,
             },
             events,
         )
@@ -200,18 +216,16 @@ impl TrampolineSpawner {
         // the child holds it, and `knsh-exec` closes it on exec.
         let (mut status, status_writer) = match std::io::pipe() {
             Ok(pipe) => pipe,
-            Err(error) => {
-                let failure = SpawnFailure::Start(PlatformError::Os {
-                    operation: Operation::Spawn,
-                    errno: error.raw_os_error().unwrap_or(0),
-                });
-                return self.not_run(sandbox_profile, failure, line.record_id);
-            }
+            Err(error) => return self.not_run(sandbox_profile, start_failure(&error), line.record_id),
         };
-        let stdio = line.stdio.take();
+        let (stdio, capture) = match child_stdio(line.stdio.take(), line.capture.take()) {
+            Ok(prepared) => prepared,
+            Err(failure) => return self.not_run(sandbox_profile, failure, line.record_id),
+        };
         let request = request(&self.trampoline, compiled.path(), &line, stdio, status_writer.into());
         let spawned = self.processes.spawn(&request);
-        // Closes this process's copies of the caller's descriptors and of the status pipe's write end.
+        // Closes this process's copies of the caller's descriptors, of the output pipes' write ends (so the readers
+        // see end of file once the line's processes close theirs) and of the status pipe's write end.
         drop(request);
         let group = match spawned {
             Ok(group) => group,
@@ -220,8 +234,9 @@ impl TrampolineSpawner {
         events.started();
 
         // Step 4.
-        let watched = self.watch(group, line.timeout, events);
+        let watched = self.watch(group, line.timeout, line.control, events);
         drop(compiled);
+        let output = capture.map(|capture| capture.finish(DRAIN_GRACE));
         let (exit, timed_out) = match watched {
             Ok(watched) => watched,
             Err(error) => return self.not_run(sandbox_profile, SpawnFailure::Wait(error), line.record_id),
@@ -243,15 +258,17 @@ impl TrampolineSpawner {
         SpawnReport {
             sandbox_profile,
             outcome,
+            output,
         }
     }
 
-    /// Polls the group until its leader exits, publishing `command.long_running` once and enforcing `timeout`, then
-    /// reaps it. Returns how the leader ended and whether the timeout fired.
+    /// Polls the group until its leader exits, publishing `command.long_running` once and enforcing `timeout` and
+    /// `exec.kill`, then reaps it. Returns how the leader ended and whether the timeout fired.
     fn watch(
         &self,
         group: ProcessGroupId,
         timeout: Option<Duration>,
+        control: &LineControl,
         events: &dyn LineEvents,
     ) -> Result<(ExitStatus, bool), PlatformError> {
         let processes = self.processes.as_ref();
@@ -261,6 +278,8 @@ impl TrampolineSpawner {
         // When `SIGTERM` was sent, as time since the start, and whether `SIGKILL` followed.
         let mut terminated_at: Option<Duration> = None;
         let mut killed = false;
+        // Whether the stop was the timeout's (answered `-32008`) rather than `exec.kill`'s.
+        let mut timed_out = false;
         loop {
             match processes.exited(group) {
                 Ok(true) => break,
@@ -277,12 +296,14 @@ impl TrampolineSpawner {
                 long_running_sent = true;
                 events.long_running();
             }
+            let timeout_due = timeout.is_some_and(|timeout| elapsed >= timeout);
             match terminated_at {
-                None if timeout.is_some_and(|timeout| elapsed >= timeout) => {
+                None if timeout_due || control.kill_requested() => {
                     // The group, not the leader: everything the line started stops too (FR-LC-40). An error means
                     // the group is already gone, which the next check sees.
                     let _ = processes.signal(group, Signal::Terminate);
                     terminated_at = Some(elapsed);
+                    timed_out = timeout_due;
                 }
                 Some(at) if !killed && elapsed >= at.saturating_add(self.limits.kill_grace) => {
                     let _ = processes.signal(group, Signal::Kill);
@@ -293,8 +314,7 @@ impl TrampolineSpawner {
             self.clock.sleep(pause);
             pause = (pause * 2).min(POLL_MAX);
         }
-        let timed_out = terminated_at.is_some();
-        if timed_out {
+        if terminated_at.is_some() {
             // The leader is gone but still unreaped, so the group id is still ours: members that ignored `SIGTERM`
             // or were started after it are killed before the id is given up. `EPERM` (nothing left) is expected.
             let _ = processes.signal(group, Signal::Kill);
@@ -322,8 +342,62 @@ impl TrampolineSpawner {
         SpawnReport {
             sandbox_profile,
             outcome: Err(failure),
+            output: None,
         }
     }
+}
+
+/// The child's stdio and, when output is captured, the readers of its stdout and stderr (module documentation,
+/// step 3). Without capture the caller's descriptors are passed as they are (or `/dev/null`). With capture, stdout
+/// and stderr are fresh pipes; stdin stays the caller's, or `/dev/null` for a captured `exec.run`.
+fn child_stdio(
+    caller: Option<LineStdio>,
+    capture: Option<CapturePlan>,
+) -> Result<(Stdio, Option<LineCapture>), SpawnFailure> {
+    let Some(plan) = capture else {
+        let stdio = caller.map_or(Stdio::Null, |fds| passed(fds.stdin, fds.stdout, fds.stderr));
+        return Ok((stdio, None));
+    };
+    let (stdout_read, stdout_write) = std::io::pipe().map_err(|error| start_failure(&error))?;
+    let (stderr_read, stderr_write) = std::io::pipe().map_err(|error| start_failure(&error))?;
+    let (stdin, forward_out, forward_err) = match caller {
+        Some(fds) => (fds.stdin, Some(File::from(fds.stdout)), Some(File::from(fds.stderr))),
+        None => (
+            OwnedFd::from(File::open("/dev/null").map_err(|error| start_failure(&error))?),
+            None,
+            None,
+        ),
+    };
+    let capture = LineCapture::start(
+        Source {
+            pipe: stdout_read,
+            forward: forward_out,
+        },
+        Source {
+            pipe: stderr_read,
+            forward: forward_err,
+        },
+        &plan,
+    )
+    .map_err(|error| start_failure(&error))?;
+    Ok((passed(stdin, stdout_write.into(), stderr_write.into()), Some(capture)))
+}
+
+/// The child's stdin, stdout and stderr, in that order.
+fn passed(stdin: OwnedFd, stdout: OwnedFd, stderr: OwnedFd) -> Stdio {
+    Stdio::Passed(Box::new([
+        SharedFd::new(stdin),
+        SharedFd::new(stdout),
+        SharedFd::new(stderr),
+    ]))
+}
+
+/// A spawn that failed before `knsh-exec` started, from an I/O error.
+fn start_failure(error: &std::io::Error) -> SpawnFailure {
+    SpawnFailure::Start(PlatformError::Os {
+        operation: Operation::Spawn,
+        errno: error.raw_os_error().unwrap_or(0),
+    })
 }
 
 /// What the status pipe says once every write end is closed: `None` at end of file (`sandbox-exec` started), the
@@ -363,7 +437,7 @@ fn request(
     trampoline: &Path,
     profile_file: &Path,
     line: &LineToRun<'_>,
-    stdio: Option<LineStdio>,
+    stdio: Stdio,
     status_writer: OwnedFd,
 ) -> SpawnRequest {
     let status_writer = SharedFd::new(status_writer);
@@ -391,14 +465,7 @@ fn request(
         .collect();
     request.cwd = Some(line.cwd.as_path().to_path_buf());
     request.inherit = vec![status_writer];
-    request.stdio = match stdio {
-        Some(stdio) => Stdio::Passed(Box::new([
-            SharedFd::new(stdio.stdin),
-            SharedFd::new(stdio.stdout),
-            SharedFd::new(stdio.stderr),
-        ])),
-        None => Stdio::Null,
-    };
+    request.stdio = stdio;
     request
 }
 

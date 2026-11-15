@@ -222,7 +222,7 @@ const fn out_of_range(field: &'static str) -> JsonError {
 }
 
 /// A byte count as a JSON string (±2^53 rule).
-fn bytes(count: u64) -> Value {
+pub(crate) fn bytes(count: u64) -> Value {
     Value::int_string(i128::from(count))
 }
 

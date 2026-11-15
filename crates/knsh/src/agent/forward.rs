@@ -167,6 +167,8 @@ pub fn request(line: &Line, cwd: &Path, env: &[(OsString, OsString)]) -> Result<
         args,
         stdio: ExecStdio::Passed,
         timeout_s: None,
+        // Output modes are for captured lines only (FR-OUT-03): `knsh -c` output goes to its own descriptors.
+        output: knsh_proto::OutputOptions::default(),
     })
 }
 

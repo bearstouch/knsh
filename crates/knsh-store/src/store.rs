@@ -80,6 +80,7 @@ enum Job {
 #[derive(Debug, Clone)]
 pub struct RecordStore {
     jobs: Sender<Job>,
+    output_cap: usize,
 }
 
 impl RecordStore {
@@ -99,7 +100,8 @@ impl RecordStore {
         clock: Arc<dyn Clock>,
         config: StoreConfig,
     ) -> Result<Self, StoreError> {
-        let database = Database::open(fs, path, owner_uid, config.output_cap)?;
+        let output_cap = config.output_cap;
+        let database = Database::open(fs, path, owner_uid, output_cap)?;
         let (jobs, inbox) = mpsc::channel();
         let worker = Worker {
             database,
@@ -111,7 +113,14 @@ impl RecordStore {
             .name(String::from("knsh-store"))
             .spawn(move || worker.run(&inbox))
             .map_err(|_| StoreError::ThreadStart)?;
-        Ok(Self { jobs })
+        Ok(Self { jobs, output_cap })
+    }
+
+    /// The most bytes stored per output stream ([`StoreConfig::output_cap`]): a capture that keeps no more than
+    /// this is stored exactly as captured (KNSH-053).
+    #[must_use]
+    pub const fn output_cap(&self) -> usize {
+        self.output_cap
     }
 
     /// Sends `job` built around a fresh answer channel and waits for the answer.

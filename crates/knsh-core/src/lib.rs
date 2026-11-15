@@ -52,6 +52,13 @@
 //! bounded queue that drops its oldest events and reports them as [`Lost`] instead of ever making a publisher wait
 //! (FR-EVT-04). [`EventScope`] limits a subscription to one session (FR-EVT-01).
 //!
+//! # Output capture and modes (KNSH-053)
+//!
+//! [`OutputCapture`] keeps a stream's head and tail within a cap as it is read, with its size and line count
+//! (FR-REC-06); [`CappedOutput`] is what is kept. [`shape`] selects what an `exec.run` caller gets back in each
+//! [`OutputMode`] (FR-OUT-01) without ever rewriting it (FR-OUT-05). Every chunk passes through the
+//! [`OutputRedaction`] hook first (FR-EVT-07), a pass-through until secret redaction arrives (KNSH-091).
+//!
 //! # Binary resolution (KNSH-035)
 //!
 //! [`resolve`] turns a simple command's name into a [`Resolution`] the way bash would run it: a function, a builtin,
@@ -119,6 +126,7 @@ mod error;
 mod event;
 mod id;
 mod lifecycle;
+mod output;
 mod path;
 mod policy;
 mod record;
@@ -140,6 +148,11 @@ pub use lifecycle::{
     Allowed, AskAnswer, AskReply, AskRequest, Authority, Caller, Decision, Effects, HookOutcome, HookVerdict, Hooks,
     INTERNAL_ERROR, LineInput, LineProfile, LocalApprovals, MAX_LINE_LEN, MAX_REWRITES, NoAuthority, NoHooks, Observer,
     Outcome, Proposal, Refusal, RefusalKind, StillWaiting, decide, redact,
+};
+pub use output::{
+    CappedOutput, CapturedStream, DEFAULT_HEAD_TAIL_LINES, DEFAULT_OUTPUT_CAP, DEFAULT_TRUNCATE_BYTES,
+    ERRORS_ONLY_STDOUT_LINES, Excerpt, HeadTail, MAX_HEAD_TAIL_LINES, MAX_TRUNCATE_BYTES, NoOutputRedaction,
+    OutputCapture, OutputRedaction, OutputRequest, ShapedOutput, shape,
 };
 pub use path::CanonicalPath;
 pub use policy::{

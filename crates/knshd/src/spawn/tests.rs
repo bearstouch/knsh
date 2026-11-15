@@ -77,6 +77,8 @@ struct FakeTrampoline {
     fs: Arc<MemFs>,
     behaviour: Behaviour,
     state: Mutex<FakeState>,
+    /// What the line writes to its stdout and stderr as it starts, then closes them.
+    writes: Option<(&'static [u8], &'static [u8])>,
 }
 
 const GROUP: i32 = 4242;
@@ -128,6 +130,16 @@ impl Processes for FakeTrampoline {
         // Kept without the status pipe's write end: holding it would keep the spawner's read from ever ending, as
         // a real child that exited no longer holds it. Its number is kept for assertions.
         let mut kept = request.clone();
+        if let (Some((stdout, stderr)), Stdio::Passed(fds)) = (self.writes, &request.stdio) {
+            std::fs::File::from(fds[1].try_clone_owned().unwrap())
+                .write_all(stdout)
+                .unwrap();
+            std::fs::File::from(fds[2].try_clone_owned().unwrap())
+                .write_all(stderr)
+                .unwrap();
+            // Like a child that exited: it no longer holds the output pipes, so the readers see end of file.
+            kept.stdio = Stdio::Null;
+        }
         state.status_fd = kept.inherit.first().map(AsRawFd::as_raw_fd);
         kept.inherit.clear();
         state.spawned.push(kept);
@@ -217,6 +229,11 @@ fn profiles_dir() -> PathBuf {
 }
 
 fn fixture(behaviour: Behaviour) -> Fixture {
+    fixture_writing(behaviour, None)
+}
+
+/// [`fixture`] whose line writes `writes` to its stdout and stderr as it starts.
+fn fixture_writing(behaviour: Behaviour, writes: Option<(&'static [u8], &'static [u8])>) -> Fixture {
     let clock = Arc::new(FakeClock::new(
         Timestamp::from_unix_micros(1_800_000_000_000_000).unwrap(),
     ));
@@ -228,6 +245,7 @@ fn fixture(behaviour: Behaviour) -> Fixture {
         fs: Arc::clone(&fs),
         behaviour,
         state: Mutex::new(FakeState::default()),
+        writes,
     });
     let log = Arc::new(RecordingLog::new());
     let spawner = TrampolineSpawner {
@@ -262,6 +280,8 @@ struct Line {
     env: Vec<(String, String)>,
     cwd: CanonicalPath,
     timeout: Option<Duration>,
+    control: LineControl,
+    capture: Option<CapturePlan>,
 }
 
 impl Line {
@@ -275,6 +295,8 @@ impl Line {
             env: vec![("HOME".to_owned(), HOME.to_owned())],
             cwd: CanonicalPath::new(PROJECT).unwrap(),
             timeout: None,
+            control: LineControl::default(),
+            capture: None,
         }
     }
 
@@ -291,6 +313,8 @@ impl Line {
             cwd: &self.cwd,
             stdio,
             timeout: self.timeout,
+            capture: self.capture.clone(),
+            control: &self.control,
         }
     }
 }
@@ -474,6 +498,89 @@ fn kills_process_group_on_timeout_with_32008() {
     let (report, _) = fixture.run(&line);
     assert!(!ran(&report).timed_out);
     assert_eq!(fixture.signals(), []);
+}
+
+// `exec.kill` stops the whole group as a timeout does (SIGTERM, SIGKILL after the grace, a last group kill before the
+// reap), but is not a timeout: the line ends by its signal and is not answered -32008.
+#[test]
+fn kill_terminates_whole_process_group() {
+    let fixture = fixture(Behaviour::IgnoresTerm);
+    let line = Line::new(Interpreter::Bash);
+    assert!(line.control.request_kill(), "still running");
+    let (report, _) = fixture.run(&line);
+    assert_eq!(
+        ran(&report),
+        Ran {
+            status: LineStatus::Signalled(9),
+            timed_out: false
+        }
+    );
+    let kinds: Vec<Signal> = fixture.signals().iter().map(|(_, signal)| *signal).collect();
+    assert_eq!(kinds, [Signal::Terminate, Signal::Kill, Signal::Kill]);
+    let signals = fixture.signals();
+    assert!(signals[0].0 < POLL_MAX, "at once: {signals:?}");
+    assert!(fixture.processes.state().reaped);
+}
+
+/// A capture plan keeping `cap` bytes, publishing nothing.
+fn capture_plan(cap: usize) -> CapturePlan {
+    CapturePlan {
+        redaction: Arc::new(knsh_core::NoOutputRedaction),
+        cap,
+        sink: None,
+    }
+}
+
+// KNSH-053: a captured line runs with stdin on /dev/null and stdout and stderr on pipes, and the report carries
+// what it wrote, capped (FR-REC-06).
+#[test]
+fn captured_line_reports_its_output() {
+    let fixture = fixture_writing(exits(0), Some((b"0123456789", b"oops\n")));
+    let mut line = Line::new(Interpreter::Bash);
+    line.capture = Some(capture_plan(4));
+    let (report, _) = fixture.run(&line);
+    assert_eq!(ran(&report).status, LineStatus::Exited(0));
+    let output = report.output.unwrap();
+    assert_eq!(output.stdout.output.data().expose(), b"0189");
+    assert_eq!(output.stdout.output.info().original, 10);
+    assert_eq!(output.stderr.output.data().expose(), b"oos\n", "head and tail");
+    assert_eq!(output.stderr.lines, 1);
+    // Without a plan, nothing is captured.
+    let fixture = self::fixture(exits(0));
+    let (report, _) = fixture.run(&Line::new(Interpreter::Bash));
+    assert!(report.output.is_none());
+}
+
+// KNSH-053, FR-OUT-04: `knsh -c` in a session that records output: the line's output is teed, so the caller's
+// descriptors receive exactly what it wrote while the capture keeps a copy; stdin stays the caller's.
+#[test]
+fn tees_passed_output_when_recording() {
+    let fixture = fixture_writing(exits(0), Some((b"to the caller\n", b"err\n")));
+    let mut line = Line::new(Interpreter::Knsh);
+    line.capture = Some(capture_plan(1 << 20));
+    let (mut out_read, out_write) = std::io::pipe().unwrap();
+    let (mut err_read, err_write) = std::io::pipe().unwrap();
+    let (stdin_read, _stdin_write) = std::io::pipe().unwrap();
+    let stdio = LineStdio {
+        stdin: stdin_read.into(),
+        stdout: out_write.into(),
+        stderr: err_write.into(),
+    };
+    let report = fixture.spawner.run(line.to_run(Some(stdio)), &Seen::default());
+    assert_eq!(ran(&report).status, LineStatus::Exited(0));
+    let output = report.output.unwrap();
+    assert_eq!(output.stdout.output.data().expose(), b"to the caller\n");
+    // Every copy of the caller's write ends is closed once the readers are done with them.
+    let mut seen = Vec::new();
+    out_read.read_to_end(&mut seen).unwrap();
+    assert_eq!(seen, b"to the caller\n");
+    let mut seen = Vec::new();
+    err_read.read_to_end(&mut seen).unwrap();
+    assert_eq!(seen, b"err\n");
+    match &fixture.request().stdio {
+        Stdio::Null => {}
+        other => panic!("the fake drops what it wrote to: {other:?}"),
+    }
 }
 
 // FR-LC-17: `command.started` once spawned; `command.long_running` exactly once after 30 s, never for a short line.
@@ -688,11 +795,39 @@ mod platform {
             cwd: &cwd,
             stdio: Some(stdio),
             timeout,
+            capture: None,
+            control: &LineControl::default(),
         };
         let report = spawner.run(line, &Seen::default());
         let mut out = String::new();
         read.read_to_string(&mut out).unwrap();
         (report, out)
+    }
+
+    /// Runs `executed` with its output captured (no passed stdio), as `exec.run` from an agent does.
+    fn run_captured(
+        spawner: &TrampolineSpawner,
+        profile: &Profile,
+        executed: &str,
+        control: &LineControl,
+    ) -> SpawnReport {
+        let cwd = CanonicalPath::new(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let line = LineToRun {
+            record_id: RecordId::from_ulid(Ulid::from_u128(7)),
+            session_id: SessionId::from_ulid(Ulid::from_u128(3)),
+            profile,
+            executed,
+            binaries: &[],
+            interpreter: Interpreter::Bash,
+            args: &[],
+            env: &[("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
+            cwd: &cwd,
+            stdio: None,
+            timeout: None,
+            capture: Some(super::capture_plan(knsh_core::DEFAULT_OUTPUT_CAP)),
+            control,
+        };
+        spawner.run(line, &Seen::default())
     }
 
     macro_rules! require_trampoline {
@@ -773,5 +908,59 @@ mod platform {
         let (report, out) = run(&spawner, &profile, "echo ran", None);
         assert!(matches!(report.outcome, Err(SpawnFailure::Start(_))), "{report:?}");
         assert_eq!(out, "");
+    }
+
+    // KNSH-053: a real line under `knsh-exec`: stdout and stderr captured apart, stdin is /dev/null.
+    #[test]
+    fn captures_stdout_and_stderr_of_a_real_line() {
+        let trampoline = require_trampoline!();
+        let scratch = Scratch::new("capture");
+        let spawner = spawner(&scratch, trampoline);
+        let profile = scratch_profile(&scratch);
+        let report = run_captured(
+            &spawner,
+            &profile,
+            "echo out; echo err >&2; /bin/cat; exit 3",
+            &LineControl::default(),
+        );
+        assert_eq!(ran(&report).status, LineStatus::Exited(3), "{report:?}");
+        let output = report.output.unwrap();
+        assert_eq!(output.stdout.output.data().expose(), b"out\n");
+        assert_eq!(output.stderr.output.data().expose(), b"err\n");
+    }
+
+    // exec.kill: a real group (`sleep & sleep; wait`) is stopped as a whole, and nothing of it survives.
+    #[test]
+    fn kill_stops_a_real_group() {
+        let trampoline = require_trampoline!();
+        let scratch = Scratch::new("kill");
+        let spawner = Arc::new(spawner(&scratch, trampoline));
+        let profile = scratch_profile(&scratch);
+        let marker = format!("101.{}", std::process::id());
+        let control = Arc::new(LineControl::default());
+        let killer = {
+            let control = Arc::clone(&control);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                control.request_kill()
+            })
+        };
+        let started = std::time::Instant::now();
+        let report = run_captured(
+            &spawner,
+            &profile,
+            &format!("/bin/sleep {marker} & /bin/sleep {marker}; wait"),
+            &control,
+        );
+        assert!(killer.join().unwrap(), "it was running");
+        let outcome = ran(&report);
+        assert!(!outcome.timed_out);
+        assert!(matches!(outcome.status, LineStatus::Signalled(_)), "{outcome:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let survivors = Command::new("/usr/bin/pgrep")
+            .args(["-f", &format!("sleep {marker}")])
+            .output()
+            .unwrap();
+        assert_eq!(survivors.status.code(), Some(1));
     }
 }

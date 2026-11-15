@@ -127,6 +127,8 @@ pub(super) struct FakeSpawner {
     pub(super) outcome: Result<Ran, SpawnFailure>,
     /// Whether it also reports a long run.
     pub(super) long_running: bool,
+    /// What the line writes to stdout and stderr, one chunk each, when its output is captured.
+    pub(super) writes: (&'static [u8], &'static [u8]),
 }
 
 impl FakeSpawner {
@@ -139,6 +141,7 @@ impl FakeSpawner {
                 timed_out: false,
             }),
             long_running: false,
+            writes: (b"", b""),
         }
     }
 }
@@ -161,9 +164,30 @@ impl Spawner for FakeSpawner {
                 events.long_running();
             }
         }
+        // A captured line's output goes through the plan as the real readers would take it: hook, capture, sink.
+        let output = plan.capture.as_ref().map(|capture| {
+            self.journal
+                .push(format!("capture publishing={}", capture.sink.is_some()));
+            let read = |stream: OutputStream, written: &[u8]| {
+                let mut kept = knsh_core::OutputCapture::new(capture.cap);
+                if !written.is_empty() {
+                    let chunk = capture.redaction.redact_chunk(written);
+                    kept.push(chunk.expose());
+                    if let Some(sink) = &capture.sink {
+                        sink.chunk(stream, 0, &chunk);
+                    }
+                }
+                kept.finish()
+            };
+            LineOutput {
+                stdout: read(OutputStream::Stdout, self.writes.0),
+                stderr: read(OutputStream::Stderr, self.writes.1),
+            }
+        });
         SpawnReport {
             sandbox_profile: Some(format!("{}@0123456789abcdef", plan.profile.name)),
             outcome: self.outcome,
+            output,
         }
     }
 }
@@ -202,6 +226,8 @@ struct Setup {
     hooks_observe: bool,
     /// The spawner; one whose lines exit 0 by default.
     spawner: Option<FakeSpawner>,
+    /// The output redaction hook; a pass-through by default.
+    redaction: Option<Arc<dyn knsh_core::OutputRedaction>>,
 }
 
 impl Daemon {
@@ -262,6 +288,9 @@ impl Daemon {
                     .spawner
                     .unwrap_or_else(|| FakeSpawner::new(Arc::clone(&self.journal))),
             ),
+            redaction: setup
+                .redaction
+                .unwrap_or_else(|| Arc::new(knsh_core::NoOutputRedaction)),
         })
     }
 
@@ -323,6 +352,7 @@ pub(super) fn forwarded(session_id: SessionId, command: &str) -> ForwardedLine {
         env: Vec::new(),
         stdio: None,
         timeout_s: None,
+        control: crate::jobs::LineControl::new(),
     }
 }
 
@@ -691,6 +721,7 @@ fn runs_with_no_hooks_and_no_authority() {
         authority: Arc::new(NoAuthority),
         approvals: Arc::new(DenyAtTimeout::default()),
         spawner: Arc::new(FakeSpawner::new(Arc::clone(&daemon.journal))),
+        redaction: Arc::new(knsh_core::NoOutputRedaction),
     });
     // `echo` is a builtin and stays as written; `ls` runs by its absolute path.
     lifecycle.run(daemon.line("echo hi; ls"), &StillWaiting).unwrap();
@@ -705,6 +736,7 @@ fn spawning(daemon: &Daemon, outcome: Result<Ran, SpawnFailure>, long_running: b
             journal: Arc::clone(&daemon.journal),
             outcome,
             long_running,
+            writes: (b"", b""),
         }),
         ..Setup::default()
     })
@@ -906,6 +938,7 @@ fn writes_one_record_per_line_reaching_parse() {
                 journal: Arc::clone(&daemon.journal),
                 outcome: Err(SpawnFailure::Trampoline(66)),
                 long_running: false,
+                writes: (b"", b""),
             }),
             ..Setup::default()
         },
@@ -1080,6 +1113,7 @@ fn exit_code_null_for_denied_line() {
             timed_out: false,
         }),
         long_running: false,
+        writes: (b"", b""),
     };
     daemon
         .next(
@@ -1154,4 +1188,180 @@ fn argv_carries_resolved_path_and_class() {
         argv(&record),
         [(None, None, "dynamic", Some("syntax_error".to_owned()), None)]
     );
+}
+
+/// `web` that records output.
+const WEB_RECORDING_OUTPUT: &str = "name = \"web\"\n[exec]\nallow = [\"git status\", \"ls\", \"echo\"]\n\
+                                    ask = [\"git push\"]\n[recording]\noutput = true\n";
+
+/// A spawner whose lines exit 0 after writing `stdout` and `stderr`.
+fn writing(daemon: &Daemon, stdout: &'static [u8], stderr: &'static [u8]) -> FakeSpawner {
+    FakeSpawner {
+        writes: (stdout, stderr),
+        ..FakeSpawner::new(Arc::clone(&daemon.journal))
+    }
+}
+
+/// The stored record of the last line run, with what was kept of its output.
+fn last_stored(daemon: &Daemon) -> knsh_store::StoredRecord {
+    daemon.stored().pop().unwrap()
+}
+
+// FR-REC-06: with `recording.output = false` (the default), a captured line's output reaches its caller but nothing
+// is stored and no `command.output` is published.
+#[test]
+fn stores_nothing_when_output_recording_off() {
+    let daemon = Daemon::new();
+    daemon.events();
+    let finished = daemon
+        .next(
+            Setup {
+                spawner: Some(writing(&daemon, b"built\n", b"warn\n")),
+                ..Setup::default()
+            },
+            "ls",
+        )
+        .unwrap();
+    // Captured for the caller (no passed stdio), without publishing.
+    assert!(
+        daemon
+            .journal
+            .entries()
+            .contains(&"capture publishing=false".to_owned())
+    );
+    let output = finished.output.unwrap();
+    assert_eq!(output.stdout.output.data().expose(), b"built\n");
+    let stored = last_stored(&daemon);
+    assert!(stored.stdout.is_none() && stored.stderr.is_none(), "nothing stored");
+    assert!(!names(&daemon.events()).contains(&"command.output"));
+}
+
+// FR-LC-18: `command.output` is published (in order, per stream) only when the session records output, and the
+// record keeps the output with its sizes (FR-REC-06).
+#[test]
+fn emits_output_events_only_when_recording() {
+    let daemon = Daemon::new();
+    daemon.events();
+    daemon
+        .next(
+            Setup {
+                spawner: Some(writing(&daemon, b"built\n", b"warn\n")),
+                profiles: Some(vec![("web", WEB_RECORDING_OUTPUT)]),
+                ..Setup::default()
+            },
+            "ls",
+        )
+        .unwrap();
+    let events = daemon.events();
+    assert_eq!(
+        names(&events),
+        [
+            "command.proposed",
+            "command.started",
+            "command.output",
+            "command.output",
+            "command.finished"
+        ]
+    );
+    let chunks: Vec<(OutputStream, Vec<u8>)> = events
+        .iter()
+        .filter_map(|event| match &event.data {
+            EventData::CommandOutput { stream, bytes, .. } => Some((*stream, bytes.expose().clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        chunks,
+        [
+            (OutputStream::Stdout, b"built\n".to_vec()),
+            (OutputStream::Stderr, b"warn\n".to_vec())
+        ]
+    );
+    let stored = last_stored(&daemon);
+    assert_eq!(stored.stdout.unwrap().original, 6);
+    assert_eq!(stored.stderr.unwrap().stored, 5);
+
+    // Passed descriptors in a session that does not record output: not captured at all.
+    let mut line = daemon.line("ls");
+    let null = || std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+    line.stdio = Some(crate::exec::Stdio {
+        stdin: null(),
+        stdout: null(),
+        stderr: null(),
+    });
+    let before = daemon.journal.entries().len();
+    let finished = daemon.lifecycle(Setup::default()).run(line, &StillWaiting).unwrap();
+    assert!(finished.output.is_none());
+    assert!(
+        !daemon.journal.entries()[before..]
+            .iter()
+            .any(|entry| entry.starts_with("capture"))
+    );
+    assert!(!names(&daemon.events()).contains(&"command.output"));
+}
+
+// FR-EVT-07: what is stored and published is what the redaction hook returned, never the raw chunk.
+#[test]
+fn stores_and_emits_only_redacted_output() {
+    struct Masking;
+    impl knsh_core::OutputRedaction for Masking {
+        fn redact_chunk(&self, chunk: &[u8]) -> Redacted<Vec<u8>> {
+            Redacted::new(chunk.iter().map(|_| b'#').collect())
+        }
+    }
+    let daemon = Daemon::new();
+    daemon.events();
+    let finished = daemon
+        .next(
+            Setup {
+                spawner: Some(writing(&daemon, b"token=abc\n", b"")),
+                profiles: Some(vec![("web", WEB_RECORDING_OUTPUT)]),
+                redaction: Some(Arc::new(Masking)),
+                ..Setup::default()
+            },
+            "ls",
+        )
+        .unwrap();
+    assert_eq!(finished.output.unwrap().stdout.output.data().expose(), b"##########");
+    let published = daemon.events().iter().find_map(|event| match &event.data {
+        EventData::CommandOutput { bytes, .. } => Some(bytes.expose().clone()),
+        _ => None,
+    });
+    assert_eq!(published.as_deref(), Some(&b"##########"[..]));
+    let record_id = last_stored(&daemon).record.record_id;
+    let range = daemon
+        .fixture
+        .store
+        .output(
+            Scope::All,
+            knsh_store::OutputRequest {
+                record_id,
+                stream: OutputStream::Stdout,
+                offset: 0,
+                length: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(range.data, b"##########");
+}
+
+// FR-AUTH-33: `executed_command` is the line actually spawned, after the rewrite, not the one received.
+#[test]
+fn returns_executed_command_after_rewrite() {
+    let daemon = Daemon::new();
+    let finished = daemon
+        .next(
+            Setup {
+                authority: Some(vec![AskReply::Rewrite {
+                    command: "git status".to_owned(),
+                }]),
+                ..Setup::default()
+            },
+            "git push --force",
+        )
+        .unwrap();
+    assert_eq!(finished.executed_command.expose(), "/usr/bin/git status");
+    assert_eq!(daemon.spawns(), ["spawn /usr/bin/git status as bash"]);
+    assert_eq!(finished.decision.verdict, DecisionVerdict::Rewrite);
+    assert_eq!(finished.default_mode, knsh_core::OutputMode::Full);
 }

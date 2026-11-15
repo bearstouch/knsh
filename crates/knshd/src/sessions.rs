@@ -366,8 +366,9 @@ impl Sessions {
             })?;
         answer(&SessionInfoResult {
             session,
-            // Human sessions never record output (FR-REC-09). Agent output is recorded only by the commands the
-            // supervisor runs (KNSH-050), which this build does not run yet, so none is recorded.
+            // Human sessions never record output (FR-REC-09). An agent session records its lines' output when its
+            // profile sets `recording.output` (KNSH-053); reporting that here needs the profile, which the registry
+            // does not load yet, so it still reads false (pending: wire the profile loader into session.info).
             output_recording: false,
         })
     }
