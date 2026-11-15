@@ -7,8 +7,8 @@ Two kinds of profile confine every agent: the envelope profile and a per-command
 | Area | Default | Notes |
 | --- | --- | --- |
 | File read | Everything except the deny list | Canonical paths; engine paths always denied |
-| File write | The profile's write roots | Plus the fixed write denies below |
-| Fixed write denies | `.git/hooks/`, `.git/config`, shell startup files (`~/.zshrc`, `~/.zprofile`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`), `~/Library/LaunchAgents`, `~/.ssh`, engine paths, and `~/Library/Keychains` (proposed by decision 11, pending acceptance) | Blocks planting code that later runs outside the sandbox; git configuration changes go through an approved command. Keychain files are written by the client process itself, so this deny stops an agent overwriting or planting `knshd`'s Keychain items while it can still read its own (KNSH-026) |
+| File write | The profile's write roots, plus `/dev/null`, `/dev/zero`, `/dev/stdout`, `/dev/stderr` and `/dev/fd/N` | Plus the fixed write denies below. The devices reach no file: they are the null devices and descriptors the process already holds (`2>/dev/null`) |
+| Fixed write denies | Every `.git` entry itself; `hooks/`, `config`, `config.worktree` and `commondir` at any depth inside `.git` (submodule git directories included); the `.git/modules` and `.git/worktrees` entries and the git directories directly below them; the entry of every directory above a fixed, engine or `fs.deny` path; shell startup files (`~/.zshenv`, `~/.zprofile`, `~/.zshrc`, `~/.zlogin`, `~/.zlogout`, `~/.bash_profile`, `~/.bash_login`, `~/.bashrc`, `~/.bash_logout`, `~/.profile`), `~/Library/LaunchAgents`, `~/.ssh`, engine paths, and `~/Library/Keychains` (proposed by decision 11, pending acceptance) | Blocks planting code that later runs outside the sandbox; git configuration changes go through an approved command. Denying the `.git` entry stops renaming a planted directory into place as `.git`, or the real one away; `git commit`, `checkout` and `gc` still work (in submodules and linked worktrees too), while `git init`, `git clone`, `git submodule add` and `git worktree add` fail (KNSH-044). `commondir` names the directory git takes hooks and configuration from, so writing it alone would plant a hook. Protecting ancestors' entries stops renaming a protected path away inside its parent, editing it and renaming it back. Keychain files are written by the client process itself, so this deny stops an agent overwriting or planting `knshd`'s Keychain items while it can still read its own (KNSH-026) |
 | Executables | Trusted binary folders, paths the profile names, and project executables if allowed | Enforced by the kernel at every exec, including by children |
 | System services | A short list command-line tools need | Denied: LaunchServices (`open`), Apple Events (scripting other apps), launchd job submission, the knsh control service, the DNS resolver. Denying the resolver does not stop a tool that sends DNS over UDP itself; the network row does. App bundles that need LaunchServices (such as Chrome.app) run only as trusted tools (KNSH-025, decision 10) |
 | Unix sockets | `agent.sock` for envelopes; none for commands | Denied unless the profile allows: `user.sock`, the Docker socket, the SSH agent socket. Binding a socket under the profile's own write roots is allowed; only connecting is limited |
@@ -18,7 +18,9 @@ Two kinds of profile confine every agent: the envelope profile and a per-command
 
 The Seatbelt operations and filters that implement each row on macOS, and what each one cannot do, were measured by
 KNSH-025 and are recorded in [verification claims C8](../07-testing/verification-claims.md#c8-process-information-signals-sockets-and-services).
-Seatbelt matches canonical paths only, so every path in a compiled profile is canonical.
+Seatbelt matches canonical paths only, so every path in a compiled profile is canonical. The file rules are compiled by
+`knsh-sandbox` (KNSH-044): every deny comes after every allow, so the fixed and engine denies always win, and every
+path is written as an SBPL string literal with `\` and `"` escaped.
 
 ## Requirements
 

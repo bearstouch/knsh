@@ -13,14 +13,14 @@ startup files, `~/Library/LaunchAgents`, `~/.ssh`, engine paths); engine paths d
 carries a knsh tag.
 
 **Acceptance criteria**
-- [ ] `compile(&ProfileInput) -> SbplText` is pure and deterministic: same input, same bytes (property test).
-- [ ] Paths are emitted as canonical literals/subpaths, correctly escaped; no string interpolation of untrusted text
+- [x] `compile(&ProfileInput) -> SbplText` is pure and deterministic: same input, same bytes (property test).
+- [x] Paths are emitted as canonical literals/subpaths, correctly escaped; no string interpolation of untrusted text
   without escaping.
-- [ ] Fixed write denies and engine-path denies are emitted after allows so they win, and cannot be disabled by input.
-- [ ] `.git/hooks/` and `.git/config` denies apply to every git directory under write roots (regex or subpath rules
+- [x] Fixed write denies and engine-path denies are emitted after allows so they win, and cannot be disabled by input.
+- [x] `.git/hooks/` and `.git/config` denies apply to every git directory under write roots (regex or subpath rules
   as determined by KNSH-025).
-- [ ] Every deny rule carries a tag of the form `knsh:<session>:<command>:<rule>` (FR-SBX-06).
-- [ ] Golden-file tests for the example profile.
+- [x] Every deny rule carries a tag of the form `knsh:<session>:<command>:<rule>` (FR-SBX-06).
+- [x] Golden-file tests for the example profile.
 
 **Unit tests**
 - `compiles_deterministically`.

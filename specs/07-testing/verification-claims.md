@@ -33,6 +33,28 @@ Facts that hold across all three claims:
 - **Canonical paths only.** `(literal "/etc/hosts")` does not match a read of `/etc/hosts`; `/private/etc/hosts`
   does *(ad hoc, confirmed in review)*. A symlink to a denied socket, or a `/var/…` spelling of a `/private/var/…`
   path, is still denied: the kernel checks the resolved path.
+- **Case-insensitive matching** *(KNSH-044, ad hoc; the `.git` cases are in the `knsh-sandbox` integration test)*: on
+  the case-insensitive data volume, `(regex #"/\.git/hooks(/|$)")` also denies `.GIT/HOOKS/x` and `.Git/hooks/x`, even
+  when the directories are new, and `(literal "…/zshrc")` denies `…/ZSHRC`.
+- **Renames into protected paths** *(KNSH-044, in the `knsh-sandbox` integration test)*: with only the `.git/hooks`
+  and `.git/config` regexes, a directory holding `hooks/pre-commit` can be renamed to `<repo>/.git`, and the real
+  `.git` renamed away. Adding `(regex #"/\.git$")` denies both, while `git commit`, `git checkout -b` and `git gc`
+  still succeed.
+- **Other git directories** *(KNSH-044; git 2.54, in the `knsh-sandbox` integration test)*: writing only
+  `.git/commondir` (a path to a planted directory with `hooks/` and `config`) makes `git commit` run the planted
+  hook, and submodule git directories in `.git/modules/<name>` have their own `hooks/` and `config`. The rules
+  `(regex #"/\.git/(.+/)?hooks(/|$)")`, `(regex #"/\.git/(.+/)?(config|config\.worktree|commondir)$")` and
+  `(regex #"/\.git/(.+/)?(modules|worktrees)(/[^/]+)?$")` deny those writes and renaming a submodule or worktree git
+  directory out and back, while commits in the repository, a submodule and a linked worktree, `git checkout -b`,
+  `git gc` and `git status` still succeed.
+- **Renaming an ancestor** *(KNSH-044, in the `knsh-sandbox` integration test)*: a subpath deny does not cover its
+  parent, so with a write root above it `~/.config` could be renamed away, the engine files read and changed at
+  the new path, and the directory renamed back. `(deny file-write* (literal "<ancestor>"))` on each ancestor denies
+  the rename while files can still be created and removed inside it. Hard links to a write-denied file fail
+  (`ln` gets `EPERM`), so they need no rule.
+- **String literals**: inside `"…"` only `\` and `"` need escaping. Paths holding `"`, `\`, `)`, `;`, a newline, a tab
+  or `é` match exactly once escaped that way; an unescaped `"` ends the string, and the rest is read as profile code
+  *(KNSH-044, ad hoc)*. APFS refuses names that are not UTF-8.
 - **setuid binaries cannot run in any sandbox**, even `(allow default)`: `exec` of `/bin/ps` fails with `EPERM` and
   logs `forbidden-exec-sugid` (untagged).
 
