@@ -72,6 +72,9 @@ const POLICIES_DIR: &str = "policies";
 const ZSH_STARTUP_DIR: [&str; 2] = ["shell", "zsh"];
 /// The bash startup directory of integration mode, below the data directory (KNSH-020).
 const BASH_STARTUP_DIR: [&str; 2] = ["shell", "bash"];
+/// The shim directory (KNSH-049): a sibling of the data directory, deliberately outside every fixed deny, since
+/// envelopes must be able to look up and run the shims it holds.
+const SHIM_DIR: &str = "knsh-shims";
 /// Agent socket, inside the run directory. Named in `knsh-core`, whose fixed denies every profile compiles in.
 const AGENT_SOCKET: &str = knsh_core::AGENT_SOCKET;
 /// User socket, inside the run directory. Named in `knsh-core`, like [`AGENT_SOCKET`].
@@ -80,7 +83,7 @@ const USER_SOCKET: &str = knsh_core::USER_SOCKET;
 /// Every engine path for one home directory (`specs/09-reference/file-locations.md`).
 ///
 /// Invariant: every path is absolute, lies under [`EnginePaths::home`], and lies under one of
-/// [`EnginePaths::fixed_denies`].
+/// [`EnginePaths::fixed_denies`], except [`EnginePaths::shim_dir`], which envelopes must reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnginePaths {
     home: PathBuf,
@@ -186,6 +189,20 @@ impl EnginePaths {
     #[must_use]
     pub fn bash_startup_dir(&self) -> PathBuf {
         join_all(&self.data, &BASH_STARTUP_DIR)
+    }
+
+    /// `~/Library/Application Support/knsh-shims/`: the shim directory (KNSH-049), holding `sh`, `bash` and `zsh`
+    /// entries that run `knsh` under those names. Envelopes put it first in `PATH` (FR-AGT-03) and supervised lines
+    /// run without it (FR-LC-16).
+    ///
+    /// Unlike every other path here it is **not** under a fixed deny: an envelope has to look up and execute what
+    /// it holds. It holds nothing secret (links to the `knsh` binary), and it is not a security boundary: an agent
+    /// that runs `/bin/bash` by absolute path bypasses it anyway, confined by its envelope (FR-AGT-31). Created by
+    /// `knsh`, not by [`ensure_engine_dirs`].
+    #[must_use]
+    pub fn shim_dir(&self) -> PathBuf {
+        let parent = self.data.parent().unwrap_or(&self.home);
+        parent.join(SHIM_DIR)
     }
 
     /// The directories [`ensure_engine_dirs`] creates, each listed after its parent.
@@ -605,6 +622,10 @@ mod tests {
             Path::new("/Users/u/Library/Application Support/knsh/shell/bash")
         );
         assert_eq!(paths.config_file(), Path::new("/Users/u/.config/knsh/config.toml"));
+        // KNSH-049: the shims sit beside the data directory, outside every fixed deny, so envelopes can run them.
+        let shims = paths.shim_dir();
+        assert_eq!(shims, Path::new("/Users/u/Library/Application Support/knsh-shims"));
+        assert!(!denies.iter().any(|deny| shims.starts_with(deny)));
     }
 
     // "No path literals elsewhere": engine path components appear in no other Rust source of the workspace, except

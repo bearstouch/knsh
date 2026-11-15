@@ -17,9 +17,23 @@ const NOT_IMPLEMENTED_STATUS: u8 = 1;
 #[cfg(target_os = "macos")]
 const EXEC_FAILED_STATUS: u8 = 127;
 
+/// Exit status of an agent line that did not run (denied, no supervisor, refused input): 126 (FR-LC-31).
+#[cfg(unix)]
+const NOT_RUN_STATUS: u8 = knsh::agent::forward::NOT_RUN_STATUS;
+
 /// Entry point: parse argv, then print help, report a usage error, or dispatch.
+///
+/// Started under a shim's name (`sh`, `bash`, `zsh`, KNSH-049) `knsh` is always a shell: `bash script.sh` names a
+/// script, never a `knsh` command.
 fn main() -> ExitCode {
-    match args::parse(&KNSH, std::env::args_os()) {
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let interpreter = interpreter(&argv);
+    let parsed = if interpreter == knsh_proto::Interpreter::Knsh {
+        args::parse(&KNSH, argv)
+    } else {
+        args::parse_shell_argv(argv).map(Invocation::Shell)
+    };
+    match parsed {
         Ok(Invocation::Help(text)) => {
             // A closed stdout (`knsh --help | head -1`) is not an error worth reporting.
             let _ = std::io::stdout().write_all(text.as_bytes());
@@ -30,7 +44,7 @@ fn main() -> ExitCode {
             let _ = std::io::stdout().write_all(knsh::cli::version::text().as_bytes());
             ExitCode::SUCCESS
         }
-        Ok(Invocation::Shell(shell)) => shell_mode(&shell),
+        Ok(Invocation::Shell(shell)) => shell_mode(&shell, interpreter),
         Ok(Invocation::Command(parsed)) => match parsed.path.as_slice() {
             ["daemon", action @ ("install" | "uninstall")] => daemon(action, parsed.json()),
             ["forget"] => forget(&parsed),
@@ -278,9 +292,22 @@ fn shell_install(_json: bool) -> ExitCode {
     not_implemented("'knsh shell install' on this platform")
 }
 
-/// Runs a shell-mode invocation. A human interactive shell is hosted in integration mode (KNSH-019); `-c` lines and
-/// scripts (the agent and unattended paths) arrive in later stories.
-fn shell_mode(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
+/// The interpreter `knsh` was started as: a shim's name, or `knsh` itself.
+#[cfg(unix)]
+fn interpreter(argv: &[std::ffi::OsString]) -> knsh_proto::Interpreter {
+    knsh::agent::shims::interpreter(argv.first().map(std::ffi::OsString::as_os_str))
+}
+
+/// Shims exist only on Unix.
+#[cfg(not(unix))]
+fn interpreter(_argv: &[std::ffi::OsString]) -> knsh_proto::Interpreter {
+    knsh_proto::Interpreter::Knsh
+}
+
+/// Runs a shell-mode invocation. A human interactive shell is hosted in integration mode (KNSH-019). Everything else
+/// (`-c` lines, scripts, commands on stdin) is an agent line, forwarded to the supervisor and never run here
+/// (KNSH-049).
+fn shell_mode(shell: &knsh::cli::args::ShellInvocation, interpreter: knsh_proto::Interpreter) -> ExitCode {
     use std::io::IsTerminal;
 
     use knsh::integration::zsh;
@@ -294,8 +321,65 @@ fn shell_mode(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
     ) {
         human_shell(shell)
     } else {
-        not_implemented("shell mode")
+        agent_line(shell, interpreter)
     }
+}
+
+/// Forwards the line `shell` names to the supervisor over `agent.sock` and exits as the line did (KNSH-049,
+/// FR-AGT-10). Nothing is ever run here: whatever fails, the line does not run, the reason goes to stderr and the
+/// exit status is 126 (FR-LC-31, NFR-REL-01).
+#[cfg(target_os = "macos")]
+fn agent_line(shell: &knsh::cli::args::ShellInvocation, interpreter: knsh_proto::Interpreter) -> ExitCode {
+    use knsh::agent::forward;
+    use knsh::agent::socket::UnixAgentSocket;
+    use knsh_platform::EnginePaths;
+
+    let not_run = |reason: &str| {
+        report(&format!("knsh: {reason}; the line did not run\n"));
+        ExitCode::from(NOT_RUN_STATUS)
+    };
+    let Some(home) = std::env::var_os("HOME") else {
+        return not_run("the supervisor is unavailable (HOME is not set, so agent.sock cannot be found)");
+    };
+    let path = match EnginePaths::for_home(std::path::Path::new(&home)) {
+        Ok(paths) => paths.agent_socket(),
+        Err(error) => return not_run(&format!("the supervisor is unavailable (unusable HOME: {error})")),
+    };
+    // Before anything else opens a descriptor: the line's stdio is this process's own.
+    let mut socket = match UnixAgentSocket::new(path) {
+        Ok(socket) => socket,
+        Err(error) => return not_run(&format!("cannot pass the standard streams ({error})")),
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => return not_run(&format!("the working directory cannot be read ({error})")),
+    };
+    // The whole environment, unchanged (FR-AGT-10); `knshd` removes the shims and the token before the line runs.
+    let env: Vec<_> = std::env::vars_os().collect();
+    // Only the token (or, without it, the audit token) decides whether this is an envelope (FR-AGT-23); a token that
+    // is not text cannot be valid, and the audit token decides.
+    let token = std::env::var_os(knsh_proto::SESSION_TOKEN_VAR).and_then(|token| token.into_string().ok());
+    let params = match forward::request(&forward::line(shell, interpreter), &cwd, &env) {
+        Ok(params) => params,
+        Err(refusal) => return not_run(&refusal.to_string()),
+    };
+    let exit = forward::forward(
+        &mut socket,
+        token.as_deref(),
+        &params,
+        &mut std::thread::sleep,
+        &mut report,
+    );
+    if let Some(message) = &exit.message {
+        report(message);
+    }
+    ExitCode::from(exit.status)
+}
+
+/// The supervisor is reached over a macOS socket only so far; elsewhere no agent line can run.
+#[cfg(not(target_os = "macos"))]
+fn agent_line(_shell: &knsh::cli::args::ShellInvocation, _interpreter: knsh_proto::Interpreter) -> ExitCode {
+    not_implemented("agent lines on this platform")
 }
 
 /// Hosts the user's stock shell for a human: the one `[shell] hosted` names (KNSH-022), else their bash when `$SHELL`

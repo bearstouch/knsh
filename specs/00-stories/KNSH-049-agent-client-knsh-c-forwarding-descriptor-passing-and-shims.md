@@ -27,26 +27,38 @@ preserved. Only the envelope's `PATH` puts that directory first (KNSH-057).
 **Acceptance criteria**
 *Agent client: `knsh -c` forwarding with descriptor passing*
 
-- [ ] The client is detected as "inside an envelope" only through the session token in the environment or a
-      successful audit-token match. Labels never relax policy.
-- [ ] The line, cwd, full environment and the requested interpreter are forwarded unchanged.
-- [ ] Stdio descriptors are passed with `SCM_RIGHTS`. Command output goes straight to the caller's terminal or pipes
+- [x] The client is detected as "inside an envelope" only through the session token in the environment or a
+      successful audit-token match. Labels never relax policy. *The client sends `KNSH_SESSION_TOKEN` in `hello` and
+      lets `knshd` bind the connection (by token, else audit token, KNSH-048); nothing else is consulted.*
+- [x] The line, cwd, full environment and the requested interpreter are forwarded unchanged.
+- [x] Stdio descriptors are passed with `SCM_RIGHTS`. Command output goes straight to the caller's terminal or pipes
       and never crosses the API as JSON (FR-OUT-04).
-- [ ] The client exits with the line's exit code. If the line was killed by a signal, it exits 128 + the signal number.
-- [ ] On denial (`-32001`), the client prints the reason and rule ID on stderr and exits **126**.
-- [ ] On `-32007` (paused or human control), the client stays held and does not exit with an error, according to
-      the hold semantics fixed in KNSH-054.
-- [ ] If `knshd` is unreachable, the client runs nothing, prints a clear error on stderr and exits non-zero
+- [x] The client exits with the line's exit code. If the line was killed by a signal, it exits 128 + the signal number.
+- [x] On denial (`-32001`), the client prints the reason and rule ID on stderr and exits **126**.
+- [x] On `-32007` (paused or human control), the client stays held and does not exit with an error, according to
+      the hold semantics fixed in KNSH-054. *Semantics settled in [sessions](../03-functional-requirements/sessions.md)
+      (answered at once, client retries every second); observed against a stand-in supervisor. `knshd` holding lines
+      is KNSH-054.*
+- [x] If `knshd` is unreachable, the client runs nothing, prints a clear error on stderr and exits non-zero
       (see Notes).
-- [ ] The client itself never `exec`s the line locally, under any error path.
+- [x] The client itself never `exec`s the line locally, under any error path.
 
 *`sh`, `bash` and `zsh` shims*
 
-- [ ] `bash -c '…'`, `sh -c '…'` and `zsh -c '…'` inside an envelope are forwarded as `knsh -c` with the requested
+- [x] `bash -c '…'`, `sh -c '…'` and `zsh -c '…'` inside an envelope are forwarded as `knsh -c` with the requested
       interpreter recorded, so `sh` later runs `/bin/sh`, `zsh` runs zsh and `bash` runs the profile's bash.
-- [ ] Policy is identical whichever interpreter was asked for (FR-LC-14).
-- [ ] Supervised lines run with a `PATH` that does not contain the shim directory (FR-LC-16).
-- [ ] The shims are only reachable through `PATH`. `/bin/bash` by absolute path is not intercepted (FR-AGT-31).
+      *Forwarding with the interpreter recorded observed end to end; choosing the binary from it is KNSH-051.*
+- [x] Policy is identical whichever interpreter was asked for (FR-LC-14). *By construction: `knshd` hands the
+      supervisor a proposal (line, cwd, `PATH`) with no interpreter in it; checked with the real policy evaluator.
+      The orchestrator that decides on it is KNSH-050.*
+- [x] Supervised lines run with a `PATH` that does not contain the shim directory (FR-LC-16). *`knshd` strips it
+      (and the session token) on receipt, before names are resolved; spawning with that environment is KNSH-051.*
+- [x] The shims are only reachable through `PATH`. `/bin/bash` by absolute path is not intercepted (FR-AGT-31).
+
+*Not served yet:* `exec.run` stays `planned` in the method catalogue until the supervisor exists (KNSH-050), so a
+real `knshd` answers `-32601` and `knsh -c` exits 126. The handler is complete and tested against a fake supervisor;
+the client is tested against a stand-in supervisor that runs lines with `/bin/bash` on the passed descriptors.
+Descriptor passing from inside a real Seatbelt envelope is verification claim C13 (pending, KNSH-057).
 
 **Unit tests**
 *Agent client: `knsh -c` forwarding with descriptor passing*
@@ -73,13 +85,19 @@ preserved. Only the envelope's `PATH` puts that directory first (KNSH-057).
 **Notes**
 *Agent client: `knsh -c` forwarding with descriptor passing*
 
-- Spec gap: the exit code when `knshd` is unreachable is not specified. Propose 126 with a "supervisor unavailable"
-  message, and record the choice in [reliability](../04-non-functional-requirements/reliability.md).
-- Spec gap: whether the client forwards signals it receives (for example SIGINT from the agent CLI) to the running
-  line's process group. Resolve in the spec before implementing; the proposal is to forward SIGINT, SIGTERM and SIGHUP.
+- Resolved: unreachable `knshd` exits 126 with "the supervisor is unavailable … the line did not run", recorded in
+  [reliability](../04-non-functional-requirements/reliability.md) (NFR-REL-01) and
+  [exit codes](../09-reference/exit-codes.md).
+- Resolved (differently from the proposal): the client installs no signal handlers. A signal that ends it closes the
+  connection, which the supervisor treats as the caller gone (cancel a pending decision, FR-LC-41; stop the running
+  line's group, KNSH-051). Forwarding one particular signal is left to `exec.kill`. Recorded in
+  [agent integration](../03-functional-requirements/agent-integration.md#forwarding-details-knsh-049).
 
 *`sh`, `bash` and `zsh` shims*
 
-- Spec gap: forms other than `-c` (`bash script.sh`, `bash -s`, `bash` reading stdin, `bash -l -c`) are not specified.
-  Propose forwarding them as the equivalent line, with the script path classified as dynamic code when it is
-  agent-writable (FR-LC-05). Resolve in [agent integration](../03-functional-requirements/agent-integration.md).
+- Resolved: forms other than `-c` are forwarded as the equivalent line (`sh 'script.sh' 'a'`) under the shim's
+  interpreter; `-l` and `-i` are ignored. Recorded in
+  [agent integration](../03-functional-requirements/agent-integration.md#forwarding-details-knsh-049). Classifying the
+  script as dynamic code when agent-writable is the classifier's (FR-LC-05).
+- The shim directory is `~/Library/Application Support/knsh-shims/` ([file locations](../09-reference/file-locations.md)):
+  outside the fixed denies, since envelopes must run it. `knsh agent` installs it (KNSH-056).

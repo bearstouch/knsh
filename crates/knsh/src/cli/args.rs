@@ -346,6 +346,21 @@ pub fn parse(root: &'static Command, argv: impl IntoIterator<Item = OsString>) -
     }
 }
 
+/// Parses a full `argv` (including `argv[0]`) as a shell invocation only, whatever its first argument: how `knsh`
+/// reads its argv when it runs as a shim (`sh`, `bash`, `zsh`, KNSH-049), where `bash script.sh` names a script,
+/// never a `knsh` command.
+///
+/// # Errors
+///
+/// As [`parse`]: an option bash users do not pass, or `-c` without its line.
+pub fn parse_shell_argv(argv: impl IntoIterator<Item = OsString>) -> Result<ShellInvocation, ArgsError> {
+    let mut words = argv.into_iter();
+    let login_argv0 = words
+        .next()
+        .is_some_and(|argv0| argv0.as_encoded_bytes().first() == Some(&b'-'));
+    parse_shell(login_argv0, words.collect())
+}
+
 /// Whether the first argument after `argv[0]` selects shell mode.
 ///
 /// No argument starts an interactive shell. A single-dash argument is always a bash option cluster (`-c`, `-lc`)

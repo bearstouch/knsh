@@ -18,6 +18,21 @@ Messages are JSON; raw bytes travel in binary frames beside them. JSON keeps the
 - A client that cannot handle binary frames says so in `hello` and receives the bytes base64-encoded inside JSON instead: the standard alphabet with padding (RFC 4648 section 4), and only the canonical encoding is accepted (no whitespace, no URL-safe alphabet, unused bits zero).
 - Output from `knsh -c` never crosses the API: the client hands its stdio descriptors to the supervisor, which attaches them to the command directly.
 
+## Descriptors
+
+Descriptors travel as `SCM_RIGHTS` ancillary data on the Unix socket (KNSH-049):
+
+- The sender sends a request's whole frame with the descriptors attached to its first byte. The receiver reads exactly
+  one frame at a time, so the descriptors received while a frame is read belong to that frame.
+- Only `exec.run` with `stdio: "passed"` takes descriptors: exactly three, stdin, stdout and stderr in that order. A
+  request for any other method that carries descriptors is answered `-32602`; descriptors on a notification or
+  response are closed unused; and whatever a handler does not take is closed when the call ends.
+- At most three may arrive with one frame. More, truncated ancillary data, or ancillary data other than `SCM_RIGHTS`
+  close the connection, and every descriptor that did arrive is closed.
+- Received descriptors are made close-on-exec at once. macOS has no `MSG_CMSG_CLOEXEC`, so a process spawned by another
+  `knshd` thread in the instant between receiving and marking could inherit one; the only such children are the
+  engine's own.
+
 ## Control service (XPC)
 
 The control service carries the same JSON payload inside XPC messages, and raw bytes as XPC data values, so all three endpoints share one schema.

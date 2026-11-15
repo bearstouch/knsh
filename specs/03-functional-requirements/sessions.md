@@ -33,6 +33,12 @@ stateDiagram-v2
 | FR-SES-13 | Sessions must be paused when the pushed policy they use expires ([policy](policy.md)). |
 | FR-SES-14 | Every state change must emit `session.state_changed`. |
 
+**Holding a line (KNSH-049, KNSH-054).** `exec.*` answers `-32007` at once, with `data.state`, rather than blocking
+the call. `knsh -c` then stays held: it prints one notice on stderr the first time, waits one second, and sends the
+same line again on the same connection, until the answer is something else. It never exits with an error because a
+line was held; the agent sees a slow command. The agent CLI's own tool timeout, which kills `knsh`, is what bounds the
+wait.
+
 ## Human sessions
 
 | ID | Requirement |

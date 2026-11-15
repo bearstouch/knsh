@@ -39,7 +39,7 @@ flowchart TD
 | 9. Spawn | FR-LC-13 | The supervisor must re-serialise the line with every command's resolved absolute path and run it through `knsh-exec`, attached to the caller's stdio descriptors. |
 | | FR-LC-14 | The interpreter must be the one the caller asked for: `sh` runs `/bin/sh` (bash in POSIX mode on macOS), `zsh` runs zsh, and `bash` or `knsh -c` run the profile's bash. Policy must not depend on which interpreter was asked for. |
 | | FR-LC-15 | The sandbox's executable rules must allow only trusted binary folders and paths the profile names, so a binary swapped after classification cannot run. |
-| | FR-LC-16 | Supervised lines must run without the shims, so any shell they start runs directly under the same profile. |
+| | FR-LC-16 | Supervised lines must run without the shims, so any shell they start runs directly under the same profile. `knshd` removes every `PATH` entry naming the shim directory (trailing slashes ignored) when it receives the line, before names are resolved, and removes the session token variable (KNSH-049). |
 | | FR-LC-17 | The supervisor must emit `command.started`, and `command.long_running` if the line is still running after 30 s (configurable). |
 | 10. Capture | FR-LC-18 | The supervisor must capture output, redact secrets, and emit `command.output` when the session records output. |
 | 11. Finish | FR-LC-19 | The supervisor must write the record, compute file changes and the checkpoint ([checkpoints](checkpoints.md)), then emit `command.finished` and reply. |

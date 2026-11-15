@@ -173,6 +173,7 @@ pub(crate) mod tests {
                 request: &request,
                 subscriber: crate::dispatch::tests::subscriber(),
                 binding: &binding,
+                descriptors: crate::dispatch::tests::no_descriptors(),
             })
             .map(|answer| answer.result.as_object().cloned().unwrap())
     }

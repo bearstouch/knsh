@@ -21,6 +21,11 @@
 //! - **Binary streams.** A handler that returns raw bytes ([`Answer::bytes`]) names the stream [`Call::stream`] in
 //!   its result; the bytes follow the JSON answer in binary chunks, closed by an end-of-stream frame, before the next
 //!   message is read. If the result itself cannot be written, the `-32603` that replaces it opens no stream.
+//! - **Descriptors** (KNSH-049). Descriptors passed with `SCM_RIGHTS` arrive with the bytes of the frame they were
+//!   sent with; the frame reader reads exactly one frame at a time, so whatever the [`Inbox`] holds once a frame is
+//!   read came with that frame. They go to that frame's call ([`Call::descriptors`]) and nowhere else: a request
+//!   other than `exec.run` that carries any is refused (`-32602`), a message that is not a request has them closed,
+//!   and whatever a handler leaves is closed when the call ends.
 //! - **Event notifications** (KNSH-018). Once the connection holds a subscription, a second thread, the *pump*,
 //!   writes its events as notifications while the first keeps reading requests. Both write through one lock on the
 //!   writer, and the reading thread holds it from dispatching a request until its answer is written, so the answer
@@ -32,6 +37,7 @@
 //! [`Closed`] says why the connection ended, without any content.
 
 use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
 
@@ -43,7 +49,7 @@ use knsh_proto::{
     SuccessResponse, decode, event_notification, lost_notification,
 };
 
-use crate::dispatch::{Answer, Call, Dispatcher, Endpoint, HELLO, Reply};
+use crate::dispatch::{Answer, Call, Dispatcher, Endpoint, HELLO, Passed, Reply};
 use crate::events::Subscriber;
 use crate::sessions::SessionBinding;
 
@@ -82,6 +88,23 @@ impl Closed {
             Self::Write(_) => "write",
             Self::Thread => "thread",
         }
+    }
+}
+
+/// Where a connection's passed descriptors collect while its bytes are read (KNSH-049).
+pub(crate) trait Inbox {
+    /// Every descriptor that arrived since the last call, in arrival order.
+    fn take(&self) -> Vec<OwnedFd>;
+}
+
+/// A transport that cannot carry descriptors (an in-memory buffer in tests): never any.
+#[cfg(test)]
+pub(crate) struct NoDescriptors;
+
+#[cfg(test)]
+impl Inbox for NoDescriptors {
+    fn take(&self) -> Vec<OwnedFd> {
+        Vec::new()
     }
 }
 
@@ -146,20 +169,22 @@ struct Session<'a> {
 }
 
 impl Session<'_> {
-    /// Handles one JSON frame payload.
-    fn handle(&mut self, payload: &[u8]) -> Step {
+    /// Handles one JSON frame payload and the descriptors that came with it. Descriptors not handed to a call are
+    /// closed when this returns.
+    fn handle(&mut self, payload: &[u8], descriptors: &Passed) -> Step {
         match decode(payload) {
-            Ok(message) if self.greeted => self.handle_message(message),
-            Ok(message) => self.handle_first(message),
+            Ok(message) if self.greeted => self.handle_message(message, descriptors),
+            Ok(message) => self.handle_first(message, descriptors),
             Err(rejection) => self.handle_rejection(&rejection),
         }
     }
 
     /// Before `hello`: only a `hello` request is accepted.
-    fn handle_first(&mut self, message: Message) -> Step {
+    fn handle_first(&mut self, message: Message, descriptors: &Passed) -> Step {
         match message {
             Message::Request(request) if request.method.as_str() == HELLO => {
-                match self.call(&request) {
+                // A `hello` with descriptors is refused by the dispatcher (`-32602`), which fails the handshake.
+                match self.call(&request, descriptors) {
                     // `hello` returns no raw bytes, so only the result is sent.
                     Ok(answer) => {
                         self.greeted = true;
@@ -178,16 +203,17 @@ impl Session<'_> {
         }
     }
 
-    /// After `hello`: requests are dispatched; client notifications and responses are ignored.
-    fn handle_message(&mut self, message: Message) -> Step {
+    /// After `hello`: requests are dispatched; client notifications and responses are ignored (and any descriptors
+    /// they carried are closed).
+    fn handle_message(&mut self, message: Message, descriptors: &Passed) -> Step {
         match message {
-            Message::Request(request) => self.dispatch(request),
+            Message::Request(request) => self.dispatch(request, descriptors),
             Message::Notification(_) | Message::Success(_) | Message::Error(_) => Step::NOTHING,
         }
     }
 
-    fn dispatch(&mut self, request: Request) -> Step {
-        match self.call(&request) {
+    fn dispatch(&mut self, request: Request, descriptors: &Passed) -> Step {
+        match self.call(&request, descriptors) {
             Ok(Answer { result, bytes }) => {
                 // A repeated `hello` echoes its own `binary_frames` choice, so the connection must follow it too;
                 // otherwise the client would be told one transport and sent the other.
@@ -226,7 +252,7 @@ impl Session<'_> {
             .unwrap_or_default();
     }
 
-    fn call(&self, request: &Request) -> Reply {
+    fn call(&self, request: &Request, descriptors: &Passed) -> Reply {
         self.dispatcher.call(&Call {
             endpoint: self.endpoint,
             bytes: self.bytes,
@@ -234,6 +260,7 @@ impl Session<'_> {
             request,
             subscriber: self.subscriber,
             binding: self.binding,
+            descriptors,
         })
     }
 
@@ -268,6 +295,29 @@ fn failure(id: Option<RequestId>, error: RpcError) -> Message {
     Message::Error(ErrorResponse { id, error })
 }
 
+/// [`serve_with_descriptors`] over a transport that carries no descriptors (an in-memory buffer in tests).
+#[cfg(test)]
+pub(crate) fn serve<R: Read, W: Write + Send>(
+    reader: R,
+    writer: W,
+    endpoint: Endpoint,
+    peer: Option<AuditToken>,
+    dispatcher: &Dispatcher,
+    on_greeted: &mut dyn FnMut(),
+    shutdown: &(dyn Fn() + Sync),
+) -> Closed {
+    serve_with_descriptors(
+        reader,
+        &NoDescriptors,
+        writer,
+        endpoint,
+        peer,
+        dispatcher,
+        on_greeted,
+        shutdown,
+    )
+}
+
 /// Serves one connection until it ends, and says why it ended.
 ///
 /// `peer` is the peer's audit token on `agent.sock` (or `None` on `user.sock`, or when the kernel could not report
@@ -276,8 +326,13 @@ fn failure(id: Option<RequestId>, error: RpcError) -> Message {
 /// `on_greeted` runs once, right after `hello` succeeds and before its answer is written; the server uses it to lift
 /// the handshake read timeout. `shutdown` closes the underlying connection in both directions: the pump calls it when
 /// a notification cannot be written, so that the reading thread, blocked in a read, ends too.
-pub(crate) fn serve<R: Read, W: Write + Send>(
+///
+/// `inbox` holds the descriptors received with the bytes `reader` returned: those collected while a frame is read go
+/// to that frame's call (module documentation, "Descriptors").
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn serve_with_descriptors<R: Read, W: Write + Send>(
     reader: R,
+    inbox: &dyn Inbox,
     writer: W,
     endpoint: Endpoint,
     peer: Option<AuditToken>,
@@ -302,7 +357,10 @@ pub(crate) fn serve<R: Read, W: Write + Send>(
     thread::scope(|scope| {
         let mut pump = None;
         let closed = loop {
-            let payload = match reader.read_frame() {
+            let frame = reader.read_frame();
+            // Whatever arrived while this frame was read belongs to it; on any other outcome it is closed here.
+            let descriptors = Passed::new(inbox.take());
+            let payload = match frame {
                 Ok(Some(Frame::Json(payload))) => payload,
                 Ok(None) => break Closed::Peer,
                 // No method opens a binary stream yet, so the reader refuses every chunk as an unknown stream before
@@ -316,7 +374,9 @@ pub(crate) fn serve<R: Read, W: Write + Send>(
             // subscription's events never precede the answer that names it, and none follow its unsubscribe.
             let mut out = lock(&writer);
             let was_greeted = session.greeted;
-            let step = session.handle(&payload);
+            let step = session.handle(&payload, &descriptors);
+            // Closed before the answer is written: by then the call has taken what it needed.
+            drop(descriptors);
             // Free the payload (up to 1 MB) before a handler's answer is written, so a connection holds one at a time.
             drop(payload);
             if session.greeted && !was_greeted {
