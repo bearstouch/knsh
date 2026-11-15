@@ -357,6 +357,10 @@ pub(crate) mod tests {
             self.scripted.wait(group)
         }
 
+        fn exited(&self, group: ProcessGroupId) -> Result<bool, PlatformError> {
+            self.scripted.exited(group)
+        }
+
         fn try_wait(&self, group: ProcessGroupId) -> Result<Option<ExitStatus>, PlatformError> {
             self.scripted.try_wait(group)
         }

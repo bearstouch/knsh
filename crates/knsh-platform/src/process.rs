@@ -7,18 +7,75 @@
 //! "Concurrency").
 
 use std::ffi::OsString;
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::error::PlatformError;
 
-/// What a child's standard input, output and error are connected to. Pipes arrive with the supervisor stories.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// An open descriptor a spawn request hands to the child, shared so the request stays cheap to clone.
+///
+/// Two values are equal when they hold the same descriptor number; the descriptor is closed when the last clone is
+/// dropped. The child receives its own copy, so dropping this after [`Processes::spawn`] returns never affects it.
+#[derive(Clone)]
+pub struct SharedFd(Arc<OwnedFd>);
+
+impl SharedFd {
+    /// Shares `fd`.
+    #[must_use]
+    pub fn new(fd: OwnedFd) -> Self {
+        Self(Arc::new(fd))
+    }
+
+    /// A new descriptor for the same open file (`dup`, close-on-exec), owned by the caller.
+    ///
+    /// # Errors
+    ///
+    /// The `dup` failed (`EMFILE`).
+    pub fn try_clone_owned(&self) -> std::io::Result<OwnedFd> {
+        self.0.try_clone()
+    }
+}
+
+impl AsRawFd for SharedFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+impl fmt::Debug for SharedFd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SharedFd({})", self.as_raw_fd())
+    }
+}
+
+impl PartialEq for SharedFd {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_raw_fd() == other.as_raw_fd()
+    }
+}
+
+impl Eq for SharedFd {}
+
+impl Hash for SharedFd {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_raw_fd().hash(state);
+    }
+}
+
+/// What a child's standard input, output and error are connected to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum Stdio {
     /// `/dev/null` for all three. The default: nothing leaks to or from the engine's own descriptors.
     #[default]
     Null,
-    /// The caller's own descriptors.
+    /// The engine's own descriptors.
     Inherit,
+    /// These three descriptors, in order, as the child's 0, 1 and 2: for example a caller's stdio received over a
+    /// socket (KNSH-051).
+    Passed(Box<[SharedFd; 3]>),
 }
 
 /// A request to start one program.
@@ -34,6 +91,10 @@ pub struct SpawnRequest {
     pub cwd: Option<PathBuf>,
     /// Standard descriptors.
     pub stdio: Stdio,
+    /// Descriptors above stdio the child keeps open under their own numbers (their `FD_CLOEXEC` is cleared in the
+    /// child only), for example a status pipe whose number the child is told in an argument. Everything else the
+    /// engine has open stays close-on-exec and never reaches the child.
+    pub inherit: Vec<SharedFd>,
 }
 
 impl SpawnRequest {
@@ -47,6 +108,7 @@ impl SpawnRequest {
             env: Vec::new(),
             cwd: None,
             stdio: Stdio::Null,
+            inherit: Vec::new(),
         }
     }
 
@@ -157,6 +219,17 @@ pub trait Processes: Send + Sync {
     /// [`PlatformError::UnknownProcessGroup`] for a group this instance does not hold, including one another
     /// thread reaped first; [`PlatformError::Os`] with [`Operation::Wait`](crate::Operation::Wait).
     fn wait(&self, group: ProcessGroupId) -> Result<ExitStatus, PlatformError>;
+
+    /// Whether the group leader has exited, without reaping it: the group stays held, so it can still be signalled
+    /// (for example to stop members that outlive the leader) before [`Processes::wait`] reaps it. Never blocks.
+    ///
+    /// On macOS, signalling a group whose only member left is the unreaped leader fails with `EPERM`
+    /// ([`PlatformError::Os`]): nothing is left to stop, so a caller stopping stragglers may ignore that error.
+    ///
+    /// # Errors
+    ///
+    /// As [`Processes::wait`].
+    fn exited(&self, group: ProcessGroupId) -> Result<bool, PlatformError>;
 
     /// Like [`Processes::wait`] but returns `Ok(None)` at once if the leader is still running.
     ///

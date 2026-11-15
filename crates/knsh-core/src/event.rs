@@ -125,6 +125,29 @@ pub enum EventData {
         /// Why, in words, when the engine has a reason.
         reason: Option<Redacted<String>>,
     },
+    /// `command.started`: an allowed line was spawned through `knsh-exec` (FR-LC-17, KNSH-051).
+    CommandStarted {
+        /// The record the line is written to when it ends.
+        record_id: RecordId,
+        /// The line that runs (after any rewrite), redacted.
+        command: Redacted<String>,
+        /// The working directory it runs in.
+        cwd: CanonicalPath,
+        /// When it was spawned.
+        started_at: Timestamp,
+    },
+    /// `command.long_running`: a line is still running after the long-running threshold, 30 s by default
+    /// (FR-LC-17, KNSH-051). Published at most once per line.
+    CommandLongRunning {
+        /// The line's record.
+        record_id: RecordId,
+        /// The line, redacted.
+        command: Redacted<String>,
+        /// The working directory it runs in.
+        cwd: CanonicalPath,
+        /// When it was spawned.
+        started_at: Timestamp,
+    },
     /// `decision.cancelled`: a pending decision ended without an answer (FR-LC-41, FR-AUTH-22, FR-AUTH-23).
     DecisionCancelled {
         /// The pending request, when the line had reached the ask step; `None` if it was still in its hooks.
@@ -169,6 +192,8 @@ impl EventData {
             Self::CommandProposed { .. } => "command.proposed",
             Self::CommandDenied { .. } => "command.denied",
             Self::DecisionCancelled { .. } => "decision.cancelled",
+            Self::CommandStarted { .. } => "command.started",
+            Self::CommandLongRunning { .. } => "command.long_running",
         }
     }
 

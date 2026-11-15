@@ -290,3 +290,65 @@ fn capability_probe_line_observes_the_denial() {
     ));
     assert_eq!(lost.status.code(), Some(1), "{lost:?}");
 }
+
+/// Runs `command` with the write end of a fresh pipe at descriptor 30 and `--status-fd 30`, and returns its output
+/// and every byte the trampoline reported there.
+fn with_status(mut command: Command) -> (Output, Vec<u8>) {
+    use std::io::Read;
+
+    let (mut reader, writer) = std::io::pipe().unwrap();
+    let writer_fd = writer.as_raw_fd();
+    command.args(["--status-fd", "30"]);
+    // SAFETY: runs in the forked child before exec; `dup2` is async-signal-safe and allocates nothing. The copy at
+    // 30 has `FD_CLOEXEC` cleared, as `knshd` leaves its status descriptor.
+    unsafe {
+        command.pre_exec(move || {
+            if dup2(writer_fd, 30) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = run(&mut command);
+    // The parent's write end, closed so the read ends once every child copy is gone.
+    drop(command);
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    (output, bytes)
+}
+
+// KNSH-051: a trampoline failure is written to the status descriptor; once `sandbox-exec` has started, the
+// descriptor is closed with nothing written, even when the line exits with a trampoline code. That is how the
+// supervisor tells "the profile was not applied" from a line that exits 66 itself.
+#[test]
+fn reports_failures_on_the_status_descriptor_only() {
+    let scratch = Scratch::new("status");
+    let missing = scratch.0.join("missing.sb");
+    let (output, status) = with_status(trampoline(&missing, "true", &[]));
+    assert_eq!(output.status.code(), Some(PROFILE));
+    assert_eq!(status, [66]);
+
+    let (output, status) = with_status(trampoline(&allow_all(&scratch), "exit 66", &[]));
+    assert_eq!(output.status.code(), Some(PROFILE), "the line's own exit");
+    assert!(status.is_empty(), "{status:?}");
+
+    // The status descriptor never reaches the line.
+    let (output, _) = with_status(trampoline(
+        &allow_all(&scratch),
+        "if [ -e /dev/fd/30 ]; then echo open; else echo closed; fi",
+        &[],
+    ));
+    assert_eq!(stdout(&output), "closed\n");
+}
+
+// KNSH-051: operands follow the line as `$0`, `$1`, … (`bash -c 'line' name arg…`), unchanged.
+#[test]
+fn passes_operands_after_the_line() {
+    let scratch = Scratch::new("operands");
+    let mut command = trampoline(&allow_all(&scratch), r#"printf '%s|' "$0" "$1" "$2""#, &[]);
+    command.args(["--arg", "name", "--arg", "two words", "--arg", "-x"]);
+    let output = run(&mut command);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(stdout(&output), "name|two words|-x|");
+}

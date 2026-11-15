@@ -110,13 +110,31 @@ impl Authority for FakeAuthority {
     }
 }
 
-/// A spawner that records each plan and answers exit code 0.
+/// A spawner that records each plan and ends every line with a set outcome.
 pub(super) struct FakeSpawner {
     pub(super) journal: Arc<Journal>,
+    /// How each spawn ends; it publishes `command.started` unless the line never started.
+    pub(super) outcome: Result<Ran, SpawnFailure>,
+    /// Whether it also reports a long run.
+    pub(super) long_running: bool,
+}
+
+impl FakeSpawner {
+    /// A spawner whose lines exit 0.
+    pub(super) fn new(journal: Arc<Journal>) -> Self {
+        Self {
+            journal,
+            outcome: Ok(Ran {
+                status: LineStatus::Exited(0),
+                timed_out: false,
+            }),
+            long_running: false,
+        }
+    }
 }
 
 impl Spawner for FakeSpawner {
-    fn spawn(&self, plan: SpawnPlan) -> Result<LineStatus, RpcError> {
+    fn spawn(&self, plan: SpawnPlan, events: &dyn LineEvents) -> SpawnReport {
         self.journal.push(format!(
             "spawn {} as {}",
             plan.allowed.executed,
@@ -124,7 +142,19 @@ impl Spawner for FakeSpawner {
         ));
         // The line's sandbox rules are tagged with the record it is written to (FR-SBX-06).
         self.journal.push(format!("record {}", plan.record_id));
-        Ok(LineStatus::Exited(0))
+        if !matches!(
+            self.outcome,
+            Err(SpawnFailure::ProfileFile | SpawnFailure::Trampoline(_))
+        ) {
+            events.started();
+            if self.long_running {
+                events.long_running();
+            }
+        }
+        SpawnReport {
+            sandbox_profile: Some(format!("{}@0123456789abcdef", plan.profile.name)),
+            outcome: self.outcome,
+        }
     }
 }
 
@@ -160,6 +190,8 @@ struct Setup {
     profiles: Option<Vec<(&'static str, &'static str)>>,
     /// The hooks count the `command.proposed` events delivered so far (and so take them off the subscriber).
     hooks_observe: bool,
+    /// The spawner; one whose lines exit 0 by default.
+    spawner: Option<FakeSpawner>,
 }
 
 impl Daemon {
@@ -215,9 +247,11 @@ impl Daemon {
             approvals: Arc::new(DenyAtTimeout {
                 timeout: setup.approvals_timeout.unwrap_or(Duration::from_millis(50)),
             }),
-            spawner: Arc::new(FakeSpawner {
-                journal: Arc::clone(&self.journal),
-            }),
+            spawner: Arc::new(
+                setup
+                    .spawner
+                    .unwrap_or_else(|| FakeSpawner::new(Arc::clone(&self.journal))),
+            ),
         })
     }
 
@@ -355,7 +389,7 @@ fn emits_command_proposed_before_hooks() {
         daemon.journal.entries()
     );
     // The hook took the proposed event off the subscriber; the rest of the line's events follow it.
-    assert_eq!(names(&daemon.events()), ["command.finished"]);
+    assert_eq!(names(&daemon.events()), ["command.started", "command.finished"]);
 }
 
 // FR-LC-32, FR-REC-03, FR-LC-31: a denial is recorded with its decision and without output, `command.denied` names
@@ -467,7 +501,12 @@ fn reevaluates_rewritten_line_once() {
     assert_eq!(record.details.decision.unwrap().verdict, DecisionVerdict::Rewrite);
     assert_eq!(
         names(&daemon.events()),
-        ["command.proposed", "command.proposed", "command.finished"]
+        [
+            "command.proposed",
+            "command.proposed",
+            "command.started",
+            "command.finished"
+        ]
     );
 
     let lifecycle = daemon.lifecycle(Setup {
@@ -641,12 +680,122 @@ fn runs_with_no_hooks_and_no_authority() {
         hooks: Arc::new(NoHooks),
         authority: Arc::new(NoAuthority),
         approvals: Arc::new(DenyAtTimeout::default()),
-        spawner: Arc::new(FakeSpawner {
-            journal: Arc::clone(&daemon.journal),
-        }),
+        spawner: Arc::new(FakeSpawner::new(Arc::clone(&daemon.journal))),
     });
     // `echo` is a builtin and stays as written; `ls` runs by its absolute path.
     lifecycle.run(daemon.line("echo hi; ls"), &StillWaiting).unwrap();
     assert_eq!(daemon.spawns(), ["spawn echo hi; /bin/ls as bash"]);
     assert_eq!(DenyAtTimeout::default().timeout, DEFAULT_ASK_TIMEOUT);
+}
+
+/// A daemon whose spawner ends every line with `outcome`, reporting a long run when `long_running`.
+fn spawning(daemon: &Daemon, outcome: Result<Ran, SpawnFailure>, long_running: bool) -> Arc<Lifecycle> {
+    daemon.lifecycle(Setup {
+        spawner: Some(FakeSpawner {
+            journal: Arc::clone(&daemon.journal),
+            outcome,
+            long_running,
+        }),
+        ..Setup::default()
+    })
+}
+
+// FR-LC-40: a line killed at its timeout is answered -32008 carrying its `record_id`; the record holds the signal
+// that ended it and no exit code, and `command.finished` follows `command.started`.
+#[test]
+fn kills_process_group_on_timeout_with_32008() {
+    let daemon = Daemon::new();
+    daemon.events();
+    let killed = Ran {
+        status: LineStatus::Signalled(9),
+        timed_out: true,
+    };
+    let error = spawning(&daemon, Ok(killed), false)
+        .run(daemon.line("ls"), &StillWaiting)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::LineTimedOut);
+    let record_id = data_field(&error, "record_id").unwrap();
+    let [record] = <[ExecutionRecord; 1]>::try_from(daemon.records()).unwrap();
+    assert_eq!(record_id.as_str(), Some(record.record_id.to_string().as_str()));
+    assert_eq!(record.details.signal.as_deref(), Some("SIGKILL"));
+    assert_eq!(record.exit_code, None);
+    assert_eq!(record.details.sandbox_profile.as_deref(), Some("web@0123456789abcdef"));
+    assert_eq!(
+        names(&daemon.events()),
+        ["command.proposed", "command.started", "command.finished"]
+    );
+
+    // A line that trapped SIGTERM and exited by itself after its timeout: still -32008, and the record names the
+    // signal it was sent beside its exit code.
+    let daemon = Daemon::new();
+    let trapped = Ran {
+        status: LineStatus::Exited(0),
+        timed_out: true,
+    };
+    let error = spawning(&daemon, Ok(trapped), false)
+        .run(daemon.line("ls"), &StillWaiting)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::LineTimedOut);
+    let [record] = <[ExecutionRecord; 1]>::try_from(daemon.records()).unwrap();
+    assert_eq!(record.details.signal.as_deref(), Some("SIGTERM"));
+    assert_eq!(record.exit_code, Some(0));
+}
+
+// FR-LC-17: `command.started` and `command.long_running` name the line's record, its redacted line and start.
+#[test]
+fn publishes_started_and_long_running_for_the_record() {
+    let daemon = Daemon::new();
+    daemon.events();
+    let exited = Ran {
+        status: LineStatus::Exited(0),
+        timed_out: false,
+    };
+    let finished = spawning(&daemon, Ok(exited), true)
+        .run(daemon.line("ls"), &StillWaiting)
+        .unwrap();
+    let events = daemon.events();
+    assert_eq!(
+        names(&events),
+        [
+            "command.proposed",
+            "command.started",
+            "command.long_running",
+            "command.finished"
+        ]
+    );
+    for event in &events[1..3] {
+        match &event.data {
+            EventData::CommandStarted { record_id, command, .. }
+            | EventData::CommandLongRunning { record_id, command, .. } => {
+                assert_eq!(Some(*record_id), finished.record_id);
+                assert_eq!(command.expose(), "ls");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+// NFR-REL-08: a line whose profile `knsh-exec` could not apply did not run: answered -32603, never with an exit
+// code, and recorded with neither exit code nor signal.
+#[test]
+fn refuses_to_run_when_profile_application_fails() {
+    let daemon = Daemon::new();
+    daemon.events();
+    let error = spawning(&daemon, Err(SpawnFailure::Trampoline(66)), false)
+        .run(daemon.line("ls"), &StillWaiting)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InternalError);
+    let [record] = <[ExecutionRecord; 1]>::try_from(daemon.records()).unwrap();
+    assert_eq!(record.exit_code, None);
+    assert_eq!(record.details.signal, None);
+    assert_eq!(names(&daemon.events()), ["command.proposed", "command.finished"]);
+}
+
+#[test]
+fn signal_names_follow_macos() {
+    assert_eq!(signal_name(9), "SIGKILL");
+    assert_eq!(signal_name(15), "SIGTERM");
+    assert_eq!(signal_name(31), "SIGUSR2");
+    assert_eq!(signal_name(64), "SIG64");
+    assert_eq!(signal_name(0), "SIG0");
 }

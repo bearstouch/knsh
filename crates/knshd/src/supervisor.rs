@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 use knsh_core::{
     Actor, Allowed, AskAnswer, AskReply, AskRequest, Authority, BinaryLookup, Caller, CancelReason, CanonicalPath,
     Decision, DecisionSource, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR, LineInput, LocalApprovals,
-    Observer, Outcome, Profile, ProfileName, Proposal, RecordDetails, RecordId, Refusal, RefusalKind, RequestId,
-    SessionId, Timestamp, Ulid, decide, redact,
+    Observer, Outcome, Profile, ProfileName, Proposal, RecordDetails, RecordId, Redacted, Refusal, RefusalKind,
+    RequestId, SessionId, Timestamp, Ulid, decide, redact,
 };
 use knsh_json::{Object, ToJson, Value};
 use knsh_platform::{Clock, Random};
@@ -62,15 +62,19 @@ const NO_CLOCK: &str = "the supervisor could not read its clock or random source
 /// Reason for a line allowed by the pipeline whose caller left before it could be spawned (FR-LC-41).
 const GONE_BEFORE_SPAWN: &str = "the caller disconnected before the line started, so it was cancelled";
 
-/// Lifecycle steps 9 and 10: starting an allowed line through `knsh-exec` and waiting for it (KNSH-051).
+/// Lifecycle steps 9 and 10: starting an allowed line through `knsh-exec` and waiting for it (KNSH-051,
+/// [`crate::spawn::TrampolineSpawner`]).
 pub(crate) trait Spawner: Send + Sync {
-    /// Runs `plan` and waits for it to end.
-    ///
-    /// # Errors
-    ///
-    /// The answer for a line that did not run to its end: `-32008` when killed at its timeout, `-32603` when it could
-    /// not be started (the line did not run).
-    fn spawn(&self, plan: SpawnPlan) -> Result<LineStatus, RpcError>;
+    /// Runs `plan`, reports its start and a long run through `events`, and waits for it to end.
+    fn spawn(&self, plan: SpawnPlan, events: &dyn LineEvents) -> SpawnReport;
+}
+
+/// What a [`Spawner`] reports while a line runs (FR-LC-17). Best effort: an event never decides anything.
+pub(crate) trait LineEvents {
+    /// The line was spawned: `command.started`.
+    fn started(&self);
+    /// The line is still running after the long-running threshold: `command.long_running`, at most once.
+    fn long_running(&self);
 }
 
 /// An allowed line, ready to spawn: what was received with it and what the decision made of it.
@@ -80,8 +84,55 @@ pub(crate) struct SpawnPlan {
     pub(crate) record_id: RecordId,
     /// The line as received: interpreter, operands, environment, descriptors, timeout.
     pub(crate) line: ForwardedLine,
-    /// The decision: the re-serialised line to run and its profile.
+    /// The decision: the re-serialised line to run, what it resolved to and its profile.
     pub(crate) allowed: Allowed,
+    /// The session's profile, as loaded for the decision: the baseline the line's sandbox profile is compiled
+    /// from, and its bash (FR-LC-12, FR-LC-14).
+    pub(crate) profile: Profile,
+}
+
+/// How a spawn went.
+#[derive(Debug)]
+pub(crate) struct SpawnReport {
+    /// The record's `sandbox_profile`, once the line's profile was written (FR-SBX-07).
+    pub(crate) sandbox_profile: Option<String>,
+    /// How the line ended, or why it did not run to its end.
+    pub(crate) outcome: Result<Ran, SpawnFailure>,
+}
+
+/// A line that ran and was reaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Ran {
+    /// Its exit code or the signal that ended it.
+    pub(crate) status: LineStatus,
+    /// Whether it was killed at its `timeout_s` (FR-LC-40): answered `-32008`.
+    pub(crate) timed_out: bool,
+}
+
+/// Why a line did not run to its end. Each is answered `-32603`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnFailure {
+    /// Its compiled profile could not be written and checked: nothing was started.
+    ProfileFile,
+    /// `knsh-exec` could not be started.
+    Start(knsh_platform::PlatformError),
+    /// `knsh-exec` started but failed with this exit code before `sandbox-exec` ran: the profile was never applied
+    /// and the line never ran (NFR-REL-08).
+    Trampoline(u8),
+    /// The line could not be watched or reaped; it was killed.
+    Wait(knsh_platform::PlatformError),
+}
+
+impl SpawnFailure {
+    /// A fixed name for logs.
+    pub(crate) const fn kind(self) -> &'static str {
+        match self {
+            Self::ProfileFile => "profile_file",
+            Self::Start(_) => "start",
+            Self::Trampoline(_) => "profile_not_applied",
+            Self::Wait(_) => "wait",
+        }
+    }
 }
 
 /// Standalone handling when no authority is connected and local approvals are not available yet (KNSH-066 adds
@@ -147,6 +198,44 @@ pub(crate) struct Parts {
     pub(crate) spawner: Arc<dyn Spawner>,
 }
 
+/// `command.started` and `command.long_running` for one line, from the [`Spawner`] (FR-LC-17).
+struct RunningEvents<'a> {
+    events: &'a EventHub,
+    session_id: SessionId,
+    actor: &'a Actor,
+    record_id: RecordId,
+    command: Redacted<String>,
+    cwd: &'a CanonicalPath,
+    started_at: Timestamp,
+}
+
+impl RunningEvents<'_> {
+    /// Best effort (FR-EVT-04): an event that cannot be published never changes how the line runs.
+    fn publish(&self, data: EventData) {
+        let _ = self.events.publish(self.session_id, self.actor, data);
+    }
+}
+
+impl LineEvents for RunningEvents<'_> {
+    fn started(&self) {
+        self.publish(EventData::CommandStarted {
+            record_id: self.record_id,
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            started_at: self.started_at,
+        });
+    }
+
+    fn long_running(&self) {
+        self.publish(EventData::CommandLongRunning {
+            record_id: self.record_id,
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            started_at: self.started_at,
+        });
+    }
+}
+
 /// The orchestrator: the [`Supervisor`] behind `exec.run`.
 pub(crate) struct Lifecycle {
     parts: Parts,
@@ -158,6 +247,8 @@ struct Ready {
     record_id: RecordId,
     actor: Actor,
     allowed: Box<Allowed>,
+    /// The session's profile the line was decided with, for its sandbox profile.
+    profile: Box<Profile>,
     latency_ms: u64,
     /// When the line was received: the record's start if the clock cannot be read at the spawn.
     received_at: Timestamp,
@@ -227,6 +318,7 @@ impl Lifecycle {
                     record_id,
                     actor,
                     allowed,
+                    profile: Box::new(profile),
                     latency_ms,
                     received_at,
                 });
@@ -350,8 +442,9 @@ impl Lifecycle {
             .is_some_and(|store| store.write_record(record, RecordedOutput::default()).is_ok())
     }
 
-    /// Step 11 for a line that was spawned (FR-LC-19): its record, then `command.finished`. Returns whether the
-    /// record was written. The full record (argv, output, signal, file changes) is KNSH-052's.
+    /// Step 11 for a line handed to the spawner (FR-LC-19): its record, then `command.finished`. Returns whether the
+    /// record was written. A line that did not run to its end is recorded too, with neither exit code nor signal
+    /// (NFR-REL-08). The full record (argv, output, file changes) is KNSH-052's.
     #[allow(clippy::too_many_arguments)]
     fn finished(
         &self,
@@ -362,12 +455,23 @@ impl Lifecycle {
         started_at: Timestamp,
         allowed: &Allowed,
         latency_ms: u64,
-        status: Option<LineStatus>,
+        report: &SpawnReport,
     ) -> bool {
         let ended_at = self.parts.clock.now().unwrap_or(started_at);
-        let exit_code = match status {
-            Some(LineStatus::Exited(code)) => Some(i32::from(code)),
-            Some(LineStatus::Signalled(_)) | None => None,
+        let ran = report.outcome.as_ref().ok();
+        let (exit_code, signal) = match ran {
+            // FR-LC-40: a timed-out line always got `SIGTERM` first; one that then exited by itself (it trapped the
+            // signal) records that signal beside its exit code. Had `SIGKILL` ended it, it would be `Signalled`.
+            Some(Ran {
+                status: LineStatus::Exited(code),
+                timed_out,
+            }) => (Some(i32::from(*code)), timed_out.then(|| signal_name(15))),
+            // A line ended by a signal (at its timeout or not) records that signal.
+            Some(Ran {
+                status: LineStatus::Signalled(number),
+                ..
+            }) => (None, Some(signal_name(*number))),
+            None => (None, None),
         };
         let command = redact(&allowed.command);
         let record = ExecutionRecord {
@@ -382,6 +486,8 @@ impl Lifecycle {
             details: RecordDetails {
                 rewritten_from: allowed.rewritten_from.as_deref().map(redact),
                 decision: Some(allowed.decision.to_record(latency_ms)),
+                signal,
+                sandbox_profile: report.sandbox_profile.clone(),
                 ..RecordDetails::default()
             },
         };
@@ -408,6 +514,7 @@ impl Supervisor for Lifecycle {
             record_id,
             actor,
             allowed,
+            profile,
             latency_ms,
             received_at,
         } = panic::catch_unwind(AssertUnwindSafe(|| self.prepare(&line, caller)))
@@ -416,21 +523,36 @@ impl Supervisor for Lifecycle {
         let cwd = line.proposal.cwd.clone();
         // Never a 1970 start, which retention would expire at once.
         let started_at = self.parts.clock.now().unwrap_or(received_at);
+        let events = RunningEvents {
+            events: &self.parts.events,
+            session_id,
+            actor: &actor,
+            record_id,
+            command: redact(&allowed.command),
+            cwd: &cwd,
+            started_at,
+        };
         let plan = SpawnPlan {
             record_id,
             line,
             allowed: (*allowed).clone(),
+            profile: *profile,
         };
-        let spawned = self.parts.spawner.spawn(plan);
-        let status = spawned.as_ref().ok().copied();
+        let report = self.parts.spawner.spawn(plan, &events);
         let written = self.finished(
-            session_id, &actor, record_id, &cwd, started_at, &allowed, latency_ms, status,
+            session_id, &actor, record_id, &cwd, started_at, &allowed, latency_ms, &report,
         );
-        let status = spawned?;
-        Ok(Finished {
-            record_id: written.then_some(record_id),
-            status,
-        })
+        let record_id = written.then_some(record_id);
+        match report.outcome {
+            Ok(Ran {
+                timed_out: false,
+                status,
+            }) => Ok(Finished { record_id, status }),
+            // FR-LC-40: killed at its timeout, `-32008` with the record (or `null` if it could not be written).
+            Ok(Ran { timed_out: true, .. }) => Err(record_error(ErrorCode::LineTimedOut, record_id)),
+            // The line did not run to its end; its record says so (no exit code, no signal).
+            Err(_) => Err(RpcError::new(ErrorCode::InternalError)),
+        }
     }
 }
 
@@ -484,6 +606,59 @@ fn denial(rule_id: Option<String>, reason: Option<String>, source: DecisionSourc
     }
     .to_error()
     .unwrap_or_else(|_| RpcError::new(ErrorCode::Denied))
+}
+
+/// `code` with `data.record_id` (`-32008`), `null` when the record could not be written.
+fn record_error(code: ErrorCode, record_id: Option<RecordId>) -> RpcError {
+    let data = record_id
+        .map(|id| id.to_string())
+        .to_json()
+        .and_then(|id| Object::new().with("record_id", id));
+    match data {
+        Ok(data) => RpcError::new(code).with_data(Value::Object(data)),
+        Err(_) => RpcError::new(code),
+    }
+}
+
+/// The record's `signal` for signal `number`: its macOS name, such as `SIGKILL`, or `SIG<number>` for one without.
+pub(crate) fn signal_name(number: u8) -> String {
+    const NAMES: [&str; 31] = [
+        "SIGHUP",
+        "SIGINT",
+        "SIGQUIT",
+        "SIGILL",
+        "SIGTRAP",
+        "SIGABRT",
+        "SIGEMT",
+        "SIGFPE",
+        "SIGKILL",
+        "SIGBUS",
+        "SIGSEGV",
+        "SIGSYS",
+        "SIGPIPE",
+        "SIGALRM",
+        "SIGTERM",
+        "SIGURG",
+        "SIGSTOP",
+        "SIGTSTP",
+        "SIGCONT",
+        "SIGCHLD",
+        "SIGTTIN",
+        "SIGTTOU",
+        "SIGIO",
+        "SIGXCPU",
+        "SIGXFSZ",
+        "SIGVTALRM",
+        "SIGPROF",
+        "SIGWINCH",
+        "SIGINFO",
+        "SIGUSR1",
+        "SIGUSR2",
+    ];
+    usize::from(number)
+        .checked_sub(1)
+        .and_then(|index| NAMES.get(index))
+        .map_or_else(|| format!("SIG{number}"), |name| (*name).to_owned())
 }
 
 /// `code` with `data.request_id` (`-32002`, `-32011`), `null` when no request had been made.

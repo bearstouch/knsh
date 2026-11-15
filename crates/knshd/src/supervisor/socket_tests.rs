@@ -106,9 +106,7 @@ impl Running {
             }),
             authority: authority.clone(),
             approvals: Arc::new(DenyAtTimeout { timeout: ask_timeout }),
-            spawner: Arc::new(FakeSpawner {
-                journal: Arc::clone(&journal),
-            }),
+            spawner: Arc::new(FakeSpawner::new(Arc::clone(&journal))),
         });
         let shims = knsh_platform::EnginePaths::for_home(std::path::Path::new(HOME))
             .unwrap()
@@ -294,10 +292,13 @@ fn lines_through_agent_sock() {
     let server = Running::start("paths", Duration::from_millis(100));
     server.events();
 
-    // Allow: spawned as its absolute form; proposed, then finished; the record says the rule allowed it.
+    // Allow: spawned as its absolute form; proposed, started, then finished; the record says the rule allowed it.
     let answer = server.run("git status");
     let record = server.record(record_id_of(&answer));
-    assert_eq!(names(&server.events()), ["command.proposed", "command.finished"]);
+    assert_eq!(
+        names(&server.events()),
+        ["command.proposed", "command.started", "command.finished"]
+    );
     assert_eq!(text(&record.command), "git status");
     assert_eq!(record.exit_code, Some(0));
     let decision = record.details.decision.unwrap();
@@ -323,7 +324,10 @@ fn lines_through_agent_sock() {
     // Ask → allow: the authority's yes, named in the record.
     let answer = server.run("git push origin main");
     let record = server.record(record_id_of(&answer));
-    assert_eq!(names(&server.events()), ["command.proposed", "command.finished"]);
+    assert_eq!(
+        names(&server.events()),
+        ["command.proposed", "command.started", "command.finished"]
+    );
     let decision = record.details.decision.unwrap();
     assert_eq!(
         (
@@ -344,7 +348,12 @@ fn lines_through_agent_sock() {
     let events = server.events();
     assert_eq!(
         names(&events),
-        ["command.proposed", "command.proposed", "command.finished"]
+        [
+            "command.proposed",
+            "command.proposed",
+            "command.started",
+            "command.finished"
+        ]
     );
     assert!(matches!(
         &events[1].data,
