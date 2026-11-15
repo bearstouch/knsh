@@ -2,7 +2,7 @@
 //!
 //! `hello` settles the protocol, reports the platform and the probed capabilities, and lists the methods callable on
 //! the caller's endpoint. That list comes from [`Catalogue::available`] with the same capabilities the dispatch
-//! tables were generated from ([`phase1_dispatcher`]), so `hello` never lists a method the endpoint does not serve.
+//! tables were generated from ([`dispatcher_with_violations`]), so `hello` never lists a method the endpoint does not serve.
 //!
 //! - No protocol in common: `-32005` with `capability: "protocol"`; the connection loop then closes the connection.
 //! - Malformed parameters: `-32602`, which also closes the connection (a failed `hello`).
@@ -17,6 +17,7 @@ use knsh_proto::{Catalogue, ErrorCode, HelloParams, HelloResult, PROTOCOL_CAPABI
 
 use crate::dispatch::{BuildError, Call, Dispatcher, HELLO, Handler, Handlers, Reply, capability_unavailable};
 use crate::probe::Probed;
+use crate::violations::ReaderStatus;
 
 /// Phase 1 is advisory (`specs/01-overview/roadmap.md`): the label is in every `hello` until phase 2 qualifies.
 const ADVISORY: bool = true;
@@ -27,6 +28,8 @@ struct Handshake {
     catalogue: Catalogue,
     /// The probe result.
     probed: Probed,
+    /// The violation reader's state, the one capability read live (KNSH-047).
+    violations: Arc<ReaderStatus>,
     /// Whether this build is advisory only.
     advisory: bool,
 }
@@ -37,7 +40,12 @@ impl Handshake {
     fn answer(&self, call: &Call<'_>) -> Reply {
         let params: HelloParams = call.request.params().map_err(|error| RpcError::from(&error))?;
         let protocol = negotiate(&params.protocols).ok_or_else(|| capability_unavailable(PROTOCOL_CAPABILITY))?;
-        let capabilities = self.probed.capabilities.as_ref();
+        // The probed backends, with the violation reader's state as it is now: the reader can stop and restart
+        // while this process runs, and a failed reader must be visible (KNSH-047). No method depends on it, so the
+        // method list is the same either way.
+        let mut capabilities = self.probed.capabilities.as_ref().clone();
+        capabilities.sandbox_violations = self.violations.current();
+        let capabilities = &capabilities;
         let result = HelloResult {
             engine_version: env!("CARGO_PKG_VERSION"),
             protocol,
@@ -64,18 +72,29 @@ fn handler(handshake: Arc<Handshake>) -> Handler {
     Arc::new(move |call: &Call<'_>| handshake.answer(call))
 }
 
-/// The dispatcher `knshd` serves in phase 1: the engine catalogue, the probed capabilities, `hello`, and the
-/// `others` implemented elsewhere (`records.query` and `records.output`, KNSH-016).
+/// [`dispatcher_with_violations`] with no violation reader (always `none`), for tests.
+#[cfg(test)]
+pub(crate) fn phase1_dispatcher(probed: Probed, others: Handlers) -> Result<Dispatcher, BuildError> {
+    dispatcher_with_violations(probed, others, ReaderStatus::stopped())
+}
+
+/// The dispatcher `knshd` serves: the engine catalogue, the probed capabilities, `hello`, and the `others`
+/// implemented elsewhere, with `hello` reporting `violations` as `capabilities.sandbox_violations` (KNSH-047).
 ///
 /// # Errors
 ///
 /// [`BuildError`] if the catalogue and the handlers disagree (a programming error caught at start-up).
-pub(crate) fn phase1_dispatcher(probed: Probed, others: Handlers) -> Result<Dispatcher, BuildError> {
+pub(crate) fn dispatcher_with_violations(
+    probed: Probed,
+    others: Handlers,
+    violations: Arc<ReaderStatus>,
+) -> Result<Dispatcher, BuildError> {
     let catalogue = Catalogue::ENGINE;
     let capabilities = Arc::clone(&probed.capabilities);
     let handshake = Arc::new(Handshake {
         catalogue,
         probed,
+        violations,
         advisory: ADVISORY,
     });
     let mut handlers = others;
@@ -290,5 +309,30 @@ pub(crate) mod tests {
             capabilities(&result).get("sandbox").and_then(Value::as_str),
             Some("seatbelt")
         );
+    }
+
+    // KNSH-047: `sandbox_violations` is read at each `hello`, so a reader that stops (or never confirmed its stream)
+    // is reported as `none`, and the method list does not change with it.
+    #[test]
+    fn reports_the_violation_reader_live() {
+        let status = ReaderStatus::stopped();
+        let dispatcher =
+            dispatcher_with_violations(probe(&Machine::working().probes()), handlers(), Arc::clone(&status)).unwrap();
+        let reported = || {
+            let result = hello(&dispatcher, Endpoint::User, PARAMS).unwrap();
+            let value = capabilities(&result)
+                .get("sandbox_violations")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            (value, methods(&result).len())
+        };
+        let (before, methods_before) = reported();
+        assert_eq!(before.as_deref(), Some("none"));
+        status.set(true);
+        let (live, methods_live) = reported();
+        assert_eq!(live.as_deref(), Some("unified_log"));
+        assert_eq!(methods_live, methods_before);
+        status.set(false);
+        assert_eq!(reported().0.as_deref(), Some("none"));
     }
 }

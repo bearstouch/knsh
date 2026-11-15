@@ -13,9 +13,13 @@
 //!   credentials and `launchctl`, without touching the real launchd (KNSH-012).
 //! - [`FakeSystemProbe`]: OS version and file-event checks with set answers, counting calls (KNSH-014).
 //!
+//! - [`ScriptedDenialLog`]: sandbox denial entries written by the test, canaries echoed back, failing opens and
+//!   ended streams (KNSH-047); [`kernel_entry`] writes one entry as the kernel logs it.
+//!
 //! Locks in the fakes are independent (one per fake) and never held across calls into another fake.
 
 mod clock;
+mod denials;
 mod fs;
 mod launchd;
 mod log;
@@ -24,6 +28,7 @@ mod process;
 mod random;
 
 pub use clock::FakeClock;
+pub use denials::{ScriptedDenialLog, kernel_entry};
 pub use fs::{DEFAULT_UID, MemFs};
 pub use launchd::{FakeSocketActivation, FixedPeerCredentials, RecordingServiceManager, ServiceCall};
 pub use log::{Entry, RecordingLog};

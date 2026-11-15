@@ -276,6 +276,13 @@ impl ToJson for RecordEntry<'_> {
                 "checkpoint_id",
                 details.checkpoint_id.map(|id| id.to_string()).to_json()?,
             )?;
+            // Best effort (FR-SBX-08): what the violation reader attributed to this line, merged.
+            let violations = details
+                .sandbox_violations
+                .iter()
+                .map(ToJson::to_json)
+                .collect::<Result<Vec<_>, _>>()?;
+            object.insert("sandbox_violations", Value::Array(violations))?;
         }
         object.insert("stdout", self.stdout.as_ref().map(output_info).transpose()?.to_json()?)?;
         object.insert("stderr", self.stderr.as_ref().map(output_info).transpose()?.to_json()?)?;
@@ -549,6 +556,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains(r#""pipestatus":[0,1]"#), "{text}");
+        assert!(text.contains(r#""sandbox_violations":[]"#), "{text}");
         assert!(
             text.contains(r#""stdout":{"size":"10","original_size":"1152921504606846976","skipped":"1152921504606846966","skipped_at":"5"}"#),
             "{text}"

@@ -24,6 +24,8 @@ libfuzzer-sys = "=0.4.13"
 knsh-json = { path = "../crates/knsh-json" }
 knsh-toml = { path = "../crates/knsh-toml" }
 knsh-bash = { path = "../crates/knsh-bash" }
+knsh-core = { path = "../crates/knsh-core" }
+knsh-platform = { path = "../crates/knsh-platform" }
 
 [[bin]]
 name = "json_reader"
@@ -63,6 +65,13 @@ bench = false
 [[bin]]
 name = "bash_parse"
 path = "fuzz_targets/bash_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sandbox_log"
+path = "fuzz_targets/sandbox_log.rs"
 test = false
 doc = false
 bench = false

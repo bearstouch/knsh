@@ -39,6 +39,7 @@ use crate::path::CanonicalPath;
 use crate::redacted::Redacted;
 use crate::session::{Actor, ProfileName, Session, SessionState, StateChanged};
 use crate::time::Timestamp;
+use crate::violation::SandboxViolation;
 
 /// Events kept per session for `since_seq` resumes (FR-EVT-03), and the bound of each subscription's queue.
 pub const EVENT_BUFFER_LEN: usize = 10_000;
@@ -95,6 +96,9 @@ pub enum EventData {
         /// The new working directory.
         cwd: CanonicalPath,
     },
+    /// `sandbox.violation`: the system reported a sandbox denial attributed to the session by its tag, best effort
+    /// (FR-SBX-08, KNSH-047). Repeats within the merge window are one event with their count.
+    SandboxViolation(Box<SandboxViolation>),
 }
 
 impl EventData {
@@ -108,6 +112,7 @@ impl EventData {
             Self::SessionIdle => "session.idle",
             Self::CommandFinished { .. } => "command.finished",
             Self::CwdChanged { .. } => "cwd.changed",
+            Self::SandboxViolation(_) => "sandbox.violation",
         }
     }
 
@@ -353,6 +358,16 @@ impl EventBus {
             subscriptions: BTreeMap::new(),
             next_subscription: 1,
         }
+    }
+
+    /// The actor of `session_id` if the session has started and not ended: who its later events must name. Lets a
+    /// publisher that only knows the session (the sandbox violation reader, KNSH-047) publish for it.
+    #[must_use]
+    pub fn session_actor(&self, session_id: SessionId) -> Option<&Actor> {
+        self.buffers
+            .get(&session_id)
+            .filter(|buffer| !buffer.ended)
+            .map(|buffer| &buffer.actor)
     }
 
     /// Numbers `data` as the session's next event, buffers it and queues it for every subscription in scope.

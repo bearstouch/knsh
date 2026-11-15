@@ -29,7 +29,8 @@ const LAYOUT: &[(&str, &[&str])] = &[
     ("knsh-json", &[]),
     ("knsh-toml", &[]),
     ("knsh-proto", &["knsh-json", "knsh-core"]),
-    ("knsh-platform", &["knsh-core", "libc"]),
+    // knsh-json reads the sandbox violation reader's `log stream` entries (KNSH-047).
+    ("knsh-platform", &["knsh-core", "knsh-json", "libc"]),
     ("knsh-sandbox", &["knsh-core"]),
     ("knsh-proxy", &["knsh-core", "knsh-platform"]),
     ("knsh-store", &["knsh-core", "knsh-platform"]),

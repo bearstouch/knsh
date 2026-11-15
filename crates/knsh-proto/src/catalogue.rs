@@ -428,6 +428,7 @@ mod tests {
             file_events: FileEvents::None,
             secrets: Secrets::None,
             checkpoints: BTreeMap::new(),
+            sandbox_violations: crate::capability::SandboxViolations::None,
         }
     }
 

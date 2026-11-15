@@ -84,6 +84,8 @@ pub enum Operation {
     /// Changing what a signal does to this process (`sigaction`; ignoring job-control signals while a hosted shell
     /// runs, KNSH-019).
     SignalDisposition,
+    /// Starting or reading the stream of sandbox denials (`log stream`), or running its canary denial (KNSH-047).
+    SandboxLog,
 }
 
 impl Operation {
@@ -124,6 +126,7 @@ impl Operation {
             Self::Pipe => "create pipe",
             Self::DescriptorFlags => "set descriptor flags",
             Self::SignalDisposition => "set signal disposition",
+            Self::SandboxLog => "sandbox log",
         }
     }
 }

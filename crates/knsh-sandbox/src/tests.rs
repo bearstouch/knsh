@@ -446,6 +446,11 @@ fn every_deny_rule_is_tagged() {
         let message = String::from_utf8(deny.strings.last().unwrap().clone()).unwrap();
         let rule = message.strip_prefix(&prefix).unwrap_or_else(|| panic!("{message}"));
         assert!(!rule.is_empty() && !rule.contains(':'), "{message}");
+        // KNSH-047: the violation reader attributes a denial only by a tag `DenialTag` parses, back to these IDs.
+        let parsed: knsh_core::DenialTag = message.parse().unwrap_or_else(|_| panic!("{message}"));
+        assert_eq!(parsed.session_id, session());
+        assert_eq!(parsed.rule.as_str(), rule);
+        assert_eq!(parsed.to_string(), message);
     }
     assert!(text.starts_with("(version 1)\n;; knsh command profile t,"));
     assert!(text.contains(&format!("\n(deny default (with message \"{prefix}default\"))\n")));
@@ -453,6 +458,8 @@ fn every_deny_rule_is_tagged() {
     // The envelope is tagged `env` in place of a record.
     let envelope = compiled_for(&profile(""), CommandTag::Envelope);
     assert!(envelope.contains(&format!("\"knsh:{}:env:fixed.ssh\"", session())));
+    let tag: knsh_core::DenialTag = format!("knsh:{}:env:fixed.ssh", session()).parse().unwrap();
+    assert_eq!(tag.command, knsh_core::TaggedCommand::Envelope);
 }
 
 // FR-SBX-04, FR-LC-15: `exec` is allowed only from the trusted folders (defaults and the profile's), the system tool

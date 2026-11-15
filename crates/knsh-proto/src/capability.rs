@@ -48,6 +48,16 @@ pub enum Secrets {
     None,
 }
 
+/// Whether sandbox denials reported by the system reach the engine (FR-SBX-08, KNSH-047). Best effort either way:
+/// no method depends on it, and a command is never blocked by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SandboxViolations {
+    /// The unified-log reader is running and a canary denial it caused has arrived through it.
+    UnifiedLog,
+    /// No reader is running, or it has not shown that it receives denials.
+    None,
+}
+
 /// How one checkpoint root is protected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CheckpointBackend {
@@ -96,6 +106,17 @@ impl Secrets {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Keychain => "keychain",
+            Self::None => NONE,
+        }
+    }
+}
+
+impl SandboxViolations {
+    /// The wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnifiedLog => "unified_log",
             Self::None => NONE,
         }
     }
@@ -160,6 +181,9 @@ pub struct Capabilities {
     pub secrets: Secrets,
     /// Per checkpoint root (canonical path), how it is protected. Empty when no root is configured.
     pub checkpoints: BTreeMap<String, CheckpointBackend>,
+    /// The sandbox violation reader. The one live field: `knshd` reports the reader's state at each `hello`, since
+    /// the reader can start, stop and restart while the process runs (KNSH-047).
+    pub sandbox_violations: SandboxViolations,
 }
 
 impl Capabilities {
@@ -175,8 +199,8 @@ impl Capabilities {
         }
     }
 
-    /// The backend fields as a JSON object: `sandbox`, `network_filter`, `file_events`, `secrets` and
-    /// `checkpoints`. `hello` adds `methods` and `deprecated` to it.
+    /// The backend fields as a JSON object: `sandbox`, `network_filter`, `file_events`, `secrets`, `checkpoints`
+    /// and `sandbox_violations`. `hello` adds `methods` and `deprecated` to it.
     ///
     /// # Errors
     ///
@@ -191,7 +215,8 @@ impl Capabilities {
             .with("network_filter", self.network_filter.as_str())?
             .with("file_events", self.file_events.as_str())?
             .with("secrets", self.secrets.as_str())?
-            .with("checkpoints", checkpoints)
+            .with("checkpoints", checkpoints)?
+            .with("sandbox_violations", self.sandbox_violations.as_str())
     }
 }
 
@@ -279,6 +304,7 @@ mod tests {
             file_events: FileEvents::None,
             secrets: Secrets::None,
             checkpoints: BTreeMap::new(),
+            sandbox_violations: crate::capability::SandboxViolations::None,
         }
     }
 

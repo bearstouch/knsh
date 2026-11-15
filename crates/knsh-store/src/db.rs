@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 
 use knsh_core::{
     Actor, ActorKind, AgentId, CanonicalPath, CheckpointId, ExecutionRecord, OutputInfo, OutputStream, RecordDetails,
-    RecordId, Redacted, Session, SessionId, Timestamp,
+    RecordId, Redacted, SandboxViolation, Session, SessionId, Timestamp, decode_violations, encode_violations,
+    merge_into,
 };
 use knsh_platform::sqlite::{Connection, DATABASE_MODE, DEFAULT_BUSY_TIMEOUT, Statement, Step, Value};
 use knsh_platform::{FileKind, Fs};
@@ -45,7 +46,11 @@ impl RecordedOutput {
 
 /// The columns [`read_record`] expects, in order.
 const RECORD_COLUMNS: &str = "record_id, session_id, actor_kind, agent_id, command, rewritten_from, cwd, started_at, \
-     ended_at, exit_code, pipestatus, signal, sandbox_profile, secrets_injected, checkpoint_id";
+     ended_at, exit_code, pipestatus, signal, sandbox_profile, secrets_injected, checkpoint_id, sandbox_violations";
+
+/// The most distinct sandbox violations one record keeps (FR-SBX-08). Repeats of a kept one only add to its count;
+/// further distinct ones are dropped, so one noisy command cannot grow its record without bound.
+pub const MAX_VIOLATIONS_PER_RECORD: usize = 256;
 
 /// The open record database.
 pub(crate) struct Database {
@@ -129,7 +134,7 @@ impl Database {
         transaction.execute(
             &format!(
                 "INSERT INTO records ({RECORD_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-                 ?13, ?14, ?15)"
+                 ?13, ?14, ?15, ?16)"
             ),
             &encoded.values(&record),
         )?;
@@ -153,6 +158,49 @@ impl Database {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Appends late sandbox violations to the finished agent record `record_id` of `session_id`, in one
+    /// transaction (FR-SBX-08, KNSH-047). Repeats of a violation the record holds add to its count; at most
+    /// [`MAX_VIOLATIONS_PER_RECORD`] distinct ones are kept.
+    ///
+    /// Returns `false`, writing nothing, when no such record exists: the tag named another session's record, an
+    /// unknown one, or a human record (which never carries violations, FR-REC-09). A denial is never attached
+    /// anywhere its tag does not name exactly.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupt`] if the stored list cannot be read; [`StoreError::Platform`] if SQLite fails, in which
+    /// case the transaction is rolled back and nothing was written.
+    pub(crate) fn append_violations(
+        &mut self,
+        session_id: SessionId,
+        record_id: RecordId,
+        violations: Vec<SandboxViolation>,
+    ) -> Result<bool, StoreError> {
+        let record_id = record_id.to_string();
+        let session_id = session_id.to_string();
+        let transaction = self.connection.transaction()?;
+        let existing = {
+            let mut statement = transaction.prepare(
+                "SELECT sandbox_violations FROM records \
+                 WHERE record_id = ?1 AND session_id = ?2 AND actor_kind = 'agent'",
+            )?;
+            statement.bind_all(&[Value::Text(&record_id), Value::Text(&session_id)])?;
+            if statement.step()? != Step::Row {
+                return Ok(false);
+            }
+            statement.column_text(0)?
+        };
+        let mut kept = stored_violations(existing.as_deref())?;
+        merge_into(&mut kept, violations, MAX_VIOLATIONS_PER_RECORD);
+        let encoded = encode_violations(&kept).map_err(|_| StoreError::InvalidRecord("sandbox_violations"))?;
+        transaction.execute(
+            "UPDATE records SET sandbox_violations = ?1 WHERE record_id = ?2",
+            &[Value::Text(&encoded), Value::Text(&record_id)],
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// One page of records visible in `scope`, ordered by `record_id`.
@@ -420,6 +468,7 @@ struct Encoded {
     pipestatus: Option<String>,
     secrets_injected: Option<String>,
     checkpoint_id: Option<String>,
+    sandbox_violations: Option<String>,
     started_at: i64,
     ended_at: Option<i64>,
 }
@@ -444,19 +493,28 @@ impl Encoded {
                 .join(" ")
         });
         let secrets_injected = (!details.secrets_injected.is_empty()).then(|| details.secrets_injected.join("\n"));
+        // Bounded like an append: merged and capped, so a record never holds more than the limit.
+        let sandbox_violations = if details.sandbox_violations.is_empty() {
+            None
+        } else {
+            let mut kept = Vec::new();
+            merge_into(&mut kept, details.sandbox_violations.clone(), MAX_VIOLATIONS_PER_RECORD);
+            Some(encode_violations(&kept).map_err(|_| StoreError::InvalidRecord("sandbox_violations"))?)
+        };
         Ok(Self {
             record_id: record.record_id.to_string(),
             session_id: record.session_id.to_string(),
             pipestatus,
             secrets_injected,
             checkpoint_id: details.checkpoint_id.map(|id| id.to_string()),
+            sandbox_violations,
             started_at: micros(record.started_at)?,
             ended_at: record.ended_at.map(micros).transpose()?,
         })
     }
 
     /// The bound values, in [`RECORD_COLUMNS`] order.
-    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 15] {
+    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 16] {
         let details = &record.details;
         [
             Value::Text(&self.record_id),
@@ -476,6 +534,7 @@ impl Encoded {
             optional_text(details.sandbox_profile.as_deref()),
             optional_text(self.secrets_injected.as_deref()),
             optional_text(self.checkpoint_id.as_deref()),
+            optional_text(self.sandbox_violations.as_deref()),
         ]
     }
 }
@@ -530,6 +589,7 @@ fn read_record(statement: &Statement<'_>) -> Result<ExecutionRecord, StoreError>
                 .map(|id| id.parse::<CheckpointId>())
                 .transpose()
                 .map_err(corrupt)?,
+            sandbox_violations: stored_violations(statement.column_text(15)?.as_deref())?,
         },
     })
 }
@@ -557,6 +617,15 @@ fn text(statement: &Statement<'_>, column: usize) -> Result<String, StoreError> 
 
 fn optional_text(text: Option<&str>) -> Value<'_> {
     text.map_or(Value::Null, Value::Text)
+}
+
+/// A record's stored `sandbox_violations` column: `NULL` is an empty list, and text the engine could not have
+/// written is [`StoreError::Corrupt`] (never repaired, so the row is not overwritten on a guess).
+fn stored_violations(text: Option<&str>) -> Result<Vec<SandboxViolation>, StoreError> {
+    text.map(decode_violations)
+        .transpose()
+        .map_err(|_| StoreError::Corrupt)
+        .map(Option::unwrap_or_default)
 }
 
 /// A timestamp as stored: microseconds since the epoch. Every valid timestamp fits in `i64`.

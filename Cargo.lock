@@ -62,6 +62,7 @@ name = "knsh-platform"
 version = "0.0.0"
 dependencies = [
  "knsh-core",
+ "knsh-json",
  "libc",
 ]
 

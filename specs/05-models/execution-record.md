@@ -37,6 +37,27 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 | `decided_by` | Who decided (hook, authority, user) |
 | `latency_ms` | Time to decide |
 
+## `sandbox_violations`
+
+Denials the system reported for the line, attributed by the tag of the rule that matched (FR-SBX-06), best effort
+(FR-SBX-08, KNSH-047). Each element:
+
+| Field | Values |
+| --- | --- |
+| `session_id`, `record_id` | From the tag `knsh:<session>:<record>:<rule>`; `record_id` is `null` for an envelope's denial (`env`), which is published but attached to no record |
+| `rule` | The deny rule that matched, e.g. `fixed.engine`, `fs.deny[0]`, `services.dns` |
+| `operation` | The Seatbelt operation, e.g. `file-read-data`, `mach-lookup`, `network-outbound` |
+| `argument` | What was denied as the system names it (a canonical path, a service name, `remote:*:53`), or `null` |
+| `process`, `pid` | The denied process's name and id as logged; informational (the pid may since have been reused) |
+| `count` | How many identical denials (same tag, process, operation and argument) this element stands for, at least 1 |
+| `at` | When the first of them reached the engine |
+
+Repeats arriving within 3 s of the first merge into one element, including the system's own "N duplicate reports"
+summaries. Denials arriving after the record was written are appended to it, merging into an existing element when
+they repeat one. A record keeps at most 256 distinct elements. A denial is never attached to a record its tag does
+not name exactly (another session's record, an unknown record, a human record). Some denials are never reported by
+the system (signals, `ENOENT` cases, dropped entries, built-in refusals: [verification claims](../07-testing/verification-claims.md#c2-denials-in-the-unified-log)).
+
 ## `argv[].class`
 
 | Class | Meaning |

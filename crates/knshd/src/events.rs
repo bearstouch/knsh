@@ -172,6 +172,24 @@ impl EventHub {
         Ok(published.event.seq)
     }
 
+    /// Publishes `data` for `session_id` as its own actor, if the session is live. For publishers that know only
+    /// the session, such as the sandbox violation reader (KNSH-047), which learns it from a denial's tag.
+    ///
+    /// # Errors
+    ///
+    /// As [`EventHub::publish`]; [`PublishError::Bus`] with [`CoreError::SessionNotFoundOrEnded`] if the session
+    /// never started or has ended.
+    pub(crate) fn publish_for_session(&self, session_id: SessionId, data: EventData) -> Result<u64, PublishError> {
+        // Read under the same lock `publish` takes, then released: the actor of a live session never changes
+        // (FR-SES-01), so it is still right when the event is numbered.
+        let actor = lock(&self.state)
+            .bus
+            .session_actor(session_id)
+            .cloned()
+            .ok_or(PublishError::Bus(CoreError::SessionNotFoundOrEnded))?;
+        self.publish(session_id, &actor, data)
+    }
+
     /// Publishes `session.started` for a session just created in the registry.
     ///
     /// # Errors
@@ -354,7 +372,9 @@ fn subscribe_error(error: SubscribeError, session_id: Option<SessionId>) -> RpcE
             | CoreError::GrantExpired
             | CoreError::GrantExists
             | CoreError::GrantNotFound
-            | CoreError::TooManyGrants,
+            | CoreError::TooManyGrants
+            | CoreError::InvalidDenialTag
+            | CoreError::InvalidViolation,
         )
         | SubscribeError::Closed => RpcError::new(ErrorCode::InternalError),
     }

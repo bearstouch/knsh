@@ -81,6 +81,10 @@ pub enum CoreError {
     GrantNotFound,
     /// The grant set already holds its maximum number of live grants (KNSH-042).
     TooManyGrants,
+    /// Text is not a knsh sandbox tag `knsh:<session>:<command>:<rule>` (FR-SBX-06, KNSH-047).
+    InvalidDenialTag,
+    /// A stored list of sandbox violations is not in the form the engine writes (KNSH-047).
+    InvalidViolation,
 }
 
 impl fmt::Display for CoreError {
@@ -124,6 +128,8 @@ impl fmt::Display for CoreError {
             Self::GrantExists => f.write_str("a grant with this id already exists"),
             Self::GrantNotFound => f.write_str("grant not found, revoked or expired"),
             Self::TooManyGrants => f.write_str("too many live grants"),
+            Self::InvalidDenialTag => f.write_str("not a knsh sandbox tag"),
+            Self::InvalidViolation => f.write_str("not a stored list of sandbox violations"),
         }
     }
 }

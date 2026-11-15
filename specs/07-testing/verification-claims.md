@@ -120,6 +120,18 @@ The argument depends on the operation:
 Real samples for each shape are kept in
 [`spikes/knsh-025-seatbelt/fixtures/macos-26.6.2/`](../../spikes/knsh-025-seatbelt/fixtures/macos-26.6.2/) for KNSH-047.
 
+**KNSH-047 (2026-11-15, same machine, macOS 26.6.2, account in `admin`, no `sudo`):** samples with the compiler's tag
+form `knsh:<session>:<record or env>:<rule>` were captured with `sandbox-exec -p` and `log stream --style ndjson`, and
+are kept with the KNSH-025 ones in
+[`crates/knsh-platform/fixtures/sandbox-log/macos-26.6.2/`](../../crates/knsh-platform/fixtures/sandbox-log/macos-26.6.2/)
+(user folder names replaced by `XX`), where the parser's tests read them. Observed: `log stream` prints a non-JSON
+header line (`Filtering the log data using …`) before any entry, even with `--style ndjson`; the tag of an `env`
+command and of a rule name holding `[` `]` (`fs.deny[0]`) arrives verbatim; a path holding a space and `"` arrives
+unescaped in the message; 9 reads of one denied file by one process gave one entry plus `8 duplicate reports`; the
+`osascript` Apple Events lookup of that run was not logged (an instance of the intermittent loss above). The
+`macos_denials` integration test sees its own canary come back through `log stream` (0.4 s in the recorded run)
+and leaves no `log` process behind. Pending: a standard (non-admin) account, macOS 14 and 15.
+
 **Tag.** The `(with message "…")` text becomes the last line of the entry, verbatim. A 97-character tag holding two
 ULIDs, `/`, `;` and `"` survived intact. `(deny default (with message "…"))` tags default denials too, with two
 exceptions: `job-creation` reached through the default was logged **untagged** (2 of 2 runs, while an explicit

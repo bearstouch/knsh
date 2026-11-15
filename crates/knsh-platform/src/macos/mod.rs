@@ -5,6 +5,7 @@
 //! offers a safe wrapper for the system call (`realpath`, `open`, `rename`, `posix_spawn`), it is used instead.
 
 mod clock;
+mod denials;
 mod digest;
 mod fs;
 mod kqueue;
@@ -16,6 +17,7 @@ mod random;
 mod shell_host;
 
 pub use clock::SystemClock;
+pub use denials::UnifiedLogDenials;
 pub use digest::{SHA256_LEN, sha256};
 pub use fs::RealFs;
 pub use kqueue::{Kqueue, Token};

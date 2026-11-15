@@ -58,11 +58,22 @@ name = "knsh-bash"
 version = "0.0.0"
 
 [[package]]
-name = "knsh-fuzz"
+name = "knsh-core"
 version = "0.0.0"
 dependencies = [
  "knsh-bash",
  "knsh-json",
+ "knsh-toml",
+]
+
+[[package]]
+name = "knsh-fuzz"
+version = "0.0.0"
+dependencies = [
+ "knsh-bash",
+ "knsh-core",
+ "knsh-json",
+ "knsh-platform",
  "knsh-toml",
  "libfuzzer-sys",
 ]
@@ -70,6 +81,15 @@ dependencies = [
 [[package]]
 name = "knsh-json"
 version = "0.0.0"
+
+[[package]]
+name = "knsh-platform"
+version = "0.0.0"
+dependencies = [
+ "knsh-core",
+ "knsh-json",
+ "libc",
+]
 
 [[package]]
 name = "knsh-toml"

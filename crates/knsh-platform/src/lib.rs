@@ -48,6 +48,13 @@
 //! [`EnginePaths::profiles_dir`] is their private directory, and `macos::sha256` hashes them with `CommonCrypto`, so a
 //! record names exactly the profile that ran (FR-SBX-07).
 //!
+//! The [`violation`] module (KNSH-047) reads the system's sandbox denials. Its parser is pure and tested over
+//! captured samples per macOS version (`fixtures/sandbox-log/`); the stream itself is a trait:
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`DenialLog`] | Stream sandbox denials; cause a canary denial | `UnifiedLogDenials` (`log stream`) | `ScriptedDenialLog` |
+//!
 //! Later stories add Keychain, `LocalAuthentication`, XPC, `FSEvents` and APFS clones to the same interface.
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
@@ -59,8 +66,9 @@
 //! One of only two crates allowed to use `unsafe` (with `knsh-exec`), and within it only the `macos` backend and
 //! `sqlite` modules: the crate root denies `unsafe_code` and those modules alone allow it. Every `unsafe` block needs a
 //! `// SAFETY:` comment and every `unsafe fn` a `# Safety` doc section. The only third-party dependency is `libc`,
-//! and no other crate may depend on it (NFR-SUP-02). The only workspace dependency is `knsh-core`, for
-//! [`knsh_core::CanonicalPath`], [`knsh_core::Timestamp`] and [`knsh_core::Ulid`].
+//! and no other crate may depend on it (NFR-SUP-02). The workspace dependencies are `knsh-core`, for
+//! [`knsh_core::CanonicalPath`], [`knsh_core::Timestamp`] and [`knsh_core::Ulid`], and `knsh-json`, for the log
+//! entries the violation reader parses.
 //!
 //! The fakes in [`testing`] are compiled only for this crate's tests or with the `testing` cargo feature, which
 //! other crates enable only in `[dev-dependencies]`.
@@ -80,6 +88,7 @@
 //! - FR-LC-03, FR-POL-13, FR-POL-14 (binary lookup for command resolution, KNSH-035)
 //! - FR-SBX-07 (profile files: directory listing, profiles directory, SHA-256, KNSH-045)
 //! - FR-POL-01, FR-POL-10, FR-POL-11 (profile source and path canonicalisation for the policy loader, KNSH-039)
+//! - FR-SBX-06, FR-SBX-08, decision 9 (sandbox denials from the unified log, KNSH-047)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
@@ -97,6 +106,7 @@ mod policy_source;
 pub mod probe;
 mod process;
 mod random;
+pub mod violation;
 
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
@@ -121,3 +131,4 @@ pub use policy_source::PolicyDirectory;
 pub use probe::{ProbeFailure, SystemProbe};
 pub use process::{ExitStatus, ProcessGroupId, Processes, Signal, SpawnRequest, Stdio};
 pub use random::Random;
+pub use violation::{CanaryNonce, DenialLog, DenialStream, LogEntry, StreamStopper};

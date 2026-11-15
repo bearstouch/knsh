@@ -35,6 +35,12 @@ redacted text and typed values. Subscribers receive events as notifications ([us
 
 A `cwd` that is not valid UTF-8 is shown with U+FFFD replacements, as in records.
 
+## Phase 2 payloads
+
+| Event | `data` |
+| --- | --- |
+| `sandbox.violation` | A [sandbox violation](execution-record.md#sandbox_violations): `session_id`, `record_id` (ULID, or `null` for a denial inside an envelope), `rule`, `operation`, `argument` (string or `null`), `process`, `pid`, `count`, `at`. Published only for a live session named by the denial's tag; repeats within 3 s are one event with their `count` (KNSH-047) |
+
 ## Catalog
 
 | Event | Emitted when | Can block |

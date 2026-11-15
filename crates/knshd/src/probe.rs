@@ -30,7 +30,7 @@ use knsh_platform::{
     Clock, ExitStatus, Field, Fs, Level, PlatformError, ProbeFailure, Processes, Random, SpawnRequest, SystemLog,
     SystemProbe, Value,
 };
-use knsh_proto::{Capabilities, FileEvents, NetworkFilter, Platform, Sandbox, Secrets};
+use knsh_proto::{Capabilities, FileEvents, NetworkFilter, Platform, Sandbox, SandboxViolations, Secrets};
 
 /// How long each check may take. A working check takes milliseconds; the bound only matters when something hangs.
 /// The checks run one after another, and a hung `knsh-exec` gets one more bound to be reaped after it is killed,
@@ -132,6 +132,8 @@ pub(crate) fn probe(probes: &Probes) -> Probed {
         file_events,
         secrets: Secrets::None,
         checkpoints: BTreeMap::new(),
+        // Not probed: the violation reader reports its own state at each `hello` (KNSH-047, `violations.rs`).
+        sandbox_violations: SandboxViolations::None,
     };
     probes.log.log(
         Level::Notice,
