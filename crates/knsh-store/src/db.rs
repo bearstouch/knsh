@@ -12,31 +12,40 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use knsh_core::{
-    Actor, ActorKind, AgentId, ArgvEntry, CanonicalPath, CheckpointId, ExecutionRecord, OutputInfo, OutputStream,
-    RecordDecision, RecordDetails, RecordId, Redacted, SandboxViolation, Session, SessionId, Timestamp, decode_argv,
-    decode_decision, decode_violations, encode_argv, encode_decision, encode_violations, merge_into,
+    Actor, ActorKind, AgentId, ArgvEntry, CanonicalPath, CappedOutput, CheckpointId, ExecutionRecord, OutputInfo,
+    OutputStream, RecordDecision, RecordDetails, RecordId, Redacted, SandboxViolation, Session, SessionId, Timestamp,
+    decode_argv, decode_decision, decode_violations, encode_argv, encode_decision, encode_violations, merge_into,
 };
 use knsh_platform::sqlite::{Connection, DATABASE_MODE, DEFAULT_BUSY_TIMEOUT, Statement, Step, Value};
 use knsh_platform::{FileKind, Fs};
 
 use crate::error::StoreError;
-use crate::output::{Capped, cap_output, len_u64};
+use crate::output::len_u64;
 use crate::query::{ForgetSelector, OutputRange, OutputRequest, Page, RecordQuery, Scope, StoredRecord, clamp};
 use crate::retention::Cutoffs;
 use crate::schema;
 
-/// A command's output as captured, before capping. Wrapped so it is never printed (NFR-PRIV-02): output may hold
-/// secrets the redaction engine (KNSH-090) has not yet removed.
+/// A command's output as captured: whole ([`CappedOutput::whole`]) or already capped while it was read (KNSH-053),
+/// with what the command wrote in all. The bytes are [`Redacted`], so they are never printed (NFR-PRIV-02).
 #[derive(Debug, Clone, Default)]
 pub struct RecordedOutput {
     /// Standard output, when output recording is on.
-    pub stdout: Option<Redacted<Vec<u8>>>,
+    pub stdout: Option<CappedOutput>,
     /// Standard error, when output recording is on.
-    pub stderr: Option<Redacted<Vec<u8>>>,
+    pub stderr: Option<CappedOutput>,
 }
 
 impl RecordedOutput {
-    fn get(&self, stream: OutputStream) -> Option<&Redacted<Vec<u8>>> {
+    /// Both streams, kept whole by the caller (the store still caps them).
+    #[must_use]
+    pub fn whole(stdout: Redacted<Vec<u8>>, stderr: Redacted<Vec<u8>>) -> Self {
+        Self {
+            stdout: Some(CappedOutput::whole(stdout)),
+            stderr: Some(CappedOutput::whole(stderr)),
+        }
+    }
+
+    fn get(&self, stream: OutputStream) -> Option<&CappedOutput> {
         match stream {
             OutputStream::Stdout => self.stdout.as_ref(),
             OutputStream::Stderr => self.stderr.as_ref(),
@@ -140,17 +149,19 @@ impl Database {
             &encoded.values(&record),
         )?;
         for stream in OutputStream::ALL {
-            let Some(bytes) = output.get(stream) else {
+            let Some(captured) = output.get(stream) else {
                 continue;
             };
-            let Capped { data, info } = cap_output(bytes.expose(), self.output_cap);
+            // Already within the cap when it was captured with the same cap; capped here otherwise (FR-REC-06).
+            let (data, info) = captured.clone().recap(self.output_cap).into_parts();
+            let data = data.expose();
             transaction.execute(
                 "INSERT INTO outputs (record_id, stream, data, original, skipped, skipped_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 &[
                     Value::Text(&encoded.record_id),
                     Value::Text(stream.as_str()),
-                    Value::Blob(&data),
+                    Value::Blob(data),
                     Value::Integer(count(info.original)?),
                     Value::Integer(count(info.skipped)?),
                     Value::Integer(count(info.skipped_at)?),

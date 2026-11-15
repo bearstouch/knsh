@@ -84,6 +84,30 @@ not certain reaches a function of the line is resolved and replaced as a program
 - **Not yet.** No proxy is wired (KNSH-059): lines are compiled without a proxy port, so their network is closed except
   the profile's loopback ports, and no per-command proxy credentials are given.
 
+## Output capture (KNSH-053)
+
+A line's output is captured (step 10, FR-LC-18) when its caller did not pass stdio (`exec.run` and `exec.start` from
+an agent that integrates natively), or when its session's profile records output (`recording.output`). Otherwise
+(`knsh -c` in a session that does not record output) the line runs on the caller's descriptors and `knshd` never sees
+its output (FR-OUT-04).
+
+- **Pipes.** stdout and stderr are pipes read by `knshd`, one thread per stream; stdin is the caller's, or
+  `/dev/null` for a captured `exec.run`. For `knsh -c`, each chunk is first written unchanged to the caller's own
+  descriptor (a tee), so the caller sees what it would have seen; if that write fails, the pipe is closed and the line
+  gets `EPIPE` as it would have. Teeing puts `knshd` in the data path: the line's stdout and stderr are pipes, not the
+  caller's terminal (latency to confirm in KNSH-076).
+- **Redaction hook.** Every chunk then passes the redaction hook (FR-EVT-07, FR-OUT-06) before it is kept, returned,
+  stored or emitted. It does nothing until secret redaction arrives (KNSH-091); a secret split across two chunks will
+  need handling then.
+- **Cap.** Each stream is kept within 1 MB as it is read: the first half and the last half, with the size written,
+  the bytes skipped and where (FR-REC-06), and the line count.
+- **Storage and events.** Only when the profile records output is the capture stored with the record and published
+  as `command.output` ([event](../05-models/event.md)). With `recording.output = false` (the default) nothing is
+  stored and nothing is emitted.
+- **End.** Once the leader is reaped, the readers get at most 250 ms to reach end of file (a background process the
+  line left behind may hold the pipe), then the capture is final: later bytes are still drained and teed, so the
+  leftover process never blocks, but are neither kept nor published.
+
 ## The decision pipeline (KNSH-050)
 
 Steps 2 to 8 are one pure function in `knsh-core` (`decide`); a driver in `knshd` performs the effects around it

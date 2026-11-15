@@ -27,7 +27,7 @@ call and is closed. The session outlives its connections: closing one does not e
 | Method | Purpose |
 | --- | --- |
 | `exec.run` | Run a line and wait; returns the record ID, `executed_command`, exit code, output in the requested mode, and the decision |
-| `exec.start`, `exec.wait`, `exec.kill` | The same for long-running lines; output arrives as events |
+| `exec.start`, `exec.wait`, `exec.kill` | The same for long-running lines ([below](#execstart-execwait-execkill)); output arrives as `command.output` events when the session records output, and in the `exec.wait` result |
 | `policy.check` | Dry run: what policy would decide for a line, without running it ([below](#policycheck)) |
 | `records.query`, `records.output` | The session's own records and output ranges ([parameters](user-socket.md#records)) |
 | `events.subscribe`, `events.unsubscribe` | The session's own events, optionally from `since_seq` |
@@ -43,17 +43,18 @@ call and is closed. The session outlives its connections: closing one does not e
 | `command` | string | The line to run |
 | `cwd` | path | Working directory |
 | `timeout_s` | int | The line is killed after this, with `-32008` |
-| `output.mode` | string | `full`, `truncate`, `head_tail`, `errors_only` or `ref` ([output modes](../03-functional-requirements/output-modes.md)); default from the profile |
-| `output.max_bytes` | int | For `truncate` |
-| `output.lines` | int | For `head_tail` |
+| `output.mode` | string | `full`, `truncate`, `head_tail`, `errors_only` or `ref` ([output modes](../03-functional-requirements/output-modes.md)); default from the profile (`output.mode`, FR-OUT-02) |
+| `output.max_bytes` | int | For `truncate`: 1 to 1048576; default 65536 |
+| `output.lines` | int | For `head_tail`: 1 to 10000; default 20 |
 | `env` | object | The caller's whole environment, name to value (KNSH-049). Names are non-empty and hold no `=`; nothing holds NUL; at most 4096 entries. Absent is empty |
 | `interpreter` | string | `knsh` (default), `bash`, `sh` or `zsh`: the shell the line runs with once allowed (FR-LC-14). It never affects the decision |
 | `args` | array of strings | The operands after the line (`bash -c 'line' name arg…`): `$0`, then `$1`, …; at most 4096 |
 | `stdio` | string | `passed`: the request carries the caller's stdin, stdout and stderr as three descriptors (`SCM_RIGHTS`, [wire format](wire-format.md#descriptors)). The line runs on them, and the result holds no output (FR-OUT-04). Absent: output is captured and returned in `output.mode` (KNSH-053) |
 
 The line is at most 65536 bytes and holds no NUL; `cwd` is absolute and resolved; `timeout_s` is positive. Anything
-else, or a descriptor count other than three with `stdio: "passed"` and zero without, is `-32602`, and the
-descriptors are closed unused.
+else, an unknown `output.mode`, a count out of range, `output` together with `stdio: "passed"` (FR-OUT-03), or a
+descriptor count other than three with `stdio: "passed"` and zero without, is `-32602`, and the descriptors are
+closed unused. `max_bytes` and `lines` are accepted whatever the mode, since the mode may come from the profile.
 
 ### What the supervisor receives (KNSH-049)
 
@@ -64,8 +65,13 @@ supervised line runs outside the envelope and has no use for its credential). Na
 an input to the decision (FR-LC-14).
 
 `exec.run` is served since lines can be spawned (KNSH-051), and listed only where the sandbox probe passed. If
-`knshd` cannot find `knsh-exec` beside itself, every call is `-32005` (`capability: "sandbox"`). How a line is
-spawned, watched and timed out is in [command lifecycle](../03-functional-requirements/command-lifecycle.md#spawning-knsh-051).
+`knshd` cannot find `knsh-exec` beside itself, every call (and every call of `exec.start`, `exec.wait` and
+`exec.kill`) is `-32005` (`capability: "sandbox"`). How a line is spawned, watched and timed out is in
+[command lifecycle](../03-functional-requirements/command-lifecycle.md#spawning-knsh-051).
+
+Without `stdio: "passed"`, the line runs with stdin on `/dev/null` and its stdout and stderr captured by the
+supervisor (KNSH-053, [capture](../03-functional-requirements/command-lifecycle.md#output-capture-knsh-053)), and the
+result carries its output in the requested mode.
 
 ### Example
 
@@ -74,24 +80,37 @@ spawned, watched and timed out is in [command lifecycle](../03-functional-requir
  "params": {"command": "npm test", "cwd": "/Users/me/code/app", "timeout_s": 600,
    "output": {"mode": "errors_only"}}}
 
-{"jsonrpc": "2.0", "id": 7, "result": {"record_id": "01J…", "executed_command": "npm test",
-   "exit_code": 1, "duration_ms": 18421, "stderr": "…", "stdout_tail": "…", "skipped_lines": 2140,
+{"jsonrpc": "2.0", "id": 7, "result": {"record_id": "01J…", "executed_command": "/usr/local/bin/npm test",
+   "exit_code": 1, "signal": null, "duration_ms": 18421,
    "decision": {"verdict": "allow", "source": "rule", "rule_id": "exec.allow[1]"},
-   "files_changed": 3, "checkpoint_id": "…"}}
+   "files_changed": null, "checkpoint_id": null, "output_mode": "errors_only",
+   "stdout_size": "183402", "stdout_lines": 2160, "stderr_size": "912", "stderr_lines": 14, "cut_to_fit": false,
+   "stderr": "…", "stderr_skipped": "0", "stdout_tail": "…", "stdout_skipped_lines": 2140}}
 ```
 
 ### Result
 
 | Field | Notes |
 | --- | --- |
-| `record_id` | The execution record |
-| `executed_command` | The line actually run, after any rewrite |
-| `exit_code` | Exit code of the line |
-| `duration_ms` | Run time |
-| Output fields | Depend on the mode (`stdout`, `stderr`, `stdout_tail`, `skipped_lines`, sizes) |
+| `record_id` | The execution record, or null if it could not be written |
+| `executed_command` | The line actually spawned, after any rewrite and with each command's canonical path (FR-AUTH-33, FR-LC-13), redacted |
+| `exit_code`, `signal` | Exactly one is set: the exit code (0–255), or the signal (1–127) that ended the line, for example after `exec.kill` |
+| `duration_ms` | From the spawn to the end |
 | `decision` | `verdict`, `source`, `rule_id` |
-| `files_changed` | Count of changed paths under checkpoint roots |
+| `files_changed` | Count of changed paths under checkpoint roots; null until checkpoints exist (phase 3) |
 | `checkpoint_id` | Checkpoint holding the pre-images, or null |
+| `output_mode` | The mode applied: the caller's, or the profile's default |
+| `stdout_size`, `stderr_size` | Bytes the line wrote to each stream (decimal strings), in every mode |
+| `stdout_lines`, `stderr_lines` | Lines it wrote to each stream, in every mode |
+| `cut_to_fit` | Whether output text was shortened so the answer fits in one frame (below) |
+| Mode fields | `full` and `truncate`: `stdout`, `stderr`, `stdout_skipped`, `stderr_skipped`. `head_tail`: `stdout_head`, `stdout_tail`, `stdout_skipped_lines` and the same for `stderr`. `errors_only`: `stderr`, `stderr_skipped`, `stdout_tail`, `stdout_skipped_lines`. `ref`: none. `*_skipped` counts bytes of the stream not returned (decimal strings) ([output modes](../03-functional-requirements/output-modes.md)) |
+
+Output text is the captured bytes after redaction (FR-OUT-06) as a JSON string; bytes that are not valid UTF-8 show as
+U+FFFD (the exact bytes stay readable with `records.output` when output is recorded). The whole answer must fit in one
+frame (1 MB, [wire format](wire-format.md#frames-unix-sockets)): when it would not, the longest output text is
+shortened (a whole stream from its middle, a head from its end, a tail from its start) until it fits, `cut_to_fit` is
+`true`, and the bytes cut are added to the stream's `*_skipped`. Output is only ever selected and cut, never
+summarised (FR-OUT-05).
 
 With `stdio: "passed"` (from `knsh -c`), the result is the outcome only: `record_id` (or null), and exactly one of
 `exit_code` (0–255) and `signal` (1–127, the signal that ended the line), the other null. The client exits with the
@@ -104,6 +123,34 @@ code, or with 128 plus the signal (NFR-COMPAT-09).
 `-32002` and `-32011` carry `request_id`, which is `null` when no request had been made yet (for example a line
 cancelled while its hooks ran). `-32011` is only ever seen by a caller that is still reading: it is the answer to a
 line whose caller disconnected (FR-LC-41).
+
+## `exec.start`, `exec.wait`, `exec.kill`
+
+For lines that run long (KNSH-053). The line is identified by the `record_id` `exec.start` returns.
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `exec.start` | Those of `exec.run`, without `stdio` (the line is always captured; `stdio: "passed"` or descriptors are `-32602`) | `{"record_id"}` as soon as the line is spawned |
+| `exec.wait` | `{"record_id"}` | The same result as `exec.run`, once the line has ended, in the `output` asked for at `exec.start` |
+| `exec.kill` | `{"record_id"}` | `{"killed": true}` if the line was still running and was stopped, `false` if it had already ended |
+
+- `exec.start` is decided exactly as `exec.run` is: a refused, held or unstartable line is answered with the error
+  `exec.run` would give (`-32001`, `-32002`, `-32007`, `-32011`, `-32603`) and nothing is kept. If the caller
+  disconnects before the line is spawned, the line is cancelled and never runs (FR-LC-41). Once spawned, the line
+  runs to its end whatever happens to the connection.
+- `exec.wait` takes no timeout: it waits until the line ends (its `timeout_s` bounds it; `exec.kill` ends it sooner).
+  The first `exec.wait` that answers collects the result; a later `exec.wait`, or `exec.kill`, for that `record_id` is
+  `-32602`. A line killed at its `timeout_s` is answered `-32008` with `record_id`. If the caller disconnects while
+  waiting, the wait ends (`-32011`) and the line can still be waited for.
+- `exec.kill` stops the line's whole process group as a timeout does: `SIGTERM`, `SIGKILL` after 2 s, and a last
+  `SIGKILL` to the group before the leader is reaped. The line is then answered with the `signal` that ended it,
+  not `-32008`.
+- A `record_id` the session did not start (another session's, or unknown) is `-32602`. A session holds at most 64
+  started lines whose results were not collected; at that bound the oldest finished one is forgotten, and when all
+  64 are still running `exec.start` is `-32602` before the line is decided, so nothing runs. The started lines of a
+  session that has ended are forgotten (nobody can name them any more).
+- While a call blocks (`exec.run`, `exec.wait`), the connection writes nothing else: events of its subscriptions
+  follow the answer. A client that wants `command.output` while it waits subscribes on a second connection.
 
 ## `policy.check`
 

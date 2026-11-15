@@ -205,7 +205,24 @@ pub enum OutputMode {
 }
 
 impl OutputMode {
-    pub(crate) fn parse(text: &str) -> Option<Self> {
+    /// Every mode, in declaration order.
+    pub const ALL: [Self; 5] = [Self::Full, Self::Truncate, Self::HeadTail, Self::ErrorsOnly, Self::Ref];
+
+    /// The name in profiles and on the wire.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Truncate => "truncate",
+            Self::HeadTail => "head_tail",
+            Self::ErrorsOnly => "errors_only",
+            Self::Ref => "ref",
+        }
+    }
+
+    /// The mode named `text` exactly.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
         match text {
             "full" => Some(Self::Full),
             "truncate" => Some(Self::Truncate),

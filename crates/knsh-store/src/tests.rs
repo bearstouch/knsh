@@ -180,10 +180,7 @@ fn stored_violations(store: &RecordStore, n: u64) -> Vec<SandboxViolation> {
 }
 
 fn output(stdout: &[u8], stderr: &[u8]) -> RecordedOutput {
-    RecordedOutput {
-        stdout: Some(Redacted::new(stdout.to_vec())),
-        stderr: Some(Redacted::new(stderr.to_vec())),
-    }
+    RecordedOutput::whole(Redacted::new(stdout.to_vec()), Redacted::new(stderr.to_vec()))
 }
 
 fn ids(page: &crate::Page) -> Vec<RecordId> {
@@ -946,7 +943,7 @@ fn size_limit_deletes_oldest_first() {
         for n in 1..=10 {
             let stdout = Redacted::new(blob(n));
             let recorded = RecordedOutput {
-                stdout: Some(stdout),
+                stdout: Some(knsh_core::CappedOutput::whole(stdout)),
                 stderr: None,
             };
             store

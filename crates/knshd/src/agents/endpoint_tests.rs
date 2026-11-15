@@ -102,7 +102,9 @@ impl Daemon {
             details: RecordDetails::default(),
         };
         let output = RecordedOutput {
-            stdout: Some(Redacted::new(format!("out-{n}").into_bytes())),
+            stdout: Some(knsh_core::CappedOutput::whole(Redacted::new(
+                format!("out-{n}").into_bytes(),
+            ))),
             stderr: None,
         };
         self.fixture.store.write_record(record, output).unwrap();

@@ -107,6 +107,7 @@ impl Running {
             authority: authority.clone(),
             approvals: Arc::new(DenyAtTimeout { timeout: ask_timeout }),
             spawner: Arc::new(FakeSpawner::new(Arc::clone(&journal))),
+            redaction: Arc::new(knsh_core::NoOutputRedaction),
         });
         let shims = knsh_platform::EnginePaths::for_home(std::path::Path::new(HOME))
             .unwrap()

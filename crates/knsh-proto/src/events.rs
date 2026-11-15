@@ -14,6 +14,7 @@ use knsh_json::{Fields, FromJson, JsonError, Object, ToJson, Value};
 use crate::envelope::Notification;
 use crate::error::ProtoError;
 use crate::method::MethodName;
+use crate::records::{OUTPUT_CONTENT_TYPE, OutputData};
 
 /// The notification announcing events a subscription will never receive.
 pub const EVENTS_LOST: &str = "events.lost";
@@ -145,6 +146,11 @@ impl ToJson for EventsUnsubscribeParams {
 ///
 /// [`JsonError`] if a value cannot be written (a `seq` beyond ±2^53, which a real session never reaches).
 pub fn event_envelope(event: &Event) -> Result<Object, JsonError> {
+    envelope_with(event, data(&event.data)?)
+}
+
+/// The envelope of `event` with `data` as its `data` member.
+fn envelope_with(event: &Event, data: Object) -> Result<Object, JsonError> {
     Object::new()
         .with("event", event.name())?
         .with("id", event.id.to_string())?
@@ -152,7 +158,7 @@ pub fn event_envelope(event: &Event) -> Result<Object, JsonError> {
         .with("ts", event.ts.to_string())?
         .with("session_id", event.session_id.to_string())?
         .with("actor", actor(&event.actor)?)?
-        .with("data", data(&event.data)?)
+        .with("data", data)
 }
 
 /// The notification delivering `event` to `subscription`: `method` is the event name, `params` the envelope plus
@@ -165,6 +171,49 @@ pub fn event_notification(subscription: SubscriptionId, event: &Event) -> Result
     let params = event_envelope(event)
         .and_then(|envelope| envelope.with("subscription_id", subscription.get().to_json()?))
         .map_err(ProtoError::Encode)?;
+    Ok(Notification {
+        method: MethodName::new(event.name())?,
+        params: Some(params),
+    })
+}
+
+/// The notification delivering an event that carries raw bytes (`command.output`, KNSH-053): the envelope of
+/// [`event_notification`] whose `data` also names the bytes, as `data.data` (`stream_id`, `size`, `content_type`)
+/// when they follow in a binary stream, or as `data.data_base64` for a client that opted out of binary frames
+/// (`specs/06-api/wire-format.md`). The caller sends the stream's chunk and end frame right after it.
+///
+/// # Errors
+///
+/// [`ProtoError::Encode`] if the envelope cannot be built, or if `event` carries no bytes.
+pub fn event_notification_with_bytes(
+    subscription: SubscriptionId,
+    event: &Event,
+    bytes: OutputData<'_>,
+) -> Result<Notification, ProtoError> {
+    let params = (|| {
+        let size = event
+            .data
+            .bytes()
+            .ok_or(JsonError::MissingField("bytes"))?
+            .expose()
+            .len();
+        let size = crate::records::bytes(u64::try_from(size).unwrap_or(u64::MAX));
+        let mut data = data(&event.data)?;
+        match bytes {
+            OutputData::Stream(id) => data.insert(
+                "data",
+                Value::Object(
+                    Object::new()
+                        .with("stream_id", id.get())?
+                        .with("size", size)?
+                        .with("content_type", OUTPUT_CONTENT_TYPE)?,
+                ),
+            )?,
+            OutputData::Base64(raw) => data.insert("data_base64", Value::from(knsh_json::base64_encode(raw)))?,
+        }
+        envelope_with(event, data)?.with("subscription_id", subscription.get().to_json()?)
+    })()
+    .map_err(ProtoError::Encode)?;
     Ok(Notification {
         method: MethodName::new(event.name())?,
         params: Some(params),
@@ -282,6 +331,20 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
             .with("command", command.expose().as_str())?
             .with("cwd", path(cwd))?
             .with("started_at", started_at.to_string()),
+        // KNSH-053: the chunk's place; its bytes are added by `event_notification_with_bytes`, never inline here.
+        EventData::CommandOutput {
+            record_id,
+            stream,
+            offset,
+            bytes,
+        } => Object::new()
+            .with("record_id", record_id.to_string())?
+            .with("stream", stream.as_str())?
+            .with("offset", crate::records::bytes(*offset))?
+            .with(
+                "size",
+                crate::records::bytes(u64::try_from(bytes.expose().len()).unwrap_or(u64::MAX)),
+            ),
     }
 }
 
@@ -608,5 +671,37 @@ mod tests {
                 r#"{{"jsonrpc":"2.0","method":"events.lost","params":{{"subscription_id":5,"session_id":"{session}","from_seq":2,"to_seq":16}}}}"#
             )
         );
+    }
+
+    // FR-LC-18, KNSH-053: `command.output` names its record, stream, offset and size; the bytes are announced as a
+    // binary stream, or inlined as base64 for a client without binary frames, never as JSON text.
+    #[test]
+    fn command_output_announces_its_bytes() {
+        let output = event(
+            EventData::CommandOutput {
+                record_id: RecordId::from_ulid(Ulid::from_u128(9)),
+                stream: knsh_core::OutputStream::Stderr,
+                offset: 8192,
+                bytes: Redacted::new(b"oops\n".to_vec()),
+            },
+            Actor::Agent(AgentId::new("claude-code").unwrap()),
+        );
+        let subscription = SubscriptionId::new(3);
+        let stream = knsh_json::StreamId::new(7).unwrap();
+        let framed = written(event_notification_with_bytes(subscription, &output, OutputData::Stream(stream)).unwrap());
+        assert!(framed.contains(r#""method":"command.output""#), "{framed}");
+        assert!(
+            framed.contains(
+                r#""data":{"record_id":"00000000000000000000000009","stream":"stderr","offset":"8192","size":"5","data":{"stream_id":7,"size":"5","content_type":"application/octet-stream"}}"#
+            ),
+            "{framed}"
+        );
+        assert!(!framed.contains("oops"), "{framed}");
+        let inline =
+            written(event_notification_with_bytes(subscription, &output, OutputData::Base64(b"oops\n")).unwrap());
+        assert!(inline.contains(r#""data_base64":"b29wcwo=""#), "{inline}");
+        // An event without bytes cannot be sent this way.
+        let ended = event(EventData::SessionEnded, Actor::Human);
+        assert!(event_notification_with_bytes(subscription, &ended, OutputData::Stream(stream)).is_err());
     }
 }

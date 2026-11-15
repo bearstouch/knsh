@@ -119,11 +119,12 @@ pub use error::{EnvelopeFault, ProtoError};
 pub use error_code::ErrorCode;
 pub use events::{
     EVENTS_LOST, EventsSubscribeParams, EventsSubscribeResult, EventsUnsubscribeParams, event_envelope,
-    event_notification, lost_notification,
+    event_notification, event_notification_with_bytes, lost_notification,
 };
 pub use exec::{
-    Denial, ExecRunParams, ExecRunResult, ExecStdio, Interpreter, LineStatus, MAX_EXEC_ARGS, MAX_EXEC_COMMAND_LEN,
-    MAX_EXEC_ENV_ENTRIES, SESSION_TOKEN_VAR,
+    Denial, ExecHandleParams, ExecKillResult, ExecOutcome, ExecRunParams, ExecRunResult, ExecStartResult, ExecStdio,
+    Interpreter, LineStatus, MAX_EXEC_ARGS, MAX_EXEC_COMMAND_LEN, MAX_EXEC_ENV_ENTRIES, MAX_EXEC_RESULT_LEN,
+    OutputOptions, SESSION_TOKEN_VAR, StreamTotals,
 };
 pub use method::{MAX_METHOD_NAME_LEN, MethodName};
 pub use policy::{

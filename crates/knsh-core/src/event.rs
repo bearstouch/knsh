@@ -148,6 +148,19 @@ pub enum EventData {
         /// When it was spawned.
         started_at: Timestamp,
     },
+    /// `command.output`: one chunk of a running line's output, published only when the session records output
+    /// (FR-LC-18, KNSH-053). A stream's chunks are published in order; the bytes travel beside the JSON as a binary
+    /// stream (or base64 for a client that opted out of binary frames).
+    CommandOutput {
+        /// The line's record.
+        record_id: RecordId,
+        /// Which stream the chunk is from.
+        stream: crate::record::OutputStream,
+        /// Where the chunk starts in the stream, as captured (after redaction).
+        offset: u64,
+        /// The chunk, already through the redaction hook (FR-EVT-07).
+        bytes: Redacted<Vec<u8>>,
+    },
     /// `decision.cancelled`: a pending decision ended without an answer (FR-LC-41, FR-AUTH-22, FR-AUTH-23).
     DecisionCancelled {
         /// The pending request, when the line had reached the ask step; `None` if it was still in its hooks.
@@ -178,6 +191,26 @@ impl CancelReason {
 }
 
 impl EventData {
+    /// The raw bytes the event carries beside its JSON: a `command.output` chunk. `None` for every other event.
+    #[must_use]
+    pub fn bytes(&self) -> Option<&Redacted<Vec<u8>>> {
+        match self {
+            Self::CommandOutput { bytes, .. } => Some(bytes),
+            Self::SessionStarted { .. }
+            | Self::SessionEnded
+            | Self::SessionStateChanged { .. }
+            | Self::SessionIdle
+            | Self::CommandFinished { .. }
+            | Self::CwdChanged { .. }
+            | Self::SandboxViolation(_)
+            | Self::CommandProposed { .. }
+            | Self::CommandDenied { .. }
+            | Self::DecisionCancelled { .. }
+            | Self::CommandStarted { .. }
+            | Self::CommandLongRunning { .. } => None,
+        }
+    }
+
     /// The event name, the envelope's `event` member, for example `session.started`.
     #[must_use]
     pub const fn name(&self) -> &'static str {
@@ -194,6 +227,7 @@ impl EventData {
             Self::DecisionCancelled { .. } => "decision.cancelled",
             Self::CommandStarted { .. } => "command.started",
             Self::CommandLongRunning { .. } => "command.long_running",
+            Self::CommandOutput { .. } => "command.output",
         }
     }
 

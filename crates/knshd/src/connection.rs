@@ -38,6 +38,7 @@
 
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
 
@@ -47,8 +48,8 @@ use knsh_core::{Caller, Delivery, Lost, SubscriptionId};
 use knsh_json::{Frame, FrameReader, FrameWriter, JsonError, StreamId};
 use knsh_platform::AuditToken;
 use knsh_proto::{
-    ByteTransport, ErrorCode, ErrorResponse, HelloParams, Message, ProtoError, Rejection, Request, RequestId, RpcError,
-    SuccessResponse, decode, event_notification, lost_notification,
+    ByteTransport, ErrorCode, ErrorResponse, HelloParams, Message, OutputData, ProtoError, Rejection, Request,
+    RequestId, RpcError, SuccessResponse, decode, event_notification, event_notification_with_bytes, lost_notification,
 };
 
 use crate::dispatch::{Answer, Call, Dispatcher, Endpoint, HELLO, Passed, Reply};
@@ -165,6 +166,9 @@ struct Session<'a> {
     greeted: bool,
     /// How raw bytes reach this client: binary frames until a `hello` opts out.
     bytes: ByteTransport,
+    /// [`bytes`](Self::bytes) as the event pump reads it: a later `hello` may change it while the pump runs. Set
+    /// before that `hello` is answered, under the writer lock, so every notification after the answer follows it.
+    pump_bytes: &'a AtomicBool,
     /// Whether a call was answered `-32009`: the connection is closed after that answer.
     unbound: bool,
     /// The stream ID the next call may open. Every stream is ended before the next message is read, so IDs never
@@ -254,6 +258,7 @@ impl Session<'_> {
             .params::<HelloParams>()
             .map(|params| params.bytes)
             .unwrap_or_default();
+        self.pump_bytes.store(self.bytes.uses_binary_frames(), Ordering::SeqCst);
     }
 
     fn call(&self, request: &Request, descriptors: &Passed) -> Reply {
@@ -352,6 +357,7 @@ pub(crate) fn serve_with_descriptors<R: Read, W: Write + Send>(
     let writer = Mutex::new(FrameWriter::new(writer));
     let subscriber = Subscriber::new();
     let binding = SessionBinding::for_peer(peer);
+    let pump_bytes = AtomicBool::new(true);
     let mut session = Session {
         endpoint,
         dispatcher,
@@ -360,6 +366,7 @@ pub(crate) fn serve_with_descriptors<R: Read, W: Write + Send>(
         caller,
         greeted: false,
         bytes: ByteTransport::BinaryFrames,
+        pump_bytes: &pump_bytes,
         unbound: false,
         next_stream: FIRST_STREAM,
     };
@@ -410,9 +417,10 @@ pub(crate) fn serve_with_descriptors<R: Read, W: Write + Send>(
             }
             // The first subscription starts the pump; connections that never subscribe never get one.
             if pump.is_none() && subscriber.is_subscribed() {
+                let (writer, subscriber, bytes) = (&writer, &subscriber, &pump_bytes);
                 let spawned = thread::Builder::new()
                     .name("knshd-events".to_owned())
-                    .spawn_scoped(scope, || pump_events(&writer, &subscriber, shutdown));
+                    .spawn_scoped(scope, move || pump_events(writer, subscriber, bytes, shutdown));
                 match spawned {
                     Ok(handle) => pump = Some(handle),
                     // Subscriptions that nothing would ever deliver must not be left looking alive.
@@ -445,18 +453,30 @@ fn lock<W>(writer: &Mutex<FrameWriter<W>>) -> MutexGuard<'_, FrameWriter<W>> {
 
 /// The pump: waits for its connection's subscriptions to have something, then writes one batch of notifications
 /// under the writer lock, until the connection closes. On a write error it closes the connection and returns it.
+///
+/// Events that carry raw bytes (`command.output`, KNSH-053) are followed by their bytes as one binary stream, or
+/// carry them as base64 when the client opted out of binary frames (`binary`, which the latest `hello` set). Every
+/// stream is opened, sent and ended under one hold of the writer lock, so no two streams are ever open at once and
+/// the pump may reuse [`FIRST_STREAM`] for each.
 fn pump_events<W: Write>(
     writer: &Mutex<FrameWriter<W>>,
     subscriber: &Subscriber,
+    binary: &AtomicBool,
     shutdown: &(dyn Fn() + Sync),
 ) -> Result<(), JsonError> {
     while subscriber.signal().wait() {
         let mut out = lock(writer);
+        // Read under the writer lock: a `hello` answered before this batch has already set it.
+        let bytes = if binary.load(Ordering::SeqCst) {
+            ByteTransport::BinaryFrames
+        } else {
+            ByteTransport::Base64
+        };
         // Taken under the writer lock, so an unsubscribe answered before this cannot have its events written after.
         let batch = subscriber.take(PUMP_BATCH);
         let written = batch
             .iter()
-            .try_for_each(|(id, delivery)| write_delivery(&mut out, *id, delivery))
+            .try_for_each(|(id, delivery)| write_delivery(&mut out, *id, delivery, bytes))
             .and_then(|()| out.flush());
         if let Err(error) = written {
             drop(out);
@@ -473,14 +493,35 @@ fn write_delivery<W: Write>(
     writer: &mut FrameWriter<W>,
     subscription: SubscriptionId,
     delivery: &Delivery,
+    bytes: ByteTransport,
 ) -> Result<(), JsonError> {
     let lost = match delivery {
         Delivery::Event(event) => {
-            if let Some(value) = notification_value(event_notification(subscription, event)) {
+            // The raw bytes to send after the notification, when they go in a binary stream.
+            let (notification, stream) = match (event.data.bytes(), bytes) {
+                (None, _) => (event_notification(subscription, event), None),
+                (Some(raw), ByteTransport::BinaryFrames) => (
+                    event_notification_with_bytes(subscription, event, OutputData::Stream(FIRST_STREAM)),
+                    Some(raw.expose().as_slice()),
+                ),
+                (Some(raw), ByteTransport::Base64) => (
+                    event_notification_with_bytes(subscription, event, OutputData::Base64(raw.expose())),
+                    None,
+                ),
+            };
+            if let Some(value) = notification_value(notification) {
                 match writer.write_json(&value) {
                     // Nothing was written; the writer is still usable for the replacement.
                     Err(JsonError::TooDeep | JsonError::FrameTooLarge { .. }) => {}
-                    written => return written,
+                    Ok(()) => {
+                        // The notification declared exactly these bytes on the stream; the end frame closes it.
+                        if let Some(raw) = stream {
+                            writer.write_chunk(FIRST_STREAM, raw)?;
+                            writer.write_end(FIRST_STREAM)?;
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
                 }
             }
             Lost {
@@ -1119,5 +1160,75 @@ mod tests {
         drop(reader);
         drop(client);
         assert_eq!(server.join().unwrap(), Closed::Peer);
+    }
+
+    // FR-LC-18, KNSH-053: a `command.output` chunk follows its notification as one binary stream (exactly the declared
+    // bytes, then the end frame); a client that opted out of binary frames gets it as base64 inside the notification.
+    #[test]
+    fn command_output_is_sent_as_a_binary_stream() {
+        use crate::events::tests::{agent, hub, sid, start};
+        use knsh_core::{EventData, OutputStream, RecordId, Redacted, Ulid};
+
+        let chunk = || EventData::CommandOutput {
+            record_id: RecordId::from_ulid(Ulid::from_u128(1)),
+            stream: OutputStream::Stdout,
+            offset: 0,
+            bytes: Redacted::new(b"\x00raw \xff bytes\n".to_vec()),
+        };
+        for (hello, binary) in [
+            (std::str::from_utf8(HELLO_REQ).unwrap(), true),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"client":"c","client_version":"1","protocols":[1],"binary_frames":false}}"#,
+                false,
+            ),
+        ] {
+            let hub = hub();
+            start(&hub, 1);
+            let (client, server) = served(&hub);
+            let mut reader = FrameReader::new(&client);
+            send(&client, hello);
+            next(&mut reader);
+            send(&client, r#"{"jsonrpc":"2.0","id":2,"method":"events.subscribe"}"#);
+            result(&next(&mut reader));
+            hub.publish(sid(1), &agent(), chunk()).unwrap();
+            hub.publish(sid(1), &agent(), EventData::SessionIdle).unwrap();
+
+            let notification = next(&mut reader);
+            assert_eq!(notified(&notification), ("command.output".to_owned(), 2));
+            let Message::Notification(notification) = notification else {
+                unreachable!()
+            };
+            let data = notification
+                .params
+                .as_ref()
+                .and_then(|params| params.get("data"))
+                .and_then(Value::as_object)
+                .unwrap();
+            assert_eq!(data.get("size").and_then(Value::as_str), Some("13"));
+            if binary {
+                let stream = data.get("data").and_then(Value::as_object).unwrap();
+                let id = u32::try_from(stream.get("stream_id").and_then(Value::as_i64).unwrap()).unwrap();
+                // A client opens the stream the notification announced, with its declared size.
+                reader.open_stream(StreamId::new(id).unwrap(), Some(13)).unwrap();
+                match reader.read_frame().unwrap() {
+                    Some(Frame::Chunk { stream, data }) => {
+                        assert_eq!(stream.get(), id);
+                        assert_eq!(data, b"\x00raw \xff bytes\n");
+                    }
+                    other => panic!("expected the chunk, got {other:?}"),
+                }
+                assert!(matches!(reader.read_frame().unwrap(), Some(Frame::End { .. })));
+            } else {
+                assert_eq!(
+                    data.get("data_base64").and_then(Value::as_str),
+                    Some(knsh_json::base64_encode(b"\x00raw \xff bytes\n").as_str())
+                );
+            }
+            // The stream ended: later events follow normally.
+            assert_eq!(notified(&next(&mut reader)), ("session.idle".to_owned(), 3));
+            drop(reader);
+            drop(client);
+            assert_eq!(server.join().unwrap(), Closed::Peer);
+        }
     }
 }

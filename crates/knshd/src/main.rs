@@ -64,6 +64,9 @@
 // Owned by the session registry, so built where it is.
 #[cfg(target_os = "macos")]
 mod agents;
+// Reading a line's output (KNSH-053): platform-neutral, used by the macOS spawner.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod capture;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod connection;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -77,6 +80,9 @@ mod events;
 mod exec;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod hello;
+// Lines started with exec.start (KNSH-053), built with `exec`.
+#[cfg(target_os = "macos")]
+mod jobs;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod lifetime;
 // Reads the session registry, so built where it is.
@@ -471,6 +477,8 @@ impl Supervision<'_> {
             authority: Arc::new(NoAuthority),
             approvals: Arc::new(DenyAtTimeout::default()),
             spawner: Arc::new(spawner),
+            // Secret redaction arrives with KNSH-091; the hook is already on the capture path.
+            redaction: Arc::new(knsh_core::NoOutputRedaction),
         });
         exec::ExecRun::new(lifecycle, self.paths.shim_dir()).handlers()
     }
