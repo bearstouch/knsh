@@ -222,11 +222,16 @@ mod tests {
         probes.check_file_events().unwrap();
     }
 
-    // The real sandbox probe: `sandbox-exec` with the trivial profile exits 0 for an ordinary user.
+    // The real bounded runner: `sandbox-exec` with an allow-all profile runs `/usr/bin/true` for an ordinary user.
     #[test]
-    fn sandbox_probe_passes_on_this_machine() {
+    fn runs_sandbox_exec_on_this_machine() {
         let processes = crate::macos::SystemProcesses::new();
         let clock = crate::macos::SystemClock::new();
-        crate::probe::check_sandbox(&processes, &clock, std::time::Duration::from_secs(10)).unwrap();
+        let request = crate::SpawnRequest::new(crate::probe::SANDBOX_EXEC)
+            .arg("-p")
+            .arg("(version 1)(allow default)")
+            .arg("/usr/bin/true");
+        let status = crate::probe::run_to_exit(&processes, &clock, &request, std::time::Duration::from_secs(10));
+        assert_eq!(status, Ok(crate::ExitStatus::Exited(0)));
     }
 }

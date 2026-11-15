@@ -1,9 +1,10 @@
 //! Capability probes: real checks that a backend works on this machine, each bounded in time (KNSH-014).
 //!
-//! A probe never guesses from a version number. The sandbox probe runs `sandbox-exec` with a trivial profile and
-//! needs a clean exit; [`SystemProbe`] reads the OS version and starts and stops an `FSEvents` stream. Every probe has
-//! a deadline on the injected [`Clock`]: one that hangs is abandoned and reported as failed, so `knshd` reports the
-//! backend as `none` (NFR-SEC-10, NFR-REL-08) instead of never answering `hello`.
+//! A probe never guesses from a version number. [`run_to_exit`] runs a probe command (the sandbox probe runs
+//! `knsh-exec` under a deny profile, KNSH-046) and reports how it ended; [`SystemProbe`] reads the OS version and
+//! starts and stops an `FSEvents` stream. Every probe has a deadline on the injected [`Clock`]: one that hangs is
+//! abandoned and reported as failed, so `knshd` reports the backend as `none` (NFR-SEC-10, NFR-REL-08) instead of
+//! never answering `hello`.
 //!
 //! Deciding what a failure means for the capability report is `knshd`'s job; this module only says whether each
 //! check passed.
@@ -19,13 +20,6 @@ use crate::process::{ExitStatus, ProcessGroupId, Processes, Signal, SpawnRequest
 
 /// The Seatbelt front end that `knsh-exec` applies profiles with.
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
-
-/// The command run under the trivial profile.
-pub const TRUE_PROGRAM: &str = "/usr/bin/true";
-
-/// The smallest valid Seatbelt profile. Allowing everything isolates the question "does Seatbelt work at all" from
-/// any rule of ours.
-pub const TRIVIAL_PROFILE: &str = "(version 1)(allow default)";
 
 /// How often a probe checks whether its work has finished.
 const POLL: Duration = Duration::from_millis(5);
@@ -87,48 +81,42 @@ impl fmt::Display for ProbeFailure {
 
 impl std::error::Error for ProbeFailure {}
 
-/// The request the sandbox probe spawns: `sandbox-exec -p <trivial profile> /usr/bin/true`, with an empty
-/// environment and null standard descriptors.
-#[must_use]
-pub fn sandbox_probe_request() -> SpawnRequest {
-    SpawnRequest::new(SANDBOX_EXEC)
-        .arg("-p")
-        .arg(TRIVIAL_PROFILE)
-        .arg(TRUE_PROGRAM)
-}
-
-/// Checks that Seatbelt works: runs [`sandbox_probe_request`] and requires exit status 0 within `timeout`.
+/// Runs `request` and returns how it ended, if it ends within `timeout`.
 ///
 /// On timeout the process group is killed and reaped (for at most another `timeout`), so a hung probe does not
-/// outlive the check.
+/// outlive the check. Which exit means success is the caller's decision.
 ///
 /// # Errors
 ///
-/// [`ProbeFailure::Platform`] if the spawn or a wait fails, [`ProbeFailure::Exited`] for any other exit,
-/// [`ProbeFailure::TimedOut`] if it did not finish in time.
-pub fn check_sandbox(processes: &dyn Processes, clock: &dyn Clock, timeout: Duration) -> Result<(), ProbeFailure> {
-    let group = processes
-        .spawn(&sandbox_probe_request())
-        .map_err(ProbeFailure::Platform)?;
+/// [`ProbeFailure::Platform`] if the spawn or a wait fails, [`ProbeFailure::TimedOut`] if it did not finish in time.
+pub fn run_to_exit(
+    processes: &dyn Processes,
+    clock: &dyn Clock,
+    request: &SpawnRequest,
+    timeout: Duration,
+) -> Result<ExitStatus, ProbeFailure> {
+    let group = processes.spawn(request).map_err(ProbeFailure::Platform)?;
     match wait_until(processes, clock, group, timeout) {
-        Ok(Some(ExitStatus::Exited(0))) => Ok(()),
-        Ok(Some(status)) => Err(ProbeFailure::Exited(status)),
+        Ok(Some(status)) => Ok(status),
         Ok(None) => {
-            // Still running at the deadline: stop the whole group, then reap it so its id is not left to be reused.
-            // Both are best effort: the probe has already failed, and a group that cannot be reaped in time is left
-            // to the kernel rather than blocking start-up.
-            let _ = processes.signal(group, Signal::Kill);
-            let _ = wait_until(processes, clock, group, timeout);
+            kill_and_reap(processes, clock, group, timeout);
             Err(ProbeFailure::TimedOut)
         }
         Err(error) => {
-            // Waiting failed with the child possibly still running: stop it the same way, so a failed probe never
-            // leaves a process group behind.
-            let _ = processes.signal(group, Signal::Kill);
-            let _ = wait_until(processes, clock, group, timeout);
+            // Waiting failed with the child possibly still running: stop it too, so a failed probe never leaves a
+            // process group behind.
+            kill_and_reap(processes, clock, group, timeout);
             Err(ProbeFailure::Platform(error))
         }
     }
+}
+
+/// Stops the whole group, then reaps it so its id is not left to be reused. Both are best effort: the probe has
+/// already failed, and a group that cannot be reaped within `timeout` is left to the kernel rather than blocking
+/// start-up.
+fn kill_and_reap(processes: &dyn Processes, clock: &dyn Clock, group: ProcessGroupId, timeout: Duration) {
+    let _ = processes.signal(group, Signal::Kill);
+    let _ = wait_until(processes, clock, group, timeout);
 }
 
 /// Polls `group` until it exits (`Some`) or `timeout` passes on `clock` (`None`).
@@ -204,40 +192,42 @@ mod tests {
         Arc::new(FakeClock::new(Timestamp::UNIX_EPOCH))
     }
 
+    const PROGRAM: &str = "/usr/bin/probe";
+
     #[test]
-    fn sandbox_probe_passes_on_clean_exit() {
+    fn reports_how_the_command_ended() {
         let processes = ScriptedProcesses::new();
-        processes.expect(SANDBOX_EXEC, Script::Exits(0));
-        assert_eq!(check_sandbox(&processes, &*clock(), TIMEOUT), Ok(()));
-        let spawned = processes.spawned();
-        assert_eq!(spawned[0].args, ["-p", TRIVIAL_PROFILE, TRUE_PROGRAM]);
-        assert!(spawned[0].env.is_empty(), "the engine's environment is never passed on");
+        processes.expect(PROGRAM, Script::Exits(42));
+        let request = SpawnRequest::new(PROGRAM).arg("-x");
+        assert_eq!(
+            run_to_exit(&processes, &*clock(), &request, TIMEOUT),
+            Ok(ExitStatus::Exited(42))
+        );
+        assert_eq!(processes.spawned(), [request]);
     }
 
-    // KNSH-014: any failure is a failed probe (fake process runner).
+    // KNSH-014: a command that cannot start is a failed probe (fake process runner).
     #[test]
-    fn failed_probe_reports_failure() {
+    fn failed_spawn_reports_failure() {
         let processes = ScriptedProcesses::new();
-        processes.expect(SANDBOX_EXEC, Script::Exits(65));
-        assert_eq!(
-            check_sandbox(&processes, &*clock(), TIMEOUT),
-            Err(ProbeFailure::Exited(ExitStatus::Exited(65)))
-        );
-        processes.expect(SANDBOX_EXEC, Script::FailsToSpawn(libc::ENOENT));
+        processes.expect(PROGRAM, Script::FailsToSpawn(libc::ENOENT));
         assert!(matches!(
-            check_sandbox(&processes, &*clock(), TIMEOUT),
+            run_to_exit(&processes, &*clock(), &SpawnRequest::new(PROGRAM), TIMEOUT),
             Err(ProbeFailure::Platform(_))
         ));
     }
 
-    // KNSH-014: a hanging sandbox-exec is killed at the deadline (fake clock: no real waiting).
+    // KNSH-014: a hanging probe command is killed at the deadline (fake clock: no real waiting).
     #[test]
-    fn hanging_sandbox_probe_times_out_and_is_killed() {
+    fn hanging_probe_command_times_out_and_is_killed() {
         let processes = ScriptedProcesses::new();
-        processes.expect(SANDBOX_EXEC, Script::RunsUntilSignalled);
+        processes.expect(PROGRAM, Script::RunsUntilSignalled);
         let clock = clock();
         let start = clock.monotonic();
-        assert_eq!(check_sandbox(&processes, &*clock, TIMEOUT), Err(ProbeFailure::TimedOut));
+        assert_eq!(
+            run_to_exit(&processes, &*clock, &SpawnRequest::new(PROGRAM), TIMEOUT),
+            Err(ProbeFailure::TimedOut)
+        );
         assert!(clock.monotonic().saturating_duration_since(start) >= TIMEOUT);
         assert_eq!(processes.signals().len(), 1);
         assert_eq!(processes.signals()[0].1, Signal::Kill);

@@ -268,11 +268,15 @@ pub(crate) mod tests {
         assert_eq!(result.get("binary_frames").and_then(Value::as_bool), Some(false));
     }
 
-    // KNSH-014: results are cached per knshd lifetime. Any number of `hello`s reuse the one probe.
+    // KNSH-014, KNSH-046: results are cached per knshd lifetime. Any number of `hello`s reuse the one probe, and
+    // knsh-exec ran once for it.
     #[test]
     fn probe_runs_once_per_lifetime() {
         let system = Arc::new(knsh_platform::testing::FakeSystemProbe::working(15));
-        let machine = Machine::new(knsh_platform::testing::Script::Exits(0), system.clone());
+        let machine = Machine::new(
+            knsh_platform::testing::Script::Exits(crate::probe::PROBE_DENIED_EXIT),
+            system.clone(),
+        );
         let dispatcher = phase1_dispatcher(probe(&machine.probes()), handlers()).unwrap();
         let after_probe = system.calls();
         for _ in 0..3 {
@@ -280,6 +284,11 @@ pub(crate) mod tests {
         }
         assert_eq!(after_probe, 2, "os version and file events, once each");
         assert_eq!(system.calls(), after_probe, "hello never probes again");
-        assert_eq!(machine.processes.spawned().len(), 1, "sandbox-exec ran once");
+        assert_eq!(machine.processes.scripted.spawned().len(), 1, "knsh-exec ran once");
+        let result = hello(&dispatcher, Endpoint::User, PARAMS).unwrap();
+        assert_eq!(
+            capabilities(&result).get("sandbox").and_then(Value::as_str),
+            Some("seatbelt")
+        );
     }
 }

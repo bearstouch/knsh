@@ -25,11 +25,11 @@ as `none` is not listed in `methods`, and calling it returns `-32005` naming tha
 
 The probe runs once when `knshd` starts, before it serves anything, and its result is kept for that process's
 lifetime; a restarted `knshd` probes again. Each check is real (never a version guess), bounded in time (2 s per
-check, run in sequence; at most 8 s in all, including reaping a hung `sandbox-exec`), and any failure, error or timeout reports `none`. A hung check is abandoned; a hung `sandbox-exec` is killed.
+check, run in sequence; at most 8 s in all, including reaping a hung `knsh-exec`), and any failure, error or timeout reports `none`. A hung check is abandoned; a hung `knsh-exec` is killed with its process group.
 
-| Capability | v1 check (phase 1) |
+| Capability | Check |
 | --- | --- |
-| `sandbox` | `/usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true` exits 0. Reported but unused in phase 1 |
+| `sandbox` | Phase 2 (KNSH-046): `knshd` writes the profile `(version 1)(allow default)(deny file-write*)` to a new `0600` file in its private run directory, checks without a sandbox that a target file next to it can be created (then removes it), and runs the `knsh-exec` installed next to `knshd` with that profile, `/bin/sh` and a line that tries to create the target (named in `KNSH_PROBE_TARGET`). `seatbelt` only if the line exits 42 (its "write failed" code) **and** the target does not exist afterwards; anything else (no `knsh-exec`, a setup error, any other exit, a timeout, the file present) reports `none`. Both files are removed afterwards. Phase 1 ran `/usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true` instead |
 | `file_events` | An `FSEvents` stream is created, started on a dispatch queue and stopped |
 | `platform` | The OS major version from `sysctl kern.osproductversion` |
 | `network_filter`, `secrets` | No backend yet: always `none` |
