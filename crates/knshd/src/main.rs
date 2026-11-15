@@ -16,7 +16,7 @@
 //! - NFR-REL-03, `specs/04-non-functional-requirements/security.md` "squats its endpoints" (launchd agent, KNSH-012)
 //! - `specs/06-api/README.md`, `specs/06-api/wire-format.md`, NFR-SEC-07 (connection server and dispatcher, KNSH-013)
 //! - `specs/06-api/handshake.md`, `specs/05-models/capabilities.md`, NFR-SEC-10, NFR-REL-08 (`hello`, method
-//!   catalogue and capability probe, KNSH-014)
+//!   catalogue and capability probe, KNSH-014; the sandbox probe through `knsh-exec`, FR-AGT-06, KNSH-046)
 //! - `specs/06-api/user-socket.md#records`, FR-REC-02, FR-REC-08, NFR-REL-05 (record store, `records.query` and
 //!   `records.output`, KNSH-016)
 //! - FR-REC-07, FR-REC-10, NFR-PRIV-03 (record retention and `records.forget`, KNSH-017)
@@ -164,8 +164,7 @@ fn start() -> Result<(), StartError> {
     use std::sync::Arc;
 
     use knsh_platform::macos::{
-        LaunchdSockets, RealFs, SystemClock, SystemPeerCredentials, SystemProbes, SystemProcesses, SystemRandom,
-        UnifiedLog, effective_uid,
+        LaunchdSockets, RealFs, SystemClock, SystemPeerCredentials, SystemRandom, UnifiedLog, effective_uid,
     };
     use knsh_platform::{EnginePaths, Field, Level, SystemLog, Value, ensure_engine_dirs};
 
@@ -173,7 +172,6 @@ fn start() -> Result<(), StartError> {
 
     use crate::events::EventHub;
     use crate::policy::PolicyCheck;
-    use crate::probe::{PROBE_TIMEOUT, Probes, probe};
     use crate::records::Records;
     use crate::server::{Config, Exit, Server, Services};
     use crate::sessions::Sessions;
@@ -240,13 +238,7 @@ fn start() -> Result<(), StartError> {
         handlers.extend(policy.handlers());
         // Probed once, before serving: every hello of this process reports the same result, and a restarted knshd
         // probes again (KNSH-014).
-        let probed = probe(&Probes {
-            processes: Arc::new(SystemProcesses::new()),
-            system: Arc::new(SystemProbes::new()),
-            clock: clock.clone(),
-            log: Arc::clone(&log),
-            timeout: PROBE_TIMEOUT,
-        });
+        let probed = probe_this_machine(&paths, clock.clone(), Arc::clone(&log));
         let services = Services {
             dispatcher: hello::phase1_dispatcher(probed, handlers).map_err(StartError::Dispatch)?,
             credentials: Arc::new(SystemPeerCredentials::new()),
@@ -276,6 +268,37 @@ fn start() -> Result<(), StartError> {
         &[Field::new("reason", Value::Static(reason))],
     );
     Ok(())
+}
+
+/// Runs the capability probe on this machine (KNSH-014). The sandbox check runs the `knsh-exec` installed next to
+/// this binary, the same one agent lines will use, and keeps its files in the private run directory (KNSH-046).
+#[cfg(target_os = "macos")]
+fn probe_this_machine(
+    paths: &knsh_platform::EnginePaths,
+    clock: std::sync::Arc<knsh_platform::macos::SystemClock>,
+    log: std::sync::Arc<dyn knsh_platform::SystemLog>,
+) -> probe::Probed {
+    use std::sync::Arc;
+
+    use knsh_platform::macos::{RealFs, SystemProbes, SystemProcesses, SystemRandom};
+
+    use crate::probe::{PROBE_TIMEOUT, Probes, SandboxProbe};
+
+    probe::probe(&Probes {
+        processes: Arc::new(SystemProcesses::new()),
+        system: Arc::new(SystemProbes::new()),
+        clock,
+        log,
+        timeout: PROBE_TIMEOUT,
+        sandbox: SandboxProbe {
+            trampoline: std::env::current_exe()
+                .ok()
+                .and_then(|exe| SandboxProbe::trampoline_beside(&exe)),
+            dir: paths.run_dir(),
+            fs: Arc::new(RealFs::new()),
+            random: Arc::new(SystemRandom::new()),
+        },
+    })
 }
 
 /// Removes the compiled profile files an earlier run left behind: no line runs yet, so none is in use (FR-SBX-07). A

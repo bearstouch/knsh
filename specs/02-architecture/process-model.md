@@ -24,6 +24,42 @@ stateDiagram-v2
     Restarting --> Running: launchd restart
 ```
 
+## `knsh-exec`
+
+`knsh-exec` is the only way an agent command or envelope starts (KNSH-046). `knshd` is multithreaded, so it never
+applies a sandbox between `fork` and `exec` itself; it spawns `knsh-exec`, which is single-threaded, depends on the
+standard library only (NFR-SUP-01), and becomes Apple's `sandbox-exec` (decision 1).
+
+```text
+knsh-exec [--keep-fd <n>]... --profile <absolute path> --interpreter <absolute path> --line <line>
+  => execve("/usr/bin/sandbox-exec", ["/usr/bin/sandbox-exec", "-f", <profile>, <interpreter>, "-c", "--", <line>], env)
+```
+
+- **Arguments.** `--profile`, `--interpreter` and `--line` are each required exactly once, in any order; `--keep-fd`
+  (a descriptor number of 3 or more, at most 16, no repeats) is optional. Paths must be absolute with no `.`, `..` or
+  empty components; the line must not be empty. Any other argument, a repeated option or a missing value is
+  rejected. Error messages never repeat a value. `--` after `-c` makes a line that starts with `-` a command, never
+  an interpreter option (`/bin/sh`, `/bin/bash` and `/bin/zsh` all accept it).
+- **Profile file.** A regular file (not a symlink) owned by the user and not writable by group or others, as `knshd`
+  writes it (FR-SBX-07); anything else is refused before `sandbox-exec` reads it.
+- **Process.** `setpgid(0, 0)`, so the line leads its own process group. Every open descriptor except 0, 1, 2 and
+  those named with `--keep-fd` gets `FD_CLOEXEC`; closed stdio or a named descriptor that is not open is refused.
+  `SIGPIPE` is reset to its default action (the Rust runtime ignores it, and ignored signals survive `execve`). The
+  thread count must be exactly 1 just before `execve`. The environment is passed on as received: `knshd` builds it.
+- **Exit codes** (`<sysexits.h>`), each with one `knsh-exec: <reason>` line on stderr, and nothing run:
+
+  | Code | Meaning |
+  | --- | --- |
+  | 64 | Malformed arguments, including a `--keep-fd` descriptor that is not open |
+  | 66 | The profile file is missing or unsafe |
+  | 69 | `execve` of `/usr/bin/sandbox-exec` failed (for example, it is missing) |
+  | 71 | Process setup failed (process group, descriptors, signals, more than one thread), or no sandbox backend on this platform |
+
+  `sandbox-exec` itself exits 65 when it cannot read or compile the profile and 71 when it cannot execute the
+  interpreter, before the line starts. There is never a fallback to running the line unsandboxed: the supervisor
+  treats each of these exits as a deny, and the capability probe reports `sandbox: none`
+  ([capabilities](../05-models/capabilities.md#probe)).
+
 ## Data locations (macOS)
 
 | Data | Path |

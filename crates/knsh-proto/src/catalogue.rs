@@ -286,7 +286,9 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("checkpoint.redo", Endpoints::ALL),
     // user.sock (specs/06-api/user-socket.md).
     MethodSpec::planned("checkpoint.restore", Endpoints::USER_CONTROL),
-    MethodSpec::planned("session.start_agent", Endpoints::USER),
+    // Agent sessions refuse to start without the sandbox (FR-AGT-06, KNSH-046): once served (KNSH-056), it is
+    // unlisted and answered -32005 naming `sandbox` whenever the probe reports `none`.
+    MethodSpec::planned("session.start_agent", Endpoints::USER).requires(Backend::Sandbox),
     MethodSpec::planned("session.list", Endpoints::USER),
     MethodSpec::planned("session.end", Endpoints::USER),
     // Human telemetry (KNSH-021): `knsh` starts a recorded human session bound to its connection and reports each
