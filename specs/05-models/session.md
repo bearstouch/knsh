@@ -27,9 +27,38 @@ request (pausing a paused session, leaving `ended`) is refused with `-32006` and
 including the one into `ended`, emits `session.state_changed`. An ended session is dropped from the live registry,
 so later lookups answer "not found or ended" (`-32006`), the same as an unknown ID.
 
-A child agent session's profile must equal or be stricter than its parent's (FR-SES-03). Until the policy model can
-compare profiles (phase 2), only the parent's own profile is accepted. A human session cannot have an agent
-session as its parent: it would be unenforced, an escape from the agent's profile (FR-SES-12).
+A child agent session's profile must equal or be stricter than its parent's (FR-SES-03): without `--profile` it gets
+the parent's, and a looser one is refused (`-32003`, [`session.start_agent`](../06-api/user-socket.md#sessionstart_agent)).
+A human session cannot have an agent session as its parent: it would be unenforced, an escape from the agent's
+profile (FR-SES-12).
+
+### Profile strictness
+
+A child profile is **equal or stricter** when everything it allows, the parent allows too, and everything the parent
+denies, it still denies (KNSH-056). The resolved profiles (after `extends`, the preset and defaults) are compared key
+by key. Where two values cannot be compared exactly, only the same value counts, so an unknown is never looser:
+
+| Key | The child is no looser when |
+| --- | --- |
+| `fs.read` | the parent reads `all`, or every child read path is at or below a parent read path |
+| `fs.write` | every child write root is at or below a parent write root |
+| `fs.deny` | every parent deny is at or below a child deny |
+| `exec.allow` | every child pattern is a parent `exec.allow` pattern (same text) |
+| `exec.ask` | every child pattern is a parent `exec.allow` or `exec.ask` pattern, and every parent pattern is a child `exec.ask` or `exec.deny` pattern |
+| `exec.deny` | every parent pattern is a child `exec.deny` pattern |
+| `exec.default`, `exec.project_executables`, `approvals.irreversible` | the child's action is the parent's or stricter (`allow` < `ask` < `deny`) |
+| `exec.trusted_folders`, `exec.trusted_tools` | a subset of the parent's |
+| `exec.interpreters`, `exec.bash` | equal |
+| `network.mode` | `none`, or both `allowlist` |
+| `network.hosts`, `network.loopback` | a subset of the parent's |
+| `network.approval_hosts` | a subset of the parent's `hosts` and `approval_hosts` |
+| `approvals.irreversible_commands` | a superset of the parent's |
+| `checkpoints` | `required` kept, every parent root kept, `exclude` a subset of the parent's |
+| `recording` | `commands` and `output` on wherever the parent's are, `retention_days` at least the parent's |
+| `secrets.env` | every child entry is the parent's, unchanged |
+
+`name`, `extends`, `preset` and `output.mode` are not compared: the first three only say where values came from,
+and the output mode shapes what the agent reads back, not what it may do.
 
 ## Session token
 

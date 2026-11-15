@@ -16,7 +16,14 @@ knsh agent --profile web-app -- claude
 | `PATH` | Shim directory first (`sh`, `bash`, `zsh` → `knsh -c`) |
 | Session token | In the environment, used by the `knsh` client in `hello` |
 | Proxy settings | Per-envelope proxy credentials |
-| Actor | `--agent <name>`, or derived from the command (`claude` → `claude-code`) |
+| Actor | `--agent <name>`, or derived from the command's file name (table below) |
+
+| Command | Actor |
+| --- | --- |
+| `claude` | `claude-code` |
+| anything else | its own file name, if it is 1–64 characters from `[A-Za-z0-9._-]`; otherwise `--agent` is required |
+
+The Codex CLI's binary name and actor are added with its preset (KNSH-058).
 
 ## Presets
 

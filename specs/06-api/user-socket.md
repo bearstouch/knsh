@@ -81,6 +81,66 @@ A telemetry call or `session.info` on a connection without a session is `-32003`
 store that fails is `-32603`. Events are best effort: a record that was written is answered even if its event could
 not be published.
 
+## Agent sessions
+
+`knsh agent` ([CLI](cli.md#agent)) starts an agent CLI in a new agent session over its own `user.sock` connection
+(KNSH-056, FR-AGT-01). The method exists on `user.sock` only: on `agent.sock` it is unknown (`-32601`) and not listed
+in `hello` (FR-SES-02).
+
+### `session.start_agent`
+
+The request carries the caller's stdin, stdout and stderr as three descriptors (`SCM_RIGHTS`), announced by
+`"stdio": "passed"`, as [`exec.run`](agent-socket.md#execrun) does; any other count is `-32602`. The call is answered
+when the CLI exits, so the client's read has no deadline.
+
+| Param | Type | Meaning |
+| --- | --- | --- |
+| `command` | array of strings | The CLI's argv after `--`, `argv[0]` first: 1 to 4096 entries, no NUL, `argv[0]` not empty |
+| `cwd` | path | The working directory: absolute and resolved |
+| `env` | object | The caller's whole environment (names non-empty, without `=`; no NUL). Absent is empty |
+| `profile` | string | `--profile`. Absent: the parent session's profile when nested, `default` otherwise |
+| `agent` | string | `--agent`: the actor's `agent_id`. Absent: derived from `argv[0]` (FR-AGT-02, below) |
+| `stdio` | string | Required: `"passed"` |
+
+`knshd` then:
+
+1. **Actor (FR-AGT-02).** `agent`, or the last path component of `argv[0]` mapped through the derivation table
+   (`claude` → `claude-code`; any other name is its own `agent_id`). A name outside `[A-Za-z0-9._-]{1,64}` is `-32602`.
+2. **Parent (FR-SES-03).** The live agent session the caller runs inside: the one whose token is
+   `KNSH_SESSION_TOKEN` in `env`, else the one whose registered envelope the caller's process descends from (its
+   audit token, as on [`agent.sock`](agent-socket.md#binding-a-connection-to-its-session)). Inside an envelope the
+   sandbox denies `user.sock`, so this is a second line of defence: a nested session can only be as strict.
+3. **Profile.** `profile`, else the parent's, else `default`. A named profile that does not exist is `-32602`; one
+   that cannot be loaded is `-32603`. With a parent, the profile must be equal to or stricter than the parent's
+   as it runs, resolved when the parent started (its `${PROJECT}`, not one found from this `cwd`)
+   ([strictness](../05-models/session.md#profile-strictness)); a looser one is `-32003` and nothing starts. Without
+   `profile`, the child runs the parent's resolved profile unchanged.
+4. **Program.** `argv[0]` with a `/` is taken relative to `cwd`; a name is looked up on the absolute entries of
+   `env`'s `PATH`, skipping the shim directory. It must be an executable file, or the call is `-32602`.
+5. **Start.** The session is created (`actor.kind` `agent`, `envelope` true, recording on by default,
+   `parent_session_id`), its row written and `session.started` published. The CLI is started through `knsh-exec` in a
+   new process group on the passed descriptors, with the session's profile compiled for an envelope and the
+   environment of [agent CLIs](../08-integrations/agent-clis.md#starting): `env` without `KNSH_SESSION_TOKEN` and the
+   dynamic linker's `DYLD_*` variables, with `SHELL` set to `knsh`, the shim directory first on `PATH` and the new
+   session's token. The group's leader is registered as the session's envelope and kept for pause and resume.
+6. **Wait.** When the CLI exits, what is left of its group gets `SIGTERM`. If the caller disconnects first, the
+   group gets `SIGTERM`, then `SIGKILL` after 2 s.
+7. **End.** The session ends (`session.state_changed` to `ended`, then `session.ended`) and its token and envelope
+   are revoked, whatever happened after step 5.
+
+Result, once the session has ended:
+
+```json
+{"session_id": "01J…", "agent_id": "claude-code", "profile": "web-app", "parent_session_id": null,
+ "exit_code": 0, "signal": null}
+```
+
+Exactly one of `exit_code` and `signal` is set. A CLI that could not be started (the trampoline failed, the profile
+file could not be written), or whose caller left, is `-32603` with no reason; its session has still ended.
+
+When the [capability probe](../05-models/capabilities.md) reports `sandbox: none` the method is not listed in `hello`
+and every call is `-32005` with `data.capability` `sandbox` (FR-AGT-06): no session is created.
+
 ## Records
 
 `records.query` and `records.output` are the only way to read execution records (FR-REC-08). On `user.sock` they see every session. On `agent.sock` the same methods see only the session the connection is bound to; naming another session, or another session's record, is `-32003`. Byte counts and offsets are decimal strings (±2^53 rule, [wire-format.md](wire-format.md#strict-json-profile)).

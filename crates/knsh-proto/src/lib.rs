@@ -97,6 +97,7 @@ mod method;
 mod policy;
 mod records;
 mod session;
+mod start_agent;
 
 pub use capability::{
     Backend, Capabilities, CheckpointBackend, FileEvents, NONE, NetworkFilter, Platform, Sandbox, SandboxViolations,
@@ -140,3 +141,4 @@ pub use session::{
     MAX_TELEMETRY_COMMAND_LEN, MAX_TELEMETRY_CWD_LEN, SessionInfoResult, SessionStartHumanParams,
     SessionStartHumanResult, TelemetryCommandParams, TelemetryCommandResult, TelemetryCwdParams, TelemetryIdleParams,
 };
+pub use start_agent::{SessionStartAgentParams, SessionStartAgentResult};

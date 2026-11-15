@@ -64,7 +64,7 @@ pub(crate) const EXEC_WAIT: &str = "exec.wait";
 pub(crate) const EXEC_KILL: &str = "exec.kill";
 
 /// The variable names are resolved on, and the one the shims are stripped from.
-const PATH_VAR: &str = "PATH";
+pub(crate) const PATH_VAR: &str = "PATH";
 
 /// What policy decides a line on (FR-LC-09, FR-LC-14): the line, where it runs, and where its names resolve.
 /// Deliberately without the interpreter.

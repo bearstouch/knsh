@@ -85,13 +85,15 @@ impl AgentSocket for UnixAgentSocket {
 /// had redirected it there.
 ///
 /// Taken before the connection is made: were descriptor 0 closed, the socket could otherwise land on it and be
-/// passed to the line as its stdin, giving the line this connection to `knshd`.
-struct Stdio {
+/// passed to the line as its stdin, giving the line this connection to `knshd`. Shared with `knsh agent` (KNSH-056),
+/// which passes the same three streams to the agent CLI.
+pub(crate) struct Stdio {
     streams: [OwnedFd; 3],
 }
 
 impl Stdio {
-    fn of_this_process() -> io::Result<Self> {
+    /// Duplicates of this process's stdin, stdout and stderr (`/dev/null` for a closed one).
+    pub(crate) fn of_this_process() -> io::Result<Self> {
         Ok(Self {
             streams: [
                 stream(io::stdin().as_fd(), false)?,
@@ -101,7 +103,8 @@ impl Stdio {
         })
     }
 
-    fn borrowed(&self) -> [BorrowedFd<'_>; 3] {
+    /// The three streams, in order, for sending.
+    pub(crate) fn borrowed(&self) -> [BorrowedFd<'_>; 3] {
         self.streams.each_ref().map(AsFd::as_fd)
     }
 }

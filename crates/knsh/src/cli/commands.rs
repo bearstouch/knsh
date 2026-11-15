@@ -23,7 +23,7 @@ pub static KNSH: Command = group(
                     long: "agent",
                     value: Some("name"),
                     required: false,
-                    help: "Agent CLI preset to apply",
+                    help: "Agent name recorded as the actor (default: derived from the command)",
                 },
             ],
             // The agent's own argv follows `--`, so none of its flags can be mistaken for ours.

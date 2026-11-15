@@ -245,8 +245,8 @@ impl FromJson for ExecRunParams {
     }
 }
 
-/// Reads `env`: an object of string values, each a valid variable.
-fn environment(env: &Value) -> Result<Vec<(String, String)>, JsonError> {
+/// Reads `env`: an object of string values, each a valid variable. Shared with `session.start_agent`.
+pub(crate) fn environment(env: &Value) -> Result<Vec<(String, String)>, JsonError> {
     let Value::Object(object) = env else {
         return Err(out_of_range("env"));
     };
@@ -266,17 +266,25 @@ fn environment(env: &Value) -> Result<Vec<(String, String)>, JsonError> {
         .collect()
 }
 
+/// Writes `env` as the object [`environment`] reads. Shared with `session.start_agent`.
+///
+/// # Errors
+///
+/// A repeated name is refused here (strict JSON has no duplicate keys), never silently merged.
+pub(crate) fn environment_value(env: &[(String, String)]) -> Result<Value, JsonError> {
+    let mut object = Object::new();
+    for (name, value) in env {
+        object.insert(name.as_str(), Value::from(value.as_str()))?;
+    }
+    Ok(Value::Object(object))
+}
+
 impl ToJson for ExecRunParams {
     fn to_json(&self) -> Result<Value, JsonError> {
-        let mut env = Object::new();
-        for (name, value) in &self.env {
-            // A repeated name is refused here (strict JSON has no duplicate keys), never silently merged.
-            env.insert(name.as_str(), Value::from(value.as_str()))?;
-        }
         let mut object = Object::new()
             .with("command", self.command.as_str())?
             .with("cwd", path_text(&self.cwd))?
-            .with("env", Value::Object(env))?
+            .with("env", environment_value(&self.env)?)?
             .with("interpreter", self.interpreter.as_str())?
             .with("args", self.args.to_json()?)?;
         match self.stdio {
@@ -312,6 +320,25 @@ impl LineStatus {
             Self::Signalled(signal) => 128u8.saturating_add(signal),
         }
     }
+
+    /// `exit_code` and `signal` as results carry them: exactly one is `Some`, the other is written as `null`.
+    pub(crate) const fn fields(self) -> (Option<u8>, Option<u8>) {
+        match self {
+            Self::Exited(code) => (Some(code), None),
+            Self::Signalled(signal) => (None, Some(signal)),
+        }
+    }
+
+    /// Reads `exit_code` and `signal` from a result: exactly one must be present, and a signal is 1 to 127.
+    pub(crate) fn from_fields(exit_code: Option<u8>, signal: Option<u8>) -> Result<Self, JsonError> {
+        match (exit_code, signal) {
+            (Some(code), None) => Ok(Self::Exited(code)),
+            (None, Some(signal @ 1..=127)) => Ok(Self::Signalled(signal)),
+            (None, Some(_)) => Err(out_of_range("signal")),
+            // Neither or both: the outcome is unknown, and an unknown outcome is never guessed.
+            (None, None) | (Some(_), Some(_)) => Err(out_of_range("exit_code")),
+        }
+    }
 }
 
 /// The result of `exec.run` for a line run on passed descriptors: no output, only how it ended.
@@ -332,13 +359,7 @@ impl FromJson for ExecRunResult {
         // Every other field (decision, duration, output sizes) is the supervisor's business, not the client's.
         fields.finish()?;
         let record_id = record_id.map(|text| parse(&text, "record_id")).transpose()?;
-        let status = match (exit_code, signal) {
-            (Some(code), None) => LineStatus::Exited(code),
-            (None, Some(signal @ 1..=127)) => LineStatus::Signalled(signal),
-            (None, Some(_)) => return Err(out_of_range("signal")),
-            // Neither or both: the outcome is unknown, and an unknown outcome is never guessed.
-            (None, None) | (Some(_), Some(_)) => return Err(out_of_range("exit_code")),
-        };
+        let status = LineStatus::from_fields(exit_code, signal)?;
         Ok(Self { record_id, status })
     }
 }
@@ -346,10 +367,7 @@ impl FromJson for ExecRunResult {
 impl ToJson for ExecRunResult {
     /// `record_id`, `exit_code` and `signal`; the one that does not apply is `null`.
     fn to_json(&self) -> Result<Value, JsonError> {
-        let (exit_code, signal) = match self.status {
-            LineStatus::Exited(code) => (Some(code), None),
-            LineStatus::Signalled(signal) => (None, Some(signal)),
-        };
+        let (exit_code, signal) = self.status.fields();
         Ok(Value::Object(
             Object::new()
                 .with("record_id", self.record_id.map(|id| id.to_string()).to_json()?)?
@@ -436,10 +454,7 @@ impl ToJson for ExecOutcome {
     /// (`verdict`, `source`, `rule_id`), `files_changed` and `checkpoint_id` (null until checkpoints exist), the
     /// `output_mode`, both streams' `*_size` (decimal strings) and `*_lines`, `cut_to_fit`, and the mode's fields.
     fn to_json(&self) -> Result<Value, JsonError> {
-        let (exit_code, signal) = match self.status {
-            LineStatus::Exited(code) => (Some(code), None),
-            LineStatus::Signalled(signal) => (None, Some(signal)),
-        };
+        let (exit_code, signal) = self.status.fields();
         let decision = Object::new()
             .with("verdict", self.decision.verdict.as_str())?
             .with("source", self.decision.source.code())?

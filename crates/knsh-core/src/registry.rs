@@ -83,26 +83,47 @@ impl<P: ProfileOrder> SessionRegistry<P> {
     ///   (FR-SES-03). Human children of human sessions are not checked: nothing in a human session is enforced.
     /// - Any error of [`Session::new`].
     pub fn create(&mut self, spec: SessionSpec) -> Result<&Session, CoreError> {
+        let Self { sessions, order } = self;
+        Self::insert(sessions, spec, order)
+    }
+
+    /// Like [`SessionRegistry::create`], but checks an agent child's profile with `order` instead of the registry's
+    /// own ordering: how `knshd` compares two profiles it has just loaded ([`LoadedProfiles`](crate::LoadedProfiles),
+    /// KNSH-056), without the registry ever loading a profile itself.
+    ///
+    /// # Errors
+    ///
+    /// As [`SessionRegistry::create`], with [`CoreError::ProfileNotStricter`] decided by `order`.
+    pub fn create_with(&mut self, spec: SessionSpec, order: &dyn ProfileOrder) -> Result<&Session, CoreError> {
+        Self::insert(&mut self.sessions, spec, order)
+    }
+
+    /// The checks and insertion of [`SessionRegistry::create`], with the profile ordering given.
+    fn insert<'s, O: ProfileOrder + ?Sized>(
+        sessions: &'s mut BTreeMap<SessionId, Session>,
+        spec: SessionSpec,
+        order: &O,
+    ) -> Result<&'s Session, CoreError> {
         let id = spec.session_id;
-        if self.sessions.contains_key(&id) {
+        if sessions.contains_key(&id) {
             return Err(CoreError::SessionExists);
         }
         if let Some(parent_id) = spec.parent_session_id {
-            let parent = self.sessions.get(&parent_id).ok_or(CoreError::ParentNotFoundOrEnded)?;
+            let parent = sessions.get(&parent_id).ok_or(CoreError::ParentNotFoundOrEnded)?;
             match (spec.actor.kind(), parent.actor().kind()) {
                 // Fail closed: a child of an agent session is still the agent's work, and a human session is never
                 // enforced, so it must not become an unenforced way out of the envelope (FR-SES-12).
                 (ActorKind::Human, ActorKind::Agent) => return Err(CoreError::HumanChildOfAgent),
                 (ActorKind::Human, ActorKind::Human) => {}
                 (ActorKind::Agent, ActorKind::Human | ActorKind::Agent) => {
-                    if !self.order.at_least_as_strict(&spec.profile, parent.profile()) {
+                    if !order.at_least_as_strict(&spec.profile, parent.profile()) {
                         return Err(CoreError::ProfileNotStricter);
                     }
                 }
             }
         }
         let session = Session::new(spec)?;
-        Ok(self.sessions.entry(id).or_insert(session))
+        Ok(sessions.entry(id).or_insert(session))
     }
 
     /// Looks up a live session.

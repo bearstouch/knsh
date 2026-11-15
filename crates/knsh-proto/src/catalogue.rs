@@ -272,8 +272,8 @@ pub struct Catalogue {
 
 /// Every method in the specification. Phase 1 implements `hello`, `records.query` and `records.output` (KNSH-016),
 /// `records.forget` (KNSH-017), `events.subscribe` and `events.unsubscribe` (KNSH-018), and the human session and
-/// telemetry methods with `session.info` (KNSH-021). Phase 2 adds `policy.check` (KNSH-043); the rest arrive with
-/// their stories.
+/// telemetry methods with `session.info` (KNSH-021). Phase 2 adds `policy.check` (KNSH-043), `exec.*` (KNSH-051,
+/// KNSH-053) and `session.start_agent` (KNSH-056); the rest arrive with their stories.
 const ENGINE_METHODS: &[MethodSpec] = &[
     // Handshake (specs/06-api/handshake.md).
     MethodSpec::planned("hello", Endpoints::ALL).available(),
@@ -307,9 +307,11 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("checkpoint.redo", Endpoints::ALL),
     // user.sock (specs/06-api/user-socket.md).
     MethodSpec::planned("checkpoint.restore", Endpoints::USER_CONTROL),
-    // Agent sessions refuse to start without the sandbox (FR-AGT-06, KNSH-046): once served (KNSH-056), it is
-    // unlisted and answered -32005 naming `sandbox` whenever the probe reports `none`.
-    MethodSpec::planned("session.start_agent", Endpoints::USER).requires(Backend::Sandbox),
+    // Agent sessions refuse to start without the sandbox (FR-AGT-06, KNSH-046). Served since KNSH-056: unlisted and
+    // answered -32005 naming `sandbox` whenever the probe reports `none`.
+    MethodSpec::planned("session.start_agent", Endpoints::USER)
+        .requires(Backend::Sandbox)
+        .available(),
     MethodSpec::planned("session.list", Endpoints::USER),
     MethodSpec::planned("session.end", Endpoints::USER),
     // Human telemetry (KNSH-021): `knsh` starts a recorded human session bound to its connection and reports each
@@ -543,7 +545,8 @@ mod tests {
     // the event subscriptions (KNSH-018), and `session.info` with, on user.sock only, the human session and telemetry
     // methods (KNSH-021); phase 2 adds `policy.check` on both sockets (KNSH-043, AC "listed in hello methods on both
     // sockets"), `exec.run` on agent.sock with a sandbox (KNSH-051), and `exec.start`, `exec.wait` and `exec.kill`
-    // (KNSH-053): no method is claimed before it exists.
+    // (KNSH-053), and `session.start_agent` on user.sock with a sandbox (KNSH-056): no method is claimed before it
+    // exists.
     #[test]
     fn lists_only_the_implemented_methods() {
         let caps = capabilities(Sandbox::Seatbelt);
@@ -557,6 +560,7 @@ mod tests {
                     "records.output",
                     "events.subscribe",
                     "events.unsubscribe",
+                    "session.start_agent",
                     "session.start_human",
                     "telemetry.command",
                     "telemetry.cwd",
