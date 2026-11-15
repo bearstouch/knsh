@@ -265,6 +265,23 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
         EventData::DecisionCancelled { request_id, reason } => Object::new()
             .with("request_id", request_id.map(|id| id.to_string()).to_json()?)?
             .with("reason", reason.as_str()),
+        // KNSH-051: the same shape for both; `command` was redacted before it was published.
+        EventData::CommandStarted {
+            record_id,
+            command,
+            cwd,
+            started_at,
+        }
+        | EventData::CommandLongRunning {
+            record_id,
+            command,
+            cwd,
+            started_at,
+        } => Object::new()
+            .with("record_id", record_id.to_string())?
+            .with("command", command.expose().as_str())?
+            .with("cwd", path(cwd))?
+            .with("started_at", started_at.to_string()),
     }
 }
 
@@ -505,6 +522,37 @@ mod tests {
             cancelled.contains(r#""data":{"request_id":null,"reason":"caller_gone"}"#),
             "{cancelled}"
         );
+        // KNSH-051 (FR-LC-17): `command.started` and `command.long_running` share one shape.
+        let started_at = Timestamp::from_unix_micros(1_700_000_000_000_000).unwrap();
+        for (event, name) in [
+            (
+                EventData::CommandStarted {
+                    record_id: record,
+                    command: Redacted::new("npm test".to_owned()),
+                    cwd: cwd(),
+                    started_at,
+                },
+                "command.started",
+            ),
+            (
+                EventData::CommandLongRunning {
+                    record_id: record,
+                    command: Redacted::new("npm test".to_owned()),
+                    cwd: cwd(),
+                    started_at,
+                },
+                "command.long_running",
+            ),
+        ] {
+            let text = data(event);
+            assert!(text.contains(&format!(r#""method":"{name}""#)), "{text}");
+            assert!(
+                text.contains(&format!(
+                    r#""data":{{"record_id":"{record}","command":"npm test","cwd":"/Users/me/app","started_at":"{started_at}"}}"#
+                )),
+                "{text}"
+            );
+        }
     }
 
     // KNSH-047 (FR-SBX-08): `sandbox.violation` carries the violation's own object.

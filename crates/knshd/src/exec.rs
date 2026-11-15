@@ -21,9 +21,9 @@
 //!   bash. The session token is removed too: a supervised line runs outside the envelope and has no use for the
 //!   envelope's credential.
 //!
-//! `exec.run` stays `planned` in the method catalogue until lines can be spawned (KNSH-051): `hello` does not list
-//! it and a call is `-32601`, so no line can reach a supervisor that could not run it. The handler is complete and
-//! tested against a fake supervisor and, end to end, against the lifecycle orchestrator (`supervisor.rs`, KNSH-050).
+//! `exec.run` is served since lines can be spawned (KNSH-051), and listed only where the sandbox probe passed. When
+//! `knshd` cannot build its supervisor (no `knsh-exec` beside it), [`unserved_handlers`] answers every call `-32005`
+//! (`capability: "sandbox"`), so no line reaches anything that could not run it under its profile.
 
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -35,7 +35,7 @@ use knsh_proto::{
     SESSION_TOKEN_VAR,
 };
 
-use crate::dispatch::{Call, EXEC_RUN, Endpoint, Handler, Handlers, Reply, answer, params};
+use crate::dispatch::{Call, EXEC_RUN, Endpoint, Handler, Handlers, Reply, answer, capability_unavailable, params};
 
 /// The variable names are resolved on, and the one the shims are stripped from.
 const PATH_VAR: &str = "PATH";
@@ -144,6 +144,16 @@ impl ExecRun {
             status: finished.status,
         })
     }
+}
+
+/// `exec.run` when no supervisor could be built: every call is `-32005` for the sandbox, and its descriptors are
+/// closed unused (fail closed, NFR-REL-08).
+pub(crate) fn unserved_handlers() -> Handlers {
+    let handler: Handler = Arc::new(|call: &Call<'_>| {
+        drop(call.descriptors.take());
+        Err(capability_unavailable("sandbox"))
+    });
+    [(EXEC_RUN, handler)].into_iter().collect()
 }
 
 /// The descriptors `mode` announces, from what arrived: three for [`ExecStdio::Passed`] (stdin, stdout, stderr in

@@ -72,10 +72,8 @@ mod dispatch;
 mod endpoints;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod events;
-// Reads the session binding, so built where the session registry is. Served once the supervisor exists (KNSH-050):
-// until then `exec.run` is planned and only tests build the handler.
+// Reads the session binding, so built where the session registry is. Served with the supervisor (KNSH-051).
 #[cfg(target_os = "macos")]
-#[cfg_attr(not(test), allow(dead_code))]
 mod exec;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod hello;
@@ -86,16 +84,15 @@ mod lifetime;
 mod policy;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod probe;
-// Hashes with CommonCrypto, so built on macOS. Only the start-up sweep uses it until the supervisor (KNSH-050)
-// writes a profile for each envelope and line.
+// Hashes with CommonCrypto, so built on macOS: the start-up sweep and each supervised line's profile (KNSH-051).
 #[cfg(target_os = "macos")]
-#[cfg_attr(not(test), allow(dead_code))]
 mod profiles;
-// The lifecycle orchestrator (KNSH-050). Served with `exec.run` once lines can be spawned (KNSH-051); until then only
-// tests build it.
+// The lifecycle orchestrator (KNSH-050), served with `exec.run` (KNSH-051).
 #[cfg(target_os = "macos")]
-#[cfg_attr(not(test), allow(dead_code))]
 mod supervisor;
+// The spawner behind the orchestrator (KNSH-051): lines through `knsh-exec`, process groups, timeouts.
+#[cfg(target_os = "macos")]
+mod spawn;
 // The record store is built on macOS only until the Linux SQLite backend exists.
 #[cfg(target_os = "macos")]
 mod records;
@@ -197,8 +194,6 @@ fn start() -> Result<(), StartError> {
     };
     use knsh_platform::{EnginePaths, Field, Level, SystemLog, Value, ensure_engine_dirs};
 
-    use knsh_store::{DATABASE_FILE, RecordStore, StoreConfig};
-
     use crate::events::EventHub;
     use crate::policy::{PolicyCheck, ProfileLoader};
     use crate::records::Records;
@@ -226,26 +221,7 @@ fn start() -> Result<(), StartError> {
         // Never a fallback bind: without launchd's sockets, knshd does not run (KNSH-012).
         let listeners = endpoints::activate(&LaunchdSockets::new()).map_err(StartError::NoLaunchdSockets)?;
         let clock = Arc::new(SystemClock::new());
-        // A store that cannot be opened (newer schema, foreign or unsafe file) is reported and left untouched; knshd
-        // still serves, so a human session is never blocked by it, and the record methods answer -32603.
-        // Retention uses the defaults (30 days or 2 GB); per-profile periods arrive with profile loading.
-        let store = match RecordStore::open(
-            &RealFs::new(),
-            &paths.data_dir().join(DATABASE_FILE),
-            uid,
-            clock.clone(),
-            StoreConfig::default(),
-        ) {
-            Ok(store) => Some(store),
-            Err(error) => {
-                log.log(
-                    Level::Error,
-                    "record store unavailable",
-                    &[Field::new("reason", Value::Static(error.kind()))],
-                );
-                None
-            }
-        };
+        let store = open_store(&paths, uid, &clock, log.as_ref());
         let records = Records::new(store.clone());
         // The event bus with the specified limits (10,000 events per session).
         let random = Arc::new(SystemRandom::new());
@@ -256,7 +232,13 @@ fn start() -> Result<(), StartError> {
         let reader = start_violation_reader(&paths, clock.clone(), random.clone(), &log, store.clone(), &events);
         // `agent.sock` callers without a token are matched to their envelope through the process table (KNSH-048).
         let processes = Arc::new(SystemProcessTree::new());
-        let sessions = Sessions::new(store, Arc::clone(&events), clock.clone(), random, processes);
+        let sessions = Sessions::new(
+            store.clone(),
+            Arc::clone(&events),
+            clock.clone(),
+            random.clone(),
+            processes,
+        );
         // Dry runs read profiles and binaries through the real filesystem. `TMPDIR` is set by launchd for the agent;
         // without it `${TMPDIR}` is the system's `/tmp`.
         let tmpdir = std::env::var_os("TMPDIR").map_or_else(|| "/tmp".into(), std::path::PathBuf::from);
@@ -266,11 +248,24 @@ fn start() -> Result<(), StartError> {
             paths.home().to_path_buf(),
             tmpdir,
         );
-        let policy = PolicyCheck::new(Arc::clone(&sessions), profiles);
+        let policy = PolicyCheck::new(Arc::clone(&sessions), profiles.clone());
         let mut handlers = records.handlers();
         handlers.extend(events.handlers());
         handlers.extend(sessions.handlers());
         handlers.extend(policy.handlers());
+        // `exec.run` (KNSH-051), listed only when the sandbox probe passes; without `knsh-exec` nothing can run.
+        let supervision = Supervision {
+            paths: &paths,
+            uid,
+            log: &log,
+            sessions: &sessions,
+            profiles,
+            events: &events,
+            store,
+            clock: clock.clone(),
+            random,
+        };
+        handlers.extend(supervision.exec_run_handlers());
         // Probed once, before serving: every hello of this process reports the same result, and a restarted knshd
         // probes again (KNSH-014).
         let probed = probe_this_machine(&paths, clock.clone(), Arc::clone(&log));
@@ -376,6 +371,109 @@ fn start_violation_reader(
         unavailable();
     }
     reader
+}
+
+/// The record store. One that cannot be opened (newer schema, foreign or unsafe file) is reported and left
+/// untouched; knshd still serves, so a human session is never blocked by it, and the record methods answer -32603.
+/// Retention uses the defaults (30 days or 2 GB); per-profile periods arrive with profile loading.
+#[cfg(target_os = "macos")]
+fn open_store(
+    paths: &knsh_platform::EnginePaths,
+    uid: u32,
+    clock: &std::sync::Arc<knsh_platform::macos::SystemClock>,
+    log: &dyn knsh_platform::SystemLog,
+) -> Option<knsh_store::RecordStore> {
+    use knsh_platform::{Field, Level, Value};
+    use knsh_store::{DATABASE_FILE, RecordStore, StoreConfig};
+
+    let opened = RecordStore::open(
+        &knsh_platform::macos::RealFs::new(),
+        &paths.data_dir().join(DATABASE_FILE),
+        uid,
+        clock.clone(),
+        StoreConfig::default(),
+    );
+    match opened {
+        Ok(store) => Some(store),
+        Err(error) => {
+            log.log(
+                Level::Error,
+                "record store unavailable",
+                &[Field::new("reason", Value::Static(error.kind()))],
+            );
+            None
+        }
+    }
+}
+
+/// What the lifecycle orchestrator and its spawner are built from (KNSH-050, KNSH-051).
+#[cfg(target_os = "macos")]
+struct Supervision<'a> {
+    paths: &'a knsh_platform::EnginePaths,
+    uid: u32,
+    log: &'a std::sync::Arc<dyn knsh_platform::SystemLog>,
+    sessions: &'a std::sync::Arc<sessions::Sessions>,
+    profiles: policy::ProfileLoader,
+    events: &'a std::sync::Arc<events::EventHub>,
+    store: Option<knsh_store::RecordStore>,
+    clock: std::sync::Arc<knsh_platform::macos::SystemClock>,
+    random: std::sync::Arc<knsh_platform::macos::SystemRandom>,
+}
+
+#[cfg(target_os = "macos")]
+impl Supervision<'_> {
+    /// The `exec.run` handler: the orchestrator over the real spawner, the `knsh-exec` installed next to this binary
+    /// (the one the sandbox probe checked). No hooks, authority or local approvals are wired yet (KNSH-062,
+    /// KNSH-069, KNSH-066): every line policy asks about waits and is denied at the timeout. When `knsh-exec` or a
+    /// canonical home cannot be found it is logged, and every call is `-32005` ([`exec::unserved_handlers`]).
+    fn exec_run_handlers(self) -> dispatch::Handlers {
+        use std::sync::Arc;
+
+        use knsh_core::{CanonicalPath, NoAuthority, NoHooks};
+        use knsh_platform::macos::{RealFs, SystemProcesses, sha256};
+
+        use crate::probe::SandboxProbe;
+        use crate::spawn::{Limits, TrampolineSpawner};
+        use crate::supervisor::{DenyAtTimeout, Lifecycle, Parts};
+
+        let trampoline = std::env::current_exe()
+            .ok()
+            .and_then(|exe| SandboxProbe::trampoline_beside(&exe));
+        let home = std::fs::canonicalize(self.paths.home())
+            .ok()
+            .and_then(|home| CanonicalPath::new(home).ok());
+        let (Some(trampoline), Some(home)) = (trampoline, home) else {
+            self.log.log(
+                knsh_platform::Level::Error,
+                "supervisor unavailable: exec.run not served",
+                &[],
+            );
+            return exec::unserved_handlers();
+        };
+        let files = profiles::ProfileFiles::new(Arc::new(RealFs::new()), self.paths.profiles_dir(), self.uid, sha256);
+        let spawner = TrampolineSpawner {
+            processes: Arc::new(SystemProcesses::new()),
+            clock: self.clock.clone(),
+            files,
+            log: Arc::clone(self.log),
+            trampoline,
+            home,
+            limits: Limits::DEFAULT,
+        };
+        let lifecycle = Lifecycle::new(Parts {
+            sessions: Arc::clone(self.sessions),
+            profiles: self.profiles,
+            events: Arc::clone(self.events),
+            store: self.store,
+            clock: self.clock,
+            random: self.random,
+            hooks: Arc::new(NoHooks),
+            authority: Arc::new(NoAuthority),
+            approvals: Arc::new(DenyAtTimeout::default()),
+            spawner: Arc::new(spawner),
+        });
+        exec::ExecRun::new(lifecycle, self.paths.shim_dir()).handlers()
+    }
 }
 
 /// Removes the compiled profile files an earlier run left behind: no line runs yet, so none is in use (FR-SBX-07). A

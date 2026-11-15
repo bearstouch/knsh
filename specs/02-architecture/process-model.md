@@ -31,13 +31,17 @@ applies a sandbox between `fork` and `exec` itself; it spawns `knsh-exec`, which
 standard library only (NFR-SUP-01), and becomes Apple's `sandbox-exec` (decision 1).
 
 ```text
-knsh-exec [--keep-fd <n>]... --profile <absolute path> --interpreter <absolute path> --line <line>
-  => execve("/usr/bin/sandbox-exec", ["/usr/bin/sandbox-exec", "-f", <profile>, <interpreter>, "-c", "--", <line>], env)
+knsh-exec [--keep-fd <n>]... [--status-fd <n>] --profile <absolute path> --interpreter <absolute path>
+          --line <line> [--arg <operand>]...
+  => execve("/usr/bin/sandbox-exec", ["/usr/bin/sandbox-exec", "-f", <profile>, <interpreter>, "-c", "--", <line>,
+            <operand>...], env)
 ```
 
 - **Arguments.** `--profile`, `--interpreter` and `--line` are each required exactly once, in any order; `--keep-fd`
-  (a descriptor number of 3 or more, at most 16, no repeats) is optional. Paths must be absolute with no `.`, `..` or
-  empty components; the line must not be empty. Any other argument, a repeated option or a missing value is
+  (a descriptor number of 3 or more, at most 16, no repeats) is optional. `--arg` (at most 4096, in order) passes
+  the line's operands, which the interpreter sees as `$0`, `$1`, … (KNSH-051). `--status-fd` (at most once, a
+  descriptor number of 3 or more that is not also kept) names where a failure is reported (below). Paths must be
+  absolute with no `.`, `..` or empty components; the line must not be empty. Any other argument, a repeated option or a missing value is
   rejected. Error messages never repeat a value. `--` after `-c` makes a line that starts with `-` a command, never
   an interpreter option (`/bin/sh`, `/bin/bash` and `/bin/zsh` all accept it).
 - **Profile file.** A regular file (not a symlink) owned by the user and not writable by group or others, as `knshd`
@@ -55,9 +59,15 @@ knsh-exec [--keep-fd <n>]... --profile <absolute path> --interpreter <absolute p
   | 69 | `execve` of `/usr/bin/sandbox-exec` failed (for example, it is missing) |
   | 71 | Process setup failed (process group, descriptors, signals, more than one thread), or no sandbox backend on this platform |
 
+  With `--status-fd`, every failure after the arguments were read also writes its exit code as one byte to that
+  descriptor. The descriptor is never kept across the exec, so the supervisor reads end of file with no byte exactly
+  when `sandbox-exec` started, and tells a trampoline failure from a line that exits with the same code (KNSH-051).
+
   `sandbox-exec` itself exits 65 when it cannot read or compile the profile and 71 when it cannot execute the
-  interpreter, before the line starts. There is never a fallback to running the line unsandboxed: the supervisor
-  treats each of these exits as a deny, and the capability probe reports `sandbox: none`
+  interpreter, before the line starts. Those two exits cannot be told from a line's own 65 or 71, and are reported as
+  the line's exit code; the profile is the compiler's deterministic output and the interpreters are always allowed,
+  so neither is expected. There is never a fallback to running the line unsandboxed: the supervisor treats each of
+  these exits as a deny, and the capability probe reports `sandbox: none`
   ([capabilities](../05-models/capabilities.md#probe)).
 
 ## Data locations (macOS)

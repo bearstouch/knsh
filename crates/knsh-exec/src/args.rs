@@ -1,13 +1,15 @@
 //! The argument protocol between `knshd` and `knsh-exec` (`specs/02-architecture/process-model.md#knsh-exec`).
 //!
 //! ```text
-//! knsh-exec [--keep-fd <n>]... --profile <absolute path> --interpreter <absolute path> --line <line>
+//! knsh-exec [--keep-fd <n>]... [--status-fd <n>] --profile <absolute path> --interpreter <absolute path>
+//!           --line <line> [--arg <operand>]...
 //! ```
 //!
-//! Every option except `--keep-fd` must appear exactly once, in any order; `--keep-fd` may appear up to
-//! [`MAX_KEPT`] times. Anything else (an unknown option, a positional argument, a repeated option, a missing value)
-//! is rejected: the trampoline never guesses what the supervisor meant, and never runs a command it could not fully
-//! read (CLAUDE.md "Untrusted input").
+//! `--profile`, `--interpreter` and `--line` must appear exactly once, in any order; `--status-fd` at most once;
+//! `--keep-fd` up to [`MAX_KEPT`] times; `--arg` up to [`MAX_ARGS`] times, its values kept in order (the line's
+//! operands: `$0`, then `$1`, …, as with `bash -c 'line' name arg…`). Anything else (an unknown option, a positional
+//! argument, a repeated option, a missing value) is rejected: the trampoline never guesses what the supervisor meant,
+//! and never runs a command it could not fully read (CLAUDE.md "Untrusted input").
 //!
 //! Error messages never repeat an argument's value: the line may hold secrets, and the messages go to stderr.
 
@@ -23,6 +25,10 @@ pub(crate) const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// (a status pipe, a pty); a long list means something is wrong.
 pub(crate) const MAX_KEPT: usize = 16;
 
+/// Operands one invocation may pass after the line: the limit `exec.run` accepts for `args`
+/// (`specs/06-api/agent-socket.md#execrun`).
+pub(crate) const MAX_ARGS: usize = 4096;
+
 /// A complete, well-formed request to run one line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Invocation {
@@ -32,8 +38,13 @@ pub(crate) struct Invocation {
     pub(crate) interpreter: PathBuf,
     /// The line, passed to the interpreter's `-c`. Never empty.
     pub(crate) line: OsString,
+    /// The operands after the line (`$0`, `$1`, …), in the order given. May be empty.
+    pub(crate) operands: Vec<OsString>,
     /// Descriptors above stdio to keep open across the exec, in the order given, without duplicates.
     pub(crate) keep: Vec<i32>,
+    /// Where to report a failure (`--status-fd`): one byte, the exit code, written before exiting. Never kept
+    /// across the exec, so the supervisor reads end of file without a byte once `sandbox-exec` has started.
+    pub(crate) status: Option<i32>,
 }
 
 /// Why the arguments were rejected. Holds option names only, never values.
@@ -57,6 +68,10 @@ pub(crate) enum UsageError {
     RepeatedDescriptor,
     /// More than [`MAX_KEPT`] descriptors are listed.
     TooManyDescriptors,
+    /// The status descriptor is not a decimal number above stdio, or is also listed with `--keep-fd`.
+    BadStatusDescriptor,
+    /// More than [`MAX_ARGS`] operands are given.
+    TooManyOperands,
 }
 
 impl fmt::Display for UsageError {
@@ -71,6 +86,10 @@ impl fmt::Display for UsageError {
             Self::BadDescriptor => f.write_str("--keep-fd must be a descriptor number of 3 or more"),
             Self::RepeatedDescriptor => f.write_str("--keep-fd lists a descriptor twice"),
             Self::TooManyDescriptors => write!(f, "--keep-fd given more than {MAX_KEPT} times"),
+            Self::BadStatusDescriptor => {
+                f.write_str("--status-fd must be a descriptor number of 3 or more, not given with --keep-fd")
+            }
+            Self::TooManyOperands => write!(f, "--arg given more than {MAX_ARGS} times"),
         }
     }
 }
@@ -81,6 +100,8 @@ const PROFILE: &str = "--profile";
 const INTERPRETER: &str = "--interpreter";
 const LINE: &str = "--line";
 const KEEP_FD: &str = "--keep-fd";
+const STATUS_FD: &str = "--status-fd";
+const ARG: &str = "--arg";
 
 /// Reads the arguments after `argv[0]`.
 ///
@@ -91,12 +112,14 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Invocati
     let mut profile = None;
     let mut interpreter = None;
     let mut line = None;
+    let mut status = None;
     let mut keep = Vec::new();
+    let mut operands = Vec::new();
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         // Options are matched exactly; `--profile=/x` and other spellings are unexpected arguments.
-        let Some(option) = [PROFILE, INTERPRETER, LINE, KEEP_FD]
+        let Some(option) = [PROFILE, INTERPRETER, LINE, KEEP_FD, STATUS_FD, ARG]
             .into_iter()
             .find(|o| arg == OsStr::new(o))
         else {
@@ -107,6 +130,9 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Invocati
             PROFILE => set_once(&mut profile, option, value)?,
             INTERPRETER => set_once(&mut interpreter, option, value)?,
             LINE => set_once(&mut line, option, value)?,
+            STATUS_FD => set_once(&mut status, option, value)?,
+            ARG if operands.len() == MAX_ARGS => return Err(UsageError::TooManyOperands),
+            ARG => operands.push(value),
             _ => keep_descriptor(&mut keep, &value)?,
         }
     }
@@ -117,12 +143,32 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Invocati
     if line.is_empty() {
         return Err(UsageError::EmptyLine);
     }
+    // Kept descriptors survive the exec; the status descriptor must not, or end of file would never say "started".
+    let status = match status {
+        None => None,
+        Some(value) => match descriptor_number(&value) {
+            Some(fd) if !keep.contains(&fd) => Some(fd),
+            Some(_) | None => return Err(UsageError::BadStatusDescriptor),
+        },
+    };
     Ok(Invocation {
         profile,
         interpreter,
         line,
+        operands,
         keep,
+        status,
     })
+}
+
+/// A descriptor number above stdio, written as plain decimal digits (no sign, no leading `+`).
+fn descriptor_number(value: &OsStr) -> Option<i32> {
+    value
+        .to_str()
+        .filter(|text| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|text| text.parse::<i32>().ok())
+        // Stdio is always inherited; naming it would suggest it could otherwise be closed.
+        .filter(|&fd| fd >= 3)
 }
 
 /// Stores the first value of an option; a second one is an error rather than a silent override.
@@ -134,18 +180,9 @@ fn set_once(slot: &mut Option<OsString>, option: &'static str, value: OsString) 
     Ok(())
 }
 
-/// Adds one `--keep-fd` value: plain decimal digits (no sign, no leading `+`), at least 3, listed once.
+/// Adds one `--keep-fd` value: a [`descriptor_number`], listed once.
 fn keep_descriptor(keep: &mut Vec<i32>, value: &OsStr) -> Result<(), UsageError> {
-    let digits = value
-        .to_str()
-        .filter(|text| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()));
-    let fd = digits
-        .and_then(|text| text.parse::<i32>().ok())
-        .ok_or(UsageError::BadDescriptor)?;
-    // Stdio is always inherited; listing it would suggest it could otherwise be closed.
-    if fd < 3 {
-        return Err(UsageError::BadDescriptor);
-    }
+    let fd = descriptor_number(value).ok_or(UsageError::BadDescriptor)?;
     if keep.contains(&fd) {
         return Err(UsageError::RepeatedDescriptor);
     }
@@ -173,13 +210,14 @@ fn absolute(value: OsString, option: &'static str) -> Result<PathBuf, UsageError
     }
 }
 
-/// The exact `argv` for `execve`: `sandbox-exec -f <profile> <interpreter> -c -- <line>`.
+/// The exact `argv` for `execve`: `sandbox-exec -f <profile> <interpreter> -c -- <line> [<operand>…]`.
 ///
 /// `--` ends the interpreter's options, so a line that starts with `-` (for example `-i` or `--rcfile=…`) is run as
-/// a command, never read as an interpreter option. `/bin/sh`, `/bin/bash` and `/bin/zsh` all accept it. The
-/// interpreter is absolute, so `sandbox-exec` cannot read it as one of its own options either.
+/// a command, never read as an interpreter option. `/bin/sh`, `/bin/bash` and `/bin/zsh` all accept it, and take the
+/// words after the line as `$0`, `$1`, …. The interpreter is absolute, so `sandbox-exec` cannot read it as one of its
+/// own options either.
 pub(crate) fn exec_argv(invocation: Invocation) -> Vec<OsString> {
-    vec![
+    let mut argv: Vec<OsString> = vec![
         SANDBOX_EXEC.into(),
         "-f".into(),
         invocation.profile.into_os_string(),
@@ -187,7 +225,9 @@ pub(crate) fn exec_argv(invocation: Invocation) -> Vec<OsString> {
         "-c".into(),
         "--".into(),
         invocation.line,
-    ]
+    ];
+    argv.extend(invocation.operands);
+    argv
 }
 
 #[cfg(test)]
@@ -226,9 +266,57 @@ mod tests {
                 profile: "/a.sb".into(),
                 interpreter: "/bin/zsh".into(),
                 line: "ls".into(),
+                operands: Vec::new(),
                 keep: vec![7],
+                status: None,
             })
         );
+    }
+
+    // KNSH-051: operands follow the line in order; the status descriptor is read once.
+    #[test]
+    fn parses_operands_and_status_descriptor() {
+        let parsed = parse(valid_with(&[
+            "--arg",
+            "name",
+            "--status-fd",
+            "9",
+            "--arg",
+            "",
+            "--arg",
+            "-x",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.operands, args(&["name", "", "-x"]));
+        assert_eq!(parsed.status, Some(9));
+        let argv = exec_argv(parsed);
+        assert_eq!(argv[5..], args(&["--", "echo hi", "name", "", "-x"]));
+    }
+
+    #[test]
+    fn rejects_bad_status_descriptors_and_too_many_operands() {
+        for bad in ["0", "2", "-1", "x", ""] {
+            assert_eq!(
+                parse(valid_with(&["--status-fd", bad])),
+                Err(UsageError::BadStatusDescriptor),
+                "{bad:?}"
+            );
+        }
+        // A kept descriptor survives the exec, so it can never report "started".
+        assert_eq!(
+            parse(valid_with(&["--keep-fd", "5", "--status-fd", "5"])),
+            Err(UsageError::BadStatusDescriptor)
+        );
+        assert_eq!(
+            parse(valid_with(&["--status-fd", "5", "--status-fd", "6"])),
+            Err(UsageError::Repeated(STATUS_FD))
+        );
+        let mut many = Vec::new();
+        for _ in 0..=MAX_ARGS {
+            many.push("--arg");
+            many.push("a");
+        }
+        assert_eq!(parse(valid_with(&many)), Err(UsageError::TooManyOperands));
     }
 
     // KNSH-046: malformed input never runs anything.

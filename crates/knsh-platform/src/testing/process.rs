@@ -156,6 +156,15 @@ impl Processes for ScriptedProcesses {
         Ok(status)
     }
 
+    fn exited(&self, group: ProcessGroupId) -> Result<bool, PlatformError> {
+        let state = lock(&self.state);
+        let running = state
+            .running
+            .get(&group.as_raw())
+            .ok_or(PlatformError::UnknownProcessGroup)?;
+        Ok(status_of(running).is_some())
+    }
+
     fn try_wait(&self, group: ProcessGroupId) -> Result<Option<ExitStatus>, PlatformError> {
         let mut state = lock(&self.state);
         let running = state

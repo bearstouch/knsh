@@ -5,8 +5,9 @@
 //! applies the profile and runs the interpreter (decision 1):
 //!
 //! ```text
-//! knsh-exec [--keep-fd <n>]... --profile <absolute path> --interpreter <absolute path> --line <line>
-//!   => execve /usr/bin/sandbox-exec -f <profile> <interpreter> -c -- <line>
+//! knsh-exec [--keep-fd <n>]... [--status-fd <n>] --profile <absolute path> --interpreter <absolute path>
+//!           --line <line> [--arg <operand>]...
+//!   => execve /usr/bin/sandbox-exec -f <profile> <interpreter> -c -- <line> [<operand>...]
 //! ```
 //!
 //! In order, before the exec:
@@ -21,8 +22,11 @@
 //! 7. `execve` of `/usr/bin/sandbox-exec` by absolute path, with the environment as received.
 //!
 //! A failure in 3 to 6 exits with [`exit::SETUP`], and a failed `execve` with [`exit::EXEC`]. Every failure prints
-//! one line to stderr (never an argument's value) and exits without running anything: there is no fallback to
-//! running the command unsandboxed. If `sandbox-exec` itself cannot apply the profile it exits non-zero before the
+//! one line to stderr (never an argument's value), writes its exit code as one byte to the `--status-fd` descriptor
+//! when one was given and read, and exits without running anything. The status descriptor is never kept across the
+//! exec, so the supervisor reads end of file without a byte exactly when `sandbox-exec` started (KNSH-051), and so
+//! tells a trampoline failure from a line that exits with the same code. There is no fallback to running the command
+//! unsandboxed. If `sandbox-exec` itself cannot apply the profile it exits non-zero before the
 //! interpreter starts (65 for an unreadable or invalid profile, 71 if the interpreter cannot be executed); the
 //! supervisor treats every such exit as a deny.
 //!
@@ -59,20 +63,36 @@ use exit::Failure;
 
 /// Entry point. Returns only on failure: on success the process has become `sandbox-exec`.
 fn main() -> ExitCode {
-    let failure = run(std::env::args_os().skip(1));
+    let mut status = None;
+    let failure = run(std::env::args_os().skip(1), &mut status);
     // `writeln!` rather than `eprintln!`, which panics if stderr is closed; the exit code alone still tells the
     // supervisor what happened.
     let _ = writeln!(std::io::stderr(), "knsh-exec: {failure}");
+    report_status(status, failure.code());
     ExitCode::from(failure.code())
 }
 
-/// Everything before the exec (crate documentation). Returns the reason the line was not run.
+/// Tells the supervisor, through its status descriptor, that nothing ran and why (crate documentation).
 #[cfg(target_os = "macos")]
-fn run(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Failure {
+fn report_status(status: Option<i32>, code: u8) {
+    if let Some(fd) = status {
+        sys::write_status(fd, code);
+    }
+}
+
+/// Not macOS: nothing ever runs, and the exit code says so.
+#[cfg(not(target_os = "macos"))]
+fn report_status(_status: Option<i32>, _code: u8) {}
+
+/// Everything before the exec (crate documentation). Returns the reason the line was not run, and sets `status` to
+/// the status descriptor once the arguments are read.
+#[cfg(target_os = "macos")]
+fn run(arguments: impl IntoIterator<Item = std::ffi::OsString>, status: &mut Option<i32>) -> Failure {
     let invocation = match args::parse(arguments) {
         Ok(invocation) => invocation,
         Err(error) => return Failure::Usage(error),
     };
+    *status = invocation.status;
     if let Err(error) = profile::check(&invocation.profile, sys::effective_uid()) {
         return Failure::Profile(error);
     }
@@ -135,7 +155,7 @@ fn os_failure(call: &'static str) -> impl Fn(std::io::Error) -> Failure {
 
 /// Not macOS: no sandbox backend exists yet, so nothing ever runs (fail closed).
 #[cfg(not(target_os = "macos"))]
-fn run(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Failure {
+fn run(arguments: impl IntoIterator<Item = std::ffi::OsString>, _status: &mut Option<i32>) -> Failure {
     match args::parse(arguments) {
         Ok(_) => Failure::Unsupported,
         Err(error) => Failure::Usage(error),

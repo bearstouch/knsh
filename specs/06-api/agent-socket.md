@@ -63,9 +63,9 @@ supervised line runs outside the envelope and has no use for its credential). Na
 `/usr/bin:/bin:/usr/sbin:/sbin` without one. Policy decides on the line, `cwd` and `PATH` only: the interpreter is not
 an input to the decision (FR-LC-14).
 
-`exec.run` stays `planned` in the method catalogue until lines can be spawned (KNSH-051): until then `hello` does not
-list it and a call is `-32601`. The supervisor that decides each line exists (KNSH-050) and is tested end to end
-through `agent.sock` with a fake spawner.
+`exec.run` is served since lines can be spawned (KNSH-051), and listed only where the sandbox probe passed. If
+`knshd` cannot find `knsh-exec` beside itself, every call is `-32005` (`capability: "sandbox"`). How a line is
+spawned, watched and timed out is in [command lifecycle](../03-functional-requirements/command-lifecycle.md#spawning-knsh-051).
 
 ### Example
 

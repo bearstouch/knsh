@@ -42,6 +42,8 @@ A `cwd` that is not valid UTF-8 is shown with U+FFFD replacements, as in records
 | `command.proposed` | `command` (redacted), `cwd`, `rewritten_from` (the line before a rewrite, redacted, or `null`). Published once for each line the supervisor evaluates, before that line's hooks run: once for the line received, and once more for the line a rewrite produced (KNSH-050) |
 | `command.denied` | `record_id` (the denial's record, or `null` if it could not be written), `command` (redacted), `cwd`, `source` (as the record's `decision.source`), `rule_id` (or `null`), `reason` (or `null`). Published after the denial's record is written (KNSH-050) |
 | `decision.cancelled` | `request_id` (the pending request, or `null` when the line had not reached the ask step), `reason`: `caller_gone` (the caller disconnected, FR-LC-41) or `timed_out` (no answer before the timeout, FR-AUTH-23). Always followed by the line's `command.denied` (KNSH-050) |
+| `command.started` | `record_id` (the record the line is written to when it ends), `command` (the line that runs, after any rewrite, redacted), `cwd`, `started_at`. Published once the line was spawned through `knsh-exec` (KNSH-051) |
+| `command.long_running` | The same fields as `command.started`. Published once, when the line is still running after the long-running threshold (30 s) (KNSH-051) |
 | `sandbox.violation` | A [sandbox violation](execution-record.md#sandbox_violations): `session_id`, `record_id` (ULID, or `null` for a denial inside an envelope), `rule`, `operation`, `argument` (string or `null`), `process`, `pid`, `count`, `at`. Published only for a live session named by the denial's tag; repeats within 3 s are one event with their `count` (KNSH-047) |
 
 ## Catalog

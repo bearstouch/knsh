@@ -150,6 +150,6 @@ pub use launchd::{LaunchAgent, PeerCredentials, ServiceManager, SocketActivation
 pub use log::{Field, Level, SystemLog, Value, render};
 pub use policy_source::PolicyDirectory;
 pub use probe::{ProbeFailure, SystemProbe};
-pub use process::{ExitStatus, ProcessGroupId, Processes, Signal, SpawnRequest, Stdio};
+pub use process::{ExitStatus, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest, Stdio};
 pub use random::Random;
 pub use violation::{CanaryNonce, DenialLog, DenialStream, LogEntry, StreamStopper};

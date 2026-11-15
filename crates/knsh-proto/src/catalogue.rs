@@ -279,7 +279,10 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("hello", Endpoints::ALL).available(),
     // agent.sock (specs/06-api/agent-socket.md). Running a line needs the sandbox: without it agent sessions refuse
     // to start (specs/05-models/capabilities.md).
-    MethodSpec::planned("exec.run", Endpoints::AGENT).requires(Backend::Sandbox),
+    // KNSH-051: served once lines can be spawned under their own profile.
+    MethodSpec::planned("exec.run", Endpoints::AGENT)
+        .requires(Backend::Sandbox)
+        .available(),
     MethodSpec::planned("exec.start", Endpoints::AGENT).requires(Backend::Sandbox),
     MethodSpec::planned("exec.wait", Endpoints::AGENT),
     MethodSpec::planned("exec.kill", Endpoints::AGENT),
@@ -536,7 +539,7 @@ mod tests {
     // Phase 1 implements the handshake, the record reads (KNSH-016), on user.sock only `records.forget` (KNSH-017),
     // the event subscriptions (KNSH-018), and `session.info` with, on user.sock only, the human session and telemetry
     // methods (KNSH-021); phase 2 adds `policy.check` on both sockets (KNSH-043, AC "listed in hello methods on both
-    // sockets"): no method is claimed before it exists.
+    // sockets") and `exec.run` on agent.sock with a sandbox (KNSH-051): no method is claimed before it exists.
     #[test]
     fn lists_only_the_implemented_methods() {
         let caps = capabilities(Sandbox::Seatbelt);
@@ -558,6 +561,7 @@ mod tests {
                 ],
                 Endpoint::Agent => &[
                     "hello",
+                    "exec.run",
                     "session.info",
                     "policy.check",
                     "records.query",

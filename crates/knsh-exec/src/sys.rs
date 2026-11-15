@@ -68,6 +68,7 @@ unsafe extern "C" {
     fn geteuid() -> u32;
     fn setpgid(pid: c_int, pgid: c_int) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
     fn signal(signum: c_int, handler: usize) -> usize;
     fn execve(path: *const c_char, argv: *const *const c_char, envp: *const *const c_char) -> c_int;
     fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: *mut c_void, buffersize: c_int) -> c_int;
@@ -181,6 +182,15 @@ pub(crate) fn set_close_on_exec(fd: i32, close: bool) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Writes the single byte `code` to `fd`, the supervisor's status descriptor. Best effort: the exit code still says
+/// what happened, so a failed write is ignored. No `EINTR` retry: the trampoline installs no signal handlers, so a
+/// one-byte pipe write is never interrupted.
+pub(crate) fn write_status(fd: i32, code: u8) {
+    // SAFETY: `code` lives on this stack frame for the whole call, and `write` reads exactly one byte from it. An
+    // invalid or closed `fd` makes `write` fail with `EBADF`, touching no memory.
+    let _ = unsafe { write(fd, (&raw const code).cast::<c_void>(), 1) };
 }
 
 /// Replaces this process with `program`, `argv` and `env` (`execve`, no `PATH` search). Returns only on failure.

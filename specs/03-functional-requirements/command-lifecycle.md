@@ -58,6 +58,32 @@ shape. Known effects: a program run by its canonical path sees that path as `arg
 through a symlink (`clang++` linking to `clang-18`, `view` to `vim`) behaves as its target; and a call the parser is
 not certain reaches a function of the line is resolved and replaced as a program.
 
+## Spawning (KNSH-051)
+
+- **Profile.** The session's profile is compiled for the line (tagged with its record), allowing exec only of the
+  trusted and system tool folders, the profile's bash and the binaries the line resolved to (FR-LC-15), and written
+  to its private file. A profile file that cannot be written means nothing starts.
+- **Interpreter.** `sh` runs `/bin/sh`, `zsh` runs `/bin/zsh`, `bash` and `knsh -c` run `exec.bash` (`/bin/bash` by
+  default).
+- **Start.** `knsh-exec` runs as the leader of a new process group, in the line's `cwd`, on the caller's three
+  descriptors (or `/dev/null` until output capture, KNSH-053), with the environment `knshd` received and nothing
+  added, with the line's operands as `--arg`. `knshd` never applies a sandbox itself. `command.started` follows the
+  spawn. The dynamic linker's `DYLD_*` variables are removed: `knsh-exec` runs unsandboxed until it becomes
+  `sandbox-exec`, so a library they name would run outside the line's profile (the SIP-protected interpreters drop
+  them anyway). An empty line runs as `:` (`knsh-exec` refuses an empty `--line`; both run nothing and exit 0).
+- **Watch.** `knshd` holds the group (its leader unreaped) until the line ends, so it never signals a reused id.
+  `command.long_running` is published once after 30 s. At `timeout_s` the group gets `SIGTERM`, then `SIGKILL` after
+  2 s; once the leader has exited, the group is killed again before the leader is reaped, so no member outlives a
+  timed-out line. The call then fails with `-32008` carrying the `record_id`, and the record's `signal` is set.
+  Members left behind by a line that ended on its own are not stopped; a process that leaves the group is out of
+  reach.
+- **Not started.** `knsh-exec` reports its own failures on a status pipe (`--status-fd`,
+  [process model](../02-architecture/process-model.md#knsh-exec)). A failure there, or a `knsh-exec` that cannot be
+  started, means the line never ran: the call fails with `-32603`, the record has neither exit code nor signal, and the
+  failure is logged.
+- **Not yet.** No proxy is wired (KNSH-059): lines are compiled without a proxy port, so their network is closed except
+  the profile's loopback ports, and no per-command proxy credentials are given.
+
 ## The decision pipeline (KNSH-050)
 
 Steps 2 to 8 are one pure function in `knsh-core` (`decide`); a driver in `knshd` performs the effects around it

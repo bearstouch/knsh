@@ -10,7 +10,9 @@
 | Authority decision timeout | 90 s, then deny | Yes; set shorter than the agent CLI's tool timeout | [authority](../03-functional-requirements/authority.md) |
 | Hook timeout | `timeout_ms` per hook (example 2000) | Per hook | [hooks](../03-functional-requirements/hooks.md) |
 | Rate limit | 5 denials of the same normalised line in 60 s → denied for 10 minutes | — | [hooks](../03-functional-requirements/hooks.md) |
-| `command.long_running` | 30 s | Yes | [command lifecycle](../03-functional-requirements/command-lifecycle.md) |
+| `command.long_running` | 30 s | Yes (`Limits` in `knshd`; no configuration file key yet) | [command lifecycle](../03-functional-requirements/command-lifecycle.md) |
+| Timeout kill grace | At `timeout_s`, `SIGTERM` to the line's process group, then `SIGKILL` after 2 s if anything is left; the group is killed once more before its leader is reaped | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md#spawning-knsh-051) |
+| Supervised line watch | Checked every 1 ms at first, backing off to every 50 ms: timeouts and `command.long_running` fire at most 50 ms late | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md#spawning-knsh-051) |
 | `session.idle` | 5 s at a human prompt | — | [sessions](../03-functional-requirements/sessions.md) |
 | Human recording | Off | `[recording] human` in `~/.config/knsh/config.toml` | [terminals and shells](../08-integrations/terminals-and-shells.md#recording-a-human-session) |
 | Hosted shell (integration mode) | The bash `$SHELL` names, else `/bin/zsh`; an invalid choice starts `/bin/zsh` | `[shell] hosted` in `~/.config/knsh/config.toml` | [terminals and shells](../08-integrations/terminals-and-shells.md#login-shell) |

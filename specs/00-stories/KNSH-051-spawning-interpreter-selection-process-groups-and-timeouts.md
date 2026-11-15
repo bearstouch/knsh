@@ -11,17 +11,18 @@ profile, descriptors and process group, so that the line runs under its own kern
 timed out or stopped reliably.
 
 **Acceptance criteria**
-- [ ] The line is re-serialised with every command's resolved absolute path (KNSH-038) before spawn.
-- [ ] `sh` runs `/bin/sh`, `zsh` runs zsh, and `bash` or `knsh -c` run the profile's bash (default `/bin/bash`).
+- [x] The line is re-serialised with every command's resolved absolute path (KNSH-038) before spawn.
+- [x] `sh` runs `/bin/sh`, `zsh` runs zsh, and `bash` or `knsh -c` run the profile's bash (default `/bin/bash`).
 - [ ] The child is started through `knsh-exec` with the compiled profile file, the caller's stdio descriptors, the
-      forwarded environment (minus shim `PATH` entries), and the per-command proxy credentials.
-- [ ] Each line runs in its own new process group. `knshd` keeps the group handle and never signals a PID that may
+      forwarded environment (minus shim `PATH` entries), and the per-command proxy credentials. *Done except the proxy
+      credentials, pending KNSH-059 (no proxy exists yet; lines get no proxy port, so their network is closed).*
+- [x] Each line runs in its own new process group. `knshd` keeps the group handle and never signals a PID that may
       have been reused.
-- [ ] `command.started` is emitted at spawn. `command.long_running` is emitted once after 30 s (configurable).
-- [ ] When `timeout_s` elapses, the whole process group is killed and the call fails with `-32008`, carrying the
+- [x] `command.started` is emitted at spawn. `command.long_running` is emitted once after 30 s (configurable).
+- [x] When `timeout_s` elapses, the whole process group is killed and the call fails with `-32008`, carrying the
       `record_id`. The record's `signal` is set.
-- [ ] No sandbox is ever applied inside `knshd` between `fork` and `exec` (only `knsh-exec` applies it).
-- [ ] If `knsh-exec` fails to apply the profile, the line does not run and the failure is recorded.
+- [x] No sandbox is ever applied inside `knshd` between `fork` and `exec` (only `knsh-exec` applies it).
+- [x] If `knsh-exec` fails to apply the profile, the line does not run and the failure is recorded.
 
 **Unit tests**
 - `selects_bin_sh_for_sh_request` — FR-LC-14.
@@ -37,4 +38,9 @@ timed out or stopped reliably.
 
 **Notes**
 - Spec gap: the grace period between SIGTERM and SIGKILL on timeout is not specified. Propose SIGTERM, then SIGKILL
-  after 2 s, and record the value in [defaults and limits](../09-reference/defaults-and-limits.md).
+  after 2 s, and record the value in [defaults and limits](../09-reference/defaults-and-limits.md). *Done: recorded
+  there.*
+- Implemented (see [command lifecycle](../03-functional-requirements/command-lifecycle.md#spawning-knsh-051)):
+  `knsh-exec` gained `--arg` (operands) and `--status-fd` (tells a trampoline failure from the line's own exit);
+  `command.long_running` is configurable in code (`Limits`) but has no configuration-file key yet; `sandbox-exec`'s
+  own exits 65 and 71 cannot be told from the line's and are reported as its exit code.
