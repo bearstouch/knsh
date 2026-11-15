@@ -11,8 +11,10 @@
 //! - available here but its backend is `none`: `-32005` with `data.capability`;
 //! - planned, unknown, or anything else: `-32601`.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use knsh_json::{FromJson, Object, StreamId, ToJson, Value};
@@ -26,6 +28,32 @@ use crate::sessions::SessionBinding;
 
 /// The name of the handshake method, which every connection must call first.
 pub(crate) const HELLO: &str = "hello";
+
+/// The only method whose request may carry descriptors: `exec.run` from `knsh -c`, with the caller's stdio
+/// (KNSH-049). Descriptors on any other request are closed unused and the request is refused (`-32602`).
+pub(crate) const EXEC_RUN: &str = "exec.run";
+
+/// Descriptors that arrived with a request (`SCM_RIGHTS`, KNSH-049). A handler takes them at most once; whatever it
+/// does not take is closed when the call ends.
+#[derive(Debug, Default)]
+pub(crate) struct Passed(RefCell<Vec<OwnedFd>>);
+
+impl Passed {
+    /// `descriptors`, in the order they arrived.
+    pub(crate) fn new(descriptors: Vec<OwnedFd>) -> Self {
+        Self(RefCell::new(descriptors))
+    }
+
+    /// Whether none are here.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.borrow().is_empty()
+    }
+
+    /// Takes every descriptor, leaving none.
+    pub(crate) fn take(&self) -> Vec<OwnedFd> {
+        self.0.take()
+    }
+}
 
 /// A Unix-socket endpoint (`specs/02-architecture/endpoints.md`). The control service (XPC) is not served here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +101,8 @@ pub(crate) struct Call<'a> {
     pub(crate) subscriber: &'a Subscriber,
     /// The human session bound to this connection (`session.start_human`, KNSH-021). Ended with the connection.
     pub(crate) binding: &'a SessionBinding,
+    /// Descriptors that arrived with the request: only `exec.run` sees any (KNSH-049).
+    pub(crate) descriptors: &'a Passed,
 }
 
 /// A successful answer: the `result`, and raw bytes to send after it on [`Call::stream`]
@@ -255,7 +285,13 @@ impl Dispatcher {
     }
 
     /// Calls the handler for `call` on its endpoint, or answers why it cannot be called.
+    ///
+    /// A request that carries descriptors is refused (`-32602`) unless it is [`EXEC_RUN`]: descriptors are never
+    /// handed to a handler that does not expect them, and dropping the call closes them.
     pub(crate) fn call(&self, call: &Call<'_>) -> Reply {
+        if !call.descriptors.is_empty() && call.request.method.as_str() != EXEC_RUN {
+            return Err(RpcError::new(ErrorCode::InvalidParams));
+        }
         match self.route(call.endpoint, &call.request.method) {
             Route::Serve(handler) => handler(call),
             Route::NotAllowed => Err(RpcError::new(ErrorCode::NotAllowed)),
@@ -327,6 +363,12 @@ pub(crate) mod tests {
         &BINDING
     }
 
+    /// No descriptors, for test calls. Leaked: a [`Passed`] is not `Sync`, so it cannot be a shared static, and a
+    /// few bytes per test call do not matter.
+    pub(crate) fn no_descriptors() -> &'static Passed {
+        Box::leak(Box::default())
+    }
+
     /// The stream ID test calls use.
     pub(crate) fn stream() -> StreamId {
         StreamId::new(1).unwrap()
@@ -341,6 +383,7 @@ pub(crate) mod tests {
             request: &request(method),
             subscriber: subscriber(),
             binding: binding(),
+            descriptors: no_descriptors(),
         })
     }
 

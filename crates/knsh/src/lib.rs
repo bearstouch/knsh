@@ -25,6 +25,9 @@
 //!   `specs/06-api/user-socket.md#human-sessions` — `integration::config` and `integration::recorder`, KNSH-021:
 //!   the recording switch, human telemetry to `knshd`, the idle prompt and `KNSH_RECORDING`, FR-SES-21, FR-SES-23, FR-SES-24, FR-SES-25, FR-REC-09, NFR-REL-02,
 //!   NFR-PRIV-05
+//! - `specs/03-functional-requirements/agent-integration.md`, `specs/06-api/agent-socket.md#execrun` — [`agent`],
+//!   KNSH-049: `knsh -c` forwarding to the supervisor with stdio passed as descriptors, and the `sh`/`bash`/`zsh`
+//!   shims, FR-AGT-10, FR-LC-14, FR-LC-31, FR-OUT-04, FR-AGT-31, NFR-COMPAT-09, NFR-REL-01
 //! - `specs/06-api/cli.md` "Version and the advisory label", `specs/01-overview/roadmap.md` — [`cli::version`],
 //!   KNSH-024: `knsh --version` labels phase 1 builds advisory
 
@@ -32,5 +35,7 @@
 #![warn(clippy::pedantic)]
 #![forbid(unsafe_code)]
 
+#[cfg(unix)]
+pub mod agent;
 pub mod cli;
 pub mod integration;

@@ -46,6 +46,25 @@ call and is closed. The session outlives its connections: closing one does not e
 | `output.mode` | string | `full`, `truncate`, `head_tail`, `errors_only` or `ref` ([output modes](../03-functional-requirements/output-modes.md)); default from the profile |
 | `output.max_bytes` | int | For `truncate` |
 | `output.lines` | int | For `head_tail` |
+| `env` | object | The caller's whole environment, name to value (KNSH-049). Names are non-empty and hold no `=`; nothing holds NUL; at most 4096 entries. Absent is empty |
+| `interpreter` | string | `knsh` (default), `bash`, `sh` or `zsh`: the shell the line runs with once allowed (FR-LC-14). It never affects the decision |
+| `args` | array of strings | The operands after the line (`bash -c 'line' name arg…`): `$0`, then `$1`, …; at most 4096 |
+| `stdio` | string | `passed`: the request carries the caller's stdin, stdout and stderr as three descriptors (`SCM_RIGHTS`, [wire format](wire-format.md#descriptors)). The line runs on them, and the result holds no output (FR-OUT-04). Absent: output is captured and returned in `output.mode` (KNSH-053) |
+
+The line is at most 65536 bytes and holds no NUL; `cwd` is absolute and resolved; `timeout_s` is positive. Anything
+else, or a descriptor count other than three with `stdio: "passed"` and zero without, is `-32602`, and the
+descriptors are closed unused.
+
+### What the supervisor receives (KNSH-049)
+
+The line, `cwd`, `env`, `args` and `interpreter` arrive unchanged, with two exceptions applied before anything else
+sees them: the shim directory is removed from `PATH` (FR-LC-16), and the session token variable is removed (a
+supervised line runs outside the envelope and has no use for its credential). Names are resolved on that `PATH`, or
+`/usr/bin:/bin:/usr/sbin:/sbin` without one. Policy decides on the line, `cwd` and `PATH` only: the interpreter is not
+an input to the decision (FR-LC-14).
+
+`exec.run` stays `planned` in the method catalogue until the supervisor that decides and runs lines exists (KNSH-050):
+until then `hello` does not list it and a call is `-32601`.
 
 ### Example
 
@@ -72,6 +91,10 @@ call and is closed. The session outlives its connections: closing one does not e
 | `decision` | `verdict`, `source`, `rule_id` |
 | `files_changed` | Count of changed paths under checkpoint roots |
 | `checkpoint_id` | Checkpoint holding the pre-images, or null |
+
+With `stdio: "passed"` (from `knsh -c`), the result is the outcome only: `record_id` (or null), and exactly one of
+`exit_code` (0–255) and `signal` (1–127, the signal that ended the line), the other null. The client exits with the
+code, or with 128 plus the signal (NFR-COMPAT-09).
 
 ### Errors
 

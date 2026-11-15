@@ -29,6 +29,8 @@
 //! - FR-SBX-06, FR-SBX-08, decision 9 (sandbox violation reader, KNSH-047)
 //! - FR-AGT-23, FR-SES-02, NFR-SEC-02, `specs/06-api/agent-socket.md` (`agent.sock`: session tokens, the envelope
 //!   registry and the audit-token fallback, KNSH-048)
+//! - FR-LC-01, FR-LC-14, FR-LC-16, FR-OUT-04, `specs/06-api/agent-socket.md#execrun`, `specs/06-api/wire-format.md`
+//!   (receiving `exec.run` from `knsh -c` with its stdio passed as descriptors, KNSH-049)
 //!
 //! On start it prepares the engine directories (KNSH-011) and takes its sockets from launchd ([`endpoints`],
 //! KNSH-012). It then serves them ([`server`], KNSH-013): a kqueue accept loop hands each connection to its own
@@ -48,8 +50,10 @@
 //! attaches them to the records their tags name; `hello` reports whether it is live. `agent.sock` is served too
 //! ([`agents`], KNSH-048): each connection is bound at `hello` to one agent session, by its session token or, without
 //! one, by the caller's audit token and the envelope it descends from, and every later call acts for that session
-//! only. It exits after ten idle minutes ([`lifetime`]) or when launchd stops it, finishing in-flight
-//! requests and committing pending writes first.
+//! only. Descriptors passed with a request (`SCM_RIGHTS`) reach that request's call, and only `exec.run` takes them
+//! ([`exec`], KNSH-049): it checks the forwarded line and hands it, without the shims in `PATH`, to the supervisor,
+//! which later stories provide. It exits after ten idle minutes ([`lifetime`]) or when launchd stops it, finishing
+//! in-flight requests and committing pending writes first.
 //! The supervisor arrives in later stories.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -68,6 +72,11 @@ mod dispatch;
 mod endpoints;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod events;
+// Reads the session binding, so built where the session registry is. Served once the supervisor exists (KNSH-050):
+// until then `exec.run` is planned and only tests build the handler.
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(test), allow(dead_code))]
+mod exec;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod hello;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]

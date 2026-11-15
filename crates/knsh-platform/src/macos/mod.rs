@@ -7,6 +7,7 @@
 mod ancestry;
 mod clock;
 mod denials;
+mod descriptors;
 mod digest;
 mod fs;
 mod kqueue;
@@ -20,6 +21,7 @@ mod shell_host;
 pub use ancestry::SystemProcessTree;
 pub use clock::SystemClock;
 pub use denials::UnifiedLogDenials;
+pub use descriptors::{MAX_PASSED_DESCRIPTORS, recv_with_descriptors, send_with_descriptors};
 pub use digest::{SHA256_LEN, sha256};
 pub use fs::RealFs;
 pub use kqueue::{Kqueue, Token};

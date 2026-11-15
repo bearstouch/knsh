@@ -66,6 +66,11 @@
 //!
 //! [`PeerCredentials::peer_audit_token`] reads the peer's [`AuditToken`] (`LOCAL_PEERTOKEN`).
 //!
+//! The macOS backend passes descriptors over Unix sockets (KNSH-049): `macos::send_with_descriptors` sends a frame
+//! with `knsh -c`'s stdio attached (`SCM_RIGHTS`), and `macos::recv_with_descriptors` reads bytes and collects what
+//! arrives, bounded and close-on-exec. Concrete, like the kqueue: tested over real socket pairs.
+//! [`EnginePaths::shim_dir`] names the shim directory, the one engine-managed path outside the fixed denies.
+//!
 //! Later stories add Keychain, `LocalAuthentication`, XPC, `FSEvents` and APFS clones to the same interface.
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
@@ -101,6 +106,8 @@
 //! - FR-POL-01, FR-POL-10, FR-POL-11 (profile source and path canonicalisation for the policy loader, KNSH-039)
 //! - FR-SBX-06, FR-SBX-08, decision 9 (sandbox denials from the unified log, KNSH-047)
 //! - FR-AGT-23, `specs/02-architecture/endpoints.md` (audit tokens and process ancestry for `agent.sock`, KNSH-048)
+//! - FR-AGT-10, FR-OUT-04, `specs/06-api/wire-format.md#descriptors` (descriptor passing and the shim directory,
+//!   KNSH-049)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 

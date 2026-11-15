@@ -33,6 +33,27 @@ knsh agent --profile web-app -- claude
 | FR-AGT-12 | Only commands spawned by the supervisor may receive more than the envelope allows, and only when policy or an approval grants it. |
 | FR-AGT-13 | On macOS 27 and later, where the Endpoint Security descendant client is available, `knshd` must decide every exec inside an envelope, including binaries run by absolute path. |
 
+### Forwarding details (KNSH-049)
+
+- **Inside an envelope** means: `knshd` bound the `agent.sock` connection to a live session, by the token in
+  `KNSH_SESSION_TOKEN` or, without it, by the caller's audit token (FR-AGT-23). `knsh` decides nothing about it
+  itself, and no other variable or label changes the session or relaxes its policy. A caller `knshd` refuses
+  (`-32009`) is not in an envelope: until the `unattended` profile is served (FR-AGT-21) its line does not run.
+- **What is sent:** the line, the operands after it (`$0`, `$1`, …), the working directory (`getcwd`), the whole
+  environment and the interpreter (`knsh`, or the shim's name), all unchanged. Anything that cannot travel unchanged
+  as JSON (text that is not UTF-8, a NUL byte, more than the protocol's limits) is refused: nothing runs and `knsh`
+  exits 126. Stdio is passed as descriptors; a stream that is closed is passed as `/dev/null`.
+- **Shim forms other than `-c`:** `bash script.sh a`, `sh` reading stdin, and the like are forwarded as the
+  equivalent line, the interpreter's own name followed by the operands, single-quoted (`sh 'script.sh' 'a'`), under
+  that interpreter, with `--` before a first operand that starts with `-` so that it stays a script name
+  (`bash -- '-c' 'x'`). The supervisor then decides that inner command like any other; a script given to an
+  interpreter is code the policy sees as such (FR-LC-05). `-l` and `-i` are ignored: a supervised line reads no startup files.
+  `knsh` itself without `-c` uses `bash`.
+- **Signals:** the client installs no handlers. A signal that ends `knsh` (`SIGINT`, `SIGTERM`, `SIGHUP`, or
+  `SIGKILL` from an agent CLI's tool timeout) closes its connection, and the supervisor treats a closed connection as
+  the caller gone: a pending decision is cancelled (FR-LC-41) and a running line's process group is stopped
+  (KNSH-051). Delivering a particular signal to the line instead is left to `exec.kill`.
+
 ## Who counts as an agent
 
 | ID | Requirement |

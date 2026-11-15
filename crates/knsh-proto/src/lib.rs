@@ -71,6 +71,14 @@
 //! verdict, its source and rule, every matched rule, each command's class and dynamic reason, the line's dynamic
 //! parts and its network classes (FR-POL-70).
 //!
+//! # Forwarded lines (KNSH-049)
+//!
+//! [`ExecRunParams`] carries a line from `knsh -c` or a shim unchanged: the line, the working directory, the whole
+//! environment, the operands after the line and the [`Interpreter`] asked for, with stdio passed as descriptors
+//! ([`ExecStdio::Passed`]) so output never crosses the API (FR-OUT-04). [`ExecRunResult`] answers with the
+//! [`LineStatus`] only; [`Denial`] reads a `-32001`'s rule and reason. [`SESSION_TOKEN_VAR`] names the variable the
+//! envelope's token travels in.
+//!
 //! Parameters and results of the other methods arrive with the stories that implement them.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -83,6 +91,7 @@ mod envelope;
 mod error;
 mod error_code;
 mod events;
+mod exec;
 mod hello;
 mod method;
 mod policy;
@@ -111,6 +120,10 @@ pub use error_code::ErrorCode;
 pub use events::{
     EVENTS_LOST, EventsSubscribeParams, EventsSubscribeResult, EventsUnsubscribeParams, event_envelope,
     event_notification, lost_notification,
+};
+pub use exec::{
+    Denial, ExecRunParams, ExecRunResult, ExecStdio, Interpreter, LineStatus, MAX_EXEC_ARGS, MAX_EXEC_COMMAND_LEN,
+    MAX_EXEC_ENV_ENTRIES, SESSION_TOKEN_VAR,
 };
 pub use method::{MAX_METHOD_NAME_LEN, MethodName};
 pub use policy::{

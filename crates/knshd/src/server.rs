@@ -6,9 +6,9 @@
 //! - **The accept loop** ([`Server::run`]) is one thread blocked in [`Kqueue::wait`]. It wakes when a listener has a
 //!   connection, when a connection closes, when [`StopHandle::stop`] or `SIGTERM` asks it to stop, or when the idle
 //!   clock is due. Nothing it does blocks on a client.
-//! - **One worker thread per connection** runs [`connection::serve`]. A slow or stuck client (or handler) holds only
-//!   its own thread, so it cannot block anyone else. At most [`Config::max_connections`] are open; excess connections
-//!   are accepted and closed at once, so the backlog never fills with clients that wait forever.
+//! - **One worker thread per connection** runs [`connection::serve_with_descriptors`]. A slow or stuck client (or
+//!   handler) holds only its own thread, so it cannot block anyone else. At most [`Config::max_connections`] are open;
+//!   excess connections are accepted and closed at once, so the backlog never fills with clients that wait forever.
 //!
 //! # Lock order
 //!
@@ -27,18 +27,18 @@
 //! The system log only accepts static messages and typed values ([`knsh_platform::Value`]), and nothing here logs a
 //! message, a method name or a parameter: only endpoint names, counts, `errno` values and fixed reasons.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Read};
 use std::net::Shutdown;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use knsh_platform::macos::{Kqueue, Token};
+use knsh_platform::macos::{Kqueue, MAX_PASSED_DESCRIPTORS, Token, recv_with_descriptors};
 use knsh_platform::{AuditToken, Clock, Field, Level, Monotonic, PeerCredentials, PlatformError, SystemLog, Value};
 
 use crate::connection::{self, Closed};
@@ -495,10 +495,22 @@ impl Server {
 /// The read side of a connection that must complete `hello` before a deadline counted from the accept, however
 /// slowly its bytes arrive: before each read the socket's read timeout is cut to the time left, so a client that
 /// trickles one byte at a time cannot hold its slot past the deadline (`specs/09-reference/defaults-and-limits.md`).
+///
+/// Every read is a `recvmsg` that also collects descriptors passed with the bytes (KNSH-049), for the connection loop
+/// to hand to the frame they came with ([`connection::Inbox`]). At most [`MAX_PASSED_DESCRIPTORS`] may be waiting at
+/// once: more within one frame is a read error, which closes the connection (and the descriptors).
 struct HandshakeReader<'a> {
     stream: &'a UnixStream,
     /// `None` once `hello` has succeeded.
     deadline: Cell<Option<Instant>>,
+    /// Descriptors received since the connection loop last took them.
+    received: RefCell<Vec<OwnedFd>>,
+}
+
+impl connection::Inbox for HandshakeReader<'_> {
+    fn take(&self) -> Vec<OwnedFd> {
+        self.received.take()
+    }
 }
 
 impl Read for &HandshakeReader<'_> {
@@ -510,8 +522,14 @@ impl Read for &HandshakeReader<'_> {
             }
             self.stream.set_read_timeout(Some(left))?;
         }
-        let mut stream = self.stream;
-        stream.read(buf)
+        let mut received = self.received.borrow_mut();
+        let read = recv_with_descriptors(self.stream, buf, &mut received)?;
+        if received.len() > MAX_PASSED_DESCRIPTORS {
+            // More than one request's worth: not a client of ours. Closed with the connection.
+            received.clear();
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(read)
     }
 }
 
@@ -526,6 +544,7 @@ fn serve_one(
     let reader = HandshakeReader {
         stream,
         deadline: Cell::new(Some(Instant::now() + shared.config.handshake_timeout)),
+        received: RefCell::new(Vec::new()),
     };
     // Lift the handshake deadline once `hello` succeeds: a greeted client (an observer, a subscriber) may stay quiet
     // as long as it likes. If lifting the socket timeout fails the connection is still served, only with it left on.
@@ -537,7 +556,8 @@ fn serve_one(
     let close = || {
         let _ = stream.shutdown(Shutdown::Both);
     };
-    let closed = connection::serve(
+    let closed = connection::serve_with_descriptors(
+        &reader,
         &reader,
         stream,
         endpoint,
@@ -670,6 +690,16 @@ mod tests {
 
     impl TestServer {
         fn start(tag: &str, config: Config, user_table: Table, peer_uid: u32) -> Self {
+            Self::start_with_agent(
+                tag,
+                config,
+                user_table,
+                Table::new().with(HELLO, ok_handler()),
+                peer_uid,
+            )
+        }
+
+        fn start_with_agent(tag: &str, config: Config, user_table: Table, agent_table: Table, peer_uid: u32) -> Self {
             let dir = SocketDir::new(tag);
             let listeners = Listeners {
                 user: vec![UnixListener::bind(dir.0.join("u")).unwrap()],
@@ -682,7 +712,7 @@ mod tests {
             let activity = Arc::new(FlagActivity::default());
             let journal = Arc::new(Journal::default());
             let services = Services {
-                dispatcher: Dispatcher::from_tables(user_table, Table::new().with(HELLO, ok_handler())),
+                dispatcher: Dispatcher::from_tables(user_table, agent_table),
                 credentials: Arc::new(FixedPeerCredentials::uid(peer_uid)),
                 log: log.clone(),
                 own_uid: OWN_UID,
@@ -1122,5 +1152,88 @@ mod tests {
         assert!(is_per_connection(&io::Error::from(io::ErrorKind::ConnectionAborted)));
         assert!(is_per_connection(&io::Error::from(io::ErrorKind::Interrupted)));
         assert!(!is_per_connection(&io::Error::from(io::ErrorKind::OutOfMemory)));
+    }
+
+    /// The bytes of one JSON frame holding a request for `method` with empty params: length, JSON frame type, stream
+    /// 0, then the text.
+    fn request_frame(id: u32, method: &str) -> Vec<u8> {
+        let text = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{}}}}"#);
+        let mut frame = u32::try_from(text.len() + 5).unwrap().to_be_bytes().to_vec();
+        frame.push(0x01);
+        frame.extend_from_slice(&[0; 4]);
+        frame.extend_from_slice(text.as_bytes());
+        frame
+    }
+
+    /// Sends one request frame for `method` on `stream` with `descriptors` attached (`SCM_RIGHTS`), as `knsh -c`
+    /// sends `exec.run`.
+    fn call_passing(stream: &UnixStream, id: u32, method: &str, descriptors: &[std::os::fd::BorrowedFd<'_>]) {
+        knsh_platform::macos::send_with_descriptors(stream, &request_frame(id, method), descriptors).unwrap();
+    }
+
+    // KNSH-049: descriptors passed with a request reach that request's handler through the server's reader, as
+    // working copies of the caller's own: the handler writes to the caller's pipe. Descriptors on any other request
+    // are refused (-32602) and closed, and the connection stays usable.
+    #[test]
+    fn passed_descriptors_reach_the_call_they_came_with() {
+        let handler: crate::dispatch::Handler = Arc::new(|call: &crate::dispatch::Call<'_>| {
+            let descriptors = call.descriptors.take();
+            let count = descriptors.len();
+            if let Some(stdout) = descriptors.into_iter().nth(1) {
+                std::fs::File::from(stdout).write_all(b"HI\n").unwrap();
+            }
+            Ok(knsh_json::Value::int(i64::try_from(count).unwrap()).unwrap().into())
+        });
+        let agent = Table::new()
+            .with(HELLO, ok_handler())
+            .with(crate::dispatch::EXEC_RUN, handler)
+            .with("session.info", ok_handler());
+        let mut server = TestServer::start_with_agent("fd", test_config(), Table::new(), agent, OWN_UID);
+        let mut stream = server.connect("a");
+        call(&mut stream, 1, HELLO);
+        assert!(matches!(read_message(&stream), Some(Message::Success(_))));
+
+        let (mut pipe_read, pipe_write) = std::io::pipe().unwrap();
+        let stdout = pipe_write.as_fd();
+        call_passing(&stream, 2, crate::dispatch::EXEC_RUN, &[stdout, stdout, stdout]);
+        match read_message(&stream) {
+            Some(Message::Success(success)) => assert_eq!(success.result.as_i64(), Some(3)),
+            other => panic!("{other:?}"),
+        }
+        // Refused on another method, and closed: once our own copy goes, the pipe reaches its end.
+        call_passing(&stream, 3, "session.info", &[stdout]);
+        match read_message(&stream) {
+            Some(Message::Error(error)) => assert_eq!(error.error.code, ErrorCode::InvalidParams),
+            other => panic!("{other:?}"),
+        }
+        drop(pipe_write);
+        let mut out = String::new();
+        pipe_read.read_to_string(&mut out).unwrap();
+        assert_eq!(
+            out, "HI\n",
+            "only the exec.run handler wrote, and no copy stayed open in the server"
+        );
+        // The connection is still served.
+        call(&mut stream, 4, "session.info");
+        assert!(matches!(read_message(&stream), Some(Message::Success(_))));
+        server.stop.stop().unwrap();
+        server.join().unwrap();
+    }
+
+    // Untrusted input: more descriptors than one request may carry close the connection, unanswered.
+    #[test]
+    fn too_many_descriptors_close_the_connection() {
+        let mut server = TestServer::simple("fdmax");
+        let mut stream = server.connect("a");
+        call(&mut stream, 1, HELLO);
+        assert!(matches!(read_message(&stream), Some(Message::Success(_))));
+        let fd = stream.as_fd();
+        // Two messages of three each, for one frame: the frame's first bytes, then the rest.
+        let frame = request_frame(2, crate::dispatch::EXEC_RUN);
+        knsh_platform::macos::send_with_descriptors(&stream, &frame[..4], &[fd, fd, fd]).unwrap();
+        knsh_platform::macos::send_with_descriptors(&stream, &frame[4..], &[fd, fd, fd]).unwrap();
+        assert!(read_message(&stream).is_none(), "closed without an answer");
+        server.stop.stop().unwrap();
+        server.join().unwrap();
     }
 }

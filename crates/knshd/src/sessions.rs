@@ -649,6 +649,7 @@ pub(crate) mod tests {
             request: &request,
             subscriber: subscriber(),
             binding,
+            descriptors: crate::dispatch::tests::no_descriptors(),
         })
     }
 

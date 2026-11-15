@@ -96,10 +96,23 @@ impl<R: Read, W: Write> Client<R, W> {
     ///
     /// Any [`ClientError`]; [`ClientError::Rpc`] with `-32005` if `knshd` speaks none of this client's protocols.
     pub fn hello(&mut self) -> Result<Value, ClientError> {
-        let params = Object::new()
+        self.hello_with_token(None)
+    }
+
+    /// The handshake on `agent.sock` (KNSH-049): [`Client::hello`], with the envelope's session token when there is
+    /// one. Without a token `knshd` matches the caller to its envelope by audit token, or refuses it (`-32009`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::hello`]; [`ClientError::Rpc`] with `-32009` when the caller is in no live session's envelope.
+    pub fn hello_with_token(&mut self, session_token: Option<&str>) -> Result<Value, ClientError> {
+        let mut params = Object::new()
             .with("client", CLIENT_NAME)?
             .with("client_version", env!("CARGO_PKG_VERSION"))?
             .with("protocols", SUPPORTED_PROTOCOLS.to_vec().to_json()?)?;
+        if let Some(token) = session_token {
+            params.insert("session_token", Value::from(token))?;
+        }
         self.call("hello", Some(params))
     }
 
@@ -110,6 +123,34 @@ impl<R: Read, W: Write> Client<R, W> {
     /// [`ClientError::Rpc`] when `knshd` answers with an error; [`ClientError::Io`], [`ClientError::Closed`] or
     /// [`ClientError::Protocol`] when no valid answer arrives.
     pub fn call(&mut self, method: &str, params: Option<Object>) -> Result<Value, ClientError> {
+        let (id, request) = self.request(method, params)?;
+        self.writer.write_json(&request)?;
+        self.writer.flush()?;
+        self.answer(&id)
+    }
+
+    /// Like [`Client::call`], but the request's frame is handed to `send` as bytes instead of being written to the
+    /// connection's writer: how `knsh -c` sends `exec.run` with its stdio descriptors attached (KNSH-049). `send`
+    /// must write every byte to the same connection.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::call`]; [`ClientError::Io`] with the error of `send`.
+    pub fn call_sending(
+        &mut self,
+        method: &str,
+        params: Option<Object>,
+        send: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+    ) -> Result<Value, ClientError> {
+        let (id, request) = self.request(method, params)?;
+        let mut frame = FrameWriter::new(Vec::new());
+        frame.write_json(&request)?;
+        send(&frame.into_inner()).map_err(ClientError::Io)?;
+        self.answer(&id)
+    }
+
+    /// The next request: its ID, and the message as a JSON value.
+    fn request(&mut self, method: &str, params: Option<Object>) -> Result<(RequestId, Value), ClientError> {
         let id = RequestId::from(self.next_id);
         self.next_id = self.next_id.wrapping_add(1);
         let request = Message::Request(Request {
@@ -117,8 +158,11 @@ impl<R: Read, W: Write> Client<R, W> {
             method: MethodName::new(method)?,
             params,
         });
-        self.writer.write_json(&request.to_value()?)?;
-        self.writer.flush()?;
+        Ok((id, request.to_value()?))
+    }
+
+    /// Waits for the answer to request `id`, skipping notifications.
+    fn answer(&mut self, id: &RequestId) -> Result<Value, ClientError> {
         loop {
             let Some(frame) = self.reader.read_frame()? else {
                 return Err(ClientError::Closed);
@@ -128,8 +172,8 @@ impl<R: Read, W: Write> Client<R, W> {
                 return Err(ClientError::Protocol);
             };
             match decode(&payload).map_err(|_| ClientError::Protocol)? {
-                Message::Success(success) if success.id == id => return Ok(success.result),
-                Message::Error(failure) if failure.id.as_ref() == Some(&id) => {
+                Message::Success(success) if success.id == *id => return Ok(success.result),
+                Message::Error(failure) if failure.id.as_ref() == Some(id) => {
                     return Err(ClientError::Rpc(failure.error));
                 }
                 // Engine notifications (events) may interleave with answers; they are not ours to handle here.

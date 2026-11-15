@@ -6,7 +6,7 @@ The engine must stay safe when parts of it are missing: fail closed for agents, 
 
 | ID | Requirement |
 | --- | --- |
-| NFR-REL-01 | If `knshd` cannot be reached, no agent line may run (there is no supervisor) and agent network must be blocked (there is no proxy). |
+| NFR-REL-01 | If `knshd` cannot be reached, no agent line may run (there is no supervisor) and agent network must be blocked (there is no proxy). `knsh -c` then runs nothing, prints that the supervisor is unavailable and that the line did not run on stderr, and exits **126**, as for a denial (KNSH-049). It never runs the line itself, whatever fails. |
 | NFR-REL-02 | If `knshd` cannot be reached, human sessions must continue normally; telemetry is dropped. |
 | NFR-REL-03 | launchd must restart `knshd` if it crashes while envelopes exist, so the unreachable case is brief. |
 | NFR-REL-04 | After `knshd` returns, it must rescan checkpoint roots and mark the gap during which envelope changes were not checkpointed. |
