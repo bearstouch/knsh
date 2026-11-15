@@ -366,12 +366,19 @@ fn shell_mode(shell: &knsh::cli::args::ShellInvocation, interpreter: knsh_proto:
     use knsh::integration::zsh;
 
     let on_terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-    if zsh::is_human_interactive(
-        shell.command.as_deref(),
-        &shell.operands,
-        shell.interactive,
-        on_terminal,
-    ) {
+    // FR-AGT-20, FR-AGT-22: inside an envelope (its session token is in the environment) there is no human shell.
+    // An interactive `knsh` there, on the envelope's terminal, is forwarded as an agent line like any other, so the
+    // commands typed into it are the agent's. Without the token, the envelope's sandbox still confines it.
+    // An empty value names no session (tokens are 64 hex characters), so it never takes a human's shell away.
+    let in_envelope = std::env::var_os(knsh_proto::SESSION_TOKEN_VAR).is_some_and(|token| !token.is_empty());
+    if !in_envelope
+        && zsh::is_human_interactive(
+            shell.command.as_deref(),
+            &shell.operands,
+            shell.interactive,
+            on_terminal,
+        )
+    {
         human_shell(shell)
     } else {
         agent_line(shell, interpreter)

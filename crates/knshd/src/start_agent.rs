@@ -29,27 +29,48 @@
 //!    an executable file; otherwise `-32602`.
 //! 6. **Session.** Opened with its parent ([`Sessions::open_agent_in`]): row written, `session.started` published,
 //!    token issued.
-//! 7. **Launch.** The [`Launcher`] starts the CLI in its envelope, in a new process group, on the caller's
-//!    descriptors, with the envelope environment ([`envelope_env`]). The group's leader is registered as the
-//!    session's envelope (FR-AGT-23) and its group kept for pause and resume (FR-SES-10).
+//! 7. **Launch (KNSH-057).** The proxy issues the envelope's credentials ([`EnvelopeProxy`]; none while no proxy
+//!    runs). The [`Launcher`] compiles the envelope profile ([`envelope_profile`]) and starts the CLI through
+//!    `knsh-exec`, in a new process group, on the caller's descriptors, with the envelope environment
+//!    ([`envelope_env`]). The group's leader is registered as the session's envelope (FR-AGT-23) and its group kept
+//!    for pause and resume (FR-SES-10).
 //! 8. **Wait.** Until the CLI exits. If the caller disconnects first (`knsh agent` was killed), the envelope's
 //!    group gets `SIGTERM`, then `SIGKILL` after [`KILL_GRACE`]: nobody is left to answer for it. When the CLI exits
 //!    on its own, what is left of its group gets `SIGTERM`: the envelope ends with its CLI.
-//! 9. **End.** The session ends (`session.state_changed` to `ended`, then `session.ended`), its token and envelope
-//!    revoked, and the call is answered with how the CLI ended ([`SessionStartAgentResult`]).
+//! 9. **End.** The envelope's proxy credentials are revoked, the session ends (`session.state_changed` to `ended`,
+//!    then `session.ended`), its token and envelope revoked, and the call is answered with how the CLI ended
+//!    ([`SessionStartAgentResult`]).
 //!
 //! Every failure after step 6 ends the session before answering, so no session outlives its envelope.
 //!
-//! # Known limits (KNSH-057 and later)
+//! # The envelope (KNSH-057)
 //!
-//! - The envelope profile is the session's profile compiled for an envelope, without the agent CLI's preset (its
-//!   API host and configuration folder, FR-AGT-04) and without a proxy (no network beyond the profile's loopback
-//!   ports). KNSH-057 and KNSH-058 complete it.
+//! - **Profile (FR-AGT-04, FR-SBX-01).** The session's profile as the loader resolved it, so with its preset's
+//!   grants (the CLI's configuration folder, the project) already merged in, compiled deny-by-default for an
+//!   envelope ([`CommandTag::Envelope`]): `agent.sock` is the one Unix socket it may connect to; `user.sock`, the
+//!   control service and every engine path are fixed denies no profile can lift (FR-SBX-05, FR-AUTH-16); outbound
+//!   network goes only to the proxy's port and the profile's `network.loopback` ports. The CLI and `knsh` (the
+//!   shims' target) are the binaries it may run besides the trusted and system folders.
+//! - **Environment (FR-AGT-03).** [`envelope_env`]: `SHELL=knsh`, the shims first on `PATH`, the session's token,
+//!   and the proxy settings with the envelope's own credentials (decision 14). Inherited proxy settings and the
+//!   dynamic linker's variables never reach it.
+//! - **Confinement (FR-AGT-11, FR-AGT-12, FR-AGT-20).** Seatbelt profiles are inherited by every child and cannot
+//!   be replaced from inside (an already sandboxed process cannot apply another), so nothing the envelope starts
+//!   directly exceeds its profile; only lines the supervisor spawns, outside the envelope, run under profiles of
+//!   their own. Every process of the tree is the agent: `knshd` binds it by the session token or by audit-token
+//!   ancestry, and `knsh` inside an envelope never hosts a human shell, so a command typed into the envelope's
+//!   terminal is forwarded as an agent line.
+//!
+//! # Known limits
+//!
+//! - No proxy runs before KNSH-059: `knshd` wires [`crate::proxy::NoProxy`], so the envelope gets no proxy settings
+//!   and reaches only its loopback ports (fail closed). The preset's model API host is the proxy's to allow.
 //! - The CLI runs in a process group of `knshd`'s session, not the terminal's: it is never the terminal's foreground
 //!   group. Terminal signals (Ctrl-C with `ISIG` on, `SIGWINCH`) go to `knsh agent`, not to the CLI; a CLI in raw
 //!   mode (as agent CLIs are) reads Ctrl-C as input. `knsh agent` dying ends the envelope (step 8).
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU16;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -63,7 +84,7 @@ use knsh_platform::{Clock, ProcessGroupId, Processes, SharedFd, Signal, SpawnReq
 use knsh_proto::{
     ErrorCode, LineStatus, RpcError, SESSION_TOKEN_VAR, SessionStartAgentParams, SessionStartAgentResult,
 };
-use knsh_sandbox::{CommandTag, ProfileInput, compile};
+use knsh_sandbox::{CommandTag, ProfileInput, SbplText, compile};
 
 use crate::agents::SessionToken;
 use crate::dispatch::{Call, Endpoint, Handler, Handlers, Reply, START_AGENT, answer, capability_unavailable, params};
@@ -71,6 +92,7 @@ use crate::exec::{PATH_VAR, without_shims};
 use crate::holds::GroupKind;
 use crate::policy::ProfileLoader;
 use crate::profiles::{CompiledProfile, ProfileFiles};
+use crate::proxy::{EnvelopeProxy, ProxyCredential, is_proxy_var, proxy_env};
 use crate::sessions::Sessions;
 use crate::spawn::{line_status, passed, read_by_dynamic_linker, read_status};
 
@@ -104,6 +126,8 @@ pub(crate) struct Launch<'a> {
     pub(crate) args: &'a [String],
     /// The complete environment ([`envelope_env`]).
     pub(crate) env: Vec<(String, String)>,
+    /// The proxy's loopback port when a proxy serves the envelope: the profile allows outbound TCP to it.
+    pub(crate) proxy_port: Option<NonZeroU16>,
     /// The working directory.
     pub(crate) cwd: &'a CanonicalPath,
     /// The caller's stdin, stdout and stderr.
@@ -147,6 +171,8 @@ pub(crate) struct AgentStarter {
     sessions: Arc<Sessions>,
     profiles: ProfileLoader,
     launcher: Arc<dyn Launcher>,
+    /// Issues and revokes each envelope's proxy credentials (FR-NET-01).
+    proxy: Arc<dyn EnvelopeProxy>,
     clock: Arc<dyn Clock>,
     /// The shim directory, put first on the envelope's `PATH` (FR-AGT-03) and skipped when finding the program.
     shim_dir: PathBuf,
@@ -160,11 +186,13 @@ pub(crate) struct AgentStarter {
 }
 
 impl AgentStarter {
-    /// The service over `sessions`, loading profiles with `profiles` and starting envelopes with `launcher`.
+    /// The service over `sessions`, loading profiles with `profiles`, starting envelopes with `launcher` and
+    /// getting their proxy credentials from `proxy`.
     pub(crate) fn new(
         sessions: Arc<Sessions>,
         profiles: ProfileLoader,
         launcher: Arc<dyn Launcher>,
+        proxy: Arc<dyn EnvelopeProxy>,
         clock: Arc<dyn Clock>,
         shim_dir: PathBuf,
         knsh: PathBuf,
@@ -173,6 +201,7 @@ impl AgentStarter {
             sessions,
             profiles,
             launcher,
+            proxy,
             clock,
             shim_dir,
             knsh,
@@ -242,6 +271,8 @@ impl AgentStarter {
         self.running().insert(session_id, Arc::clone(&profile));
         // Steps 7 to 9. Whatever happens, the session ends before the answer.
         let ran = self.run(session_id, &opened.token, &profile, &program, &params, stdio, call);
+        // Revoked first: once the envelope is gone, nothing may use its credentials (FR-NET-01).
+        self.proxy.revoke(session_id);
         self.sessions.end_agent(session_id);
         self.running().remove(&session_id);
         let status = ran?;
@@ -325,6 +356,8 @@ impl AgentStarter {
         call: &Call<'_>,
     ) -> Result<LineStatus, RpcError> {
         let processes = self.launcher.processes();
+        // A proxy that runs but cannot issue credentials stops the launch: no envelope runs untied to its session.
+        let proxy = self.proxy.issue(session_id).map_err(|_| internal_error())?;
         let envelope = self
             .launcher
             .launch(Launch {
@@ -332,7 +365,8 @@ impl AgentStarter {
                 profile,
                 program,
                 args: &params.command[1..],
-                env: envelope_env(&params.env, token, &self.shim_dir, &self.knsh),
+                env: envelope_env(&params.env, token, &self.shim_dir, &self.knsh, proxy.as_ref()),
+                proxy_port: proxy.as_ref().map(ProxyCredential::port),
                 cwd: &params.cwd,
                 stdio,
             })
@@ -404,21 +438,27 @@ fn stdio(descriptors: Vec<OwnedFd>) -> Result<[OwnedFd; 3], RpcError> {
     <[OwnedFd; 3]>::try_from(descriptors).map_err(|_| invalid_params())
 }
 
-/// The environment the CLI starts with (FR-AGT-03): the caller's, minus any session token it carried and the
-/// dynamic linker's variables (`knsh-exec` runs unsandboxed until it becomes `sandbox-exec`), with `SHELL` set to
-/// `knsh`, the shim directory first on `PATH` (once), and the new session's token. Order is kept otherwise; the
-/// variables set here come last.
+/// The environment the CLI starts with (FR-AGT-03): the caller's, minus any session token it carried, its proxy
+/// settings ([`is_proxy_var`]) and the dynamic linker's variables (`knsh-exec` runs unsandboxed until it becomes
+/// `sandbox-exec`), with `SHELL` set to `knsh`, the shim directory first on `PATH` (once), the new session's token
+/// and, when a proxy serves the envelope, its proxy settings with the envelope's own credentials ([`proxy_env`]).
+/// Order is kept otherwise; the variables set here come last.
 pub(crate) fn envelope_env(
     caller: &[(String, String)],
     token: &SessionToken,
     shim_dir: &Path,
     knsh: &Path,
+    proxy: Option<&ProxyCredential>,
 ) -> Vec<(String, String)> {
     let shims = shim_dir.to_string_lossy().into_owned();
     let mut env: Vec<(String, String)> = caller
         .iter()
         .filter(|(name, _)| {
-            name != SESSION_TOKEN_VAR && name != SHELL_VAR && name != PATH_VAR && !read_by_dynamic_linker(name)
+            name != SESSION_TOKEN_VAR
+                && name != SHELL_VAR
+                && name != PATH_VAR
+                && !is_proxy_var(name)
+                && !read_by_dynamic_linker(name)
         })
         .cloned()
         .collect();
@@ -433,7 +473,31 @@ pub(crate) fn envelope_env(
     env.push((PATH_VAR.to_owned(), path));
     env.push((SHELL_VAR.to_owned(), knsh.to_string_lossy().into_owned()));
     env.push((SESSION_TOKEN_VAR.to_owned(), token.encode().expose().clone()));
+    env.extend(proxy_env(proxy));
     env
+}
+
+/// The envelope profile (module documentation, "The envelope"): `profile`, as resolved with its preset, compiled for
+/// the envelope of `session_id`. Besides the trusted and system folders it may run exactly the CLI (`program`) and
+/// `knsh`, which the shims link to; with `proxy_port`, it may also connect to the proxy. Pure: the same input gives
+/// the same bytes.
+pub(crate) fn envelope_profile(
+    session_id: SessionId,
+    profile: &Profile,
+    home: &CanonicalPath,
+    program: &CanonicalPath,
+    knsh: &CanonicalPath,
+    proxy_port: Option<NonZeroU16>,
+) -> SbplText {
+    let executables = [program.clone(), knsh.clone()];
+    compile(&ProfileInput {
+        session: session_id,
+        command: CommandTag::Envelope,
+        profile,
+        home,
+        executables: &executables,
+        proxy_port,
+    })
 }
 
 /// `-32602`.
@@ -487,15 +551,14 @@ impl Launcher for TrampolineLauncher {
     }
 
     fn launch(&self, launch: Launch<'_>) -> Result<Box<dyn Envelope>, LaunchError> {
-        let executables = [launch.program.clone(), self.knsh.clone()];
-        let text = compile(&ProfileInput {
-            session: launch.session_id,
-            command: CommandTag::Envelope,
-            profile: launch.profile,
-            home: &self.home,
-            executables: &executables,
-            proxy_port: None,
-        });
+        let text = envelope_profile(
+            launch.session_id,
+            launch.profile,
+            &self.home,
+            launch.program,
+            &self.knsh,
+            launch.proxy_port,
+        );
         let compiled = self
             .files
             .write(&launch.profile.name, &text)

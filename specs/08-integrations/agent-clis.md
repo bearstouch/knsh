@@ -8,14 +8,14 @@ How agent CLIs such as Claude Code and Codex CLI run under Kinetic Shell. Requir
 knsh agent --profile web-app -- claude
 ```
 
-`knshd` starts the CLI through `knsh-exec` inside an envelope, with:
+`knshd` compiles the envelope profile (the session's profile with its preset, deny by default, `agent.sock` the only Unix socket it may connect to) and starts the CLI through `knsh-exec` inside an envelope, in a process group of its own, with:
 
 | Setting | Value |
 | --- | --- |
 | `SHELL` | `knsh` |
 | `PATH` | Shim directory first (`sh`, `bash`, `zsh` → `knsh -c`) |
 | Session token | In the environment, used by the `knsh` client in `hello` |
-| Proxy settings | Per-envelope proxy credentials |
+| Proxy settings | Per-envelope proxy credentials ([decision 14](../09-reference/decisions.md)): `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy` set to `http://knsh-<id>:<token>@127.0.0.1:<port>`, `NODE_USE_ENV_PROXY=1`, `GIT_HTTP_PROXY_AUTHMETHOD=basic`. Inherited proxy settings (`ALL_PROXY`, `NO_PROXY`, the tool-specific ones) are removed. Issued when the session opens, revoked when it ends. None until the proxy runs (KNSH-059): the envelope then reaches only its loopback ports |
 | Actor | `--agent <name>`, or derived from the command's file name (table below) |
 
 | Command | Actor |
