@@ -53,7 +53,9 @@
 //! only. Descriptors passed with a request (`SCM_RIGHTS`) reach that request's call, and only `exec.run` takes them
 //! ([`exec`], KNSH-049): it checks the forwarded line and hands it, without the shims in `PATH`, to the supervisor,
 //! which later stories provide. It exits after ten idle minutes ([`lifetime`]) or when launchd stops it, finishing
-//! in-flight requests and committing pending writes first.
+//! in-flight requests and committing pending writes first. A session can be paused or taken over by a human
+//! ([`holds`], KNSH-054): its new lines are held with `-32007`, and a pause stops its envelope's and running lines'
+//! process groups.
 //! The supervisor arrives in later stories.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -80,6 +82,9 @@ mod events;
 mod exec;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod hello;
+// Pause, resume and human control (KNSH-054): owned by the session registry.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod holds;
 // Lines started with exec.start (KNSH-053), built with `exec`.
 #[cfg(target_os = "macos")]
 mod jobs;

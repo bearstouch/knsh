@@ -21,6 +21,15 @@
 //! `recording.output = false` (the default) nothing is stored and nothing is emitted, and a captured line's output
 //! goes only to its caller. Every chunk passes the [`OutputRedaction`] hook first (FR-EVT-07).
 //!
+//! # Held lines (KNSH-054)
+//!
+//! A line for a session that is paused or under human control is answered `-32007` with `data.state` before anything
+//! else, and nothing about it is recorded: the client sends it again (FR-SES-10, FR-SES-12). The session is checked
+//! once more after the decision, which may have waited on an ask for a long time: a line allowed for a session that
+//! was paused or taken over meanwhile is recorded as a deny with [`HELD_AFTER_DECISION`] and answered `-32007` too.
+//! A line spawned in the instant between that check and a pause is stopped as soon as its group is kept
+//! ([`crate::holds`]).
+//!
 //! Nothing is spawned unless the pipeline returned [`Outcome::Run`] and the caller is still connected (FR-LC-09,
 //! FR-LC-30). Everything before the spawn runs inside a `catch_unwind` boundary as defence in depth: a panic there is
 //! a deny.
@@ -47,13 +56,14 @@ use knsh_core::{
     Redacted, Refusal, RefusalKind, RequestId, SessionId, Timestamp, Ulid, argv_of, decide, redact,
 };
 use knsh_json::{Object, ToJson, Value};
-use knsh_platform::{Clock, Random};
+use knsh_platform::{Clock, ProcessGroupId, Processes, Random};
 use knsh_proto::{Denial, ErrorCode, LineStatus, RpcError};
 use knsh_store::{RecordStore, RecordedOutput};
 
 use crate::capture::{CapturePlan, LineOutput, OutputSink};
 use crate::events::EventHub;
 use crate::exec::{Finished, ForwardedLine, Supervisor};
+use crate::holds::{GroupKind, Kept};
 use crate::jobs::LineControl;
 use crate::policy::ProfileLoader;
 use crate::sessions::Sessions;
@@ -68,6 +78,12 @@ const CALLER_POLL: Duration = Duration::from_millis(100);
 const NO_STORE: &str = "the record store is unavailable, so the line cannot be recorded and was denied (fail closed)";
 const NO_PROFILE: &str = "the session's profile could not be loaded, so the line was denied (fail closed)";
 const NO_CLOCK: &str = "the supervisor could not read its clock or random source, so the line was denied (fail closed)";
+/// Reason for a line allowed by the pipeline whose session was paused or taken over before it could be spawned
+/// (FR-SES-10, FR-SES-12). The client sends the line again and it is decided afresh.
+const HELD_AFTER_DECISION: &str =
+    "the session was paused or taken over while the line was decided, so it was held and did not start";
+/// Reason for a line allowed by the pipeline whose session ended before it could be spawned.
+const ENDED_AFTER_DECISION: &str = "the session ended while the line was decided, so it did not start";
 /// Reason for a line allowed by the pipeline whose caller left before it could be spawned (FR-LC-41).
 const GONE_BEFORE_SPAWN: &str = "the caller disconnected before the line started, so it was cancelled";
 
@@ -80,6 +96,9 @@ pub(crate) trait Spawner: Send + Sync {
 
 /// What a [`Spawner`] reports while a line runs (FR-LC-17). Best effort: an event never decides anything.
 pub(crate) trait LineEvents {
+    /// The line was spawned as `group` by `processes`: keeps the group as one of its session's, so a pause stops it
+    /// (FR-SES-10). The spawner drops the handle before it reaps the group.
+    fn keep(&self, group: ProcessGroupId, processes: Arc<dyn Processes>) -> Kept;
     /// The line was spawned: `command.started`.
     fn started(&self);
     /// The line is still running after the long-running threshold: `command.long_running`, at most once.
@@ -226,6 +245,8 @@ struct RunningEvents<'a> {
     started_at: Timestamp,
     /// Told when the line is spawned, so `exec.start` can answer.
     control: &'a LineControl,
+    /// Keeps the line's process group with its session's (KNSH-054).
+    sessions: &'a Sessions,
 }
 
 impl RunningEvents<'_> {
@@ -236,6 +257,11 @@ impl RunningEvents<'_> {
 }
 
 impl LineEvents for RunningEvents<'_> {
+    fn keep(&self, group: ProcessGroupId, processes: Arc<dyn Processes>) -> Kept {
+        self.sessions
+            .keep_group(self.session_id, group, processes, GroupKind::Line)
+    }
+
     fn started(&self) {
         self.control.mark_started(self.record_id);
         self.publish(EventData::CommandStarted {
@@ -305,8 +331,9 @@ impl Lifecycle {
     fn prepare(&self, line: &ForwardedLine, caller: &dyn Caller) -> Result<Ready, RpcError> {
         let parts = &self.parts;
         let session_id = line.session_id;
-        // The session ended under the call: there is no one to record for, and nothing runs.
-        let (actor, profile_name) = parts.sessions.agent_of(session_id)?;
+        // The session ended under the call: there is no one to record for, and nothing runs. A session that holds its
+        // lines answers `-32007` here, before anything is recorded (module documentation, "Held lines").
+        let (actor, profile_name) = parts.sessions.runnable(session_id)?;
         let Some((received_at, record_id)) = self.record_id() else {
             return Err(self.refuse_early(line, &actor, None, NO_CLOCK));
         };
@@ -355,6 +382,28 @@ impl Lifecycle {
                 kind: RefusalKind::Cancelled { request_id: None },
                 classification: Some(allowed.classification),
             },
+            // The session was paused or taken over while the line was decided (module documentation, "Held lines"):
+            // recorded as a deny so the decision is not lost, and answered with the hold so the client retries.
+            Outcome::Run(allowed) if let Err(hold) = parts.sessions.runnable(session_id) => {
+                let refusal = Refusal {
+                    decision: Decision::deny(DecisionSource::Standalone, None, None),
+                    command: allowed.command,
+                    rewritten_from: allowed.rewritten_from,
+                    // The session may also have ended meanwhile (`-32006`): still a deny, with its own reason.
+                    reason: Some(
+                        if hold.code == ErrorCode::SessionHeld {
+                            HELD_AFTER_DECISION
+                        } else {
+                            ENDED_AFTER_DECISION
+                        }
+                        .to_owned(),
+                    ),
+                    kind: RefusalKind::Denied,
+                    classification: Some(allowed.classification),
+                };
+                let _ = self.refused(line, &actor, record_id, received_at, latency_ms, &refusal);
+                return Err(hold);
+            }
             Outcome::Run(allowed) => {
                 return Ok(Ready {
                     record_id,
@@ -629,6 +678,7 @@ impl Supervisor for Lifecycle {
             cwd: &cwd,
             started_at,
             control: &control,
+            sessions: &self.parts.sessions,
         };
         let plan = SpawnPlan {
             record_id,
@@ -796,5 +846,7 @@ fn request_error(code: ErrorCode, request_id: Option<RequestId>) -> RpcError {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod hold_tests;
 #[cfg(test)]
 mod socket_tests;

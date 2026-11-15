@@ -39,6 +39,23 @@ same line again on the same connection, until the answer is something else. It n
 line was held; the agent sees a slow command. The agent CLI's own tool timeout, which kills `knsh`, is what bounds the
 wait.
 
+**Pausing and taking control (KNSH-054).**
+
+- A held line is answered before anything else and is not recorded: it was never proposed. The session is checked
+  again after the decision, which may have waited on an ask: a line allowed for a session that was paused or taken
+  over meanwhile does not start, is recorded as a deny (reason: held after the decision) and is answered `-32007`.
+- The supervisor keeps a handle on each of the session's process groups (its envelope's and each running line's): the
+  group id together with the unreaped leader it holds. A line's handle is dropped before its leader is reaped, so a
+  pause never signals an id that may have been reused. A pause stops the envelope's group first, then the lines';
+  a resume continues the lines first, then the envelope.
+- A line spawned in the instant between the second check and a pause is stopped as soon as its group is kept.
+- Human control stops nothing: lines already running go on to their end; only new lines are held. A line that
+  passed the second check an instant before control was taken still runs, like one already running.
+- Time a line spends paused does not count towards its `timeout_s`.
+- A session that ends while paused gets `SIGCONT` on every group still kept, so nothing it started stays stopped.
+- A refused transition (pausing a paused session, resuming an active one, any transition of an ended or unknown
+  session) is `-32006` with `data.session_id`; the state is unchanged and no event is emitted.
+
 ## Human sessions
 
 | ID | Requirement |

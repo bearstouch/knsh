@@ -10,16 +10,16 @@
 the agent mid-task and inspect or intervene safely.
 
 **Acceptance criteria**
-- [ ] Pausing sends `SIGSTOP` to the envelope's process group and to every running line's process group. Resuming
+- [x] Pausing sends `SIGSTOP` to the envelope's process group and to every running line's process group. Resuming
       sends `SIGCONT` to the same groups.
-- [ ] While paused or under human control, new lines are held and the caller sees `-32007` with `data.state`.
+- [x] While paused or under human control, new lines are held and the caller sees `-32007` with `data.state`.
 - [ ] A process that left its group with `setsid` keeps running while paused, still sandboxed (documented
       behaviour, not a bug).
-- [ ] Human control holds agent lines until control is handed back. Nothing typed into the envelope is treated as
+- [x] Human control holds agent lines until control is handed back. Nothing typed into the envelope is treated as
       human.
-- [ ] Every transition emits `session.state_changed`. Illegal transitions (for example resuming an ended session)
+- [x] Every transition emits `session.state_changed`. Illegal transitions (for example resuming an ended session)
       return `-32006`.
-- [ ] Signals target process groups through kept handles, never bare PIDs that may have been reused.
+- [x] Signals target process groups through kept handles, never bare PIDs that may have been reused.
 
 **Unit tests**
 - `pause_stops_envelope_and_running_groups` — FR-SES-10 (fake process service).
@@ -30,6 +30,12 @@ the agent mid-task and inspect or intervene safely.
 - `rejects_transition_from_ended_with_32006` — session model.
 
 **Notes**
-- Spec gap: whether a held line blocks until resume, or `-32007` is returned immediately so the client retries.
-  The client behaviour in KNSH-049 depends on it. Propose that `exec.*` returns `-32007` immediately and that the
-  `knsh -c` client waits and retries. Settle this in [sessions](../03-functional-requirements/sessions.md).
+- Spec gap (settled): `exec.*` returns `-32007` immediately and `knsh -c` waits and retries
+  ([sessions](../03-functional-requirements/sessions.md), "Holding a line"). The rest of the behaviour is in
+  "Pausing and taking control" on the same page.
+- The `setsid` criterion is documented behaviour (FR-SES-11, `crates/knshd/src/holds.rs`); no test observes a
+  `setsid` process keeping running while paused, so it stays unchecked.
+- The pause criterion is met by the mechanism (`Sessions::keep_group` with `GroupKind::Envelope`, tested with fake
+  and real process groups); end to end it also needs the envelope wiring below.
+- Pending: the envelope's group is kept by `session.start_agent` (KNSH-056) and the `session.*` control methods
+  that pause and take control arrive with KNSH-071; until then only tests reach `Sessions::change_state`.

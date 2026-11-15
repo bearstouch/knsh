@@ -4,12 +4,15 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use knsh_core::{LookupError, PathContext, PolicyFs, ProfileName, ProfileSource, Timestamp, Ulid, load_profile_text};
+use knsh_core::{
+    LookupError, PathContext, PolicyFs, ProfileName, ProfileSource, SessionState, Timestamp, Ulid, load_profile_text,
+};
 use knsh_platform::engine_dirs::DIR_MODE;
 use knsh_platform::testing::{DEFAULT_UID, FakeClock, MemFs, RecordingLog};
 use knsh_platform::{EnginePaths, Fs, Monotonic, Operation};
 
 use super::*;
+use crate::holds::{GroupKind, Holds};
 
 const HOME: &str = "/Users/u";
 const PROJECT: &str = "/Users/u/app";
@@ -189,6 +192,9 @@ impl Processes for FakeTrampoline {
 struct Seen {
     events: Mutex<Vec<(&'static str, Duration)>>,
     clock: Option<Arc<FakeClock>>,
+    /// Keeps the line's group with this session's (KNSH-054), which is resumed at `command.long_running`. Without
+    /// it the line's handle is detached.
+    holds: Option<(Arc<Holds>, SessionId)>,
 }
 
 impl Seen {
@@ -206,12 +212,24 @@ impl Seen {
 }
 
 impl LineEvents for Seen {
+    fn keep(&self, group: ProcessGroupId, processes: Arc<dyn Processes>) -> Kept {
+        match &self.holds {
+            Some((holds, session_id)) => {
+                holds.keep(*session_id, SessionState::Active, group, processes, GroupKind::Line)
+            }
+            None => Holds::detached(),
+        }
+    }
+
     fn started(&self) {
         self.at("started");
     }
 
     fn long_running(&self) {
         self.at("long_running");
+        if let Some((holds, session_id)) = &self.holds {
+            holds.moved(*session_id, SessionState::Paused, SessionState::Active);
+        }
     }
 }
 
@@ -498,6 +516,45 @@ fn kills_process_group_on_timeout_with_32008() {
     let (report, _) = fixture.run(&line);
     assert!(!ran(&report).timed_out);
     assert_eq!(fixture.signals(), []);
+}
+
+// KNSH-054 (FR-SES-10): a line of a paused session is stopped as soon as its group is kept, continued at resume, and
+// the time it spent paused does not count towards its `timeout_s`. Its handle is dropped before the reap.
+#[test]
+fn paused_time_does_not_count_towards_the_timeout() {
+    let second = Duration::from_secs(1);
+    let fixture = fixture(Behaviour::StopsOnTerm);
+    let mut line = Line::new(Interpreter::Bash);
+    line.timeout = Some(second);
+    let holds = Arc::new(Holds::new());
+    let session_id = SessionId::from_ulid(Ulid::from_u128(3));
+    holds.moved(session_id, SessionState::Active, SessionState::Paused);
+    let seen = Seen {
+        clock: Some(Arc::clone(&fixture.clock)),
+        holds: Some((Arc::clone(&holds), session_id)),
+        ..Seen::default()
+    };
+    let report = fixture.spawner.run(line.to_run(None), &seen);
+    assert!(ran(&report).timed_out);
+
+    let signals = fixture.signals();
+    let kinds: Vec<Signal> = signals.iter().map(|(_, signal)| *signal).collect();
+    assert_eq!(kinds, [Signal::Stop, Signal::Continue, Signal::Terminate, Signal::Kill]);
+    // Stopped at once; continued at the resume (30 s, the long-running event); timed out one running second later.
+    let long_running = Limits::DEFAULT.long_running;
+    assert_eq!(signals[0].0, Duration::ZERO);
+    assert!(
+        signals[1].0 >= long_running && signals[1].0 < long_running + POLL_MAX,
+        "{signals:?}"
+    );
+    let terminate = signals[2].0;
+    assert!(
+        terminate >= long_running + second && terminate < long_running + second + 2 * POLL_MAX,
+        "{signals:?}"
+    );
+    // Forgotten before the reap: nothing of the session is kept any more.
+    assert_eq!(holds.kept(session_id), 0);
+    assert!(fixture.processes.state().reaped);
 }
 
 // `exec.kill` stops the whole group as a timeout does (SIGTERM, SIGKILL after the grace, a last group kill before the

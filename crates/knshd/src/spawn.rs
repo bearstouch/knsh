@@ -24,6 +24,8 @@
 //!    whole time, so no reused process id is ever signalled; after a timeout or a kill the group is killed once more,
 //!    before the leader is reaped, so no member outlives it. Captured output is then collected, waiting at most
 //!    [`DRAIN_GRACE`] for a leftover writer.
+//!    The group is kept with its session's groups while it runs ([`crate::holds`], KNSH-054): a pause stops it with
+//!    `SIGSTOP` and a resume continues it; time spent paused does not count towards `timeout_s`.
 //! 5. **Did it start? (NFR-REL-08).** `knsh-exec` writes its exit code to the status pipe when it fails (bad
 //!    arguments, unsafe profile file, setup, a failed exec of `sandbox-exec`), and the pipe is closed on exec
 //!    otherwise. A byte there means the profile was never applied and the line never ran: the spawn is reported as a
@@ -59,6 +61,7 @@ use knsh_sandbox::{CommandTag, ProfileInput, compile};
 
 use crate::capture::{CapturePlan, DRAIN_GRACE, LineCapture, Source};
 use crate::exec::Stdio as LineStdio;
+use crate::holds::Kept;
 use crate::jobs::LineControl;
 use crate::profiles::ProfileFiles;
 use crate::supervisor::{LineEvents, Ran, SpawnFailure, SpawnPlan, SpawnReport, Spawner};
@@ -231,10 +234,12 @@ impl TrampolineSpawner {
             Ok(group) => group,
             Err(error) => return self.not_run(sandbox_profile, SpawnFailure::Start(error), line.record_id),
         };
+        // Kept with the session's groups at once, so a pause reaches it (or stops it now if the session is paused).
+        let kept = events.keep(group, Arc::clone(&self.processes));
         events.started();
 
         // Step 4.
-        let watched = self.watch(group, line.timeout, line.control, events);
+        let watched = self.watch(group, kept, line.timeout, line.control, events);
         drop(compiled);
         let output = capture.map(|capture| capture.finish(DRAIN_GRACE));
         let (exit, timed_out) = match watched {
@@ -264,9 +269,14 @@ impl TrampolineSpawner {
 
     /// Polls the group until its leader exits, publishing `command.long_running` once and enforcing `timeout` and
     /// `exec.kill`, then reaps it. Returns how the leader ended and whether the timeout fired.
+    ///
+    /// Time the session spends paused does not count towards `timeout` (KNSH-054): a paused line is stopped, not
+    /// slow, and must not be killed for it once resumed. `kept` is dropped before the leader is reaped, so a pause
+    /// never signals the group id once it may be reused.
     fn watch(
         &self,
         group: ProcessGroupId,
+        kept: Kept,
         timeout: Option<Duration>,
         control: &LineControl,
         events: &dyn LineEvents,
@@ -280,6 +290,10 @@ impl TrampolineSpawner {
         let mut killed = false;
         // Whether the stop was the timeout's (answered `-32008`) rather than `exec.kill`'s.
         let mut timed_out = false;
+        // Time spent paused so far, and the elapsed time at the previous check with whether the session was paused
+        // then. A pause is counted from the check that first saw it, to within one poll.
+        let mut paused_for = Duration::ZERO;
+        let mut last = (Duration::ZERO, false);
         loop {
             match processes.exited(group) {
                 Ok(true) => break,
@@ -287,16 +301,22 @@ impl TrampolineSpawner {
                 Err(error) => {
                     // Fail safe: a line that cannot be watched is stopped, and reaped if possible.
                     let _ = processes.signal(group, Signal::Kill);
+                    drop(kept);
                     let _ = processes.wait(group);
                     return Err(error);
                 }
             }
             let elapsed = self.clock.monotonic().saturating_duration_since(start);
+            if last.1 {
+                paused_for += elapsed.saturating_sub(last.0);
+            }
+            last = (elapsed, kept.paused());
             if !long_running_sent && elapsed >= self.limits.long_running {
                 long_running_sent = true;
                 events.long_running();
             }
-            let timeout_due = timeout.is_some_and(|timeout| elapsed >= timeout);
+            let running_for = elapsed.saturating_sub(paused_for);
+            let timeout_due = timeout.is_some_and(|timeout| running_for >= timeout);
             match terminated_at {
                 None if timeout_due || control.kill_requested() => {
                     // The group, not the leader: everything the line started stops too (FR-LC-40). An error means
@@ -319,6 +339,8 @@ impl TrampolineSpawner {
             // or were started after it are killed before the id is given up. `EPERM` (nothing left) is expected.
             let _ = processes.signal(group, Signal::Kill);
         }
+        // Forgotten by its session before the id is given up (module documentation of `crate::holds`).
+        drop(kept);
         let exit = processes.wait(group)?;
         Ok((exit, timed_out))
     }
