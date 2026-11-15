@@ -174,6 +174,15 @@ impl CommandClass {
     pub const fn is_dynamic(self) -> bool {
         matches!(self, Self::Dynamic { .. })
     }
+
+    /// Why the command is dynamic code, or `None` when it is not.
+    #[must_use]
+    pub const fn dynamic_reason(self) -> Option<DynamicReason> {
+        match self {
+            Self::Dynamic { reason } => Some(reason),
+            Self::Static | Self::Wrapper | Self::ProjectExecutable => None,
+        }
+    }
 }
 
 /// One argument of a classified command.

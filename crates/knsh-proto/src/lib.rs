@@ -64,6 +64,13 @@
 //! [`SessionInfoResult`] answers `session.info` with the caller's session and its recording state (FR-SES-25,
 //! NFR-PRIV-05).
 //!
+//! # Policy dry runs (KNSH-043)
+//!
+//! [`PolicyCheckParams`] reads `policy.check` strictly: a bounded line, a resolved working directory, an optional
+//! `PATH`, and at most one [`PolicyCheckTarget`] (`session_id` or `profile`). [`PolicyCheckResult`] writes the
+//! verdict, its source and rule, every matched rule, each command's class and dynamic reason, the line's dynamic
+//! parts and its network classes (FR-POL-70).
+//!
 //! Parameters and results of the other methods arrive with the stories that implement them.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -78,6 +85,7 @@ mod error_code;
 mod events;
 mod hello;
 mod method;
+mod policy;
 mod records;
 mod session;
 
@@ -104,6 +112,10 @@ pub use events::{
     event_notification, lost_notification,
 };
 pub use method::{MAX_METHOD_NAME_LEN, MethodName};
+pub use policy::{
+    DEFAULT_POLICY_CHECK_PATH, MAX_POLICY_CHECK_COMMAND_LEN, MAX_POLICY_CHECK_PATH_LEN, PolicyCheckParams,
+    PolicyCheckResult, PolicyCheckTarget,
+};
 pub use records::{
     DEFAULT_RECORDS_PAGE, MAX_BASE64_OUTPUT, MAX_RECORDS_PAGE, MAX_RECORDS_TEXT_LEN, OUTPUT_CONTENT_TYPE, OutputData,
     RecordEntry, RecordsForgetParams, RecordsForgetResult, RecordsOutputParams, RecordsOutputResult,

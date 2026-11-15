@@ -38,7 +38,7 @@ use knsh_core::{
     Actor, CoreError, EventData, ExecutionRecord, ProfileName, RecordDetails, RecordId, Redacted, SessionId,
     SessionRegistry, SessionSpec, Timestamp, Transition, Ulid,
 };
-use knsh_json::{FromJson, Object, ToJson, Value};
+use knsh_json::{Object, Value};
 use knsh_platform::{Clock, Random};
 use knsh_proto::{
     ErrorCode, RpcError, SessionInfoResult, SessionStartHumanParams, SessionStartHumanResult, TelemetryCommandParams,
@@ -46,7 +46,7 @@ use knsh_proto::{
 };
 use knsh_store::RecordStore;
 
-use crate::dispatch::{Answer, Call, Endpoint, Handler, Handlers, Reply};
+use crate::dispatch::{Answer, Call, Endpoint, Handler, Handlers, Reply, answer, params};
 use crate::events::EventHub;
 use crate::lifetime::Activity;
 
@@ -301,6 +301,18 @@ impl Sessions {
         })
     }
 
+    /// The profile of the live session `session_id`, for `policy.check` (KNSH-043). Reads the registry only.
+    ///
+    /// # Errors
+    ///
+    /// `-32006` naming the session if it is not live (never started, or ended).
+    pub(crate) fn profile_of(&self, session_id: SessionId) -> Result<ProfileName, RpcError> {
+        lock(&self.registry)
+            .get(session_id)
+            .map(|session| session.profile().clone())
+            .map_err(|_| session_gone(session_id))
+    }
+
     /// Ends `session_id`: its connection closed. Writes the ended state and publishes `session.state_changed` to
     /// `ended`, then `session.ended`.
     fn end(&self, session_id: SessionId) {
@@ -353,16 +365,6 @@ fn user_only(endpoint: Endpoint) -> Result<(), RpcError> {
     }
 }
 
-/// The params of `call`, parsed strictly; a malformed value is refused as [`RpcError::from`] maps it (`-32602`).
-fn params<T: FromJson>(call: &Call<'_>) -> Result<T, RpcError> {
-    call.request.params().map_err(|error| RpcError::from(&error))
-}
-
-/// `result` as the answer. A result that cannot be encoded is `-32603`: the reason never reaches the client.
-fn answer(result: &impl ToJson) -> Reply {
-    Ok(Answer::from(result.to_json().map_err(|_| internal_error())?))
-}
-
 /// `-32603`, without the reason (see the module docs).
 fn internal_error() -> RpcError {
     RpcError::new(ErrorCode::InternalError)
@@ -378,7 +380,7 @@ fn session_gone(session_id: SessionId) -> RpcError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use knsh_core::Timestamp;
     use knsh_platform::macos::{RealFs, effective_uid};
     use knsh_platform::testing::{FakeClock, SeededRandom};
@@ -389,7 +391,8 @@ mod tests {
     use crate::dispatch::tests::{stream, subscriber};
     use crate::events::Subscriber;
 
-    struct TempDir(std::path::PathBuf);
+    /// A temporary directory for the record store, removed on drop.
+    pub(crate) struct TempDir(std::path::PathBuf);
 
     impl TempDir {
         fn new() -> Self {
@@ -408,14 +411,15 @@ mod tests {
         }
     }
 
-    struct Fixture {
+    /// The live sessions with a real record store and event hub, so a test can see what was written and published.
+    pub(crate) struct Fixture {
         _dir: TempDir,
-        store: RecordStore,
-        hub: Arc<EventHub>,
-        sessions: Arc<Sessions>,
+        pub(crate) store: RecordStore,
+        pub(crate) hub: Arc<EventHub>,
+        pub(crate) sessions: Arc<Sessions>,
     }
 
-    fn fixture() -> Fixture {
+    pub(crate) fn fixture() -> Fixture {
         let dir = TempDir::new();
         let clock = Arc::new(FakeClock::new(
             Timestamp::from_unix_micros(1_800_000_000_000_000).unwrap(),

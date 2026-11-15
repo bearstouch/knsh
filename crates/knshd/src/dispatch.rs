@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use knsh_json::{Object, StreamId, Value};
+use knsh_json::{FromJson, Object, StreamId, ToJson, Value};
 use knsh_proto::{
     Availability, Backend, ByteTransport, Capabilities, Catalogue, CatalogueError, ErrorCode, Lookup, MethodName,
     Release, Request, RpcError,
@@ -273,6 +273,17 @@ pub(crate) fn capability_unavailable(capability: &'static str) -> RpcError {
         // A one-key object with a fixed key cannot fail to build; without data the code still says enough.
         Err(_) => error,
     }
+}
+
+/// The params of `call`, parsed strictly; a malformed value is refused as [`RpcError::from`] maps it (`-32602`).
+pub(crate) fn params<T: FromJson>(call: &Call<'_>) -> Result<T, RpcError> {
+    call.request.params().map_err(|error| RpcError::from(&error))
+}
+
+/// `result` as the answer. A result that cannot be encoded is `-32603`: the reason never reaches the client.
+pub(crate) fn answer(result: &impl ToJson) -> Reply {
+    let result = result.to_json().map_err(|_| RpcError::new(ErrorCode::InternalError))?;
+    Ok(Answer::from(result))
 }
 
 #[cfg(test)]

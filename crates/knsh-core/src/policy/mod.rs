@@ -2,7 +2,8 @@
 //! command rule matching (KNSH-040; FR-POL-13 to FR-POL-17, in the `rules` module: [`evaluate_command`]), and line
 //! verdicts, fixed denies and the built-in `unattended` profile (KNSH-041; FR-POL-18, FR-POL-20, FR-POL-21,
 //! FR-POL-30, FR-AGT-21: [`evaluate_line`], [`FixedDenies`], [`load_unattended`]), and grants (KNSH-042; FR-POL-60,
-//! FR-POL-61: [`Grant`], [`GrantSet`], [`evaluate_line_with_grants`]).
+//! FR-POL-61: [`Grant`], [`GrantSet`], [`evaluate_line_with_grants`]), and dry runs (KNSH-043; FR-POL-70:
+//! [`check_line`]).
 //!
 //! [`load_profile`] (by name) and [`load_profile_text`] (a snapshot pushed with `policy.set`) turn profile text into
 //! one resolved [`Profile`]:
@@ -32,6 +33,7 @@
 //! proposed in the models page: `exec.trusted_folders`, `exec.trusted_tools`, `exec.bash`,
 //! `approvals.irreversible_commands` and `output.mode`.
 
+mod check;
 mod fixed;
 mod grant;
 mod layer;
@@ -45,6 +47,7 @@ mod unattended;
 #[cfg(test)]
 mod tests;
 
+pub use check::{LineCheck, LineResolver, check_line};
 pub use fixed::{CONTROL_SERVICE, ENGINE_CONFIG_DIR, ENGINE_DATA_DIR, FixedDenies};
 pub use grant::{Grant, GrantScope, GrantSet, MAX_GRANTS};
 use layer::{Layer, LayerKind, ReadTemplate};

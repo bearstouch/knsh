@@ -257,7 +257,8 @@ pub struct Catalogue {
 
 /// Every method in the specification. Phase 1 implements `hello`, `records.query` and `records.output` (KNSH-016),
 /// `records.forget` (KNSH-017), `events.subscribe` and `events.unsubscribe` (KNSH-018), and the human session and
-/// telemetry methods with `session.info` (KNSH-021); the rest arrive with their stories.
+/// telemetry methods with `session.info` (KNSH-021). Phase 2 adds `policy.check` (KNSH-043); the rest arrive with
+/// their stories.
 const ENGINE_METHODS: &[MethodSpec] = &[
     // Handshake (specs/06-api/handshake.md).
     MethodSpec::planned("hello", Endpoints::ALL).available(),
@@ -271,8 +272,9 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     // refused until sessions are bound there (KNSH-048).
     MethodSpec::planned("session.info", Endpoints::SOCKETS).available(),
     // Shared by agent.sock (own session) and user.sock (all sessions); the read and checkpoint methods are on the
-    // control service too.
-    MethodSpec::planned("policy.check", Endpoints::SOCKETS),
+    // control service too. Dry runs (KNSH-043): agent.sock checks against the caller's session, refused until
+    // sessions are bound there (KNSH-048); user.sock against a named session or profile.
+    MethodSpec::planned("policy.check", Endpoints::SOCKETS).available(),
     MethodSpec::planned("records.query", Endpoints::ALL).available(),
     MethodSpec::planned("records.output", Endpoints::ALL).available(),
     // Events (KNSH-018): agent.sock sees its own session, user.sock and the control service every session.
@@ -508,15 +510,17 @@ mod tests {
 
     // Phase 1 implements the handshake, the record reads (KNSH-016), on user.sock only `records.forget` (KNSH-017),
     // the event subscriptions (KNSH-018), and `session.info` with, on user.sock only, the human session and telemetry
-    // methods (KNSH-021): no method is claimed before it exists.
+    // methods (KNSH-021); phase 2 adds `policy.check` on both sockets (KNSH-043, AC "listed in hello methods on both
+    // sockets"): no method is claimed before it exists.
     #[test]
-    fn phase1_lists_hello_record_and_event_methods_only() {
+    fn lists_only_the_implemented_methods() {
         let caps = capabilities(Sandbox::Seatbelt);
         for endpoint in Endpoint::ALL {
             let expected: &[&str] = match endpoint {
                 Endpoint::User => &[
                     "hello",
                     "session.info",
+                    "policy.check",
                     "records.query",
                     "records.output",
                     "events.subscribe",
@@ -530,6 +534,7 @@ mod tests {
                 Endpoint::Agent => &[
                     "hello",
                     "session.info",
+                    "policy.check",
                     "records.query",
                     "records.output",
                     "events.subscribe",
@@ -550,6 +555,11 @@ mod tests {
                 endpoint.name()
             );
         }
+        // KNSH-043: dry runs are on both sockets, never on the control service.
+        assert_eq!(
+            Catalogue::ENGINE.lookup(Endpoint::Control, "policy.check", &caps),
+            Lookup::NotOnEndpoint
+        );
         assert_eq!(
             Catalogue::ENGINE.lookup(Endpoint::Agent, "records.forget", &caps),
             Lookup::NotOnEndpoint,
