@@ -2,15 +2,37 @@
 
 Reachable by processes inside envelopes. Every method is scoped to the caller's session.
 
+## Binding a connection to its session
+
+`hello` binds the connection to exactly one agent session (FR-AGT-23, KNSH-048), and `hello`'s result names it in
+`session_id`:
+
+1. **Session token.** The `session_token` from the envelope's environment, if it is the live token of a session.
+   Tokens are 256 bits from the platform random source, sent as 64 lowercase hex characters, compared in constant
+   time, and never logged, stored or recorded (NFR-SEC-02).
+2. **Audit token.** Otherwise (no token, or one that is malformed, unknown or expired), the kernel's audit token for
+   the connection (`LOCAL_PEERTOKEN`): if the caller's process is the root of a registered envelope or descends from
+   one, the connection is bound to that envelope's session; the nearest envelope wins. Processes are never matched by
+   pid alone: the caller by pid and pid version (as its audit token names it), envelope roots and ancestors by pid and
+   the kernel's unique id, which unlike the pid version survives `exec`. A process that reuses a dead envelope's pid
+   is not inside it, and a root stays its envelope's root after it execs. A process
+   whose parent chain cannot be read, or that was re-parented away from its envelope (its parent exited), is not
+   inside it either.
+3. Otherwise `-32009`, and the connection is closed.
+
+A connection is bound once: a later `hello` must resolve to the same session, or it is `-32009` and the connection is
+closed. When a session ends its token and envelopes are revoked; a connection bound to it gets `-32009` on its next
+call and is closed. The session outlives its connections: closing one does not end it.
+
 | Method | Purpose |
 | --- | --- |
 | `exec.run` | Run a line and wait; returns the record ID, `executed_command`, exit code, output in the requested mode, and the decision |
 | `exec.start`, `exec.wait`, `exec.kill` | The same for long-running lines; output arrives as events |
-| `policy.check` | Dry run: what policy would decide for a line, without running it ([below](#policycheck)); `-32003` until sessions are bound to `agent.sock` connections (KNSH-048) |
+| `policy.check` | Dry run: what policy would decide for a line, without running it ([below](#policycheck)) |
 | `records.query`, `records.output` | The session's own records and output ranges ([parameters](user-socket.md#records)) |
 | `events.subscribe`, `events.unsubscribe` | The session's own events, optionally from `since_seq` |
 | `checkpoint.list`, `checkpoint.diff`, `checkpoint.undo`, `checkpoint.redo` | The session's own changes, without `force` |
-| `session.info` | Actor, profile, state, recording settings ([result](user-socket.md#sessioninfo)); `-32003` until sessions are bound to `agent.sock` connections (KNSH-048) |
+| `session.info` | Actor, profile, state, recording settings of the connection's session ([result](user-socket.md#sessioninfo)) |
 
 ## `exec.run`
 
@@ -62,9 +84,8 @@ against a profile's rules exactly as `exec.run` would before running it, and not
 written, no event is published and no process is started. Hooks, the authority and grants are not consulted, so a line
 the rules ask about is answered `ask` even if a grant or the authority would allow it.
 
-On `agent.sock` the line is checked against the caller's own session's profile; `session_id` and `profile` are
-refused with `-32003`. Until a session is bound to an `agent.sock` connection (KNSH-048) every call there is `-32003`,
-after its params are checked. On `user.sock` exactly one of `session_id` and `profile` is required.
+On `agent.sock` the line is checked against the profile of the session the connection is bound to; `session_id` and
+`profile` are refused with `-32003`. On `user.sock` exactly one of `session_id` and `profile` is required.
 
 ### Request
 
@@ -117,5 +138,8 @@ Malformed params, two targets, or none on `user.sock` are `-32602`, as is a `pro
 ## Restrictions
 
 - `force` is never accepted on this endpoint.
-- Sessions cannot be created from this endpoint.
-- Records, events and checkpoints of other sessions are never visible (`-32003`).
+- Sessions cannot be created from this endpoint (FR-SES-02): `session.start_agent`, `session.start_human` and any
+  other session-creating method are not part of its protocol, and calling one is "method not found" (`-32601`), not
+  `-32003`. The method catalogue refuses to declare one on `agent.sock`.
+- Records, events and checkpoints of other sessions are never visible (`-32003`). Without `session_id`,
+  `records.query` and `events.subscribe` see only the connection's own session.

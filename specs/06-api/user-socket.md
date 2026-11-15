@@ -71,8 +71,9 @@ No params. The caller's own session (FR-SES-25, NFR-PRIV-05):
 ```
 
 `recording` says whether command lines are recorded, `output_recording` whether their output is (never for a human
-session). On `user.sock` the caller's session is the one bound to the connection. On `agent.sock` it is the envelope's
-session; until a session is bound to an `agent.sock` connection (KNSH-048) the call is refused with `-32003`.
+session). On `user.sock` the caller's session is the one bound to the connection. On `agent.sock` it is the session
+the connection was bound to at `hello` ([binding](agent-socket.md#binding-a-connection-to-its-session)); once that
+session has ended it is `-32009`.
 
 ### Errors
 
@@ -82,7 +83,7 @@ not be published.
 
 ## Records
 
-`records.query` and `records.output` are the only way to read execution records (FR-REC-08). On `user.sock` they see every session. On `agent.sock` the same methods see only the caller's own session; until a session is bound to an `agent.sock` connection (KNSH-048) every call there is refused with `-32003`. Byte counts and offsets are decimal strings (±2^53 rule, [wire-format.md](wire-format.md#strict-json-profile)).
+`records.query` and `records.output` are the only way to read execution records (FR-REC-08). On `user.sock` they see every session. On `agent.sock` the same methods see only the session the connection is bound to; naming another session, or another session's record, is `-32003`. Byte counts and offsets are decimal strings (±2^53 rule, [wire-format.md](wire-format.md#strict-json-profile)).
 
 ### `records.query`
 
@@ -130,7 +131,7 @@ Until checkpoints exist (phase 3), `with_checkpoints: true` is refused with `-32
 
 ## Events
 
-`events.subscribe` and `events.unsubscribe` deliver the events of [../05-models/event.md](../05-models/event.md) live, with the delivery rules of [events](../03-functional-requirements/events.md) (KNSH-018). On `user.sock` a subscription sees every session, or one session with `session_id`. On `agent.sock` it sees only the caller's own session; until a session is bound to an `agent.sock` connection (KNSH-048) every call there is refused with `-32003`.
+`events.subscribe` and `events.unsubscribe` deliver the events of [../05-models/event.md](../05-models/event.md) live, with the delivery rules of [events](../03-functional-requirements/events.md) (KNSH-018). On `user.sock` a subscription sees every session, or one session with `session_id`. On `agent.sock` it sees only the session the connection is bound to: without `session_id` that session, and naming another is `-32003`.
 
 ### `events.subscribe`
 

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use super::lock;
+use crate::ancestry::{AuditToken, ProcessIdentity};
 use crate::error::{Operation, PlatformError};
 use crate::launchd::{PeerCredentials, ServiceManager, SocketActivation};
 
@@ -76,29 +77,51 @@ impl SocketActivation for FakeSocketActivation {
     }
 }
 
-/// Peer credentials fixed in advance: every peer has the same uid, or the lookup fails.
+/// Peer credentials fixed in advance: every peer has the same uid (and, if set, the same audit token), or the lookup
+/// fails.
 #[derive(Debug, Clone, Copy)]
 pub struct FixedPeerCredentials {
     uid: Option<u32>,
+    /// The audit token every peer reports; `None` fails the lookup.
+    token: Option<AuditToken>,
 }
 
 impl FixedPeerCredentials {
-    /// Every peer runs as `uid`.
+    /// Every peer runs as `uid`. Its audit token cannot be read (fails with `EINVAL`).
     #[must_use]
     pub const fn uid(uid: u32) -> Self {
-        Self { uid: Some(uid) }
+        Self {
+            uid: Some(uid),
+            token: None,
+        }
+    }
+
+    /// Every peer is `process`, running as `uid`, with an audit token naming it (KNSH-048).
+    #[must_use]
+    pub const fn process(uid: u32, process: ProcessIdentity) -> Self {
+        Self {
+            uid: Some(uid),
+            token: Some(AuditToken::for_process(process, uid)),
+        }
     }
 
     /// The kernel cannot report any peer (fails with `EINVAL`).
     #[must_use]
     pub const fn unavailable() -> Self {
-        Self { uid: None }
+        Self { uid: None, token: None }
     }
 }
 
 impl PeerCredentials for FixedPeerCredentials {
     fn peer_uid(&self, _stream: &UnixStream) -> Result<u32, PlatformError> {
         self.uid.ok_or(PlatformError::Os {
+            operation: Operation::PeerCredentials,
+            errno: libc::EINVAL,
+        })
+    }
+
+    fn peer_audit_token(&self, _stream: &UnixStream) -> Result<AuditToken, PlatformError> {
+        self.token.ok_or(PlatformError::Os {
             operation: Operation::PeerCredentials,
             errno: libc::EINVAL,
         })

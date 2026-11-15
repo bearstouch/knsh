@@ -21,11 +21,12 @@
 //! 26.6 with a build in `~/Desktop`).
 //!
 //! The XPC control service is declared too (`MachServices`), so launchd reserves its name from the start, but it is
-//! served only from phase 2 (KNSH-067). `agent.sock` is likewise declared now and served in phase 2 (KNSH-048).
+//! served only from phase 2 (KNSH-067). `agent.sock` is served from phase 2 on (KNSH-048).
 
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
+use crate::ancestry::AuditToken;
 use crate::engine_dirs::{EnginePaths, ensure_engine_dirs};
 use crate::error::PlatformError;
 use crate::fs::{FileKind, Fs};
@@ -276,6 +277,16 @@ pub trait PeerCredentials: Send + Sync {
     /// [`PlatformError::Os`] with [`Operation::PeerCredentials`](crate::Operation::PeerCredentials) if the kernel
     /// cannot report it (for example on a connection already closed). Callers refuse the connection then.
     fn peer_uid(&self, stream: &UnixStream) -> Result<u32, PlatformError>;
+
+    /// The peer's audit token, as the kernel recorded it when the connection was made (`LOCAL_PEERTOKEN`). It names
+    /// the peer process with its pid version, so `agent.sock` can match it to an envelope without trusting a bare pid
+    /// that may have been reused (KNSH-048).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Os`] with [`Operation::PeerCredentials`](crate::Operation::PeerCredentials) if the kernel
+    /// cannot report it. Callers then cannot match the peer to an envelope, and refuse it unless it holds a token.
+    fn peer_audit_token(&self, stream: &UnixStream) -> Result<AuditToken, PlatformError>;
 }
 
 /// Loads and unloads launchd jobs in a user's GUI domain (`gui/<uid>`). Object safe.

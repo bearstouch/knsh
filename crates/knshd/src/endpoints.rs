@@ -5,7 +5,7 @@
 //! launchd and fails if there are none, and nothing here can bind a socket, so `knshd` never claims an endpoint name
 //! itself.
 //!
-//! Each connection on `user.sock` is admitted only if its peer runs as the same user as `knshd` ([`admit`]): one
+//! Each connection, on either socket, is admitted only if its peer runs as the same user as `knshd` ([`admit`]): one
 //! process per user, never serving another macOS user. The socket is already owner-only; the check is the second
 //! layer, and it fails closed when the kernel cannot say who the peer is.
 //!
@@ -21,7 +21,7 @@ use knsh_platform::{PeerCredentials, PlatformError, SocketActivation};
 pub(crate) struct Listeners {
     /// `user.sock`: user processes outside envelopes.
     pub(crate) user: Vec<UnixListener>,
-    /// `agent.sock`: processes inside envelopes (served from phase 2).
+    /// `agent.sock`: processes inside envelopes, each bound to its own session at `hello` (KNSH-048).
     pub(crate) agent: Vec<UnixListener>,
 }
 

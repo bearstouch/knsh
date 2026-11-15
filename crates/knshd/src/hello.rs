@@ -6,8 +6,10 @@
 //!
 //! - No protocol in common: `-32005` with `capability: "protocol"`; the connection loop then closes the connection.
 //! - Malformed parameters: `-32602`, which also closes the connection (a failed `hello`).
-//! - `session_token` and `session_id` belong to `agent.sock`, whose connections are not served until phase 2
-//!   (KNSH-048). The token is read (bounded, redacted) and otherwise ignored; no `session_id` is reported.
+//! - On `agent.sock`, `hello` binds the connection to one agent session (KNSH-048, [`crate::agents`]): by its
+//!   `session_token`, else by the caller's audit token if it runs inside a registered envelope. The result carries
+//!   that `session_id`. With neither it is `-32009`, and the connection is closed. On `user.sock` the token is read
+//!   (bounded, redacted) and ignored, and no `session_id` is reported.
 //! - Phase 1 builds report `advisory: true`: no security guarantees, not for running agents unattended (KNSH-024).
 
 use std::sync::Arc;
@@ -15,8 +17,11 @@ use std::sync::Arc;
 use knsh_json::ToJson;
 use knsh_proto::{Catalogue, ErrorCode, HelloParams, HelloResult, PROTOCOL_CAPABILITY, RpcError, negotiate};
 
-use crate::dispatch::{BuildError, Call, Dispatcher, HELLO, Handler, Handlers, Reply, capability_unavailable};
+use crate::dispatch::{
+    BuildError, Call, Dispatcher, Endpoint, HELLO, Handler, Handlers, Reply, capability_unavailable,
+};
 use crate::probe::Probed;
+use crate::sessions::Sessions;
 use crate::violations::ReaderStatus;
 
 /// Phase 1 is advisory (`specs/01-overview/roadmap.md`): the label is in every `hello` until phase 2 qualifies.
@@ -32,6 +37,8 @@ struct Handshake {
     violations: Arc<ReaderStatus>,
     /// Whether this build is advisory only.
     advisory: bool,
+    /// The live sessions `agent.sock` connections are bound to.
+    sessions: Arc<Sessions>,
 }
 
 impl Handshake {
@@ -40,6 +47,11 @@ impl Handshake {
     fn answer(&self, call: &Call<'_>) -> Reply {
         let params: HelloParams = call.request.params().map_err(|error| RpcError::from(&error))?;
         let protocol = negotiate(&params.protocols).ok_or_else(|| capability_unavailable(PROTOCOL_CAPABILITY))?;
+        // agent.sock: every later call acts for exactly this session; without one the caller is refused (-32009).
+        let session_id = match call.endpoint {
+            Endpoint::User => None,
+            Endpoint::Agent => Some(self.sessions.bind_agent(call.binding, params.session_token.as_ref())?),
+        };
         // The probed backends, with the violation reader's state as it is now: the reader can stop and restart
         // while this process runs, and a failed reader must be visible (KNSH-047). No method depends on it, so the
         // method list is the same either way.
@@ -50,7 +62,7 @@ impl Handshake {
             engine_version: env!("CARGO_PKG_VERSION"),
             protocol,
             platform: self.probed.platform,
-            session_id: None,
+            session_id,
             advisory: self.advisory,
             bytes: params.bytes,
             capabilities,
@@ -72,14 +84,15 @@ fn handler(handshake: Arc<Handshake>) -> Handler {
     Arc::new(move |call: &Call<'_>| handshake.answer(call))
 }
 
-/// [`dispatcher_with_violations`] with no violation reader (always `none`), for tests.
+/// [`dispatcher_with_violations`] with no violation reader (always `none`) and no agent sessions, for tests.
 #[cfg(test)]
 pub(crate) fn phase1_dispatcher(probed: Probed, others: Handlers) -> Result<Dispatcher, BuildError> {
-    dispatcher_with_violations(probed, others, ReaderStatus::stopped())
+    dispatcher_with_violations(probed, others, ReaderStatus::stopped(), tests::sessions())
 }
 
 /// The dispatcher `knshd` serves: the engine catalogue, the probed capabilities, `hello`, and the `others`
-/// implemented elsewhere, with `hello` reporting `violations` as `capabilities.sandbox_violations` (KNSH-047).
+/// implemented elsewhere, with `hello` reporting `violations` as `capabilities.sandbox_violations` (KNSH-047) and
+/// binding `agent.sock` connections to `sessions` (KNSH-048).
 ///
 /// # Errors
 ///
@@ -88,6 +101,7 @@ pub(crate) fn dispatcher_with_violations(
     probed: Probed,
     others: Handlers,
     violations: Arc<ReaderStatus>,
+    sessions: Arc<Sessions>,
 ) -> Result<Dispatcher, BuildError> {
     let catalogue = Catalogue::ENGINE;
     let capabilities = Arc::clone(&probed.capabilities);
@@ -96,6 +110,7 @@ pub(crate) fn dispatcher_with_violations(
         probed,
         violations,
         advisory: ADVISORY,
+        sessions,
     });
     let mut handlers = others;
     handlers.insert(HELLO, handler(handshake));
@@ -121,18 +136,24 @@ pub(crate) mod tests {
         }
     }
 
+    /// Sessions that cannot record (no store), on an empty event bus and process table.
+    pub(crate) fn sessions() -> Arc<Sessions> {
+        Sessions::new(
+            None,
+            crate::events::tests::hub(),
+            Arc::new(knsh_platform::testing::FakeClock::new(knsh_core::Timestamp::UNIX_EPOCH)),
+            Arc::new(knsh_platform::testing::SeededRandom::new(1)),
+            Arc::new(knsh_platform::testing::FakeProcessTree::new()),
+        )
+    }
+
     /// Every handler besides `hello`: records without a store, events on an empty bus, sessions that cannot record
     /// (no store), and `policy.check` over an empty filesystem.
     pub(crate) fn handlers() -> Handlers {
         let mut handlers = crate::records::Records::unavailable().handlers();
         let hub = crate::events::tests::hub();
         handlers.extend(hub.handlers());
-        let sessions = crate::sessions::Sessions::new(
-            None,
-            hub,
-            std::sync::Arc::new(knsh_platform::testing::FakeClock::new(knsh_core::Timestamp::UNIX_EPOCH)),
-            std::sync::Arc::new(knsh_platform::testing::SeededRandom::new(1)),
-        );
+        let sessions = sessions();
         handlers.extend(sessions.handlers());
         handlers.extend(crate::policy::tests::service(sessions, knsh_platform::testing::MemFs::new()).handlers());
         handlers
@@ -142,6 +163,8 @@ pub(crate) mod tests {
 
     fn hello(dispatcher: &Dispatcher, endpoint: Endpoint, params: &str) -> Result<Object, RpcError> {
         let request = hello_request(params);
+        // A fresh binding per call: an agent hello binds it, and a binding is never moved to another session.
+        let binding = crate::sessions::SessionBinding::new();
         dispatcher
             .call(&Call {
                 endpoint,
@@ -149,9 +172,24 @@ pub(crate) mod tests {
                 stream: crate::dispatch::tests::stream(),
                 request: &request,
                 subscriber: crate::dispatch::tests::subscriber(),
-                binding: crate::dispatch::tests::binding(),
+                binding: &binding,
             })
             .map(|answer| answer.result.as_object().cloned().unwrap())
+    }
+
+    /// Hello params carrying the token of a fresh agent session of `sessions`, and that session's ID.
+    fn agent_params(sessions: &Sessions) -> (String, knsh_core::SessionId) {
+        let opened = sessions
+            .open_agent(
+                knsh_core::Actor::Agent(knsh_core::AgentId::new("claude-code").unwrap()),
+                knsh_core::ProfileName::new("default").unwrap(),
+            )
+            .unwrap();
+        let params = format!(
+            r#"{{"client":"test","client_version":"1.0","protocols":[1],"session_token":"{}"}}"#,
+            opened.token.encode().expose()
+        );
+        (params, opened.session_id)
     }
 
     fn capabilities(result: &Object) -> &Object {
@@ -199,9 +237,21 @@ pub(crate) mod tests {
         for machine in [Machine::working(), Machine::failing()] {
             let probed = probe(&machine.probes());
             let capabilities = Arc::clone(&probed.capabilities);
-            let dispatcher = phase1_dispatcher(probed, handlers()).unwrap();
+            let fixture = crate::sessions::tests::fixture();
+            let dispatcher = dispatcher_with_violations(
+                probed,
+                handlers(),
+                ReaderStatus::stopped(),
+                Arc::clone(&fixture.sessions),
+            )
+            .unwrap();
+            let (agent_params, _) = agent_params(&fixture.sessions);
             for endpoint in Endpoint::ALL {
-                let result = hello(&dispatcher, endpoint, PARAMS).unwrap();
+                let params = match endpoint {
+                    Endpoint::User => PARAMS,
+                    Endpoint::Agent => &agent_params,
+                };
+                let result = hello(&dispatcher, endpoint, params).unwrap();
                 let mut listed = methods(&result);
                 let from_catalogue: Vec<&str> = Catalogue::ENGINE
                     .available(endpoint.catalogue(), &capabilities)
@@ -244,6 +294,31 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(result.get("protocol").and_then(Value::as_i64), Some(1));
+    }
+
+    // KNSH-048: on agent.sock hello binds the connection to the token's session and reports it; a token on
+    // user.sock is ignored; an agent hello with no token and no envelope is -32009.
+    #[test]
+    fn agent_hello_reports_the_bound_session() {
+        let fixture = crate::sessions::tests::fixture();
+        let dispatcher = dispatcher_with_violations(
+            probe(&Machine::working().probes()),
+            handlers(),
+            ReaderStatus::stopped(),
+            Arc::clone(&fixture.sessions),
+        )
+        .unwrap();
+        let (params, session_id) = agent_params(&fixture.sessions);
+        let result = hello(&dispatcher, Endpoint::Agent, &params).unwrap();
+        assert_eq!(
+            result.get("session_id").and_then(Value::as_str),
+            Some(session_id.to_string().as_str())
+        );
+        let user = hello(&dispatcher, Endpoint::User, &params).unwrap();
+        assert!(!user.contains_key("session_id"), "no session on user.sock");
+        let refused = hello(&dispatcher, Endpoint::Agent, PARAMS).unwrap_err();
+        assert_eq!(refused.code, ErrorCode::InvalidSessionToken);
+        assert!(refused.data.is_none(), "-32009 says nothing about why");
     }
 
     #[test]
@@ -316,8 +391,13 @@ pub(crate) mod tests {
     #[test]
     fn reports_the_violation_reader_live() {
         let status = ReaderStatus::stopped();
-        let dispatcher =
-            dispatcher_with_violations(probe(&Machine::working().probes()), handlers(), Arc::clone(&status)).unwrap();
+        let dispatcher = dispatcher_with_violations(
+            probe(&Machine::working().probes()),
+            handlers(),
+            Arc::clone(&status),
+            sessions(),
+        )
+        .unwrap();
         let reported = || {
             let result = hello(&dispatcher, Endpoint::User, PARAMS).unwrap();
             let value = capabilities(&result)

@@ -95,7 +95,7 @@ pub use capability::{
 };
 pub use catalogue::{
     Availability, Catalogue, CatalogueError, DEPRECATION_WINDOW, Deprecation, Endpoint, Endpoints, Lookup, MethodSpec,
-    Release,
+    Release, SESSION_CREATING_METHODS, creates_session,
 };
 pub use hello::{
     ByteTransport, HelloParams, HelloResult, MAX_CLIENT_FIELD_LEN, MAX_PROTOCOLS, MAX_SESSION_TOKEN_LEN,

@@ -55,6 +55,17 @@
 //! | --- | --- | --- | --- |
 //! | [`DenialLog`] | Stream sandbox denials; cause a canary denial | `UnifiedLogDenials` (`log stream`) | `ScriptedDenialLog` |
 //!
+//! The `ancestry` module (KNSH-048) names peer processes by audit token and walks the process tree one step at a
+//! time, so `agent.sock` can match a caller without a session token to the envelope it runs in. A process is always
+//! named with its pid version ([`ProcessIdentity`]) or its unique id ([`ProcessKey`], stable across `exec`), never by
+//! a bare pid that may have been reused.
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`ProcessTree`] | Current identity of a pid; key of an identity; parent of a process | `SystemProcessTree` (`proc_pidinfo`) | `FakeProcessTree` |
+//!
+//! [`PeerCredentials::peer_audit_token`] reads the peer's [`AuditToken`] (`LOCAL_PEERTOKEN`).
+//!
 //! Later stories add Keychain, `LocalAuthentication`, XPC, `FSEvents` and APFS clones to the same interface.
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
@@ -89,12 +100,14 @@
 //! - FR-SBX-07 (profile files: directory listing, profiles directory, SHA-256, KNSH-045)
 //! - FR-POL-01, FR-POL-10, FR-POL-11 (profile source and path canonicalisation for the policy loader, KNSH-039)
 //! - FR-SBX-06, FR-SBX-08, decision 9 (sandbox denials from the unified log, KNSH-047)
+//! - FR-AGT-23, `specs/02-architecture/endpoints.md` (audit tokens and process ancestry for `agent.sock`, KNSH-048)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms, unsafe_code)]
 #![warn(clippy::pedantic)]
 
+mod ancestry;
 mod clock;
 pub mod engine_dirs;
 mod error;
@@ -121,6 +134,7 @@ pub mod sqlite;
 #[cfg(any(test, doc, feature = "testing"))]
 pub mod testing;
 
+pub use ancestry::{AuditToken, ProcessIdentity, ProcessKey, ProcessTree};
 pub use clock::{Clock, Monotonic};
 pub use engine_dirs::{EnginePaths, ensure_engine_dirs};
 pub use error::{Operation, PlatformError, SqliteCode};

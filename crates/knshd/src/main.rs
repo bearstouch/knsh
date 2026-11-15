@@ -27,6 +27,8 @@
 //! - `specs/06-api/agent-socket.md#policycheck`, FR-POL-70 (`policy.check` dry runs, KNSH-043)
 //! - FR-SBX-07 (compiled profile files named by hash, collected when unused, KNSH-045)
 //! - FR-SBX-06, FR-SBX-08, decision 9 (sandbox violation reader, KNSH-047)
+//! - FR-AGT-23, FR-SES-02, NFR-SEC-02, `specs/06-api/agent-socket.md` (`agent.sock`: session tokens, the envelope
+//!   registry and the audit-token fallback, KNSH-048)
 //!
 //! On start it prepares the engine directories (KNSH-011) and takes its sockets from launchd ([`endpoints`],
 //! KNSH-012). It then serves them ([`server`], KNSH-013): a kqueue accept loop hands each connection to its own
@@ -43,7 +45,10 @@
 //! running nothing. Compiled sandbox profiles are written to private files named by their hash ([`profiles`],
 //! KNSH-045), and the ones an earlier run left behind are removed at start. The sandbox violation reader
 //! ([`violations`], KNSH-047) streams the system's sandbox denials, publishes them as `sandbox.violation` and
-//! attaches them to the records their tags name; `hello` reports whether it is live. It exits after ten idle minutes ([`lifetime`]) or when launchd stops it, finishing in-flight
+//! attaches them to the records their tags name; `hello` reports whether it is live. `agent.sock` is served too
+//! ([`agents`], KNSH-048): each connection is bound at `hello` to one agent session, by its session token or, without
+//! one, by the caller's audit token and the envelope it descends from, and every later call acts for that session
+//! only. It exits after ten idle minutes ([`lifetime`]) or when launchd stops it, finishing in-flight
 //! requests and committing pending writes first.
 //! The supervisor arrives in later stories.
 
@@ -52,6 +57,9 @@
 #![forbid(unsafe_code)]
 
 // Platform-neutral, but only the macOS server uses them until the Linux backend exists.
+// Owned by the session registry, so built where it is.
+#[cfg(target_os = "macos")]
+mod agents;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod connection;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -170,7 +178,8 @@ fn start() -> Result<(), StartError> {
     use std::sync::Arc;
 
     use knsh_platform::macos::{
-        LaunchdSockets, RealFs, SystemClock, SystemPeerCredentials, SystemRandom, UnifiedLog, effective_uid,
+        LaunchdSockets, RealFs, SystemClock, SystemPeerCredentials, SystemProcessTree, SystemRandom, UnifiedLog,
+        effective_uid,
     };
     use knsh_platform::{EnginePaths, Field, Level, SystemLog, Value, ensure_engine_dirs};
 
@@ -231,7 +240,9 @@ fn start() -> Result<(), StartError> {
         // Sandbox denials the system reports, attributed by tag to sessions and records (KNSH-047). Best effort:
         // a reader that cannot start is reported as `sandbox_violations: none` and never blocks anything.
         let reader = start_violation_reader(&paths, clock.clone(), random.clone(), &log, store.clone(), &events);
-        let sessions = Sessions::new(store, Arc::clone(&events), clock.clone(), random);
+        // `agent.sock` callers without a token are matched to their envelope through the process table (KNSH-048).
+        let processes = Arc::new(SystemProcessTree::new());
+        let sessions = Sessions::new(store, Arc::clone(&events), clock.clone(), random, processes);
         // Dry runs read profiles and binaries through the real filesystem. `TMPDIR` is set by launchd for the agent;
         // without it `${TMPDIR}` is the system's `/tmp`.
         let tmpdir = std::env::var_os("TMPDIR").map_or_else(|| "/tmp".into(), std::path::PathBuf::from);
@@ -251,7 +262,7 @@ fn start() -> Result<(), StartError> {
         let probed = probe_this_machine(&paths, clock.clone(), Arc::clone(&log));
         let violation_status = reader.as_ref().map_or_else(ReaderStatus::stopped, Reader::status);
         let services = Services {
-            dispatcher: hello::dispatcher_with_violations(probed, handlers, violation_status)
+            dispatcher: hello::dispatcher_with_violations(probed, handlers, violation_status, Arc::clone(&sessions))
                 .map_err(StartError::Dispatch)?,
             credentials: Arc::new(SystemPeerCredentials::new()),
             log: Arc::clone(&log),

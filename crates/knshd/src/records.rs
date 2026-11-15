@@ -19,8 +19,8 @@
 //! outside it. [`scope_of`] decides the scope from the caller:
 //!
 //! - `user.sock`: [`Scope::All`], read-only access to every session.
-//! - `agent.sock`: only the caller's own session. Phase 1 binds no session to an agent connection (KNSH-048), so
-//!   every call there is refused with `-32003`: fail closed rather than guess a session.
+//! - `agent.sock`: [`Scope::Session`] of the agent session the connection was bound to at `hello` (KNSH-048). A
+//!   connection whose session has ended is refused with `-32009`.
 //!
 //! # Errors
 //!
@@ -211,12 +211,11 @@ impl Records {
     }
 }
 
-/// The scope a caller may read. Phase 2 replaces the `agent.sock` arm with the session bound to the connection.
+/// The scope a caller may read: every session on `user.sock`, only its own on `agent.sock` (KNSH-048).
 fn scope_of(call: &Call<'_>) -> Result<Scope, RpcError> {
     match call.endpoint {
         Endpoint::User => Ok(Scope::All),
-        // No session is bound to agent connections until KNSH-048: refuse rather than widen to all sessions.
-        Endpoint::Agent => Err(RpcError::new(ErrorCode::NotAllowed)),
+        Endpoint::Agent => call.binding.agent_session().map(Scope::Session),
     }
 }
 
@@ -563,6 +562,7 @@ mod tests {
             Cursor::new(input),
             &mut output,
             Endpoint::User,
+            None,
             &dispatcher,
             &mut || {},
             &|| {},

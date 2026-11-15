@@ -8,6 +8,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use crate::ancestry::AuditToken;
 use crate::error::{Operation, PlatformError};
 use crate::launchd::{PeerCredentials, ServiceManager, SocketActivation};
 
@@ -121,6 +122,43 @@ impl PeerCredentials for SystemPeerCredentials {
             ))
         }
     }
+
+    fn peer_audit_token(&self, stream: &UnixStream) -> Result<AuditToken, PlatformError> {
+        // `audit_token_t` is eight `unsigned int`s; the libc crate does not bind it.
+        let mut words = [0u32; 8];
+        let expected = std::mem::size_of_val(&words);
+        let mut len = libc::socklen_t::try_from(expected).map_err(|_| peer_error(libc::EINVAL))?;
+        // SAFETY: the descriptor is open for the lifetime of `stream`; `words` is a writable buffer of `len` bytes
+        // and `len` is a valid place for the kernel to write the size it used.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERTOKEN,
+                words.as_mut_ptr().cast(),
+                &raw mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(PlatformError::from_io(
+                Operation::PeerCredentials,
+                &io::Error::last_os_error(),
+            ));
+        }
+        // A short answer would leave the pid version zero: refuse it rather than match on a partial token.
+        if usize::try_from(len).ok() != Some(expected) {
+            return Err(peer_error(libc::EIO));
+        }
+        Ok(AuditToken::from_raw(words))
+    }
+}
+
+/// A peer-credentials failure with `errno`.
+fn peer_error(errno: c_int) -> PlatformError {
+    PlatformError::Os {
+        operation: Operation::PeerCredentials,
+        errno,
+    }
 }
 
 /// `launchctl` exit status meaning the job is not loaded (`Boot-out failed: 3: No such process`, macOS 14 to 26).
@@ -197,6 +235,22 @@ mod tests {
         assert_eq!(
             LaunchdSockets::new().listeners("a\0b").unwrap_err().errno(),
             Some(libc::EINVAL)
+        );
+    }
+
+    // KNSH-048: the audit token of a socket pair names this process, with the pid version the process tree reports.
+    #[test]
+    fn peer_audit_token_names_this_process() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let token = SystemPeerCredentials::new().peer_audit_token(&a).unwrap();
+        assert_eq!(token.euid(), super::super::effective_uid());
+        let own = std::process::id().cast_signed();
+        assert_eq!(token.process().pid(), own);
+        let identity = crate::ProcessTree::identity(&super::super::SystemProcessTree::new(), own).unwrap();
+        assert_eq!(
+            token.process(),
+            identity,
+            "audit token pid version matches proc_pidinfo"
         );
     }
 

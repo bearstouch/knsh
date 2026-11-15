@@ -39,7 +39,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use knsh_platform::macos::{Kqueue, Token};
-use knsh_platform::{Clock, Field, Level, Monotonic, PeerCredentials, PlatformError, SystemLog, Value};
+use knsh_platform::{AuditToken, Clock, Field, Level, Monotonic, PeerCredentials, PlatformError, SystemLog, Value};
 
 use crate::connection::{self, Closed};
 use crate::dispatch::{Dispatcher, Endpoint};
@@ -375,21 +375,19 @@ impl Server {
         if stream.set_nonblocking(false).is_err() {
             return;
         }
-        match endpoint {
-            Endpoint::User => {
-                if let Err(refusal) = admit(
-                    self.shared.services.credentials.as_ref(),
-                    self.shared.services.own_uid,
-                    &stream,
-                ) {
-                    self.log_refusal(refusal);
-                    return;
-                }
-            }
-            // Closed unserved until phase 2 (KNSH-048): with no session matching yet, refusing is the fail-closed
-            // answer for agents.
-            Endpoint::Agent => return,
+        let credentials = self.shared.services.credentials.as_ref();
+        // Both endpoints serve only the user knshd runs as: envelopes run as that user too.
+        if let Err(refusal) = admit(credentials, self.shared.services.own_uid, &stream) {
+            self.log_refusal(endpoint, refusal);
+            return;
         }
+        // agent.sock: the peer's audit token, taken now (the kernel's record of who connected), so `hello` can match
+        // a caller without a session token to its envelope (KNSH-048). If it cannot be read the caller is still
+        // served, but only a valid session token can bind it: the fallback fails closed.
+        let peer = match endpoint {
+            Endpoint::User => None,
+            Endpoint::Agent => credentials.peer_audit_token(&stream).ok(),
+        };
         let Some(registration) = self.register(&stream) else {
             self.shared.log(
                 Level::Error,
@@ -412,7 +410,7 @@ impl Server {
         let shared = Arc::clone(&self.shared);
         let spawned = thread::Builder::new()
             .name("knshd-connection".to_owned())
-            .spawn(move || serve_one(&shared, endpoint, &stream, registration));
+            .spawn(move || serve_one(&shared, endpoint, peer, &stream, registration));
         if let Err(error) = spawned {
             // The closure, with the stream and the registration, was dropped: the connection is closed and removed.
             self.shared.log(
@@ -439,20 +437,21 @@ impl Server {
         })
     }
 
-    fn log_refusal(&self, refusal: Refusal) {
+    fn log_refusal(&self, endpoint: Endpoint, refusal: Refusal) {
+        let endpoint = Field::new("endpoint", Value::Static(endpoint.name()));
         match refusal {
             Refusal::OtherUser { peer_uid } => self.shared.log(
                 Level::Error,
-                "refused user.sock connection from another user",
-                &[Field::new("peer_uid", Value::U64(u64::from(peer_uid)))],
+                "refused connection from another user",
+                &[endpoint, Field::new("peer_uid", Value::U64(u64::from(peer_uid)))],
             ),
             Refusal::UnknownPeer(error) => self.shared.log(
                 Level::Error,
-                "refused user.sock connection with unknown peer",
-                &[Field::new(
-                    "errno",
-                    Value::Errno(error.errno().unwrap_or(UNKNOWN_ERRNO)),
-                )],
+                "refused connection with unknown peer",
+                &[
+                    endpoint,
+                    Field::new("errno", Value::Errno(error.errno().unwrap_or(UNKNOWN_ERRNO))),
+                ],
             ),
         }
     }
@@ -517,7 +516,13 @@ impl Read for &HandshakeReader<'_> {
 }
 
 /// A connection thread: serves the connection, then logs why it ended if that was abnormal.
-fn serve_one(shared: &Shared, endpoint: Endpoint, stream: &UnixStream, registration: Registration) {
+fn serve_one(
+    shared: &Shared,
+    endpoint: Endpoint,
+    peer: Option<AuditToken>,
+    stream: &UnixStream,
+    registration: Registration,
+) {
     let reader = HandshakeReader {
         stream,
         deadline: Cell::new(Some(Instant::now() + shared.config.handshake_timeout)),
@@ -536,20 +541,23 @@ fn serve_one(shared: &Shared, endpoint: Endpoint, stream: &UnixStream, registrat
         &reader,
         stream,
         endpoint,
+        peer,
         &shared.services.dispatcher,
         &mut lift_timeout,
         &close,
     );
     match closed {
         Closed::Peer => {}
-        Closed::Frame(_) | Closed::Handshake | Closed::Parse | Closed::Write(_) | Closed::Thread => shared.log(
-            Level::Info,
-            "connection closed",
-            &[
-                Field::new("endpoint", Value::Static(endpoint.name())),
-                Field::new("reason", Value::Static(closed.kind())),
-            ],
-        ),
+        Closed::Frame(_) | Closed::Handshake | Closed::Parse | Closed::Unbound | Closed::Write(_) | Closed::Thread => {
+            shared.log(
+                Level::Info,
+                "connection closed",
+                &[
+                    Field::new("endpoint", Value::Static(endpoint.name())),
+                    Field::new("reason", Value::Static(closed.kind())),
+                ],
+            );
+        }
     }
     // Close before deregistering, so a drain that sees the registry empty knows every connection is already closed.
     let _ = stream.shutdown(Shutdown::Both);
@@ -937,16 +945,21 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .any(|entry| entry.message == "refused user.sock connection from another user")
+                .any(|entry| entry.message == "refused connection from another user")
         );
+        // agent.sock serves only the same user too: envelopes never run as anyone else.
+        let mut agent = server.connect("a");
+        assert!(is_closed(&mut agent));
     }
 
-    // agent.sock connections are closed unserved until phase 2 (KNSH-048): agents fail closed.
+    // KNSH-048: agent.sock is served. Its hello here is a test handler; binding is tested with the real one in
+    // `agents::endpoint_tests` and `agents::platform_tests`.
     #[test]
-    fn agent_sock_connections_are_closed_unserved() {
+    fn agent_sock_connections_are_served() {
         let server = TestServer::simple("agent");
         let mut stream = server.connect("a");
-        assert!(is_closed(&mut stream));
+        call(&mut stream, 1, HELLO);
+        assert!(matches!(read_message(&stream), Some(Message::Success(_))));
     }
 
     // KNSH-013: with no sessions and no connections, the server exits after 10 idle minutes of the injected clock,

@@ -19,16 +19,17 @@ Out of scope: the methods themselves (KNSH-053 and others) and creating sessions
 endpoint.
 
 **Acceptance criteria**
-- [ ] `hello` with a valid session token binds the connection to that session, and the result carries its `session_id`.
-- [ ] `hello` with a missing, invalid or expired token is matched by audit token: a caller whose process is
+- [x] `hello` with a valid session token binds the connection to that session, and the result carries its `session_id`.
+- [x] `hello` with a missing, invalid or expired token is matched by audit token: a caller whose process is
       a descendant of a registered envelope is bound to that envelope's session.
-- [ ] A caller that matches neither a token nor an envelope is refused with `-32009`, and the connection is closed.
+- [x] A caller that matches neither a token nor an envelope is refused with `-32009`, and the connection is closed.
 - [ ] Every method call is evaluated against the bound session only. Naming another session's record, event stream or
-      checkpoint returns `-32003`.
-- [ ] `session.start_agent` and any other session-creating method are not in this endpoint's catalogue. Calling one
+      checkpoint returns `-32003`. *Records, output, events, `policy.check` and `session.info` observed; checkpoints
+      pending: the `checkpoint.*` methods are not implemented yet (KNSH-088), so they answer `-32601`.*
+- [x] `session.start_agent` and any other session-creating method are not in this endpoint's catalogue. Calling one
       returns JSON-RPC "method not found".
-- [ ] A token is invalidated when its session ends, after which it yields `-32009`.
-- [ ] Tokens are at least 128 bits from the platform random source, compared in constant time, and never logged
+- [x] A token is invalidated when its session ends, after which it yields `-32009`.
+- [x] Tokens are at least 128 bits from the platform random source, compared in constant time, and never logged
       or recorded.
 
 **Unit tests**
