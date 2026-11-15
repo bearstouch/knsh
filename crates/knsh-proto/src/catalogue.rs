@@ -233,6 +233,8 @@ pub enum CatalogueError {
     /// A deprecated method is not served while its deprecation window is still open, or is deprecated in a release
     /// after this one.
     DeprecationWindow(&'static str),
+    /// A method that creates sessions is declared on `agent.sock` (FR-SES-02).
+    SessionCreationOnAgent(&'static str),
 }
 
 impl fmt::Display for CatalogueError {
@@ -243,11 +245,24 @@ impl fmt::Display for CatalogueError {
             Self::NoEndpoint(name) => write!(f, "method {name:?} is on no endpoint"),
             Self::Hello => f.write_str("hello must be available on every endpoint with no backend requirement"),
             Self::DeprecationWindow(name) => write!(f, "deprecated method {name:?} must still be served"),
+            Self::SessionCreationOnAgent(name) => write!(f, "session-creating method {name:?} is on agent.sock"),
         }
     }
 }
 
 impl std::error::Error for CatalogueError {}
+
+/// Every method that creates a session. None may ever be on `agent.sock`: nothing inside an envelope may create a
+/// session (FR-SES-02, KNSH-048). [`Catalogue::validate`] refuses a catalogue that puts one there, and
+/// [`Catalogue::lookup`] answers them on `agent.sock` as [`Lookup::Unknown`] (`-32601`), not as another endpoint's
+/// method: an agent is not even told they exist.
+pub const SESSION_CREATING_METHODS: &[&str] = &["session.start_agent", "session.start_human"];
+
+/// Whether `name` creates a session ([`SESSION_CREATING_METHODS`]).
+#[must_use]
+pub fn creates_session(name: &str) -> bool {
+    SESSION_CREATING_METHODS.contains(&name)
+}
 
 /// A list of methods, with the queries `knshd` builds its tables and `hello` from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,11 +284,11 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("exec.wait", Endpoints::AGENT),
     MethodSpec::planned("exec.kill", Endpoints::AGENT),
     // The caller's own session (KNSH-021): on user.sock the human session bound to the connection; on agent.sock
-    // refused until sessions are bound there (KNSH-048).
+    // the agent session the connection was bound to at hello (KNSH-048).
     MethodSpec::planned("session.info", Endpoints::SOCKETS).available(),
     // Shared by agent.sock (own session) and user.sock (all sessions); the read and checkpoint methods are on the
-    // control service too. Dry runs (KNSH-043): agent.sock checks against the caller's session, refused until
-    // sessions are bound there (KNSH-048); user.sock against a named session or profile.
+    // control service too. Dry runs (KNSH-043): agent.sock checks against the session the connection is bound to
+    // (KNSH-048); user.sock against a named session or profile.
     MethodSpec::planned("policy.check", Endpoints::SOCKETS).available(),
     MethodSpec::planned("records.query", Endpoints::ALL).available(),
     MethodSpec::planned("records.output", Endpoints::ALL).available(),
@@ -343,9 +358,13 @@ impl Catalogue {
 
     /// What a call to `name` on `endpoint` meets, given `capabilities`. The checks run in a fixed order: a method
     /// on another endpoint is `NotOnEndpoint` even if it is planned, so an agent learns only that it may not call
-    /// it, never more.
+    /// it, never more. A session-creating method is `Unknown` on `agent.sock` (FR-SES-02): it is not part of that
+    /// endpoint's protocol at all.
     #[must_use]
     pub fn lookup(&self, endpoint: Endpoint, name: &str, capabilities: &Capabilities) -> Lookup<'static> {
+        if endpoint == Endpoint::Agent && creates_session(name) {
+            return Lookup::Unknown;
+        }
         let Some(spec) = self.find(name) else {
             return Lookup::Unknown;
         };
@@ -392,6 +411,9 @@ impl Catalogue {
             }
             if spec.endpoints.is_empty() {
                 return Err(CatalogueError::NoEndpoint(spec.name));
+            }
+            if creates_session(spec.name) && spec.endpoints.contains(Endpoint::Agent) {
+                return Err(CatalogueError::SessionCreationOnAgent(spec.name));
             }
             if let Some(deprecation) = spec.deprecated {
                 let deprecated_later = deprecation.since > release;
@@ -603,10 +625,42 @@ mod tests {
             Lookup::Planned
         );
         assert_eq!(catalogue.lookup(Endpoint::User, "no.such", &seatbelt), Lookup::Unknown);
+        // FR-SES-02, KNSH-048: a session-creating method is not even known on agent.sock.
         assert_eq!(
             catalogue.lookup(Endpoint::Agent, "session.start_agent", &seatbelt),
-            Lookup::NotOnEndpoint
+            Lookup::Unknown
         );
+    }
+
+    // FR-SES-02, KNSH-048: agent.sock's catalogue has no session-creating method, on any machine, and every
+    // `session.start_*` method of the engine is in the list that keeps them off it.
+    #[test]
+    fn agent_catalogue_has_no_session_creation_methods() {
+        for sandbox in [Sandbox::None, Sandbox::Seatbelt] {
+            let caps = capabilities(sandbox);
+            for spec in Catalogue::ENGINE.available(Endpoint::Agent, &caps) {
+                assert!(!creates_session(spec.name), "{}", spec.name);
+            }
+        }
+        for spec in Catalogue::ENGINE.methods() {
+            if spec.name.starts_with("session.start") {
+                assert!(
+                    creates_session(spec.name),
+                    "{} must be listed as session-creating",
+                    spec.name
+                );
+            }
+            if creates_session(spec.name) {
+                assert!(!spec.endpoints.contains(Endpoint::Agent), "{}", spec.name);
+                assert_eq!(
+                    Catalogue::ENGINE.lookup(Endpoint::Agent, spec.name, &capabilities(Sandbox::Seatbelt)),
+                    Lookup::Unknown
+                );
+            }
+        }
+        for name in SESSION_CREATING_METHODS {
+            assert!(Catalogue::ENGINE.find(name).is_some(), "{name} is an engine method");
+        }
     }
 
     // A method whose backend is missing is not listed (honest capabilities, NFR-SEC-10).
@@ -684,6 +738,10 @@ mod tests {
         const NO_HELLO: &[MethodSpec] = &[MethodSpec::planned("exec.run", Endpoints::AGENT)];
         const PARTIAL_HELLO: &[MethodSpec] = &[MethodSpec::planned("hello", Endpoints::USER).available()];
         const PLANNED_HELLO: &[MethodSpec] = &[MethodSpec::planned("hello", Endpoints::ALL)];
+        const AGENT_CREATES: &[MethodSpec] = &[
+            MethodSpec::planned("hello", Endpoints::ALL).available(),
+            MethodSpec::planned("session.start_agent", Endpoints::SOCKETS),
+        ];
         let release = Release::current();
         let check = |methods| Catalogue::new(methods).validate(release);
         assert_eq!(check(BAD_NAME), Err(CatalogueError::InvalidName("Exec.run")));
@@ -692,5 +750,9 @@ mod tests {
         assert_eq!(check(NO_HELLO), Err(CatalogueError::Hello));
         assert_eq!(check(PARTIAL_HELLO), Err(CatalogueError::Hello));
         assert_eq!(check(PLANNED_HELLO), Err(CatalogueError::Hello));
+        assert_eq!(
+            check(AGENT_CREATES),
+            Err(CatalogueError::SessionCreationOnAgent("session.start_agent"))
+        );
     }
 }

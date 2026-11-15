@@ -86,6 +86,9 @@ pub enum Operation {
     SignalDisposition,
     /// Starting or reading the stream of sandbox denials (`log stream`), or running its canary denial (KNSH-047).
     SandboxLog,
+    /// Reading another process's identity or parent (`proc_pidinfo`; matching `agent.sock` peers to envelopes,
+    /// KNSH-048).
+    ProcessInfo,
 }
 
 impl Operation {
@@ -127,6 +130,7 @@ impl Operation {
             Self::DescriptorFlags => "set descriptor flags",
             Self::SignalDisposition => "set signal disposition",
             Self::SandboxLog => "sandbox log",
+            Self::ProcessInfo => "read process information",
         }
     }
 }

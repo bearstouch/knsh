@@ -34,3 +34,8 @@ session as its parent: it would be unenforced, an escape from the agent's profil
 ## Session token
 
 Agent sessions get a session token in the envelope's environment. Clients pass it in `hello`. A missing, invalid or expired token yields `-32009` unless the caller can be matched to its envelope by audit token.
+
+A token is 256 bits from the platform random source, carried as 64 lowercase hex characters. It is compared in
+constant time and never logged, stored in the record store, or recorded. It expires when its session ends: from then
+on it yields `-32009`, and connections already bound to the session get `-32009` on their next call
+([agent socket](../06-api/agent-socket.md#binding-a-connection-to-its-session), KNSH-048).

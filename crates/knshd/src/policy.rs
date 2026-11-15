@@ -9,9 +9,9 @@
 //!
 //! # Whose policy
 //!
-//! - `agent.sock`: the caller's own session's profile, so neither `session_id` nor `profile` may be given (`-32003`,
-//!   as for any other session). Until a session is bound to an `agent.sock` connection (KNSH-048) every call there is
-//!   refused with `-32003`, after its params are checked.
+//! - `agent.sock`: the profile of the session the connection was bound to at `hello` (KNSH-048), so neither
+//!   `session_id` nor `profile` may be given (`-32003`, as for any other session). A connection whose session has
+//!   ended is refused with `-32009`.
 //! - `user.sock`: exactly one of `session_id` (a live session's profile; `-32006` when it is not live) and `profile`
 //!   (by name); neither is `-32602`.
 //!
@@ -113,9 +113,8 @@ impl PolicyCheck {
     /// The profile `target` names on the call's endpoint (module documentation, "Whose policy").
     fn profile_name(&self, call: &Call<'_>, target: &PolicyCheckTarget) -> Result<ProfileName, RpcError> {
         match (call.endpoint, target) {
-            // KNSH-048 binds sessions to agent.sock connections; until then no caller has a session to check
-            // against. Fail closed rather than guess one.
-            (Endpoint::Agent, PolicyCheckTarget::Caller) => Err(RpcError::new(ErrorCode::NotAllowed)),
+            // The session the connection was bound to at hello (KNSH-048): its profile, never another.
+            (Endpoint::Agent, PolicyCheckTarget::Caller) => self.sessions.profile_of(call.binding.agent_session()?),
             // An agent may check only its own session's policy, never another session's or a named profile.
             (Endpoint::Agent, PolicyCheckTarget::Session(_) | PolicyCheckTarget::Profile(_)) => {
                 Err(RpcError::new(ErrorCode::NotAllowed))
@@ -412,9 +411,10 @@ pub(crate) mod tests {
         );
     }
 
-    // agent.sock checks only the caller's own session, which no agent connection has before KNSH-048.
+    // KNSH-048: agent.sock checks only the caller's own session. A connection without a bound agent session is
+    // refused, as is naming any session or profile.
     #[test]
-    fn agent_sock_is_refused_until_sessions_are_bound() {
+    fn agent_sock_without_a_bound_session_is_refused() {
         let service = web();
         for params in [
             r#"{"command":"ls","cwd":"/Users/u/app"}"#,
@@ -427,6 +427,47 @@ pub(crate) mod tests {
                 "{params}"
             );
         }
+    }
+
+    // KNSH-048: a bound agent connection is checked against its own session's profile, and may name neither
+    // another session nor a profile; once its session ends it is -32009.
+    #[test]
+    fn agent_sock_checks_the_bound_sessions_profile() {
+        let fixture = fixture();
+        let service = service(Arc::clone(&fixture.sessions), fs(&[("web", WEB)]));
+        let opened = fixture
+            .sessions
+            .open_agent(
+                knsh_core::Actor::Agent(knsh_core::AgentId::new("claude-code").unwrap()),
+                ProfileName::new("web").unwrap(),
+            )
+            .unwrap();
+        let binding = SessionBinding::for_peer(None);
+        fixture
+            .sessions
+            .bind_agent(&binding, Some(&opened.token.encode()))
+            .unwrap();
+        let on_agent = |params: &str| call_with(&service.handlers(), Endpoint::Agent, &binding, POLICY_CHECK, params);
+        let result = on_agent(r#"{"command":"git push origin main","cwd":"/Users/u/app","path":"/usr/bin:/bin"}"#)
+            .unwrap()
+            .result;
+        let result = result.as_object().unwrap();
+        assert_eq!(text(result, "profile"), r#""web""#);
+        assert_eq!(text(result, "verdict"), r#""ask""#);
+        for params in [
+            r#"{"command":"ls","cwd":"/Users/u/app","profile":"web"}"#,
+            &format!(
+                r#"{{"command":"ls","cwd":"/Users/u/app","session_id":"{}"}}"#,
+                opened.session_id
+            ),
+        ] {
+            assert_eq!(code(on_agent(params)), ErrorCode::NotAllowed, "{params}");
+        }
+        fixture.sessions.end_agent(opened.session_id);
+        assert_eq!(
+            code(on_agent(r#"{"command":"ls","cwd":"/Users/u/app"}"#)),
+            ErrorCode::InvalidSessionToken
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! module opts back in). Each `unsafe` block carries a `// SAFETY:` comment. Where the standard library already
 //! offers a safe wrapper for the system call (`realpath`, `open`, `rename`, `posix_spawn`), it is used instead.
 
+mod ancestry;
 mod clock;
 mod denials;
 mod digest;
@@ -16,6 +17,7 @@ mod process;
 mod random;
 mod shell_host;
 
+pub use ancestry::SystemProcessTree;
 pub use clock::SystemClock;
 pub use denials::UnifiedLogDenials;
 pub use digest::{SHA256_LEN, sha256};

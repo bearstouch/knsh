@@ -15,11 +15,19 @@
 //! - `telemetry.cwd`: `cwd.changed`.
 //! - `telemetry.idle`: `session.idle`, at most once between two commands (FR-SES-24). `knsh` already sends it only
 //!   once; the daemon checks again, so a confused client cannot flood subscribers.
-//! - `session.info`: the bound session's actor, profile, state and recording settings (FR-SES-25, NFR-PRIV-05).
-//!   On `agent.sock` no session is bound to a connection until KNSH-048, so it is refused there with `-32003`.
+//! - `session.info`: the bound session's actor, profile, state and recording settings (FR-SES-25, NFR-PRIV-05). On
+//!   `agent.sock` it is the agent session the connection was bound to at `hello`.
 //!
-//! These methods exist on `user.sock` only (the catalogue keeps them off `agent.sock`, and each handler checks the
-//! endpoint again): nothing inside an envelope may create a session (FR-SES-02) or write records as a human.
+//! The other methods exist on `user.sock` only (the catalogue keeps them off `agent.sock`, and each handler checks
+//! the endpoint again): nothing inside an envelope may create a session (FR-SES-02) or write records as a human.
+//!
+//! # Agent sessions
+//!
+//! An agent session is opened with a session token and registers the root process of each of its envelopes
+//! ([`Sessions::open_agent`], [`Sessions::register_envelope`]); both are kept in [`AgentAccess`]. An `agent.sock`
+//! connection is bound to one of them at `hello` ([`Sessions::bind_agent`], KNSH-048), and unlike a human session it
+//! does not end with the connection: it ends with its envelope ([`Sessions::end_agent`]), which revokes its token
+//! and envelopes first, so nothing can bind to it, or keep acting through a binding, once it is ending.
 //!
 //! # Errors
 //!
@@ -29,8 +37,9 @@
 //!
 //! # Locks
 //!
-//! Lock order: a connection's [`SessionBinding`], then the registry, then the event hub's own lock. The registry
-//! lock is never held while waiting for the record store.
+//! Lock order: a connection's [`SessionBinding`], then the registry, then [`AgentAccess`], then the event hub's own
+//! lock. The registry lock is never held while waiting for the record store, and the agent table is never held while
+//! reading the process table.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -39,13 +48,14 @@ use knsh_core::{
     SessionRegistry, SessionSpec, Timestamp, Transition, Ulid,
 };
 use knsh_json::{Object, Value};
-use knsh_platform::{Clock, Random};
+use knsh_platform::{AuditToken, Clock, ProcessIdentity, ProcessTree, Random};
 use knsh_proto::{
     ErrorCode, RpcError, SessionInfoResult, SessionStartHumanParams, SessionStartHumanResult, TelemetryCommandParams,
     TelemetryCommandResult, TelemetryCwdParams, TelemetryIdleParams,
 };
 use knsh_store::RecordStore;
 
+use crate::agents::{AgentAccess, Grant, SessionToken, invalid_session_token};
 use crate::dispatch::{Answer, Call, Endpoint, Handler, Handlers, Reply, answer, params};
 use crate::events::EventHub;
 use crate::lifetime::Activity;
@@ -68,44 +78,91 @@ pub(crate) struct Sessions {
     events: Arc<EventHub>,
     clock: Arc<dyn Clock>,
     random: Arc<dyn Random>,
+    /// Live agent sessions' tokens and envelopes (KNSH-048).
+    agents: AgentAccess,
 }
 
-/// The session bound to one connection, if any. Created by the connection, released when it closes.
+/// The session bound to one connection, if any, and who is at its other end. Created by the connection, released
+/// when it closes.
 #[derive(Default)]
 pub(crate) struct SessionBinding {
     bound: Mutex<Option<Bound>>,
+    /// The peer's audit token, read when the connection was accepted. Only `agent.sock` connections have one; it is
+    /// how a caller without a session token is matched to its envelope (FR-AGT-23).
+    peer: Option<AuditToken>,
 }
 
-/// A connection's human session.
-struct Bound {
-    session_id: SessionId,
-    /// Whether `session.idle` was already published since the last command (FR-SES-24).
-    idle_reported: bool,
-    /// Ends the session when the connection closes.
-    owner: Arc<Sessions>,
+/// A connection's session.
+enum Bound {
+    /// A human session the connection started; it ends with the connection.
+    Human {
+        session_id: SessionId,
+        /// Whether `session.idle` was already published since the last command (FR-SES-24).
+        idle_reported: bool,
+        /// Ends the session when the connection closes.
+        owner: Arc<Sessions>,
+    },
+    /// The agent session an `agent.sock` connection was bound to at `hello`. It outlives the connection.
+    Agent(Arc<Grant>),
 }
 
 impl SessionBinding {
-    /// A binding with no session.
+    /// A binding with no session and no known peer.
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    /// Ends the bound session, if any: the connection closed. Called once, after the last call of the connection.
-    pub(crate) fn release(&self) {
-        let bound = lock(&self.bound).take();
-        if let Some(bound) = bound {
-            bound.owner.end(bound.session_id);
+    /// A binding with no session yet, for a connection whose peer has audit token `peer` (`None` if the kernel
+    /// could not report it: the peer can then only bind with a session token).
+    pub(crate) fn for_peer(peer: Option<AuditToken>) -> Self {
+        Self {
+            bound: Mutex::new(None),
+            peer,
         }
     }
 
-    /// The bound session, for a telemetry call.
-    fn session_id(&self) -> Result<SessionId, RpcError> {
-        lock(&self.bound)
-            .as_ref()
-            .map(|bound| bound.session_id)
-            .ok_or_else(|| RpcError::new(ErrorCode::NotAllowed))
+    /// Ends the bound human session, if any: the connection closed. Called once, after the last call of the
+    /// connection. An agent session is only unbound: it lives as long as its envelope, not its connections.
+    pub(crate) fn release(&self) {
+        let bound = lock(&self.bound).take();
+        match bound {
+            Some(Bound::Human { session_id, owner, .. }) => owner.end(session_id),
+            Some(Bound::Agent(_)) | None => {}
+        }
     }
+
+    /// The bound human session, for a telemetry call.
+    fn session_id(&self) -> Result<SessionId, RpcError> {
+        match lock(&self.bound).as_ref() {
+            Some(Bound::Human { session_id, .. }) => Ok(*session_id),
+            Some(Bound::Agent(_)) | None => Err(RpcError::new(ErrorCode::NotAllowed)),
+        }
+    }
+
+    /// The agent session this `agent.sock` connection acts for: every agent call is evaluated against it alone
+    /// (KNSH-048).
+    ///
+    /// # Errors
+    ///
+    /// `-32009` if the session has ended since the connection was bound; `-32003` if the connection has no agent
+    /// session (never the case after a successful `hello` on `agent.sock`; refused rather than widened).
+    pub(crate) fn agent_session(&self) -> Result<SessionId, RpcError> {
+        match lock(&self.bound).as_ref() {
+            Some(Bound::Agent(grant)) => grant.session_id(),
+            Some(Bound::Human { .. }) | None => Err(RpcError::new(ErrorCode::NotAllowed)),
+        }
+    }
+}
+
+/// An agent session just opened, with the token its envelope's environment will carry. Read by
+/// `session.start_agent` (KNSH-056); until then only tests open agent sessions.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct OpenedAgent {
+    /// The new session.
+    pub(crate) session_id: SessionId,
+    /// Its token. Never logged or stored; only written into the envelope's environment.
+    pub(crate) token: SessionToken,
 }
 
 impl Drop for SessionBinding {
@@ -123,6 +180,7 @@ impl Sessions {
         events: Arc<EventHub>,
         clock: Arc<dyn Clock>,
         random: Arc<dyn Random>,
+        processes: Arc<dyn ProcessTree>,
     ) -> Arc<Self> {
         Arc::new(Self {
             registry: Mutex::new(SessionRegistry::new()),
@@ -130,6 +188,7 @@ impl Sessions {
             events,
             clock,
             random,
+            agents: AgentAccess::new(processes),
         })
     }
 
@@ -193,7 +252,7 @@ impl Sessions {
         }
         // Best effort: a session whose start could not be published still records (see the module docs).
         let _ = self.events.session_started(&session);
-        *binding = Some(Bound {
+        *binding = Some(Bound::Human {
             session_id,
             idle_reported: false,
             owner: Arc::clone(self),
@@ -249,8 +308,8 @@ impl Sessions {
             },
         );
         // A new command: the next idle prompt is reported again (FR-SES-24).
-        if let Some(bound) = lock(&call.binding.bound).as_mut() {
-            bound.idle_reported = false;
+        if let Some(Bound::Human { idle_reported, .. }) = lock(&call.binding.bound).as_mut() {
+            *idle_reported = false;
         }
         answer(&TelemetryCommandResult { record_id })
     }
@@ -272,33 +331,135 @@ impl Sessions {
         user_only(call.endpoint)?;
         let TelemetryIdleParams = params(call)?;
         let mut binding = lock(&call.binding.bound);
-        let bound = binding.as_mut().ok_or_else(|| RpcError::new(ErrorCode::NotAllowed))?;
-        let emitted = !bound.idle_reported;
+        let Some(Bound::Human {
+            session_id,
+            idle_reported,
+            ..
+        }) = binding.as_mut()
+        else {
+            return Err(RpcError::new(ErrorCode::NotAllowed));
+        };
+        let emitted = !*idle_reported;
         if emitted {
-            bound.idle_reported = true;
-            let _ = self
-                .events
-                .publish(bound.session_id, &Actor::Human, EventData::SessionIdle);
+            *idle_reported = true;
+            let _ = self.events.publish(*session_id, &Actor::Human, EventData::SessionIdle);
         }
         let result = Object::new().with("emitted", emitted).map_err(|_| internal_error())?;
         Ok(Answer::from(Value::Object(result)))
     }
 
-    /// `session.info`: the caller's own session.
+    /// `session.info`: the caller's own session: the human session the connection started on `user.sock`, the
+    /// agent session it was bound to on `agent.sock`.
     fn info(&self, call: &Call<'_>) -> Reply {
-        // agent.sock: no session is bound to an agent connection before KNSH-048. Fail closed rather than guess.
-        user_only(call.endpoint)?;
-        let session_id = call.binding.session_id()?;
+        let session_id = match call.endpoint {
+            Endpoint::User => call.binding.session_id()?,
+            Endpoint::Agent => call.binding.agent_session()?,
+        };
         let session = lock(&self.registry)
             .get(session_id)
             .cloned()
-            // Bound sessions end only when their connection closes, after its last call; kept for safety.
-            .map_err(|_| session_gone(session_id))?;
+            .map_err(|_| match call.endpoint {
+                // A human session ends only when its connection closes, after its last call; kept for safety.
+                Endpoint::User => session_gone(session_id),
+                // An agent session ended between the binding check and this read: the binding is expired.
+                Endpoint::Agent => invalid_session_token(),
+            })?;
         answer(&SessionInfoResult {
             session,
-            // Human sessions never record output (FR-REC-09).
+            // Human sessions never record output (FR-REC-09). Agent output is recorded only by the commands the
+            // supervisor runs (KNSH-050), which this build does not run yet, so none is recorded.
             output_recording: false,
         })
+    }
+
+    /// Opens an agent session running `profile` for `actor`, with its envelope flag set, and issues its session
+    /// token: writes its row, publishes `session.started`, and returns the token for the envelope's environment.
+    /// The caller (`session.start_agent`, KNSH-056, on `user.sock` only) then registers the envelope's root
+    /// process with [`Sessions::register_envelope`].
+    ///
+    /// # Errors
+    ///
+    /// `-32603` if the registry, the store, the clock or the random source fails; nothing is left behind then.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn open_agent(&self, actor: Actor, profile: ProfileName) -> Result<OpenedAgent, RpcError> {
+        let now = self.clock.now().map_err(|_| internal_error())?;
+        let session_id = SessionId::from_ulid(self.ulid(now)?);
+        let session = lock(&self.registry)
+            .create(SessionSpec {
+                session_id,
+                actor,
+                profile,
+                envelope: true,
+                recording: None,
+                parent_session_id: None,
+            })
+            .cloned()
+            .map_err(|_| internal_error())?;
+        let undo = || {
+            let _ = lock(&self.registry).transition(session_id, Transition::End);
+        };
+        // A recorded session needs its row before any of its records; an unrecorded one may run without a store.
+        let written = match (&self.store, session.recording()) {
+            (Some(store), _) => store.write_session(&session, now).is_ok(),
+            (None, recording) => !recording,
+        };
+        if !written {
+            undo();
+            return Err(internal_error());
+        }
+        let Ok(token) = self.agents.issue(session_id, self.random.as_ref()) else {
+            undo();
+            return Err(internal_error());
+        };
+        let _ = self.events.session_started(&session);
+        Ok(OpenedAgent { session_id, token })
+    }
+
+    /// Registers `root`, the first process of an envelope of the agent session `session_id`: callers without a
+    /// token that descend from it are bound to the session (FR-AGT-23), even after `root` execs. The supervisor
+    /// reads `root` while it holds the unreaped child, so its pid cannot have been reused.
+    ///
+    /// # Errors
+    ///
+    /// `-32006` if `session_id` is not a live agent session, or if `root` is no longer the live process at that pid
+    /// version (nothing is registered then).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn register_envelope(&self, session_id: SessionId, root: ProcessIdentity) -> Result<(), RpcError> {
+        if self.agents.register_envelope(session_id, root) {
+            Ok(())
+        } else {
+            Err(session_gone(session_id))
+        }
+    }
+
+    /// Ends the agent session `session_id`: its envelope is gone. Its token and envelopes are revoked before
+    /// anything else, then it ends as every session does.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn end_agent(&self, session_id: SessionId) {
+        self.end(session_id);
+    }
+
+    /// Binds an `agent.sock` connection to its agent session at `hello`: by `token` if it is live, else by the
+    /// peer's audit token (FR-AGT-23). A connection is bound once; a repeated `hello` must name the same session.
+    ///
+    /// # Errors
+    ///
+    /// `-32009` if no live session matches, or if a repeated `hello` would move the connection to another session.
+    pub(crate) fn bind_agent(
+        &self,
+        binding: &SessionBinding,
+        token: Option<&Redacted<String>>,
+    ) -> Result<SessionId, RpcError> {
+        let grant = self.agents.bind(token, binding.peer)?;
+        let session_id = grant.session_id()?;
+        let mut bound = lock(&binding.bound);
+        match bound.as_ref() {
+            None => *bound = Some(Bound::Agent(grant)),
+            Some(Bound::Agent(existing)) if Arc::ptr_eq(existing, &grant) => {}
+            // Another session, or a human one (never on agent.sock): one connection acts for one session only.
+            Some(Bound::Agent(_) | Bound::Human { .. }) => return Err(invalid_session_token()),
+        }
+        Ok(session_id)
     }
 
     /// The profile of the live session `session_id`, for `policy.check` (KNSH-043). Reads the registry only.
@@ -316,6 +477,8 @@ impl Sessions {
     /// Ends `session_id`: its connection closed. Writes the ended state and publishes `session.state_changed` to
     /// `ended`, then `session.ended`.
     fn end(&self, session_id: SessionId) {
+        // First, so that nothing binds to the session, or acts through an existing binding, while it ends.
+        self.agents.revoke(session_id);
         let (session, change) = {
             let mut registry = lock(&self.registry);
             // Already gone (never expected: each binding ends its session once): nothing to write or publish.
@@ -383,7 +546,7 @@ fn session_gone(session_id: SessionId) -> RpcError {
 pub(crate) mod tests {
     use knsh_core::Timestamp;
     use knsh_platform::macos::{RealFs, effective_uid};
-    use knsh_platform::testing::{FakeClock, SeededRandom};
+    use knsh_platform::testing::{FakeClock, FakeProcessTree, SeededRandom};
     use knsh_proto::{ByteTransport, MethodName, Request, RequestId};
     use knsh_store::{PageSize, RecordQuery, Scope, StoreConfig};
 
@@ -413,13 +576,27 @@ pub(crate) mod tests {
 
     /// The live sessions with a real record store and event hub, so a test can see what was written and published.
     pub(crate) struct Fixture {
-        _dir: TempDir,
+        dir: TempDir,
         pub(crate) store: RecordStore,
         pub(crate) hub: Arc<EventHub>,
         pub(crate) sessions: Arc<Sessions>,
+        /// The fake process table agent connections are matched against, unless the fixture was built on another.
+        pub(crate) processes: Arc<FakeProcessTree>,
+    }
+
+    impl Fixture {
+        /// The directory holding the record store's files.
+        pub(crate) fn dir(&self) -> &std::path::Path {
+            &self.dir.0
+        }
     }
 
     pub(crate) fn fixture() -> Fixture {
+        fixture_on(None)
+    }
+
+    /// [`fixture`], matching agent callers against `processes` (the real process table, say) instead of the fake.
+    pub(crate) fn fixture_on(processes: Option<Arc<dyn ProcessTree>>) -> Fixture {
         let dir = TempDir::new();
         let clock = Arc::new(FakeClock::new(
             Timestamp::from_unix_micros(1_800_000_000_000_000).unwrap(),
@@ -433,17 +610,20 @@ pub(crate) mod tests {
         )
         .unwrap();
         let hub = crate::events::tests::hub();
+        let fake = Arc::new(FakeProcessTree::new());
         let sessions = Sessions::new(
             Some(store.clone()),
             Arc::clone(&hub),
             clock,
             Arc::new(SeededRandom::new(3)),
+            processes.unwrap_or_else(|| fake.clone()),
         );
         Fixture {
-            _dir: dir,
+            dir,
             store,
             hub,
             sessions,
+            processes: fake,
         }
     }
 
@@ -562,7 +742,7 @@ pub(crate) mod tests {
     }
 
     // KNSH-021 (FR-SES-25, NFR-PRIV-05): `session.info` reports actor, profile, state and recording for the caller's
-    // session; without one it is refused, and agent.sock is refused until KNSH-048.
+    // session; without one it is refused. On agent.sock a connection with no agent session is refused too.
     #[test]
     fn session_info_reports_recording_state() {
         let fixture = fixture();
@@ -672,6 +852,7 @@ pub(crate) mod tests {
             std::io::Cursor::new(input.into_inner()),
             &mut output,
             Endpoint::User,
+            None,
             &dispatcher,
             &mut || {},
             &|| {},
@@ -703,6 +884,7 @@ pub(crate) mod tests {
             crate::events::tests::hub(),
             Arc::new(FakeClock::new(Timestamp::UNIX_EPOCH)),
             Arc::new(SeededRandom::new(1)),
+            Arc::new(FakeProcessTree::new()),
         );
         let binding = SessionBinding::new();
         let error = call(&sessions, &binding, "session.start_human", "{}").unwrap_err();

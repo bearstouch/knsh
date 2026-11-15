@@ -9,8 +9,9 @@
 //! # Scope
 //!
 //! - `user.sock`: [`EventScope::All`], or one session with `session_id` (FR-EVT-01).
-//! - `agent.sock`: only the caller's own session. Phase 1 binds no session to an agent connection (KNSH-048), so
-//!   every call there is refused with `-32003`: fail closed rather than guess a session.
+//! - `agent.sock`: only the session the connection was bound to at `hello` (KNSH-048). Without `session_id` the
+//!   subscription is that session's; naming any other session is `-32003`. A connection whose session has ended is
+//!   refused with `-32009`.
 //!
 //! # Lock order
 //!
@@ -232,9 +233,8 @@ impl EventHub {
     /// `events.subscribe`: registers a subscription for the calling connection and answers its ID. The buffered
     /// events after `since_seq` are queued in the same step, so they reach the client right after this answer.
     fn subscribe(self: &Arc<Self>, call: &Call<'_>) -> Reply {
-        endpoint_allowed(call.endpoint)?;
         let params: EventsSubscribeParams = call.request.params().map_err(|error| RpcError::from(&error))?;
-        let scope = params.session_id.map_or(EventScope::All, EventScope::Session);
+        let scope = scope_of(call, params.session_id)?;
         let subscribed = call
             .subscriber
             .subscribe(self, scope, params.since_seq)
@@ -248,7 +248,10 @@ impl EventHub {
     /// `events.unsubscribe`: ends one of the calling connection's subscriptions. Nothing more is sent for it after
     /// this answer. The connection's [`Subscriber`] knows the hub, so no hub is needed here.
     fn unsubscribe(call: &Call<'_>) -> Reply {
-        endpoint_allowed(call.endpoint)?;
+        // agent.sock: only while the connection's session is live. Its subscriptions are its own either way.
+        if call.endpoint == Endpoint::Agent {
+            call.binding.agent_session()?;
+        }
         let params: EventsUnsubscribeParams = call.request.params().map_err(|error| RpcError::from(&error))?;
         // Only the connection's own subscriptions: an ID made elsewhere is as unknown as one never made.
         if !call.subscriber.unsubscribe(params.subscription_id) {
@@ -309,11 +312,18 @@ impl EventHub {
     }
 }
 
-/// Phase 1 binds no session to an `agent.sock` connection, so there is no session to scope its events to: refuse.
-fn endpoint_allowed(endpoint: Endpoint) -> Result<(), RpcError> {
-    match endpoint {
-        Endpoint::User => Ok(()),
-        Endpoint::Agent => Err(RpcError::new(ErrorCode::NotAllowed)),
+/// The events a caller may see: every session (or the one it names) on `user.sock`; on `agent.sock` only the session
+/// the connection was bound to, whether or not it is named (KNSH-048).
+fn scope_of(call: &Call<'_>, asked: Option<SessionId>) -> Result<EventScope, RpcError> {
+    match call.endpoint {
+        Endpoint::User => Ok(asked.map_or(EventScope::All, EventScope::Session)),
+        Endpoint::Agent => {
+            let own = call.binding.agent_session()?;
+            match asked {
+                Some(other) if other != own => Err(RpcError::new(ErrorCode::NotAllowed)),
+                Some(_) | None => Ok(EventScope::Session(own)),
+            }
+        }
     }
 }
 

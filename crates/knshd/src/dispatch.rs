@@ -372,6 +372,13 @@ pub(crate) mod tests {
             deprecated: None,
         },
         MethodSpec {
+            name: "approval.list",
+            endpoints: Endpoints::USER,
+            availability: Availability::Available,
+            requires: None,
+            deprecated: None,
+        },
+        MethodSpec {
             name: "records.query",
             endpoints: Endpoints::SOCKETS,
             availability: Availability::Planned,
@@ -392,7 +399,7 @@ pub(crate) mod tests {
         Dispatcher::build(
             Catalogue::new(TEST_METHODS),
             Arc::new(capabilities),
-            &handlers(&["hello", "exec.run", "session.start_agent"]),
+            &handlers(&["hello", "exec.run", "session.start_agent", "approval.list"]),
         )
         .unwrap()
     }
@@ -401,13 +408,35 @@ pub(crate) mod tests {
     #[test]
     fn method_not_on_endpoint_returns_minus_32003() {
         let dispatcher = built(Sandbox::Seatbelt);
-        let error = call(&dispatcher, Endpoint::Agent, "session.start_agent").unwrap_err();
+        let error = call(&dispatcher, Endpoint::Agent, "approval.list").unwrap_err();
         assert_eq!(error.code, ErrorCode::NotAllowed);
         let error = call(&dispatcher, Endpoint::User, "exec.run").unwrap_err();
         assert_eq!(error.code, ErrorCode::NotAllowed);
         // Each endpoint still serves its own.
         assert!(call(&dispatcher, Endpoint::User, "session.start_agent").is_ok());
         assert!(call(&dispatcher, Endpoint::Agent, "exec.run").is_ok());
+    }
+
+    // FR-SES-02, KNSH-048: session-creating methods are not part of agent.sock at all: "method not found", not
+    // "another endpoint's method", in the engine catalogue as in any other.
+    #[test]
+    fn catalogue_has_no_session_creation_methods() {
+        let dispatcher = built(Sandbox::Seatbelt);
+        let error = call(&dispatcher, Endpoint::Agent, "session.start_agent").unwrap_err();
+        assert_eq!(error.code, ErrorCode::MethodNotFound);
+        let engine = Dispatcher::from_tables(Table::new(), Table::new());
+        for name in knsh_proto::SESSION_CREATING_METHODS {
+            let error = call(&engine, Endpoint::Agent, name).unwrap_err();
+            assert_eq!(error.code, ErrorCode::MethodNotFound, "{name}");
+        }
+        let served = crate::hello::phase1_dispatcher(
+            crate::probe::probe(&crate::probe::tests::Machine::working().probes()),
+            crate::hello::tests::handlers(),
+        )
+        .unwrap();
+        for name in served.methods(Endpoint::Agent) {
+            assert!(!knsh_proto::creates_session(name), "{name} is served on agent.sock");
+        }
     }
 
     #[test]
@@ -451,7 +480,10 @@ pub(crate) mod tests {
             expected.sort_unstable();
             assert_eq!(dispatcher.methods(endpoint), expected, "{}", endpoint.name());
         }
-        assert_eq!(dispatcher.methods(Endpoint::User), ["hello", "session.start_agent"]);
+        assert_eq!(
+            dispatcher.methods(Endpoint::User),
+            ["approval.list", "hello", "session.start_agent"]
+        );
         assert_eq!(dispatcher.methods(Endpoint::Agent), ["exec.run", "hello"]);
     }
 

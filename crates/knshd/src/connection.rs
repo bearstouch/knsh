@@ -11,6 +11,9 @@
 //! - **Malformed JSON is answered `-32700` and closes the connection.** The peer is sending something the strict
 //!   profile forbids, and the engine never tries to recover from malformed input.
 //! - Other envelope faults (`-32600`, `-32601`, `-32602`) are answered and the connection stays open.
+//! - **`-32009` closes the connection** (KNSH-048). On `agent.sock` it means the caller has no live session: its
+//!   `hello` matched no token or envelope, or the session it was bound to has ended. Nothing more can be done on
+//!   the connection, so it is answered and closed rather than left open for a caller with no rights.
 //! - Notifications and responses from the client are ignored: no client notification exists yet, and `knshd` sends
 //!   no requests that a client could answer.
 //! - **Byte transport.** A successful `hello` with `binary_frames: false` switches the connection to base64 inside
@@ -34,6 +37,7 @@ use std::thread;
 
 use knsh_core::{Delivery, Lost, SubscriptionId};
 use knsh_json::{Frame, FrameReader, FrameWriter, JsonError, StreamId};
+use knsh_platform::AuditToken;
 use knsh_proto::{
     ByteTransport, ErrorCode, ErrorResponse, HelloParams, Message, ProtoError, Rejection, Request, RequestId, RpcError,
     SuccessResponse, decode, event_notification, lost_notification,
@@ -58,6 +62,8 @@ pub(crate) enum Closed {
     Handshake,
     /// A message was not strict-profile JSON; `-32700` was sent.
     Parse,
+    /// After `hello`, a call was answered `-32009`: the connection's session ended (KNSH-048).
+    Unbound,
     /// Writing an answer or an event notification failed.
     Write(JsonError),
     /// The thread that writes event notifications could not be started; the connection's subscriptions were ended.
@@ -72,6 +78,7 @@ impl Closed {
             Self::Frame(_) => "frame",
             Self::Handshake => "handshake",
             Self::Parse => "parse",
+            Self::Unbound => "unbound",
             Self::Write(_) => "write",
             Self::Thread => "thread",
         }
@@ -131,6 +138,8 @@ struct Session<'a> {
     greeted: bool,
     /// How raw bytes reach this client: binary frames until a `hello` opts out.
     bytes: ByteTransport,
+    /// Whether a call was answered `-32009`: the connection is closed after that answer.
+    unbound: bool,
     /// The stream ID the next call may open. Every stream is ended before the next message is read, so IDs never
     /// collide; they still advance so that a client never sees an ID reused back to back.
     next_stream: StreamId,
@@ -190,6 +199,11 @@ impl Session<'_> {
                     stream,
                     ..Step::reply(success(request.id, result))
                 }
+            }
+            // The caller has no live session any more: nothing else can succeed on this connection.
+            Err(error) if error.code == ErrorCode::InvalidSessionToken => {
+                self.unbound = true;
+                Step::reply_and_close(failure(Some(request.id), error))
             }
             Err(error) => Step::reply(failure(Some(request.id), error)),
         }
@@ -256,6 +270,9 @@ fn failure(id: Option<RequestId>, error: RpcError) -> Message {
 
 /// Serves one connection until it ends, and says why it ended.
 ///
+/// `peer` is the peer's audit token on `agent.sock` (or `None` on `user.sock`, or when the kernel could not report
+/// it); `hello` there uses it to match a caller without a session token to its envelope (KNSH-048).
+///
 /// `on_greeted` runs once, right after `hello` succeeds and before its answer is written; the server uses it to lift
 /// the handshake read timeout. `shutdown` closes the underlying connection in both directions: the pump calls it when
 /// a notification cannot be written, so that the reading thread, blocked in a read, ends too.
@@ -263,6 +280,7 @@ pub(crate) fn serve<R: Read, W: Write + Send>(
     reader: R,
     writer: W,
     endpoint: Endpoint,
+    peer: Option<AuditToken>,
     dispatcher: &Dispatcher,
     on_greeted: &mut dyn FnMut(),
     shutdown: &(dyn Fn() + Sync),
@@ -270,7 +288,7 @@ pub(crate) fn serve<R: Read, W: Write + Send>(
     let mut reader = FrameReader::new(reader);
     let writer = Mutex::new(FrameWriter::new(writer));
     let subscriber = Subscriber::new();
-    let binding = SessionBinding::new();
+    let binding = SessionBinding::for_peer(peer);
     let mut session = Session {
         endpoint,
         dispatcher,
@@ -278,6 +296,7 @@ pub(crate) fn serve<R: Read, W: Write + Send>(
         binding: &binding,
         greeted: false,
         bytes: ByteTransport::BinaryFrames,
+        unbound: false,
         next_stream: FIRST_STREAM,
     };
     thread::scope(|scope| {
@@ -310,9 +329,11 @@ pub(crate) fn serve<R: Read, W: Write + Send>(
             }
             drop(out);
             if step.close {
-                // Once greeted, only malformed JSON closes the connection; before that, every close is the handshake
-                // rule (including malformed JSON as the first message).
-                break if session.greeted {
+                // Once greeted, only malformed JSON and a lost session close the connection; before that, every close
+                // is the handshake rule (including malformed JSON as the first message, and a refused agent hello).
+                break if session.unbound {
+                    Closed::Unbound
+                } else if session.greeted {
                     Closed::Parse
                 } else {
                     Closed::Handshake
@@ -497,6 +518,7 @@ mod tests {
             Cursor::new(input),
             &mut output,
             Endpoint::User,
+            None,
             dispatcher,
             &mut || {},
             &|| {},
@@ -565,6 +587,7 @@ mod tests {
             Cursor::new(frames(&[HELLO_REQ, HELLO_REQ])),
             &mut output,
             Endpoint::User,
+            None,
             &dispatcher,
             &mut || {},
             &|| {},
@@ -717,6 +740,7 @@ mod tests {
             Cursor::new(frames(&[HELLO_REQ, HELLO_REQ])),
             &mut output,
             Endpoint::User,
+            None,
             &dispatcher(),
             &mut || calls += 1,
             &|| {},
@@ -744,6 +768,7 @@ mod tests {
             Cursor::new(frames(&[HELLO_REQ])),
             &mut output,
             Endpoint::User,
+            None,
             &dispatcher,
             &mut || {},
             &|| {},
@@ -774,7 +799,7 @@ mod tests {
             .unwrap();
         let thread = std::thread::spawn(move || {
             let stream = &server;
-            serve(stream, stream, Endpoint::User, &dispatcher, &mut || {}, &|| {
+            serve(stream, stream, Endpoint::User, None, &dispatcher, &mut || {}, &|| {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
             })
         });
@@ -968,7 +993,7 @@ mod tests {
             std::thread::spawn(move || {
                 let stream = &server;
                 let writer = BreakableWriter { stream, fail: &fail };
-                serve(stream, writer, Endpoint::User, &dispatcher, &mut || {}, &|| {
+                serve(stream, writer, Endpoint::User, None, &dispatcher, &mut || {}, &|| {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                 })
             })

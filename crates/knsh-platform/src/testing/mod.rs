@@ -11,6 +11,8 @@
 //! - [`RecordingLog`]: keeps every entry for assertions.
 //! - [`FakeSocketActivation`], [`FixedPeerCredentials`], [`RecordingServiceManager`]: launchd sockets, peer
 //!   credentials and `launchctl`, without touching the real launchd (KNSH-012).
+//! - [`FakeProcessTree`]: a process table the test builds, with processes that exit and pids that are reused
+//!   (KNSH-048).
 //! - [`FakeSystemProbe`]: OS version and file-event checks with set answers, counting calls (KNSH-014).
 //!
 //! - [`ScriptedDenialLog`]: sandbox denial entries written by the test, canaries echoed back, failing opens and
@@ -18,6 +20,7 @@
 //!
 //! Locks in the fakes are independent (one per fake) and never held across calls into another fake.
 
+mod ancestry;
 mod clock;
 mod denials;
 mod fs;
@@ -27,6 +30,7 @@ mod probe;
 mod process;
 mod random;
 
+pub use ancestry::FakeProcessTree;
 pub use clock::FakeClock;
 pub use denials::{ScriptedDenialLog, kernel_entry};
 pub use fs::{DEFAULT_UID, MemFs};
