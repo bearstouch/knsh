@@ -12,9 +12,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use knsh_core::{
-    Actor, ActorKind, AgentId, CanonicalPath, CheckpointId, ExecutionRecord, OutputInfo, OutputStream, RecordDetails,
-    RecordId, Redacted, SandboxViolation, Session, SessionId, Timestamp, decode_violations, encode_violations,
-    merge_into,
+    Actor, ActorKind, AgentId, CanonicalPath, CheckpointId, ExecutionRecord, OutputInfo, OutputStream, RecordDecision,
+    RecordDetails, RecordId, Redacted, SandboxViolation, Session, SessionId, Timestamp, decode_decision,
+    decode_violations, encode_decision, encode_violations, merge_into,
 };
 use knsh_platform::sqlite::{Connection, DATABASE_MODE, DEFAULT_BUSY_TIMEOUT, Statement, Step, Value};
 use knsh_platform::{FileKind, Fs};
@@ -46,7 +46,8 @@ impl RecordedOutput {
 
 /// The columns [`read_record`] expects, in order.
 const RECORD_COLUMNS: &str = "record_id, session_id, actor_kind, agent_id, command, rewritten_from, cwd, started_at, \
-     ended_at, exit_code, pipestatus, signal, sandbox_profile, secrets_injected, checkpoint_id, sandbox_violations";
+     ended_at, exit_code, pipestatus, signal, sandbox_profile, secrets_injected, checkpoint_id, sandbox_violations, \
+     decision";
 
 /// The most distinct sandbox violations one record keeps (FR-SBX-08). Repeats of a kept one only add to its count;
 /// further distinct ones are dropped, so one noisy command cannot grow its record without bound.
@@ -134,7 +135,7 @@ impl Database {
         transaction.execute(
             &format!(
                 "INSERT INTO records ({RECORD_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-                 ?13, ?14, ?15, ?16)"
+                 ?13, ?14, ?15, ?16, ?17)"
             ),
             &encoded.values(&record),
         )?;
@@ -469,6 +470,7 @@ struct Encoded {
     secrets_injected: Option<String>,
     checkpoint_id: Option<String>,
     sandbox_violations: Option<String>,
+    decision: Option<String>,
     started_at: i64,
     ended_at: Option<i64>,
 }
@@ -501,6 +503,13 @@ impl Encoded {
             merge_into(&mut kept, details.sandbox_violations.clone(), MAX_VIOLATIONS_PER_RECORD);
             Some(encode_violations(&kept).map_err(|_| StoreError::InvalidRecord("sandbox_violations"))?)
         };
+        // The `decision` object as JSON text (KNSH-050); the column was reserved, always NULL, before.
+        let decision = details
+            .decision
+            .as_ref()
+            .map(encode_decision)
+            .transpose()
+            .map_err(|_| StoreError::InvalidRecord("decision"))?;
         Ok(Self {
             record_id: record.record_id.to_string(),
             session_id: record.session_id.to_string(),
@@ -508,13 +517,14 @@ impl Encoded {
             secrets_injected,
             checkpoint_id: details.checkpoint_id.map(|id| id.to_string()),
             sandbox_violations,
+            decision,
             started_at: micros(record.started_at)?,
             ended_at: record.ended_at.map(micros).transpose()?,
         })
     }
 
     /// The bound values, in [`RECORD_COLUMNS`] order.
-    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 16] {
+    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 17] {
         let details = &record.details;
         [
             Value::Text(&self.record_id),
@@ -535,6 +545,7 @@ impl Encoded {
             optional_text(self.secrets_injected.as_deref()),
             optional_text(self.checkpoint_id.as_deref()),
             optional_text(self.sandbox_violations.as_deref()),
+            optional_text(self.decision.as_deref()),
         ]
     }
 }
@@ -590,6 +601,7 @@ fn read_record(statement: &Statement<'_>) -> Result<ExecutionRecord, StoreError>
                 .transpose()
                 .map_err(corrupt)?,
             sandbox_violations: stored_violations(statement.column_text(15)?.as_deref())?,
+            decision: stored_decision(statement.column_text(16)?.as_deref())?,
         },
     })
 }
@@ -626,6 +638,12 @@ fn stored_violations(text: Option<&str>) -> Result<Vec<SandboxViolation>, StoreE
         .transpose()
         .map_err(|_| StoreError::Corrupt)
         .map(Option::unwrap_or_default)
+}
+
+/// A record's stored `decision` column: `NULL` is no decision (a human record, or one written before KNSH-050), and
+/// text the engine could not have written is [`StoreError::Corrupt`].
+fn stored_decision(text: Option<&str>) -> Result<Option<RecordDecision>, StoreError> {
+    text.map(decode_decision).transpose().map_err(|_| StoreError::Corrupt)
 }
 
 /// A timestamp as stored: microseconds since the epoch. Every valid timestamp fits in `i64`.

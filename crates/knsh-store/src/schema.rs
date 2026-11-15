@@ -9,7 +9,8 @@
 //!
 //! The schema holds every field of `specs/05-models/execution-record.md`, most of them empty in phase 1. Agent-only
 //! fields that are structured (`argv`, `decision`, `children`, …) are reserved text columns; later phases define
-//! their encoding in a migration of their own.
+//! their encoding. `decision` holds the record's `decision` object as JSON text (KNSH-050); no migration was needed,
+//! because the column existed and no earlier version wrote it.
 
 use knsh_platform::sqlite::{Connection, Step};
 

@@ -283,6 +283,9 @@ impl ToJson for RecordEntry<'_> {
                 .map(ToJson::to_json)
                 .collect::<Result<Vec<_>, _>>()?;
             object.insert("sandbox_violations", Value::Array(violations))?;
+            // How the line was decided (KNSH-050, `execution-record.md#decision`), or null for a record written
+            // before decisions were recorded.
+            object.insert("decision", details.decision.to_json()?)?;
         }
         object.insert("stdout", self.stdout.as_ref().map(output_info).transpose()?.to_json()?)?;
         object.insert("stderr", self.stderr.as_ref().map(output_info).transpose()?.to_json()?)?;
@@ -557,6 +560,26 @@ mod tests {
         );
         assert!(text.contains(r#""pipestatus":[0,1]"#), "{text}");
         assert!(text.contains(r#""sandbox_violations":[]"#), "{text}");
+        assert!(text.contains(r#""decision":null"#), "{text}");
+        let mut decided = record(Actor::Agent(AgentId::new("codex").unwrap()));
+        decided.details.decision = Some(knsh_core::RecordDecision {
+            verdict: knsh_core::DecisionVerdict::Deny,
+            source: knsh_core::DecisionSource::Hook,
+            rule_id: None,
+            decided_by: Some("guard".to_owned()),
+            latency_ms: 3,
+        });
+        let text_decided = json(&RecordEntry {
+            record: &decided,
+            stdout: None,
+            stderr: None,
+        });
+        assert!(
+            text_decided.contains(
+                r#""decision":{"verdict":"deny","source":"hook","rule_id":null,"decided_by":"guard","latency_ms":3}"#
+            ),
+            "{text_decided}"
+        );
         assert!(
             text.contains(r#""stdout":{"size":"10","original_size":"1152921504606846976","skipped":"1152921504606846966","skipped_at":"5"}"#),
             "{text}"

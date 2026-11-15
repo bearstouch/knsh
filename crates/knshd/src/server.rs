@@ -533,6 +533,16 @@ impl Read for &HandshakeReader<'_> {
     }
 }
 
+/// Whether the client of a connection is still there while one of its calls is handled (FR-LC-41): the connection's
+/// reader is idle then, so a peek at the socket shows whether the client closed it.
+struct PeerPresence<'a>(&'a UnixStream);
+
+impl knsh_core::Caller for PeerPresence<'_> {
+    fn gone(&self) -> bool {
+        knsh_platform::macos::peer_closed(self.0)
+    }
+}
+
 /// A connection thread: serves the connection, then logs why it ended if that was abnormal.
 fn serve_one(
     shared: &Shared,
@@ -559,6 +569,7 @@ fn serve_one(
     let closed = connection::serve_with_descriptors(
         &reader,
         &reader,
+        &PeerPresence(stream),
         stream,
         endpoint,
         peer,

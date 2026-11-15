@@ -239,7 +239,38 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
         EventData::CwdChanged { cwd } => Object::new().with("cwd", path(cwd)),
         // The violation's own object (`specs/05-models/event.md#phase-2-payloads`, KNSH-047).
         EventData::SandboxViolation(violation) => violation.to_object(),
+        // KNSH-050 (`specs/05-models/event.md#phase-2-payloads`). Every text was redacted before it was published.
+        EventData::CommandProposed {
+            command,
+            cwd,
+            rewritten_from,
+        } => Object::new()
+            .with("command", command.expose().as_str())?
+            .with("cwd", path(cwd))?
+            .with("rewritten_from", redacted(rewritten_from.as_ref()).to_json()?),
+        EventData::CommandDenied {
+            record_id,
+            command,
+            cwd,
+            source,
+            rule_id,
+            reason,
+        } => Object::new()
+            .with("record_id", record_id.map(|id| id.to_string()).to_json()?)?
+            .with("command", command.expose().as_str())?
+            .with("cwd", path(cwd))?
+            .with("source", source.code())?
+            .with("rule_id", redacted(rule_id.as_ref()).to_json()?)?
+            .with("reason", redacted(reason.as_ref()).to_json()?),
+        EventData::DecisionCancelled { request_id, reason } => Object::new()
+            .with("request_id", request_id.map(|id| id.to_string()).to_json()?)?
+            .with("reason", reason.as_str()),
     }
+}
+
+/// An optional text that was redacted before it was published, as it is emitted.
+fn redacted(text: Option<&knsh_core::Redacted<String>>) -> Option<String> {
+    text.map(|text| text.expose().clone())
 }
 
 /// A path need not be UTF-8; JSON strings must be. Bytes that are not valid UTF-8 show as U+FFFD, as in records.
@@ -429,6 +460,50 @@ mod tests {
             started
                 .contains(r#""data":{"profile":"default","envelope":false,"recording":true,"parent_session_id":null}"#),
             "{started}"
+        );
+    }
+
+    // KNSH-050 (FR-LC-07, FR-LC-32, FR-LC-41): the lifecycle payloads of `specs/05-models/event.md`.
+    #[test]
+    fn lifecycle_payloads() {
+        let agent = || Actor::Agent(AgentId::new("claude-code").unwrap());
+        let cwd = || CanonicalPath::new("/Users/me/app").unwrap();
+        let data =
+            |data: EventData| written(event_notification(SubscriptionId::new(1), &event(data, agent())).unwrap());
+        let proposed = data(EventData::CommandProposed {
+            command: Redacted::new("git status".to_owned()),
+            cwd: cwd(),
+            rewritten_from: Some(Redacted::new("git push --force".to_owned())),
+        });
+        assert!(proposed.contains(r#""method":"command.proposed""#), "{proposed}");
+        assert!(
+            proposed.contains(
+                r#""data":{"command":"git status","cwd":"/Users/me/app","rewritten_from":"git push --force"}"#
+            ),
+            "{proposed}"
+        );
+        let record = RecordId::from_ulid(Ulid::from_u128(9));
+        let denied = data(EventData::CommandDenied {
+            record_id: Some(record),
+            command: Redacted::new("rm -rf build".to_owned()),
+            cwd: cwd(),
+            source: knsh_core::DecisionSource::Rule,
+            rule_id: Some(Redacted::new("exec.deny[0]".to_owned())),
+            reason: None,
+        });
+        assert!(
+            denied.contains(&format!(
+                r#""data":{{"record_id":"{record}","command":"rm -rf build","cwd":"/Users/me/app","source":"rule","rule_id":"exec.deny[0]","reason":null}}"#
+            )),
+            "{denied}"
+        );
+        let cancelled = data(EventData::DecisionCancelled {
+            request_id: None,
+            reason: knsh_core::CancelReason::CallerGone,
+        });
+        assert!(
+            cancelled.contains(r#""data":{"request_id":null,"reason":"caller_gone"}"#),
+            "{cancelled}"
         );
     }
 

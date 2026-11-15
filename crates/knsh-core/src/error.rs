@@ -38,6 +38,8 @@ pub enum CoreError {
     InvalidTimestamp,
     /// A record or output stream name was not one the model defines (`stdout` or `stderr`).
     InvalidOutputStream,
+    /// A record's decision verdict was not `allow`, `deny` or `rewrite`.
+    InvalidDecision,
     /// An agent identifier was empty, too long or held a character outside `[A-Za-z0-9._-]`.
     InvalidAgentId,
     /// A profile name was empty, too long or held a character outside `[A-Za-z0-9._-]`.
@@ -102,6 +104,7 @@ impl fmt::Display for CoreError {
             Self::TimestampOutOfRange => f.write_str("timestamp is outside 1970-01-01 to 9999-12-31 UTC"),
             Self::InvalidTimestamp => f.write_str("timestamp must be YYYY-MM-DDTHH:MM:SS[.ffffff]Z"),
             Self::InvalidOutputStream => f.write_str("output stream must be stdout or stderr"),
+            Self::InvalidDecision => f.write_str("decision verdict must be allow, deny or rewrite"),
             Self::InvalidAgentId => f.write_str("agent_id must be 1 to 64 characters from [A-Za-z0-9._-]"),
             Self::InvalidProfileName => f.write_str("profile name must be 1 to 64 characters from [A-Za-z0-9._-]"),
             Self::AgentIdRequired => f.write_str("an agent session requires actor.agent_id"),

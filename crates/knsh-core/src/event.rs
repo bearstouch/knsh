@@ -34,8 +34,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use crate::error::CoreError;
-use crate::id::{EventId, RecordId, SessionId};
+use crate::id::{EventId, RecordId, RequestId, SessionId};
 use crate::path::CanonicalPath;
+use crate::policy::DecisionSource;
 use crate::redacted::Redacted;
 use crate::session::{Actor, ProfileName, Session, SessionState, StateChanged};
 use crate::time::Timestamp;
@@ -99,6 +100,58 @@ pub enum EventData {
     /// `sandbox.violation`: the system reported a sandbox denial attributed to the session by its tag, best effort
     /// (FR-SBX-08, KNSH-047). Repeats within the merge window are one event with their count.
     SandboxViolation(Box<SandboxViolation>),
+    /// `command.proposed`: lifecycle step 3 (FR-LC-07, KNSH-050), once for each line the supervisor evaluates and
+    /// before its hooks run: once for the line received, and once more for the line a rewrite produced.
+    CommandProposed {
+        /// The line, redacted: what hooks and the authority see (FR-REC-05).
+        command: Redacted<String>,
+        /// The working directory the line would run in.
+        cwd: CanonicalPath,
+        /// The line before a rewrite, when this is the rewritten one (FR-AUTH-30).
+        rewritten_from: Option<Redacted<String>>,
+    },
+    /// `command.denied`: a line was refused and never ran (FR-LC-32).
+    CommandDenied {
+        /// The record of the denial (FR-REC-03), or `None` if it could not be written.
+        record_id: Option<RecordId>,
+        /// The line that was refused, redacted.
+        command: Redacted<String>,
+        /// The working directory it would have run in.
+        cwd: CanonicalPath,
+        /// Which component refused it.
+        source: DecisionSource,
+        /// The rule that matched, when a rule decided.
+        rule_id: Option<Redacted<String>>,
+        /// Why, in words, when the engine has a reason.
+        reason: Option<Redacted<String>>,
+    },
+    /// `decision.cancelled`: a pending decision ended without an answer (FR-LC-41, FR-AUTH-22, FR-AUTH-23).
+    DecisionCancelled {
+        /// The pending request, when the line had reached the ask step; `None` if it was still in its hooks.
+        request_id: Option<RequestId>,
+        /// Why it ended.
+        reason: CancelReason,
+    },
+}
+
+/// Why a pending decision was cancelled (`decision.cancelled`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CancelReason {
+    /// The caller disconnected while the decision was pending (FR-LC-41): the line never runs.
+    CallerGone,
+    /// No answer came before the timeout (FR-AUTH-23): the line is denied.
+    TimedOut,
+}
+
+impl CancelReason {
+    /// The wire spelling: `caller_gone` or `timed_out`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CallerGone => "caller_gone",
+            Self::TimedOut => "timed_out",
+        }
+    }
 }
 
 impl EventData {
@@ -113,6 +166,9 @@ impl EventData {
             Self::CommandFinished { .. } => "command.finished",
             Self::CwdChanged { .. } => "cwd.changed",
             Self::SandboxViolation(_) => "sandbox.violation",
+            Self::CommandProposed { .. } => "command.proposed",
+            Self::CommandDenied { .. } => "command.denied",
+            Self::DecisionCancelled { .. } => "decision.cancelled",
         }
     }
 

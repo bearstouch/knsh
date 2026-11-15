@@ -103,6 +103,9 @@ pub(crate) struct Call<'a> {
     pub(crate) binding: &'a SessionBinding,
     /// Descriptors that arrived with the request: only `exec.run` sees any (KNSH-049).
     pub(crate) descriptors: &'a Passed,
+    /// Whether the client that sent the request is still connected, for a handler that waits on a decision
+    /// (FR-LC-41, KNSH-050).
+    pub(crate) caller: &'a dyn knsh_core::Caller,
 }
 
 /// A successful answer: the `result`, and raw bytes to send after it on [`Call::stream`]
@@ -257,6 +260,18 @@ impl Dispatcher {
         }
     }
 
+    /// This dispatcher with `handler` also serving `name` on `endpoint`, whatever the catalogue says: for tests of
+    /// a method that is still `planned` (`exec.run` until KNSH-051).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn serving(mut self, endpoint: Endpoint, name: &'static str, handler: Handler) -> Self {
+        match endpoint {
+            Endpoint::User => self.user = self.user.with(name, handler),
+            Endpoint::Agent => self.agent = self.agent.with(name, handler),
+        }
+        self
+    }
+
     fn table(&self, endpoint: Endpoint) -> &Table {
         match endpoint {
             Endpoint::User => &self.user,
@@ -384,6 +399,7 @@ pub(crate) mod tests {
             subscriber: subscriber(),
             binding: binding(),
             descriptors: no_descriptors(),
+            caller: &knsh_core::StillWaiting,
         })
     }
 

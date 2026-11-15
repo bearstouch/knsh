@@ -91,6 +91,11 @@ mod probe;
 #[cfg(target_os = "macos")]
 #[cfg_attr(not(test), allow(dead_code))]
 mod profiles;
+// The lifecycle orchestrator (KNSH-050). Served with `exec.run` once lines can be spawned (KNSH-051); until then only
+// tests build it.
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(test), allow(dead_code))]
+mod supervisor;
 // The record store is built on macOS only until the Linux SQLite backend exists.
 #[cfg(target_os = "macos")]
 mod records;
@@ -195,7 +200,7 @@ fn start() -> Result<(), StartError> {
     use knsh_store::{DATABASE_FILE, RecordStore, StoreConfig};
 
     use crate::events::EventHub;
-    use crate::policy::PolicyCheck;
+    use crate::policy::{PolicyCheck, ProfileLoader};
     use crate::records::Records;
     use crate::server::{Config, Exit, Server, Services};
     use crate::sessions::Sessions;
@@ -255,13 +260,13 @@ fn start() -> Result<(), StartError> {
         // Dry runs read profiles and binaries through the real filesystem. `TMPDIR` is set by launchd for the agent;
         // without it `${TMPDIR}` is the system's `/tmp`.
         let tmpdir = std::env::var_os("TMPDIR").map_or_else(|| "/tmp".into(), std::path::PathBuf::from);
-        let policy = PolicyCheck::new(
-            Arc::clone(&sessions),
+        let profiles = ProfileLoader::new(
             Arc::new(RealFs::new()),
             paths.policies_dir(),
             paths.home().to_path_buf(),
             tmpdir,
         );
+        let policy = PolicyCheck::new(Arc::clone(&sessions), profiles);
         let mut handlers = records.handlers();
         handlers.extend(events.handlers());
         handlers.extend(sessions.handlers());

@@ -41,7 +41,9 @@ use std::os::fd::OwnedFd;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
 
-use knsh_core::{Delivery, Lost, SubscriptionId};
+#[cfg(test)]
+use knsh_core::StillWaiting;
+use knsh_core::{Caller, Delivery, Lost, SubscriptionId};
 use knsh_json::{Frame, FrameReader, FrameWriter, JsonError, StreamId};
 use knsh_platform::AuditToken;
 use knsh_proto::{
@@ -157,6 +159,8 @@ struct Session<'a> {
     subscriber: &'a Subscriber,
     /// The human session bound to the connection, if any (KNSH-021).
     binding: &'a SessionBinding,
+    /// Whether the client is still connected, for calls that wait on a decision (FR-LC-41).
+    caller: &'a dyn Caller,
     /// Whether `hello` has succeeded.
     greeted: bool,
     /// How raw bytes reach this client: binary frames until a `hello` opts out.
@@ -261,6 +265,7 @@ impl Session<'_> {
             subscriber: self.subscriber,
             binding: self.binding,
             descriptors,
+            caller: self.caller,
         })
     }
 
@@ -309,6 +314,7 @@ pub(crate) fn serve<R: Read, W: Write + Send>(
     serve_with_descriptors(
         reader,
         &NoDescriptors,
+        &StillWaiting,
         writer,
         endpoint,
         peer,
@@ -328,11 +334,13 @@ pub(crate) fn serve<R: Read, W: Write + Send>(
 /// a notification cannot be written, so that the reading thread, blocked in a read, ends too.
 ///
 /// `inbox` holds the descriptors received with the bytes `reader` returned: those collected while a frame is read go
-/// to that frame's call (module documentation, "Descriptors").
+/// to that frame's call (module documentation, "Descriptors"). `caller` says whether the client is still connected
+/// while a call is being handled ([`Call::caller`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_with_descriptors<R: Read, W: Write + Send>(
     reader: R,
     inbox: &dyn Inbox,
+    caller: &dyn Caller,
     writer: W,
     endpoint: Endpoint,
     peer: Option<AuditToken>,
@@ -349,6 +357,7 @@ pub(crate) fn serve_with_descriptors<R: Read, W: Write + Send>(
         dispatcher,
         subscriber: &subscriber,
         binding: &binding,
+        caller,
         greeted: false,
         bytes: ByteTransport::BinaryFrames,
         unbound: false,

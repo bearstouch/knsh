@@ -6,17 +6,20 @@
 //!
 //! The fields every record has (the human telemetry set of FR-REC-09: `command`, `cwd`, times and `exit_code`) are
 //! plain members; the fields only agent records carry are grouped in [`RecordDetails`], so the store can drop them
-//! as one unit for human sessions. `sandbox_violations` is filled by the violation reader (KNSH-047). Fields that
-//! later phases fill (`argv`, `decision`, `children`,
+//! as one unit for human sessions. `sandbox_violations` is filled by the violation reader (KNSH-047), and `decision`
+//! ([`RecordDecision`]) by the supervisor (KNSH-050). Fields that later phases fill (`argv`, `children`,
 //! `files_changed`, `network`, …) have columns in the store's schema but no member here yet: they are always empty
 //! in phase 1.
 
 use std::fmt;
 use std::str::FromStr;
 
+use knsh_json::{Fields, FromJson, JsonError, Object, ToJson, Value};
+
 use crate::error::CoreError;
 use crate::id::{CheckpointId, RecordId, SessionId};
 use crate::path::CanonicalPath;
+use crate::policy::DecisionSource;
 use crate::redacted::Redacted;
 use crate::session::Actor;
 use crate::time::Timestamp;
@@ -68,6 +71,123 @@ impl FromStr for OutputStream {
     }
 }
 
+/// A record's final effective verdict (`specs/05-models/execution-record.md#decision`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DecisionVerdict {
+    /// The line was allowed as received.
+    Allow,
+    /// The line was refused and never ran (FR-LC-30).
+    Deny,
+    /// A rewrite was applied and the rewritten line was allowed (FR-LC-11).
+    Rewrite,
+}
+
+impl DecisionVerdict {
+    /// The record spelling: `allow`, `deny` or `rewrite`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Rewrite => "rewrite",
+        }
+    }
+}
+
+impl FromStr for DecisionVerdict {
+    type Err = CoreError;
+
+    /// Parses the record spelling exactly.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidDecision`] for anything else.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "allow" => Ok(Self::Allow),
+            "deny" => Ok(Self::Deny),
+            "rewrite" => Ok(Self::Rewrite),
+            _ => Err(CoreError::InvalidDecision),
+        }
+    }
+}
+
+/// The record's `decision` object: how the line was decided, by whom, and how long it took
+/// (`specs/05-models/execution-record.md#decision`, KNSH-050).
+///
+/// The supervisor builds it from the pipeline's own decision, so the record says exactly what the pipeline decided.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RecordDecision {
+    /// The final effective verdict.
+    pub verdict: DecisionVerdict,
+    /// Which component made the final decision.
+    pub source: DecisionSource,
+    /// The deciding rule (`exec.allow[1]`), when a rule decided or asked.
+    pub rule_id: Option<String>,
+    /// Who decided when it was not a rule: the hook, the authority or the user.
+    pub decided_by: Option<String>,
+    /// Time from receiving the line to the final decision, in milliseconds.
+    pub latency_ms: u64,
+}
+
+impl ToJson for RecordDecision {
+    /// `{verdict, source, rule_id, decided_by, latency_ms}`, with `null` for what is unknown.
+    fn to_json(&self) -> Result<Value, JsonError> {
+        Ok(Value::Object(
+            Object::new()
+                .with("verdict", self.verdict.as_str())?
+                .with("source", self.source.code())?
+                .with("rule_id", self.rule_id.to_json()?)?
+                .with("decided_by", self.decided_by.to_json()?)?
+                .with("latency_ms", self.latency_ms.to_json()?)?,
+        ))
+    }
+}
+
+impl FromJson for RecordDecision {
+    /// Reads the object [`ToJson`] writes: every member present (`null` where unknown), nothing else.
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let invalid = |field| JsonError::OutOfRange { field: Some(field) };
+        let mut fields = Fields::new(value)?;
+        let verdict: String = fields.required("verdict")?;
+        let source: String = fields.required("source")?;
+        let rule_id: Option<String> = fields.required("rule_id")?;
+        let decided_by: Option<String> = fields.required("decided_by")?;
+        let latency_ms: u64 = fields.required("latency_ms")?;
+        fields.finish_closed()?;
+        Ok(Self {
+            verdict: verdict.parse().map_err(|_| invalid("verdict"))?,
+            source: DecisionSource::from_code(&source).ok_or_else(|| invalid("source"))?,
+            rule_id,
+            decided_by,
+            latency_ms,
+        })
+    }
+}
+
+/// The stored form of a record's `decision`: its JSON object as text.
+///
+/// # Errors
+///
+/// [`CoreError::InvalidDecision`] only if the object cannot be written, which a valid decision always can.
+pub fn encode_decision(decision: &RecordDecision) -> Result<String, CoreError> {
+    decision
+        .to_json()
+        .and_then(|value| knsh_json::write(&value))
+        .map_err(|_| CoreError::InvalidDecision)
+}
+
+/// Reads the stored form written by [`encode_decision`].
+///
+/// # Errors
+///
+/// [`CoreError::InvalidDecision`] for text that is not such an object.
+pub fn decode_decision(text: &str) -> Result<RecordDecision, CoreError> {
+    knsh_json::parse(text.as_bytes(), text.len())
+        .and_then(|value| RecordDecision::from_json(&value))
+        .map_err(|_| CoreError::InvalidDecision)
+}
+
 /// The fields of an execution record that only agent records carry.
 ///
 /// A human telemetry record keeps none of them (FR-REC-09): the store replaces them with
@@ -89,6 +209,8 @@ pub struct RecordDetails {
     /// Denials the system reported for the line, best effort (FR-SBX-08, KNSH-047). Late ones are appended after
     /// the record is written.
     pub sandbox_violations: Vec<SandboxViolation>,
+    /// How the line was decided (KNSH-050). Every agent line that reaches lifecycle step 2 has one (FR-REC-01).
+    pub decision: Option<RecordDecision>,
 }
 
 impl RecordDetails {
@@ -103,6 +225,7 @@ impl RecordDetails {
             secrets_injected,
             checkpoint_id,
             sandbox_violations,
+            decision,
         } = self;
         rewritten_from.is_none()
             && pipestatus.is_empty()
@@ -111,6 +234,7 @@ impl RecordDetails {
             && secrets_injected.is_empty()
             && checkpoint_id.is_none()
             && sandbox_violations.is_empty()
+            && decision.is_none()
     }
 }
 
@@ -190,6 +314,34 @@ mod tests {
             ..RecordDetails::default()
         };
         assert!(!details.is_empty());
+    }
+
+    // The stored form of `decision` reads back as written; anything else is refused.
+    #[test]
+    fn decision_round_trips_its_json_form() {
+        let decision = RecordDecision {
+            verdict: DecisionVerdict::Rewrite,
+            source: DecisionSource::Authority,
+            rule_id: Some("exec.ask[0]".to_owned()),
+            decided_by: None,
+            latency_ms: 42,
+        };
+        let value = decision.to_json().unwrap();
+        assert_eq!(RecordDecision::from_json(&value).unwrap(), decision);
+        assert_eq!(decode_decision(&encode_decision(&decision).unwrap()).unwrap(), decision);
+        assert_eq!(decode_decision("deny"), Err(CoreError::InvalidDecision));
+        for verdict in [DecisionVerdict::Allow, DecisionVerdict::Deny, DecisionVerdict::Rewrite] {
+            assert_eq!(verdict.as_str().parse::<DecisionVerdict>(), Ok(verdict));
+        }
+        for bad in [
+            r#"{"verdict":"ask","source":"rule","rule_id":null,"decided_by":null,"latency_ms":1}"#,
+            r#"{"verdict":"allow","source":"nobody","rule_id":null,"decided_by":null,"latency_ms":1}"#,
+            r#"{"verdict":"allow","source":"rule","rule_id":null,"decided_by":null,"latency_ms":-1}"#,
+            r#"{"verdict":"allow","source":"rule","decided_by":null,"latency_ms":1}"#,
+        ] {
+            let value = knsh_json::parse(bad.as_bytes(), bad.len()).unwrap();
+            assert!(RecordDecision::from_json(&value).is_err(), "{bad}");
+        }
     }
 
     // NFR-PRIV-02: a record's derived Debug never shows the command.

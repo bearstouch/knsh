@@ -316,7 +316,7 @@ pub(crate) fn invalid_session_token() -> RpcError {
 }
 
 #[cfg(test)]
-mod endpoint_tests;
+pub(crate) mod endpoint_tests;
 #[cfg(test)]
 mod platform_tests;
 

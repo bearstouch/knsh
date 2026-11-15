@@ -30,7 +30,7 @@ const OUTSIDER: ProcessIdentity = ProcessIdentity::new(300, 1);
 
 /// The dispatcher `knshd` serves, over `fixture`'s sessions and store: `hello` and the record, event, session and
 /// policy handlers. Shared with the socket-level tests in `platform_tests`.
-pub(super) fn dispatcher(fixture: &Fixture) -> Dispatcher {
+pub(crate) fn dispatcher(fixture: &Fixture) -> Dispatcher {
     let mut handlers = crate::records::Records::new(Some(fixture.store.clone())).handlers();
     handlers.extend(fixture.hub.handlers());
     handlers.extend(fixture.sessions.handlers());

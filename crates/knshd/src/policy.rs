@@ -41,10 +41,10 @@ use crate::sessions::Sessions;
 /// The method name.
 const POLICY_CHECK: &str = "policy.check";
 
-/// The `policy.check` service. One per `knshd`, shared by every connection.
-pub(crate) struct PolicyCheck {
-    /// The live sessions, read for a session's profile name.
-    sessions: Arc<Sessions>,
+/// Loads profiles by name as `policy.check` and the supervisor both do (module documentation, "Whose policy"), and
+/// gives read-only binary lookups through the same filesystem.
+#[derive(Clone)]
+pub(crate) struct ProfileLoader {
     /// Read only: profile files and binary lookups.
     fs: Arc<dyn Fs>,
     /// The policies directory ([`knsh_platform::EnginePaths::policies_dir`]).
@@ -55,23 +55,54 @@ pub(crate) struct PolicyCheck {
     tmpdir: PathBuf,
 }
 
-impl PolicyCheck {
-    /// The service over `sessions`, reading profiles from `policies` through `fs` and expanding paths with `home` and
-    /// `tmpdir`.
-    pub(crate) fn new(
-        sessions: Arc<Sessions>,
-        fs: Arc<dyn Fs>,
-        policies: PathBuf,
-        home: PathBuf,
-        tmpdir: PathBuf,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            sessions,
+impl ProfileLoader {
+    /// Reads profiles from `policies` through `fs`, expanding paths with `home` and `tmpdir`.
+    pub(crate) fn new(fs: Arc<dyn Fs>, policies: PathBuf, home: PathBuf, tmpdir: PathBuf) -> Self {
+        Self {
             fs,
             policies,
             home,
             tmpdir,
-        })
+        }
+    }
+
+    /// The filesystem profiles and binaries are read through.
+    pub(crate) fn fs(&self) -> &dyn Fs {
+        &*self.fs
+    }
+
+    /// Loads `name` for a line whose working directory is `cwd` (which `${PROJECT}` is found from): `unattended` is
+    /// built in, anything else comes from the policies directory.
+    ///
+    /// # Errors
+    ///
+    /// [`ProfileError`] for a profile that is missing, unreadable or invalid.
+    pub(crate) fn load(&self, name: &ProfileName, cwd: &std::path::Path) -> Result<Profile, ProfileError> {
+        let context = PathContext {
+            home: self.home.clone(),
+            tmpdir: self.tmpdir.clone(),
+            start_dir: cwd.to_path_buf(),
+        };
+        let fs: &dyn Fs = &*self.fs;
+        if name.as_str() == UNATTENDED_PROFILE {
+            return load_unattended(&context, fs);
+        }
+        load_profile(name, &PolicyDirectory::new(self.policies.clone(), fs), &context, fs)
+    }
+}
+
+/// The `policy.check` service. One per `knshd`, shared by every connection.
+pub(crate) struct PolicyCheck {
+    /// The live sessions, read for a session's profile name.
+    sessions: Arc<Sessions>,
+    /// Profiles, loaded as the supervisor loads them.
+    profiles: ProfileLoader,
+}
+
+impl PolicyCheck {
+    /// The service over `sessions`, loading profiles with `profiles`.
+    pub(crate) fn new(sessions: Arc<Sessions>, profiles: ProfileLoader) -> Arc<Self> {
+        Arc::new(Self { sessions, profiles })
     }
 
     /// The `policy.check` handler.
@@ -91,15 +122,11 @@ impl PolicyCheck {
             target,
         } = params(call)?;
         let name = self.profile_name(call, &target)?;
-        let context = PathContext {
-            home: self.home.clone(),
-            tmpdir: self.tmpdir.clone(),
-            start_dir: cwd.as_path().to_path_buf(),
-        };
         let profile = self
-            .load(&name, &context)
+            .profiles
+            .load(&name, cwd.as_path())
             .map_err(|error| load_error(&error, &name, &target))?;
-        let fs: &dyn Fs = &*self.fs;
+        let fs = self.profiles.fs();
         let check = check_line(
             &profile,
             &command,
@@ -124,16 +151,6 @@ impl PolicyCheck {
             (Endpoint::User, PolicyCheckTarget::Session(session_id)) => self.sessions.profile_of(*session_id),
             (Endpoint::User, PolicyCheckTarget::Profile(name)) => Ok(name.clone()),
         }
-    }
-
-    /// Loads `name` as the supervisor will: `unattended` is built in, anything else comes from the policies
-    /// directory.
-    fn load(&self, name: &ProfileName, context: &PathContext) -> Result<Profile, ProfileError> {
-        let fs: &dyn Fs = &*self.fs;
-        if name.as_str() == UNATTENDED_PROFILE {
-            return load_unattended(context, fs);
-        }
-        load_profile(name, &PolicyDirectory::new(self.policies.clone(), fs), context, fs)
     }
 }
 
@@ -177,13 +194,12 @@ pub(crate) mod tests {
 
     /// The service over `sessions` and `fs`, with the fake home's policies directory, `HOME` and `TMPDIR`.
     pub(crate) fn service(sessions: Arc<Sessions>, fs: MemFs) -> Arc<PolicyCheck> {
-        PolicyCheck::new(
-            sessions,
-            Arc::new(fs),
-            policies(),
-            PathBuf::from(HOME),
-            PathBuf::from("/tmp"),
-        )
+        PolicyCheck::new(sessions, loader(fs))
+    }
+
+    /// Profiles from the fake home's policies directory on `fs`.
+    pub(crate) fn loader(fs: MemFs) -> ProfileLoader {
+        ProfileLoader::new(Arc::new(fs), policies(), PathBuf::from(HOME), PathBuf::from("/tmp"))
     }
 
     /// A Mac-like filesystem: trusted binaries, a project, the policies directory and the profiles given.
@@ -233,6 +249,7 @@ pub(crate) mod tests {
             subscriber: subscriber(),
             binding,
             descriptors: crate::dispatch::tests::no_descriptors(),
+            caller: &knsh_core::StillWaiting,
         })
     }
 
@@ -354,7 +371,7 @@ pub(crate) mod tests {
             .publish(session_id, &Actor::Human, EventData::SessionIdle)
             .unwrap();
         assert_eq!(next, 2, "no event is emitted");
-        let fs_after = &service.fs;
+        let fs_after = &service.profiles.fs;
         for (path, contents) in &files_before {
             assert_eq!(&fs_after.read(path, 1 << 20).ok(), contents, "{}", path.display());
         }

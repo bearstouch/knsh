@@ -100,6 +100,22 @@ impl DecisionSource {
             Self::Grant => "grant",
         }
     }
+
+    /// The source spelled `code` ([`code`](Self::code)), or `None` for any other text.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            Self::Rule,
+            Self::Hook,
+            Self::Authority,
+            Self::User,
+            Self::Standalone,
+            Self::RateLimit,
+            Self::Grant,
+        ]
+        .into_iter()
+        .find(|source| source.code() == code)
+    }
 }
 
 /// The decision for one part of a line.
