@@ -31,9 +31,19 @@ pub(super) fn filesystem(profiles: &[(&str, &str)]) -> MemFs {
     }
     let policies = EnginePaths::for_home(Path::new(HOME)).unwrap().policies_dir();
     fs.add_dir_all(&policies).unwrap();
-    for binary in ["/usr/bin/git", "/bin/ls", "/bin/echo", "/bin/rm", "/bin/bash"] {
+    for binary in [
+        "/usr/bin/git",
+        "/usr/bin/env",
+        "/bin/ls",
+        "/bin/echo",
+        "/bin/rm",
+        "/bin/bash",
+    ] {
         fs.write(Path::new(binary), b"#!/bin/sh\n", 0o755).unwrap();
     }
+    // An agent-writable binary: a project executable (FR-POL-14).
+    fs.write(&Path::new(PROJECT).join("build.sh"), b"#!/bin/sh\n", 0o755)
+        .unwrap();
     for (name, text) in profiles {
         fs.write(&policies.join(format!("{name}.toml")), text.as_bytes(), 0o600)
             .unwrap();
@@ -798,4 +808,350 @@ fn signal_names_follow_macos() {
     assert_eq!(signal_name(31), "SIGUSR2");
     assert_eq!(signal_name(64), "SIG64");
     assert_eq!(signal_name(0), "SIG0");
+}
+
+// ---- KNSH-052: agent execution records ----
+
+/// `WEB` with command and output recording off.
+const WEB_UNRECORDED: &str = "name = \"web\"\n[exec]\nallow = [\"git status\", \"ls\", \"echo\"]\nask = [\"git push\"]\n\
+                              deny = [\"rm\"]\n[recording]\ncommands = false\noutput = false\n";
+
+impl Daemon {
+    /// Runs `line` one millisecond after the previous one, so record IDs (and so `records()`) follow the order the
+    /// lines were run in: the last record is the last line's.
+    fn next(&self, setup: Setup, line: &str) -> Result<Finished, RpcError> {
+        self.clock.advance(Duration::from_millis(1));
+        self.lifecycle(setup).run(self.line(line), &StillWaiting)
+    }
+
+    /// The session's records as the store holds them, with what was kept of their output.
+    fn stored(&self) -> Vec<knsh_store::StoredRecord> {
+        self.fixture
+            .store
+            .query(
+                Scope::All,
+                RecordQuery {
+                    session: Some(self.session_id),
+                    since: None,
+                    until: None,
+                    text: None,
+                    after: None,
+                    limit: PageSize::new(100).unwrap(),
+                },
+            )
+            .unwrap()
+            .records
+    }
+}
+
+/// `(name, path, class, reason, wrapper)` of one `argv` entry.
+type ArgvSummary = (
+    Option<String>,
+    Option<String>,
+    &'static str,
+    Option<String>,
+    Option<usize>,
+);
+
+/// The summary of each `argv` entry of `record`.
+fn argv(record: &ExecutionRecord) -> Vec<ArgvSummary> {
+    record
+        .details
+        .argv
+        .iter()
+        .map(|entry| {
+            (
+                entry.name.as_ref().map(|name| name.expose().clone()),
+                entry.path.clone(),
+                entry.class.code(),
+                entry.class.reason().map(str::to_owned),
+                entry.wrapper,
+            )
+        })
+        .collect()
+}
+
+// FR-REC-01: every line that reaches lifecycle step 2 produces exactly one record, whether it ran, was denied by a
+// rule or a hook, timed out waiting for an answer, was rewritten, or did not run to its end.
+#[test]
+fn writes_one_record_per_line_reaching_parse() {
+    let daemon = Daemon::new();
+    let mut answered = 0;
+    let mut run = |setup: Setup, line: &str| {
+        let _ = daemon.next(setup, line);
+        answered += 1;
+    };
+    run(Setup::default(), "ls");
+    run(Setup::default(), "rm -rf build");
+    run(Setup::default(), "git push");
+    run(
+        Setup {
+            hooks: vec![HookVerdict::Failed],
+            ..Setup::default()
+        },
+        "ls",
+    );
+    run(
+        Setup {
+            authority: Some(vec![AskReply::Rewrite {
+                command: "git status".to_owned(),
+            }]),
+            ..Setup::default()
+        },
+        "git push",
+    );
+    run(
+        Setup {
+            spawner: Some(FakeSpawner {
+                journal: Arc::clone(&daemon.journal),
+                outcome: Err(SpawnFailure::Trampoline(66)),
+                long_running: false,
+            }),
+            ..Setup::default()
+        },
+        "ls",
+    );
+    // A line the parser cannot read still reached step 2: it is recorded (as dynamic) and denied or asked.
+    run(Setup::default(), "echo 'unterminated");
+    let records = daemon.records();
+    assert_eq!(records.len(), answered, "one record per line");
+    let mut ids: Vec<_> = records.iter().map(|record| record.record_id).collect();
+    ids.dedup();
+    assert_eq!(ids.len(), answered, "distinct records");
+    assert!(
+        records.iter().all(|record| record.details.decision.is_some()),
+        "every record says how it was decided"
+    );
+}
+
+// FR-REC-02, NFR-REL-05: when the orchestrator answers (what `exec.run` replies with), the record is already
+// committed, with the line's end, exit code and decision; the reply names exactly that record. The same holds for a
+// denial, whose `command.denied` (published before the answer) names the committed record.
+#[test]
+fn commits_record_before_reply() {
+    let daemon = Daemon::new();
+    daemon.events();
+    let finished = daemon.next(Setup::default(), "ls").unwrap();
+    // Nothing else runs between the answer and this read: the record was written before the answer existed.
+    let record_id = finished.record_id.expect("the reply names its record");
+    let records = daemon.records();
+    let record = records.iter().find(|record| record.record_id == record_id).unwrap();
+    assert!(record.ended_at.is_some());
+    assert_eq!(record.exit_code, Some(0));
+    assert!(record.details.decision.is_some());
+
+    let error = daemon.next(Setup::default(), "rm -rf build").unwrap_err();
+    assert_eq!(error.code, ErrorCode::Denied);
+    let denied = daemon
+        .events()
+        .into_iter()
+        .find_map(|event| match &event.data {
+            EventData::CommandDenied { record_id, .. } => Some(*record_id),
+            _ => None,
+        })
+        .flatten()
+        .expect("command.denied names the written record");
+    assert!(daemon.records().iter().any(|record| record.record_id == denied));
+
+    // A line that cannot be recorded is never run (and so never answered as run).
+    let error = daemon
+        .next(
+            Setup {
+                no_store: true,
+                ..Setup::default()
+            },
+            "ls",
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Denied);
+    assert_eq!(daemon.spawns().len(), 1, "only the first line ran");
+}
+
+// FR-REC-04: `command` is the line executed after the rewrite and `rewritten_from` the received one, for a hook's
+// rewrite as for the authority's; a line that was not rewritten has no `rewritten_from`. The executed line's `argv`
+// is the rewritten one's.
+#[test]
+fn records_rewritten_from() {
+    let daemon = Daemon::new();
+    daemon
+        .next(
+            Setup {
+                hooks: vec![HookVerdict::Rewrite {
+                    command: "git status".to_owned(),
+                }],
+                ..Setup::default()
+            },
+            "git push --force",
+        )
+        .unwrap();
+    let record = daemon.records().pop().unwrap();
+    assert_eq!(record.command.expose(), "git status");
+    assert_eq!(
+        record
+            .details
+            .rewritten_from
+            .as_ref()
+            .map(|text| text.expose().as_str()),
+        Some("git push --force")
+    );
+    let decision = record.details.decision.clone().unwrap();
+    assert_eq!(decision.verdict, DecisionVerdict::Rewrite);
+    assert_eq!(
+        decision.source,
+        DecisionSource::Rule,
+        "the rules allowed the rewritten line"
+    );
+    assert_eq!(
+        argv(&record),
+        [(
+            Some("git".to_owned()),
+            Some("/usr/bin/git".to_owned()),
+            "static",
+            None,
+            None
+        )]
+    );
+
+    daemon.next(Setup::default(), "ls").unwrap();
+    assert!(daemon.records().pop().unwrap().details.rewritten_from.is_none());
+}
+
+// FR-REC-03: with command and output recording off in the profile, denials and approvals are still recorded, with
+// their decision and without output.
+#[test]
+fn records_denial_without_output_when_recording_off() {
+    let daemon = Daemon::new();
+    let unrecorded = || Setup {
+        profiles: Some(vec![("web", WEB_UNRECORDED)]),
+        ..Setup::default()
+    };
+    let error = daemon.next(unrecorded(), "rm -rf build").unwrap_err();
+    assert_eq!(error.code, ErrorCode::Denied);
+    daemon
+        .next(
+            Setup {
+                authority: Some(vec![AskReply::Allow]),
+                ..unrecorded()
+            },
+            "git push",
+        )
+        .unwrap();
+
+    let stored = daemon.stored();
+    assert_eq!(stored.len(), 2, "the denial and the approval");
+    let verdicts: Vec<_> = stored
+        .iter()
+        .map(|stored| {
+            let decision = stored.record.details.decision.clone().unwrap();
+            (decision.verdict, decision.source)
+        })
+        .collect();
+    assert_eq!(
+        verdicts,
+        [
+            (DecisionVerdict::Deny, DecisionSource::Rule),
+            (DecisionVerdict::Allow, DecisionSource::Authority)
+        ]
+    );
+    for stored in &stored {
+        assert_eq!((stored.stdout, stored.stderr), (None, None), "no output");
+    }
+}
+
+// Record model: a denied line never ran, so its exit code, signal and sandbox profile are null and it has no
+// pipestatus; its start and end are still set. A line that ran has its exit code and sandbox profile, and no secret
+// was injected in phase 2 (FR-REC-11).
+#[test]
+fn exit_code_null_for_denied_line() {
+    let daemon = Daemon::new();
+    daemon.next(Setup::default(), "rm -rf build").unwrap_err();
+    let denied = daemon.records().pop().unwrap();
+    assert_eq!(denied.exit_code, None);
+    assert_eq!(denied.details.signal, None);
+    assert_eq!(denied.details.sandbox_profile, None);
+    assert_eq!(denied.details.pipestatus, Vec::<i32>::new());
+    assert!(denied.ended_at.is_some());
+    assert_eq!(denied.details.secrets_injected, Vec::<String>::new());
+
+    let failing = FakeSpawner {
+        journal: Arc::clone(&daemon.journal),
+        outcome: Ok(Ran {
+            status: LineStatus::Exited(3),
+            timed_out: false,
+        }),
+        long_running: false,
+    };
+    daemon
+        .next(
+            Setup {
+                spawner: Some(failing),
+                ..Setup::default()
+            },
+            "ls",
+        )
+        .unwrap();
+    let ran = daemon.records().pop().unwrap();
+    assert_eq!(ran.exit_code, Some(3));
+    assert_eq!(ran.details.signal, None);
+    assert_eq!(ran.details.sandbox_profile.as_deref(), Some("web@0123456789abcdef"));
+    assert!(ran.ended_at.unwrap() >= ran.started_at);
+    assert_eq!(ran.details.secrets_injected, Vec::<String>::new());
+}
+
+// Record model (`argv`): each simple command with its canonical path and class; a wrapper and the command it runs
+// are separate entries, the inner one linked to its wrapper; a builtin has no path; a dynamic entry carries its
+// reason; a binary outside the trusted folders is a project executable. Denied lines carry it too; a line the parser
+// could not read is one dynamic entry with the parser's reason.
+#[test]
+fn argv_carries_resolved_path_and_class() {
+    let daemon = Daemon::new();
+    daemon.next(Setup::default(), "echo hi; env FOO=1 git status").ok();
+    let record = daemon.records().pop().unwrap();
+    assert_eq!(
+        argv(&record),
+        [
+            (Some("echo".to_owned()), None, "static", None, None),
+            (
+                Some("env".to_owned()),
+                Some("/usr/bin/env".to_owned()),
+                "wrapper",
+                None,
+                None
+            ),
+            (
+                Some("git".to_owned()),
+                Some("/usr/bin/git".to_owned()),
+                "static",
+                None,
+                Some(1)
+            ),
+        ]
+    );
+    assert!(record.details.argv.iter().all(|entry| entry.arguments_complete));
+
+    daemon.next(Setup::default(), "./build.sh && eval ls").unwrap_err();
+    let record = daemon.records().pop().unwrap();
+    assert_eq!(record.details.decision.as_ref().unwrap().verdict, DecisionVerdict::Deny);
+    let entries = argv(&record);
+    assert_eq!(
+        entries[0],
+        (
+            Some("./build.sh".to_owned()),
+            Some(format!("{PROJECT}/build.sh")),
+            "project_executable",
+            None,
+            None
+        )
+    );
+    assert_eq!(
+        entries[1],
+        (Some("eval".to_owned()), None, "dynamic", Some("eval".to_owned()), None)
+    );
+
+    daemon.next(Setup::default(), "echo 'unterminated").unwrap_err();
+    let record = daemon.records().pop().unwrap();
+    assert_eq!(
+        argv(&record),
+        [(None, None, "dynamic", Some("syntax_error".to_owned()), None)]
+    );
 }
