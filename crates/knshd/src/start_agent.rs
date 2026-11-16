@@ -29,8 +29,8 @@
 //!    an executable file; otherwise `-32602`.
 //! 6. **Session.** Opened with its parent ([`Sessions::open_agent_in`]): row written, `session.started` published,
 //!    token issued.
-//! 7. **Launch (KNSH-057).** The proxy issues the envelope's credentials ([`EnvelopeProxy`]; none while no proxy
-//!    runs). The [`Launcher`] compiles the envelope profile ([`envelope_profile`]) and starts the CLI through
+//! 7. **Launch (KNSH-057).** The proxy issues the envelope's credentials ([`ProxyIssuer`]; none if no proxy
+//!    runs), revoked with the session's lines' when the envelope ends. The [`Launcher`] compiles the envelope profile ([`envelope_profile`]) and starts the CLI through
 //!    `knsh-exec`, in a new process group, on the caller's descriptors, with the envelope environment
 //!    ([`envelope_env`]). The group's leader is registered as the session's envelope (FR-AGT-23) and its group kept
 //!    for pause and resume (FR-SES-10).
@@ -63,8 +63,9 @@
 //!
 //! # Known limits
 //!
-//! - No proxy runs before KNSH-059: `knshd` wires [`crate::proxy::NoProxy`], so the envelope gets no proxy settings
-//!   and reaches only its loopback ports (fail closed). The preset's model API host is the proxy's to allow.
+//! - The proxy (KNSH-059) refuses every destination until host rules exist (KNSH-060), so the envelope still reaches
+//!   only its loopback ports (fail closed); if the proxy could not start, `knshd` wires [`crate::proxy::NoProxy`]
+//!   and the envelope gets no proxy settings at all. The preset's model API host is the proxy's to allow.
 //! - The CLI runs in a process group of `knshd`'s session, not the terminal's: it is never the terminal's foreground
 //!   group. Terminal signals (Ctrl-C with `ISIG` on, `SIGWINCH`) go to `knsh agent`, not to the CLI; a CLI in raw
 //!   mode (as agent CLIs are) reads Ctrl-C as input. `knsh agent` dying ends the envelope (step 8).
@@ -92,7 +93,7 @@ use crate::exec::{PATH_VAR, without_shims};
 use crate::holds::GroupKind;
 use crate::policy::ProfileLoader;
 use crate::profiles::{CompiledProfile, ProfileFiles};
-use crate::proxy::{EnvelopeProxy, ProxyCredential, is_proxy_var, proxy_env};
+use crate::proxy::{ProxyCredential, ProxyIssuer, is_proxy_var, proxy_env};
 use crate::sessions::Sessions;
 use crate::spawn::{line_status, passed, read_by_dynamic_linker, read_status};
 
@@ -172,7 +173,7 @@ pub(crate) struct AgentStarter {
     profiles: ProfileLoader,
     launcher: Arc<dyn Launcher>,
     /// Issues and revokes each envelope's proxy credentials (FR-NET-01).
-    proxy: Arc<dyn EnvelopeProxy>,
+    proxy: Arc<dyn ProxyIssuer>,
     clock: Arc<dyn Clock>,
     /// The shim directory, put first on the envelope's `PATH` (FR-AGT-03) and skipped when finding the program.
     shim_dir: PathBuf,
@@ -192,7 +193,7 @@ impl AgentStarter {
         sessions: Arc<Sessions>,
         profiles: ProfileLoader,
         launcher: Arc<dyn Launcher>,
-        proxy: Arc<dyn EnvelopeProxy>,
+        proxy: Arc<dyn ProxyIssuer>,
         clock: Arc<dyn Clock>,
         shim_dir: PathBuf,
         knsh: PathBuf,

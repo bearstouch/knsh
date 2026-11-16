@@ -19,20 +19,20 @@ so that my traffic is checked like everything else.
 **Acceptance criteria**
 *Proxy core: HTTP CONNECT and per-command credentials*
 
-- [ ] The proxy listens on a loopback port that is allowed in every profile, and on nothing else.
-- [ ] Every spawned line and every envelope gets unique proxy credentials, which are revoked when the line or session
+- [x] The proxy listens on a loopback port that is allowed in every profile, and on nothing else.
+- [x] Every spawned line and every envelope gets unique proxy credentials, which are revoked when the line or session
       ends.
-- [ ] A request with missing or unknown credentials is refused (`407`), and the refusal is reported.
-- [ ] CONNECT requests are parsed with strict limits (request-line and header size, header count). Malformed requests
+- [x] A request with missing or unknown credentials is refused (`407`), and the refusal is reported.
+- [x] CONNECT requests are parsed with strict limits (request-line and header size, header count). Malformed requests
       are refused, never repaired.
-- [ ] The proxy makes no requests of its own (FR-NET-13).
-- [ ] Connections are tunnelled byte for byte after the checks pass. Idle and total timeouts are enforced.
+- [x] The proxy makes no requests of its own (FR-NET-13).
+- [x] Connections are tunnelled byte for byte after the checks pass. Idle and total timeouts are enforced.
 
 *SOCKS5 support*
 
-- [ ] SOCKS5 with username/password authentication (RFC 1929) maps credentials to command and session.
-- [ ] Other authentication methods, SOCKS4, UDP ASSOCIATE and BIND are refused.
-- [ ] Domain-name targets go through the same host rules and address checks as CONNECT. IP-literal targets are
+- [x] SOCKS5 with username/password authentication (RFC 1929) maps credentials to command and session.
+- [x] Other authentication methods, SOCKS4, UDP ASSOCIATE and BIND are refused.
+- [x] Domain-name targets go through the same host rules and address checks as CONNECT. IP-literal targets are
       refused unless allowlisted.
 
 **Unit tests**
@@ -65,3 +65,30 @@ so that my traffic is checked like everything else.
 *SOCKS5 support*
 
 - The spec says "SOCKS" without a version. SOCKS5 only is a proposal to confirm in the spec.
+
+**Implementation status (KNSH-059)**
+
+- `knsh-proxy`: credentials (`credentials.rs`), strict HTTP head reader (`http.rs`), SOCKS5 reader (`socks5.rs`),
+  destinations (`target.rs`), the `ConnectionGate` and `ProxyReport` seams (`gate.rs`), byte-for-byte relay with idle
+  and total timeouts (`relay.rs`), and the server on a kqueue accept loop with one thread per connection
+  (`server.rs`). Fuzz target `proxy_handshake`.
+- `knshd`: starts the proxy on `127.0.0.1:<ephemeral>`; envelopes (KNSH-057) and every spawned line get their own
+  credentials and the proxy port in their profile; a line's inherited proxy settings are replaced by its own; line
+  credentials are revoked when the line ends, a session's when its envelope ends, closing their tunnels.
+- Decisions taken here (written into [network proxy](../03-functional-requirements/network-proxy.md#proxy-core-knsh-059)
+  and [limits](../09-reference/defaults-and-limits.md)): SOCKS5 only (SOCKS4 rejected); plain-HTTP absolute-URI
+  requests are refused with `405` rather than forwarded; a name whose last label is numeric is refused.
+- The refusal "is reported" to the system log for now; the `proxy.denied` event and the record's `network` field are
+  KNSH-060.
+
+**Verified:** unit tests above, plus server tests over real loopback sockets (byte-for-byte tunnel, pipelined bytes,
+owner passed to the gate, 407 cases, revocation closing live tunnels, malformed and oversized heads, `405`, IP
+literals over both protocols, SOCKS5 refusals, handshake, idle and total timeouts, connection limit). Real clients
+through the proxy on macOS 26: curl over CONNECT and over `socks5h` with URL credentials, curl without credentials
+gets `407`, git authenticates after the `407` challenge. Fuzz target `proxy_handshake` ran 60 s (1.8 M inputs)
+without a failure.
+
+**Pending:** the rest of the KNSH-027 client matrix (npm, pip, cargo and Node over CONNECT; git, npm and cargo over
+SOCKS5) needs real hosts, which the proxy refuses until host rules (KNSH-060) and the TLS server-name check (KNSH-061)
+exist. Until then `knshd` runs the proxy with a gate that refuses every destination, and `hello` still reports
+`network_filter: none`.

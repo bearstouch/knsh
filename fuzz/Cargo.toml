@@ -26,6 +26,7 @@ knsh-toml = { path = "../crates/knsh-toml" }
 knsh-bash = { path = "../crates/knsh-bash" }
 knsh-core = { path = "../crates/knsh-core" }
 knsh-platform = { path = "../crates/knsh-platform" }
+knsh-proxy = { path = "../crates/knsh-proxy" }
 
 [[bin]]
 name = "json_reader"
@@ -72,6 +73,13 @@ bench = false
 [[bin]]
 name = "sandbox_log"
 path = "fuzz_targets/sandbox_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_handshake"
+path = "fuzz_targets/proxy_handshake.rs"
 test = false
 doc = false
 bench = false

@@ -278,6 +278,7 @@ fn fixture_writing(behaviour: Behaviour, writes: Option<(&'static [u8], &'static
         trampoline: PathBuf::from(TRAMPOLINE),
         home: CanonicalPath::new(HOME).unwrap(),
         limits: Limits::DEFAULT,
+        proxy: Arc::new(crate::proxy::NoProxy),
     };
     Fixture {
         clock,
@@ -472,6 +473,71 @@ fn strips_shim_directory_from_child_path() {
         Some("web")
     );
     assert!(fixture.fs.contents(Path::new(&profile_file)).is_none());
+}
+
+/// The environment `knsh-exec` was given, as strings.
+fn spawned_env(request: &SpawnRequest) -> Vec<(String, String)> {
+    request
+        .env
+        .iter()
+        .map(|(name, value)| (name.to_str().unwrap().to_owned(), value.to_str().unwrap().to_owned()))
+        .collect()
+}
+
+// FR-NET-01 (KNSH-059): a line gets proxy credentials of its own, tied to its record, in place of any it inherited
+// (its envelope's included); its profile allows the proxy's port; its credentials are revoked when it ends.
+#[test]
+fn line_gets_its_own_proxy_credentials() {
+    let mut fixture = fixture(exits(0));
+    let proxy = Arc::new(crate::proxy::tests::FakeProxy::new(41_000));
+    fixture.spawner.proxy = proxy.clone();
+    let mut line = Line::new(Interpreter::Bash);
+    line.env.extend([
+        (
+            "HTTPS_PROXY".to_owned(),
+            "http://knsh-1:envelopeTok@127.0.0.1:41000".to_owned(),
+        ),
+        ("NO_PROXY".to_owned(), "*".to_owned()),
+    ]);
+    let (report, _) = fixture.run(&line);
+    assert_eq!(ran(&report).status, LineStatus::Exited(0));
+
+    let env = spawned_env(&fixture.request());
+    let url = format!(
+        "http://knsh-line1:{}@127.0.0.1:41000",
+        crate::proxy::tests::FakeProxy::TOKEN
+    );
+    for name in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+        assert!(env.contains(&(name.to_owned(), url.clone())), "{name}: {env:?}");
+    }
+    assert!(
+        !env.iter()
+            .any(|(name, value)| name == "NO_PROXY" || value.contains("envelopeTok")),
+        "{env:?}"
+    );
+    let seen = String::from_utf8(fixture.processes.state().profile_seen.clone().unwrap()).unwrap();
+    assert!(seen.contains("localhost:41000"), "{seen}");
+    let record = RecordId::from_ulid(Ulid::from_u128(7));
+    assert_eq!(*proxy.lines.lock().unwrap(), [record]);
+    assert_eq!(*proxy.revoked_lines.lock().unwrap(), [record]);
+}
+
+// FR-NET-01, fail closed: a line whose credentials cannot be issued never starts, and nothing is left issued.
+#[test]
+fn line_without_proxy_credentials_does_not_start() {
+    let mut fixture = fixture(exits(0));
+    let mut proxy = crate::proxy::tests::FakeProxy::new(41_000);
+    proxy.broken = true;
+    let proxy = Arc::new(proxy);
+    fixture.spawner.proxy = proxy.clone();
+    let (report, seen) = fixture.run(&Line::new(Interpreter::Bash));
+    assert_eq!(report.outcome, Err(SpawnFailure::ProxyCredentials));
+    assert_eq!(fixture.processes.state().spawned, []);
+    assert_eq!(seen.names(), [""; 0]);
+    assert_eq!(
+        *proxy.revoked_lines.lock().unwrap(),
+        [RecordId::from_ulid(Ulid::from_u128(7))]
+    );
 }
 
 // FR-LC-40: at `timeout_s` the group gets SIGTERM, then SIGKILL after the grace period if it is still there; it is
@@ -809,6 +875,7 @@ mod platform {
             trampoline,
             home: CanonicalPath::new(home).unwrap(),
             limits: Limits::DEFAULT,
+            proxy: Arc::new(crate::proxy::NoProxy),
         }
     }
 

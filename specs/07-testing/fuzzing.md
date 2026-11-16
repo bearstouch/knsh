@@ -19,7 +19,7 @@ Test-only crates (fuzzers, property testing) are allowed under the [dependency p
 
 ## Harness
 
-The targets live in `fuzz/`, a test-only workspace outside the shipped one (NFR-SUP-05); its crates are vendored like every other dependency. Each target's properties are a plain function in `fuzz/src/checks.rs` (JSON), `fuzz/src/toml_checks.rs` (TOML), `fuzz/src/bash_checks.rs` (bash lexer and parser) or `fuzz/src/sandbox_log_checks.rs` (sandbox denial log entries), which the stable test suite also runs over every seed and every saved crash (`fuzz/regressions/<target>/`), so a crash found once stays a failing test until it is fixed.
+The targets live in `fuzz/`, a test-only workspace outside the shipped one (NFR-SUP-05); its crates are vendored like every other dependency. Each target's properties are a plain function in `fuzz/src/checks.rs` (JSON), `fuzz/src/toml_checks.rs` (TOML), `fuzz/src/bash_checks.rs` (bash lexer and parser), `fuzz/src/sandbox_log_checks.rs` (sandbox denial log entries) or `fuzz/src/proxy_checks.rs` (proxy handshakes, target `proxy_handshake`), which the stable test suite also runs over every seed and every saved crash (`fuzz/regressions/<target>/`), so a crash found once stays a failing test until it is fixed.
 
 - **CI:** every push runs each target for 60 seconds (`scripts/fuzz.sh`) on a pinned nightly. A crash, a hang (over 10 seconds on one input) or a property failure fails the pipeline, and the crashing inputs are uploaded as an artefact.
 - **Local:** `cargo +nightly fuzz run <target>` runs open-ended and grows the checked-in corpus; `scripts/fuzz.sh <seconds> <target>` runs time-boxed.

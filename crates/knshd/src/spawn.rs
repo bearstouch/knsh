@@ -3,6 +3,11 @@
 //!
 //! [`TrampolineSpawner`] is the real [`Spawner`] behind the lifecycle orchestrator (`supervisor.rs`). For each line:
 //!
+//! 0. **Proxy credentials (FR-NET-01, KNSH-059).** The proxy issues the line credentials of its own, tied to its
+//!    record, and revokes them (closing the connections they opened) when the line ends, however it ends. A line
+//!    whose credentials cannot be issued does not start. Its environment loses every inherited proxy setting (the
+//!    envelope's credentials included, which would attribute its connections to the session alone) and gets its
+//!    own ([`command_env`]); its profile allows the proxy's port. Without a proxy it gets neither.
 //! 1. **Profile (FR-LC-12, FR-SBX-03, FR-SBX-04, FR-LC-15).** The session's profile is compiled for this line by
 //!    `knsh-sandbox`, tagged with its record, allowing exec only of trusted folders, the profile's bash and the
 //!    binaries the line resolved to. It is written to its private `0600` file ([`ProfileFiles`]), referenced until the
@@ -38,8 +43,8 @@
 //!   compiler's deterministic output and the interpreters are always allowed, so neither is expected.
 //! - Members of the group that outlive a leader that exited on its own (`server &`) are left running; only a timeout
 //!   kills the group. A process that leaves the group (`setsid`) is out of reach, as for any process group.
-//! - No proxy is wired yet (KNSH-059): lines are compiled without a proxy port, so the network is closed except the
-//!   profile's loopback ports, and no per-command proxy credentials are given.
+//! - Until host rules exist (KNSH-060) the proxy refuses every destination, so a line still reaches nothing but its
+//!   profile's loopback ports; its credentials and proxy settings are already its own.
 //! - Teeing `knsh -c` output (a session that records output) puts `knshd` in the data path: the line's stdout and
 //!   stderr are pipes, not the caller's terminal, so `isatty` is false for them (stdin stays the caller's).
 
@@ -64,6 +69,7 @@ use crate::exec::Stdio as LineStdio;
 use crate::holds::Kept;
 use crate::jobs::LineControl;
 use crate::profiles::ProfileFiles;
+use crate::proxy::{ProxyCredential, ProxyIssuer, command_env};
 use crate::supervisor::{LineEvents, Ran, SpawnFailure, SpawnPlan, SpawnReport, Spawner};
 
 /// `sh` lines (FR-LC-14): bash in POSIX mode on macOS.
@@ -135,7 +141,7 @@ pub(crate) struct LineToRun<'a> {
     pub(crate) interpreter: Interpreter,
     /// `$0`, `$1`, ….
     pub(crate) args: &'a [String],
-    /// The complete environment.
+    /// The complete environment, before step 0 replaces its proxy settings.
     pub(crate) env: &'a [(String, String)],
     /// The working directory.
     pub(crate) cwd: &'a CanonicalPath,
@@ -165,6 +171,20 @@ pub(crate) struct TrampolineSpawner {
     pub(crate) home: CanonicalPath,
     /// Watch timings.
     pub(crate) limits: Limits,
+    /// Issues and revokes each line's proxy credentials (step 0).
+    pub(crate) proxy: Arc<dyn ProxyIssuer>,
+}
+
+/// Revokes a line's proxy credentials when dropped, so every way out of [`TrampolineSpawner::run`] revokes them.
+struct RevokeOnDrop<'a> {
+    proxy: &'a dyn ProxyIssuer,
+    record_id: RecordId,
+}
+
+impl Drop for RevokeOnDrop<'_> {
+    fn drop(&mut self) {
+        self.proxy.revoke_line(self.record_id);
+    }
 }
 
 impl Spawner for TrampolineSpawner {
@@ -199,8 +219,19 @@ impl Spawner for TrampolineSpawner {
 }
 
 impl TrampolineSpawner {
-    /// Steps 1 to 5 of the module documentation for `line`.
+    /// Steps 0 to 5 of the module documentation for `line`.
     pub(crate) fn run(&self, mut line: LineToRun<'_>, events: &dyn LineEvents) -> SpawnReport {
+        // Step 0. Revoked when `_revoke` is dropped: after the line has ended, or on any early return. Revoking is
+        // harmless when nothing was issued.
+        let _revoke = RevokeOnDrop {
+            proxy: self.proxy.as_ref(),
+            record_id: line.record_id,
+        };
+        let Ok(credential) = self.proxy.issue_line(line.session_id, line.record_id) else {
+            return self.not_run(None, SpawnFailure::ProxyCredentials, line.record_id);
+        };
+        let env = command_env(line.env, credential.as_ref());
+
         // Step 1. The file stays until `compiled` is dropped, after the line has ended.
         let text = compile(&ProfileInput {
             session: line.session_id,
@@ -208,7 +239,7 @@ impl TrampolineSpawner {
             profile: line.profile,
             home: &self.home,
             executables: line.binaries,
-            proxy_port: None,
+            proxy_port: credential.as_ref().map(ProxyCredential::port),
         });
         let Ok(compiled) = self.files.write(&line.profile.name, &text) else {
             return self.not_run(None, SpawnFailure::ProfileFile, line.record_id);
@@ -225,7 +256,14 @@ impl TrampolineSpawner {
             Ok(prepared) => prepared,
             Err(failure) => return self.not_run(sandbox_profile, failure, line.record_id),
         };
-        let request = request(&self.trampoline, compiled.path(), &line, stdio, status_writer.into());
+        let request = request(
+            &self.trampoline,
+            compiled.path(),
+            &line,
+            &env,
+            stdio,
+            status_writer.into(),
+        );
         let spawned = self.processes.spawn(&request);
         // Closes this process's copies of the caller's descriptors, of the output pipes' write ends (so the readers
         // see end of file once the line's processes close theirs) and of the status pipe's write end.
@@ -358,7 +396,7 @@ impl TrampolineSpawner {
                     fields.push(Field::new("errno", Value::Errno(errno)));
                 }
             }
-            SpawnFailure::ProfileFile => {}
+            SpawnFailure::ProxyCredentials | SpawnFailure::ProfileFile => {}
         }
         self.log.log(Level::Error, "agent line not run", &fields);
         SpawnReport {
@@ -459,6 +497,7 @@ fn request(
     trampoline: &Path,
     profile_file: &Path,
     line: &LineToRun<'_>,
+    env: &[(String, String)],
     stdio: Stdio,
     status_writer: OwnedFd,
 ) -> SpawnRequest {
@@ -479,8 +518,7 @@ fn request(
     for operand in line.args {
         request = request.arg("--arg").arg(operand);
     }
-    request.env = line
-        .env
+    request.env = env
         .iter()
         .filter(|(name, _)| !read_by_dynamic_linker(name))
         .map(|(name, value)| (OsString::from(name), OsString::from(value)))
