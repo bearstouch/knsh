@@ -189,7 +189,9 @@ impl PolicyEditor {
 fn user_only(call: &Call<'_>) -> Result<(), RpcError> {
     match call.endpoint {
         Endpoint::User => Ok(()),
-        Endpoint::Agent => Err(RpcError::new(ErrorCode::NotAllowed)),
+        // Signed policy files are edited by the user only (FR-POL-41); the authority pushes policy with
+        // `policy.set` instead (KNSH-071).
+        Endpoint::Agent | Endpoint::Control => Err(RpcError::new(ErrorCode::NotAllowed)),
     }
 }
 

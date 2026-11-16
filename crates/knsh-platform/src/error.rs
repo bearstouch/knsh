@@ -95,6 +95,11 @@ pub enum Operation {
     KeychainRead,
     /// Creating a Keychain item (`SecItemAdd`; the policy signing key, KNSH-065).
     KeychainAdd,
+    /// Reading the code signature of a control-service peer (`SecCodeCreateWithXPCMessage`,
+    /// `SecCodeCopySigningInformation`; KNSH-067).
+    CodeSigning,
+    /// Compiling a code requirement (`SecRequirementCreateWithString`; KNSH-067).
+    CodeRequirement,
 }
 
 impl Operation {
@@ -140,6 +145,8 @@ impl Operation {
             Self::Resolve => "resolve host name",
             Self::KeychainRead => "read keychain item",
             Self::KeychainAdd => "add keychain item",
+            Self::CodeSigning => "read code signature",
+            Self::CodeRequirement => "compile code requirement",
         }
     }
 }
@@ -323,6 +330,17 @@ pub enum PlatformError {
     /// A Keychain item exists but its value is not what the engine stores there (for example a signing key of the
     /// wrong length). Treated like a read failure: tampering, fail closed (decision 11).
     KeychainValueInvalid,
+    /// A Security framework call about code signatures failed (KNSH-067). Carries the `OSStatus`, for example
+    /// `-67065` when the code that sent a message is gone (it exited or exec'd another binary).
+    Security {
+        /// What was being done.
+        operation: Operation,
+        /// The `OSStatus` the Security framework returned.
+        status: i32,
+    },
+    /// An XPC call failed or an XPC object was not what it had to be (KNSH-067). XPC reports no status for most
+    /// failures, so only the operation is kept.
+    Xpc,
 }
 
 impl PlatformError {
@@ -352,7 +370,9 @@ impl PlatformError {
             | Self::InvalidLaunchAgent
             | Self::Launchctl { .. }
             | Self::Keychain { .. }
-            | Self::KeychainValueInvalid => None,
+            | Self::KeychainValueInvalid
+            | Self::Security { .. }
+            | Self::Xpc => None,
         }
     }
 
@@ -374,7 +394,9 @@ impl PlatformError {
             | Self::InvalidLaunchAgent
             | Self::Launchctl { .. }
             | Self::Keychain { .. }
-            | Self::KeychainValueInvalid => None,
+            | Self::KeychainValueInvalid
+            | Self::Security { .. }
+            | Self::Xpc => None,
         }
     }
 
@@ -412,8 +434,11 @@ impl fmt::Display for PlatformError {
             ),
             Self::Launchctl { status: Some(status) } => write!(f, "launchctl exited with status {status}"),
             Self::Launchctl { status: None } => f.write_str("launchctl was ended by a signal"),
-            Self::Keychain { operation, status } => write!(f, "{} failed: OSStatus {status}", operation.as_str()),
+            Self::Keychain { operation, status } | Self::Security { operation, status } => {
+                write!(f, "{} failed: OSStatus {status}", operation.as_str())
+            }
             Self::KeychainValueInvalid => f.write_str("keychain item does not hold a value the engine wrote"),
+            Self::Xpc => f.write_str("xpc call failed"),
         }
     }
 }
@@ -435,7 +460,9 @@ impl std::error::Error for PlatformError {
             | Self::InvalidLaunchAgent
             | Self::Launchctl { .. }
             | Self::Keychain { .. }
-            | Self::KeychainValueInvalid => None,
+            | Self::KeychainValueInvalid
+            | Self::Security { .. }
+            | Self::Xpc => None,
         }
     }
 }

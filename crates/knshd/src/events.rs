@@ -316,7 +316,8 @@ impl EventHub {
 /// the connection was bound to, whether or not it is named (KNSH-048).
 fn scope_of(call: &Call<'_>, asked: Option<SessionId>) -> Result<EventScope, RpcError> {
     match call.endpoint {
-        Endpoint::User => Ok(asked.map_or(EventScope::All, EventScope::Session)),
+        // The authority sees every session, as the user does (`specs/06-api/control-service.md`).
+        Endpoint::User | Endpoint::Control => Ok(asked.map_or(EventScope::All, EventScope::Session)),
         Endpoint::Agent => {
             let own = call.binding.agent_session()?;
             match asked {

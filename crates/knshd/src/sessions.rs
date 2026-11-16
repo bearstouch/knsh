@@ -402,13 +402,16 @@ impl Sessions {
         let session_id = match call.endpoint {
             Endpoint::User => call.binding.session_id()?,
             Endpoint::Agent => call.binding.agent_session()?,
+            // The authority has no session of its own; the catalogue does not list this method there.
+            Endpoint::Control => return Err(RpcError::new(ErrorCode::NotAllowed)),
         };
         let session = lock(&self.registry)
             .get(session_id)
             .cloned()
             .map_err(|_| match call.endpoint {
                 // A human session ends only when its connection closes, after its last call; kept for safety.
-                Endpoint::User => session_gone(session_id),
+                // (The control service never gets here: it was refused above.)
+                Endpoint::User | Endpoint::Control => session_gone(session_id),
                 // An agent session ended between the binding check and this read: the binding is expired.
                 Endpoint::Agent => invalid_session_token(),
             })?;
@@ -706,7 +709,7 @@ impl Activity for Sessions {
 fn user_only(endpoint: Endpoint) -> Result<(), RpcError> {
     match endpoint {
         Endpoint::User => Ok(()),
-        Endpoint::Agent => Err(RpcError::new(ErrorCode::NotAllowed)),
+        Endpoint::Agent | Endpoint::Control => Err(RpcError::new(ErrorCode::NotAllowed)),
     }
 }
 

@@ -26,10 +26,14 @@
 //! - [`MemKeyStore`]: the policy signing key in memory, with read and create failures injected as `OSStatus`
 //!   values, every call counted (KNSH-065).
 //!
+//! - [`FakeCodeSigning`]: the code-signing facts of a control-service peer, scripted and changeable mid-test (a
+//!   peer that exec'd), every inspection counted (KNSH-067).
+//!
 //! Locks in the fakes are independent (one per fake) and never held across calls into another fake.
 
 mod ancestry;
 mod clock;
+mod control;
 mod denials;
 mod fs;
 mod keychain;
@@ -43,6 +47,7 @@ mod resolver;
 
 pub use ancestry::FakeProcessTree;
 pub use clock::FakeClock;
+pub use control::FakeCodeSigning;
 pub use denials::{ScriptedDenialLog, kernel_entry};
 pub use fs::{DEFAULT_UID, MemFs};
 pub use keychain::MemKeyStore;

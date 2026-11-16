@@ -91,7 +91,8 @@ impl Records {
         // let an agent erase records.
         match call.endpoint {
             Endpoint::User => {}
-            Endpoint::Agent => return Err(RpcError::new(ErrorCode::NotAllowed)),
+            // Records are forgotten by the user only, never by an agent or the authority.
+            Endpoint::Agent | Endpoint::Control => return Err(RpcError::new(ErrorCode::NotAllowed)),
         }
         let params: RecordsForgetParams = call.request.params().map_err(|error| RpcError::from(&error))?;
         if params.with_checkpoints {
@@ -211,10 +212,11 @@ impl Records {
     }
 }
 
-/// The scope a caller may read: every session on `user.sock`, only its own on `agent.sock` (KNSH-048).
+/// The scope a caller may read: every session on `user.sock` and the control service
+/// (`specs/06-api/control-service.md`: reads across all sessions), only its own on `agent.sock` (KNSH-048).
 fn scope_of(call: &Call<'_>) -> Result<Scope, RpcError> {
     match call.endpoint {
-        Endpoint::User => Ok(Scope::All),
+        Endpoint::User | Endpoint::Control => Ok(Scope::All),
         Endpoint::Agent => call.binding.agent_session().map(Scope::Session),
     }
 }

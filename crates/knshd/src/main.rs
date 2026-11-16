@@ -35,6 +35,8 @@
 //!   (receiving `exec.run` from `knsh -c` with its stdio passed as descriptors, KNSH-049)
 //! - FR-AUTH-40 to FR-AUTH-43, `specs/06-api/user-socket.md#approvals` (`approval.list`, `approval.approve` and
 //!   `approval.deny`, KNSH-066)
+//! - FR-AUTH-12 – FR-AUTH-14, NFR-SEC-01, `specs/06-api/control-service.md` (the XPC control service with peer
+//!   verification, KNSH-067)
 //!
 //! On start it prepares the engine directories (KNSH-011) and takes its sockets from launchd ([`endpoints`],
 //! KNSH-012). It then serves them ([`server`], KNSH-013): a kqueue accept loop hands each connection to its own
@@ -62,7 +64,11 @@
 //! process groups. Policy files are accepted only with `knshd`'s signature, made with a Keychain key after Touch ID or
 //! the password ([`policy_edit`], KNSH-065). Without an authority, an ask waits for `knsh approve` (after Touch ID or
 //! the password, shown by `knshd`) or `knsh deny` from another terminal, and is denied at the timeout otherwise
-//! ([`approvals`], KNSH-066).
+//! ([`approvals`], KNSH-066). The XPC control service ([`control`], KNSH-067) is served on the Mach name the launch
+//! agent declares: every peer must meet the trusted authority's code-signing requirement, and every message's sender
+//! is checked again (hardened runtime, not debuggable, minimum version) before the message is read; with no trusted
+//! authority every connection is refused. Verified messages are served like socket messages, through the same
+//! dispatcher on the control endpoint.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
@@ -80,6 +86,9 @@ mod approvals;
 mod capture;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod connection;
+// The XPC control service's JSON-RPC side (KNSH-067): verified messages served through the shared dispatcher.
+#[cfg(target_os = "macos")]
+mod control;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod dispatch;
 #[cfg(target_os = "macos")]
@@ -294,27 +303,28 @@ fn start() -> Result<(), StartError> {
             approvals,
         };
         handlers.extend(supervision.handlers());
-        // Probed once, before serving: every hello of this process reports the same result, and a restarted knshd
-        // probes again (KNSH-014).
+        // Probed once before serving: every hello reports the same result; a restarted knshd probes again (KNSH-014).
         let probed = probe_this_machine(&paths, clock.clone(), Arc::clone(&log));
         let violation_status = reader.as_ref().map_or_else(ReaderStatus::stopped, Reader::status);
+        let dispatcher = hello::dispatcher_with_violations(probed, handlers, violation_status, Arc::clone(&sessions));
+        let dispatcher = Arc::new(dispatcher.map_err(StartError::Dispatch)?);
+        let (control, control_service) = serve_control(&dispatcher, &log);
         let services = Services {
-            dispatcher: hello::dispatcher_with_violations(probed, handlers, violation_status, Arc::clone(&sessions))
-                .map_err(StartError::Dispatch)?,
+            dispatcher,
             credentials: Arc::new(SystemPeerCredentials::new()),
             log: Arc::clone(&log),
             own_uid: uid,
             clock,
-            // A recording session keeps knshd alive, as does any open connection. Records are committed as they are
-            // written; on exit knshd waits for queued store jobs.
-            activity: sessions,
+            // Recording sessions and open connections (sockets or control) keep knshd alive; records commit as written.
+            activity: Arc::new(lifetime::AnyActivity(vec![sessions, control])),
             pending: Arc::new(records),
         };
         let server = Server::new(listeners, services, Config::DEFAULT).map_err(StartError::Serve)?;
         server.stop_on_termination_signals().map_err(StartError::Serve)?;
-        Ok((server, reader))
+        Ok((server, reader, control_service))
     };
-    let (server, mut reader) = prepare().map_err(fail)?;
+    // `_control` serves the control service until `start` returns; dropping it cancels every control connection.
+    let (server, mut reader, _control) = prepare().map_err(fail)?;
 
     log.log(Level::Notice, "knshd started", &[]);
     let exit = server.run().map_err(|error| fail(StartError::Serve(error)));
@@ -322,8 +332,7 @@ fn start() -> Result<(), StartError> {
     if let Some(reader) = reader.as_mut() {
         reader.stop();
     }
-    let exit = exit?;
-    let reason = match exit {
+    let reason = match exit? {
         Exit::Idle => "idle",
         Exit::Stopped => "stopped",
     };
@@ -333,6 +342,44 @@ fn start() -> Result<(), StartError> {
         &[Field::new("reason", Value::Static(reason))],
     );
     Ok(())
+}
+
+/// Serves the XPC control service (KNSH-067) on the Mach name the launch agent declares (FR-AUTH-12), verifying every
+/// peer against the trusted authority, and dispatching verified messages through the shared `dispatcher`. Without a
+/// trust record every connection is refused, but the name is still served: launchd would otherwise keep queueing (and
+/// relaunching `knshd` for) messages nobody reads.
+///
+/// Returns the endpoint (its open connections keep `knshd` alive) and the listener, `None`, logged, if it cannot be
+/// created: the engine works fully without an authority.
+#[cfg(target_os = "macos")]
+fn serve_control(
+    dispatcher: &std::sync::Arc<dispatch::Dispatcher>,
+    log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+) -> (
+    std::sync::Arc<control::ControlEndpoint>,
+    Option<knsh_platform::macos::XpcControlService>,
+) {
+    use std::sync::Arc;
+
+    use knsh_platform::launchd::CONTROL_SERVICE;
+    use knsh_platform::macos::XpcControlService;
+    use knsh_platform::{Level, PeerGate};
+
+    let control = control::ControlEndpoint::new(Arc::clone(dispatcher), Arc::clone(log));
+    let gate = PeerGate::new(trusted_authority());
+    let handler: Arc<dyn knsh_platform::ControlHandler> = control.clone();
+    let service = XpcControlService::listen(CONTROL_SERVICE, gate, handler).ok();
+    if service.is_none() {
+        log.log(Level::Error, "control service unavailable", &[]);
+    }
+    (control, service)
+}
+
+/// The authority the user trusted with `knsh authority trust` (FR-AUTH-10). The trust record and its Keychain item
+/// arrive with KNSH-068; until then nothing is trusted, so the control service refuses every connection (FR-AUTH-12).
+#[cfg(target_os = "macos")]
+fn trusted_authority() -> Option<knsh_platform::TrustedAuthority> {
+    None
 }
 
 /// Runs the capability probe on this machine (KNSH-014). The sandbox check runs the `knsh-exec` installed next to

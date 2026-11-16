@@ -124,7 +124,7 @@ impl Running {
             Arc::clone(&exec.handlers()[EXEC_RUN]),
         );
         let services = Services {
-            dispatcher,
+            dispatcher: Arc::new(dispatcher),
             credentials: Arc::new(SystemPeerCredentials::new()),
             log: Arc::new(RecordingLog::new()),
             own_uid: effective_uid(),

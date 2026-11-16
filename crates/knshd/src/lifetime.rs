@@ -23,6 +23,16 @@ pub(crate) trait Activity: Send + Sync {
     fn keeps_alive(&self) -> bool;
 }
 
+/// Keeps `knshd` alive while any of its parts does: the session registry, and the control service's open
+/// connections (KNSH-067).
+pub(crate) struct AnyActivity(pub(crate) Vec<std::sync::Arc<dyn Activity>>);
+
+impl Activity for AnyActivity {
+    fn keeps_alive(&self) -> bool {
+        self.0.iter().any(|activity| activity.keeps_alive())
+    }
+}
+
 /// Writes that must reach disk before `knshd` exits, such as buffered records.
 pub(crate) trait PendingWrites: Send + Sync {
     /// Commits everything pending and returns once it is durable.

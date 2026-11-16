@@ -37,6 +37,20 @@ Descriptors travel as `SCM_RIGHTS` ancillary data on the Unix socket (KNSH-049):
 
 The control service carries the same JSON payload inside XPC messages, and raw bytes as XPC data values, so all three endpoints share one schema.
 
+- **Shape.** Each message is an XPC dictionary. Key `json` holds one JSON-RPC message (UTF-8, strict profile below)
+  as an XPC data value, at most 1 MB, the frame payload limit. Messages from `knshd` may also hold key `bytes`: the
+  raw bytes of the stream the JSON names (for example `records.output`), in place of binary chunks. A request must
+  hold exactly the key `json`; anything else (a missing or non-data `json`, a larger payload, `bytes` or any other
+  key) closes the connection without an answer, like a framing violation on a socket.
+- **Answers** go back as the XPC reply to the request (or as a plain message if the request expects no reply). Event
+  notifications are plain messages on the same connection, sent after the answer that created the subscription. A
+  client that receives replies and messages on different queues must order them itself (by subscription ID). A
+  closing error answer (`-32600`, `-32700`) is sent just before the connection is cancelled and may not arrive.
+- **Same rules.** Handshake first, `-32700` closes, the same dispatch rules; only the method list differs per
+  endpoint. No descriptors travel over XPC.
+- **Verification first** ([control service](control-service.md#verification)). Every message's sender is checked
+  before the message is read; a refused sender's connection is closed without an answer (KNSH-067).
+
 ## Strict JSON profile
 
 The engine accepts only a strict subset of JSON, based on I-JSON (RFC 7493), because its JSON parser reads input from untrusted processes:

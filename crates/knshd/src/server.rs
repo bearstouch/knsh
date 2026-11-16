@@ -92,8 +92,8 @@ impl Config {
 
 /// The effects and services the server needs, shared by every thread.
 pub(crate) struct Services {
-    /// The per-endpoint dispatch tables.
-    pub(crate) dispatcher: Dispatcher,
+    /// The per-endpoint dispatch tables, shared with the control service (KNSH-067).
+    pub(crate) dispatcher: Arc<Dispatcher>,
     /// Who is at the other end of each connection.
     pub(crate) credentials: Arc<dyn PeerCredentials>,
     /// Where refusals and failures are reported. Never receives message content.
@@ -722,7 +722,7 @@ mod tests {
             let activity = Arc::new(FlagActivity::default());
             let journal = Arc::new(Journal::default());
             let services = Services {
-                dispatcher: Dispatcher::from_tables(user_table, agent_table),
+                dispatcher: Arc::new(Dispatcher::from_tables(user_table, agent_table)),
                 credentials: Arc::new(FixedPeerCredentials::uid(peer_uid)),
                 log: log.clone(),
                 own_uid: OWN_UID,

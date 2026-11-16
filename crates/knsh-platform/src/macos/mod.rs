@@ -20,6 +20,7 @@ mod process;
 mod random;
 mod resolver;
 mod shell_host;
+mod xpc;
 
 pub use ancestry::SystemProcessTree;
 pub use clock::SystemClock;
@@ -37,6 +38,7 @@ pub use process::SystemProcesses;
 pub use random::SystemRandom;
 pub use resolver::SystemResolver;
 pub use shell_host::{JobSignalsIgnored, TelemetryPipe, reraise_default};
+pub use xpc::{SecCodeSigning, XpcControlService, XpcMessage};
 
 /// The effective user id of this process: the only owner whose engine paths are used (KNSH-011, NFR-SEC-08).
 #[must_use]
