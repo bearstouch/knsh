@@ -99,7 +99,7 @@ mod probe;
 #[cfg(target_os = "macos")]
 mod profiles;
 // The lifecycle orchestrator (KNSH-050), served with `exec.run` (KNSH-051).
-// Envelope proxy credentials (KNSH-057), used by `start_agent`.
+// Envelope and line proxy credentials (KNSH-057, KNSH-059), used by `start_agent` and the spawner.
 #[cfg(target_os = "macos")]
 mod proxy;
 #[cfg(target_os = "macos")]
@@ -436,13 +436,49 @@ struct Supervision<'a> {
     random: std::sync::Arc<knsh_platform::macos::SystemRandom>,
 }
 
+/// Starts the network proxy (KNSH-059) on a loopback port, refusing every destination until host rules exist
+/// (KNSH-060) and logging each refusal. One that cannot start is logged, and envelopes and lines then get no proxy
+/// settings and no proxy port ([`proxy::NoProxy`]): they reach only their loopback ports (fail closed).
+#[cfg(target_os = "macos")]
+fn start_proxy(
+    clock: std::sync::Arc<knsh_platform::macos::SystemClock>,
+    random: std::sync::Arc<knsh_platform::macos::SystemRandom>,
+    log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+) -> std::sync::Arc<dyn proxy::ProxyIssuer> {
+    use std::sync::Arc;
+
+    use knsh_platform::{Field, Level, Value};
+    use knsh_proxy::{Config, Parts, Proxy, RefuseAll};
+
+    let started = Proxy::start(
+        Config::DEFAULT,
+        Parts {
+            gate: Arc::new(RefuseAll),
+            report: Arc::new(proxy::LoggedDenials::new(Arc::clone(log))),
+            random,
+            clock,
+        },
+    );
+    match started {
+        Ok(running) => Arc::new(proxy::LiveProxy::new(running)),
+        Err(error) => {
+            log.log(
+                Level::Error,
+                "network proxy unavailable",
+                &[Field::new("reason", Value::Static(error.kind()))],
+            );
+            Arc::new(proxy::NoProxy)
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl Supervision<'_> {
     /// The `exec.run` handler: the orchestrator over the real spawner, the `knsh-exec` installed next to this binary
     /// (the one the sandbox probe checked). No hooks, authority or local approvals are wired yet (KNSH-062,
     /// KNSH-069, KNSH-066): every line policy asks about waits and is denied at the timeout. When `knsh-exec` or a
     /// canonical home cannot be found it is logged, and every call is `-32005` ([`exec::unserved_handlers`]).
-    fn exec_run_handlers(self) -> dispatch::Handlers {
+    fn exec_run_handlers(self, proxy: std::sync::Arc<dyn proxy::ProxyIssuer>) -> dispatch::Handlers {
         use std::sync::Arc;
 
         use knsh_core::{CanonicalPath, NoAuthority, NoHooks};
@@ -475,6 +511,7 @@ impl Supervision<'_> {
             trampoline,
             home,
             limits: Limits::DEFAULT,
+            proxy,
         };
         let lifecycle = Lifecycle::new(Parts {
             sessions: Arc::clone(self.sessions),
@@ -499,15 +536,17 @@ impl Supervision<'_> {
     /// `session.start_agent` (KNSH-056) and `exec.*` (KNSH-050 to KNSH-053), over the same paths, sessions,
     /// profiles and clock.
     fn handlers(self) -> dispatch::Handlers {
-        let mut handlers = self.start_agent_handlers();
-        handlers.extend(self.exec_run_handlers());
+        // One proxy issues every envelope's and line's credentials (KNSH-059).
+        let proxy = start_proxy(self.clock.clone(), self.random.clone(), self.log);
+        let mut handlers = self.start_agent_handlers(&proxy);
+        handlers.extend(self.exec_run_handlers(proxy));
         handlers
     }
 
     /// The `session.start_agent` handler (KNSH-056), launching envelopes through the `knsh-exec` beside `knshd`
     /// with the `knsh` beside it as their `SHELL`. Without either binary or a canonical home it is logged, and every
     /// call is `-32005` for the sandbox ([`start_agent::unserved_handlers`]).
-    fn start_agent_handlers(&self) -> dispatch::Handlers {
+    fn start_agent_handlers(&self, proxy: &std::sync::Arc<dyn proxy::ProxyIssuer>) -> dispatch::Handlers {
         use std::sync::Arc;
 
         use knsh_core::CanonicalPath;
@@ -547,8 +586,7 @@ impl Supervision<'_> {
             Arc::clone(self.sessions),
             self.profiles.clone(),
             Arc::new(launcher),
-            // No proxy runs before KNSH-059 (`network_filter: none`): envelopes reach only their loopback ports.
-            Arc::new(proxy::NoProxy),
+            Arc::clone(proxy),
             self.clock.clone(),
             self.paths.shim_dir(),
             knsh.into_path_buf(),

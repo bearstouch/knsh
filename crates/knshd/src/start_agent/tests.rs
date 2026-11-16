@@ -913,7 +913,7 @@ mod platform {
             policies: PathBuf,
             profiles: PathBuf,
             knsh: &CanonicalPath,
-            proxy: Arc<dyn EnvelopeProxy>,
+            proxy: Arc<dyn ProxyIssuer>,
         ) -> Self {
             let fixture = fixture_on(Some(Arc::new(SystemProcessTree::new())));
             let launcher = TrampolineLauncher {

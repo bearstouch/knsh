@@ -13,6 +13,13 @@
 | `command.long_running` | 30 s | Yes (`Limits` in `knshd`; no configuration file key yet) | [command lifecycle](../03-functional-requirements/command-lifecycle.md) |
 | Timeout kill grace | At `timeout_s`, `SIGTERM` to the line's process group, then `SIGKILL` after 2 s if anything is left; the group is killed once more before its leader is reaped | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md#spawning-knsh-051) |
 | Supervised line watch | Checked every 1 ms at first, backing off to every 50 ms: timeouts and `command.long_running` fire at most 50 ms late | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md#spawning-knsh-051) |
+| Proxy listener | One ephemeral port on `127.0.0.1` only, chosen at `knshd` start | — | [network proxy](../03-functional-requirements/network-proxy.md#proxy-core-knsh-059) |
+| Proxy handshake | 10 s for the whole handshake (request head, or SOCKS5 greeting to request), then the connection is closed | — | [network proxy](../03-functional-requirements/network-proxy.md#proxy-core-knsh-059) |
+| Proxy request head | Request line 4096 bytes, header line 8192 bytes, 64 header lines, 16 KiB in all; over a limit is `431` | — | [network proxy](../03-functional-requirements/network-proxy.md#proxy-core-knsh-059) |
+| Proxy connect | 10 s to reach the destination, then `504` (SOCKS5 `0x06`) | — | [network proxy](../03-functional-requirements/network-proxy.md#proxy-core-knsh-059) |
+| Proxy tunnel timeouts | Closed after 5 minutes without a byte either way, and 4 hours after it opened | — | [network proxy](../03-functional-requirements/network-proxy.md#proxy-core-knsh-059) |
+| Proxy connections | 512 at once; further connections are closed on accept and reported | — | [network proxy](../03-functional-requirements/network-proxy.md#proxy-core-knsh-059) |
+| Proxy credentials | 65,536 live at once; a command whose credentials cannot be issued does not start | — | [network proxy](../03-functional-requirements/network-proxy.md#proxy-core-knsh-059) |
 | `session.idle` | 5 s at a human prompt | — | [sessions](../03-functional-requirements/sessions.md) |
 | Human recording | Off | `[recording] human` in `~/.config/knsh/config.toml` | [terminals and shells](../08-integrations/terminals-and-shells.md#recording-a-human-session) |
 | Hosted shell (integration mode) | The bash `$SHELL` names, else `/bin/zsh`; an invalid choice starts `/bin/zsh` | `[shell] hosted` in `~/.config/knsh/config.toml` | [terminals and shells](../08-integrations/terminals-and-shells.md#login-shell) |

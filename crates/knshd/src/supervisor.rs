@@ -155,6 +155,8 @@ pub(crate) struct Ran {
 /// Why a line did not run to its end. Each is answered `-32603`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpawnFailure {
+    /// The proxy could not issue the line's own credentials (FR-NET-01): nothing was started.
+    ProxyCredentials,
     /// Its compiled profile could not be written and checked: nothing was started.
     ProfileFile,
     /// `knsh-exec` could not be started.
@@ -170,6 +172,7 @@ impl SpawnFailure {
     /// A fixed name for logs.
     pub(crate) const fn kind(self) -> &'static str {
         match self {
+            Self::ProxyCredentials => "proxy_credentials",
             Self::ProfileFile => "profile_file",
             Self::Start(_) => "start",
             Self::Trampoline(_) => "profile_not_applied",

@@ -74,6 +74,7 @@ dependencies = [
  "knsh-core",
  "knsh-json",
  "knsh-platform",
+ "knsh-proxy",
  "knsh-toml",
  "libfuzzer-sys",
 ]
@@ -89,6 +90,14 @@ dependencies = [
  "knsh-core",
  "knsh-json",
  "libc",
+]
+
+[[package]]
+name = "knsh-proxy"
+version = "0.0.0"
+dependencies = [
+ "knsh-core",
+ "knsh-platform",
 ]
 
 [[package]]
