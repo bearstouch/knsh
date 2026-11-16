@@ -10,7 +10,7 @@
 // Test helpers outside `#[test]` functions: a failed step should stop the test.
 #![allow(clippy::unwrap_used, clippy::panic)]
 
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::num::NonZeroU16;
 use std::os::unix::net::UnixListener;
@@ -370,16 +370,27 @@ fn unix_sockets_limited_under_sandbox_exec() {
 #[test]
 fn executables_and_signals_limited_under_sandbox_exec() {
     let fixture = Fixture::new("045-exec");
-    // A copy of a platform binary is killed by the system unless re-signed, so it is signed ad hoc.
+    // A project binary: a native program built here, which the linker signs ad hoc. Not a copy of `/bin/echo`: its
+    // only Apple silicon slice is arm64e, which macOS 15 refuses to run once the binary is no longer a platform
+    // binary (observed on the macOS 15.8.2 CI runner; macOS 26.6 runs it), so it failed even under `allow`.
     let copied = fixture.project().join("bin/echo");
-    std::fs::copy("/bin/echo", &copied).unwrap();
-    let signed = Command::new("/usr/bin/codesign")
-        .args(["-s", "-", "-f"])
+    let mut cc = Command::new("/usr/bin/cc")
+        .args(["-x", "c", "-", "-o"])
         .arg(&copied)
-        .stderr(Stdio::null())
-        .status()
+        .stdin(Stdio::piped())
+        .spawn()
         .unwrap();
-    assert!(signed.success());
+    cc.stdin
+        .take()
+        .unwrap()
+        .write_all(b"int main(void) { return 0; }\n")
+        .unwrap();
+    assert!(cc.wait().unwrap().success(), "cc failed");
+    // A precondition, so a binary the system will not run cannot pass for a sandbox failure.
+    assert!(
+        Command::new(&copied).status().unwrap().success(),
+        "the project binary does not run unsandboxed"
+    );
     let script = fixture.project().join("bin/build.sh");
     std::fs::write(&script, "#!/bin/sh\necho built\n").unwrap();
     std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
