@@ -31,10 +31,10 @@ struct Gate {
 }
 
 impl ConnectionGate for Gate {
-    fn check(&self, owner: &Owner, target: &Target) -> Result<SocketAddr, Refusal> {
+    fn check(&self, owner: &Owner, target: &Target) -> Result<Vec<SocketAddr>, Refusal> {
         self.checked.lock().unwrap().push(*owner);
         match &target.host {
-            Host::Name(name) if name == "allowed.test" => Ok(self.server),
+            Host::Name(name) if name == "allowed.test" => Ok(vec![self.server]),
             Host::Name(_) | Host::Ip(_) => Err(Refusal::HostNotAllowed),
         }
     }
@@ -47,6 +47,8 @@ impl ProxyReport for Recorder {
     fn denied(&self, denial: &Denial) {
         self.0.lock().unwrap().push(denial.clone());
     }
+
+    fn contacted(&self, _owner: &Owner, _target: &Target) {}
 }
 
 /// A local HTTP server: every connection gets a fixed `200` after its first read.

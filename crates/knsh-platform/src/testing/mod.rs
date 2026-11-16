@@ -18,6 +18,8 @@
 //! - [`ScriptedDenialLog`]: sandbox denial entries written by the test, canaries echoed back, failing opens and
 //!   ended streams (KNSH-047); [`kernel_entry`] writes one entry as the kernel logs it.
 //!
+//! - [`FakeResolver`]: host names resolved to the addresses the test sets, every question counted (KNSH-060).
+//!
 //! Locks in the fakes are independent (one per fake) and never held across calls into another fake.
 
 mod ancestry;
@@ -29,6 +31,7 @@ mod log;
 mod probe;
 mod process;
 mod random;
+mod resolver;
 
 pub use ancestry::FakeProcessTree;
 pub use clock::FakeClock;
@@ -39,6 +42,7 @@ pub use log::{Entry, RecordingLog};
 pub use probe::FakeSystemProbe;
 pub use process::{Script, ScriptedProcesses};
 pub use random::SeededRandom;
+pub use resolver::FakeResolver;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 

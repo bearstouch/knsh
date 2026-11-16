@@ -172,6 +172,21 @@ pub enum EventData {
         /// The chunk, already through the redaction hook (FR-EVT-07).
         bytes: Redacted<Vec<u8>>,
     },
+    /// `proxy.denied`: the proxy refused a connection of the session (FR-NET-09, KNSH-060). Published for refusals
+    /// whose credentials were live, so the session is known; refusals before that are only logged.
+    ProxyDenied {
+        /// The line whose credentials made the request, or `None` for the envelope's own connection: envelope-level
+        /// connections are attributed to the session alone.
+        record_id: Option<RecordId>,
+        /// How the client spoke to the proxy (`http` or `socks5`), when known.
+        protocol: Option<&'static str>,
+        /// The host the request named, redacted, or `None` when it named no valid one.
+        host: Option<Redacted<String>>,
+        /// The port the request named, when it named a valid destination.
+        port: Option<u16>,
+        /// The proxy's fixed reason (`host_not_allowed`, `approval_required`, `address_not_allowed`, …).
+        reason: &'static str,
+    },
     /// `decision.cancelled`: a pending decision ended without an answer (FR-LC-41, FR-AUTH-22, FR-AUTH-23).
     DecisionCancelled {
         /// The pending request, when the line had reached the ask step; `None` if it was still in its hooks.
@@ -214,6 +229,7 @@ impl EventData {
             | Self::CommandFinished { .. }
             | Self::CwdChanged { .. }
             | Self::SandboxViolation(_)
+            | Self::ProxyDenied { .. }
             | Self::CommandProposed { .. }
             | Self::CommandDenied { .. }
             | Self::CommandDeniedRepeatedly { .. }
@@ -234,6 +250,7 @@ impl EventData {
             Self::CommandFinished { .. } => "command.finished",
             Self::CwdChanged { .. } => "cwd.changed",
             Self::SandboxViolation(_) => "sandbox.violation",
+            Self::ProxyDenied { .. } => "proxy.denied",
             Self::CommandProposed { .. } => "command.proposed",
             Self::CommandDenied { .. } => "command.denied",
             Self::CommandDeniedRepeatedly { .. } => "command.denied_repeatedly",

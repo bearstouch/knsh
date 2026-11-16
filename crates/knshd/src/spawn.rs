@@ -3,11 +3,13 @@
 //!
 //! [`TrampolineSpawner`] is the real [`Spawner`] behind the lifecycle orchestrator (`supervisor.rs`). For each line:
 //!
-//! 0. **Proxy credentials (FR-NET-01, KNSH-059).** The proxy issues the line credentials of its own, tied to its
-//!    record, and revokes them (closing the connections they opened) when the line ends, however it ends. A line
-//!    whose credentials cannot be issued does not start. Its environment loses every inherited proxy setting (the
-//!    envelope's credentials included, which would attribute its connections to the session alone) and gets its
-//!    own ([`command_env`]); its profile allows the proxy's port. Without a proxy it gets neither.
+//! 0. **Proxy credentials (FR-NET-01, KNSH-059, KNSH-060).** The proxy issues the line credentials of its own, tied
+//!    to its record and scoped by the session profile's host rules with the line's classes, dynamic flag and
+//!    approval ([`LineAccess`]), and revokes them (closing the connections they opened) when the line ends, however
+//!    it ends. A line whose credentials cannot be issued does not start. Its environment loses every inherited proxy
+//!    setting (the envelope's credentials included, which would attribute its connections to the session alone) and
+//!    gets its own ([`command_env`]); its profile allows the proxy's port. Without a proxy it gets neither. Revoking
+//!    returns the hosts the line contacted or was refused, for its record's `network` field (FR-NET-09).
 //! 1. **Profile (FR-LC-12, FR-SBX-03, FR-SBX-04, FR-LC-15).** The session's profile is compiled for this line by
 //!    `knsh-sandbox`, tagged with its record, allowing exec only of trusted folders, the profile's bash and the
 //!    binaries the line resolved to. It is written to its private `0600` file ([`ProfileFiles`]), referenced until the
@@ -43,8 +45,6 @@
 //!   compiler's deterministic output and the interpreters are always allowed, so neither is expected.
 //! - Members of the group that outlive a leader that exited on its own (`server &`) are left running; only a timeout
 //!   kills the group. A process that leaves the group (`setsid`) is out of reach, as for any process group.
-//! - Until host rules exist (KNSH-060) the proxy refuses every destination, so a line still reaches nothing but its
-//!   profile's loopback ports; its credentials and proxy settings are already its own.
 //! - Teeing `knsh -c` output (a session that records output) puts `knshd` in the data path: the line's stdout and
 //!   stderr are pipes, not the caller's terminal, so `isatty` is false for them (stdin stays the caller's).
 
@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use knsh_core::{Allowed, CanonicalPath, Profile, RecordId, SessionId};
+use knsh_core::{Allowed, CanonicalPath, LineAccess, NetworkEntry, Profile, RecordId, SessionId};
 use knsh_platform::{
     Clock, ExitStatus, Field, Level, Operation, PlatformError, ProcessGroupId, Processes, SharedFd, Signal,
     SpawnRequest, Stdio, SystemLog, Value,
@@ -153,6 +153,8 @@ pub(crate) struct LineToRun<'a> {
     pub(crate) capture: Option<CapturePlan>,
     /// The line's handle: its kill flag is read while it runs (`exec.kill`).
     pub(crate) control: &'a LineControl,
+    /// What the line presents to the proxy's host rules: its classes, dynamic flag and approval (KNSH-060).
+    pub(crate) access: LineAccess,
 }
 
 /// The [`Spawner`] that runs lines through `knsh-exec` (module documentation).
@@ -175,15 +177,27 @@ pub(crate) struct TrampolineSpawner {
     pub(crate) proxy: Arc<dyn ProxyIssuer>,
 }
 
-/// Revokes a line's proxy credentials when dropped, so every way out of [`TrampolineSpawner::run`] revokes them.
+/// Revokes a line's proxy credentials when dropped, so every way out of [`TrampolineSpawner::run`] revokes them;
+/// [`RevokeOnDrop::finish`] revokes them and keeps what the proxy reported for the record.
 struct RevokeOnDrop<'a> {
     proxy: &'a dyn ProxyIssuer,
     record_id: RecordId,
+    revoked: bool,
+}
+
+impl RevokeOnDrop<'_> {
+    /// Revokes the credentials now and returns the line's `network` entries (FR-NET-09).
+    fn finish(mut self) -> Vec<NetworkEntry> {
+        self.revoked = true;
+        self.proxy.revoke_line(self.record_id)
+    }
 }
 
 impl Drop for RevokeOnDrop<'_> {
     fn drop(&mut self) {
-        self.proxy.revoke_line(self.record_id);
+        if !self.revoked {
+            let _ = self.proxy.revoke_line(self.record_id);
+        }
     }
 }
 
@@ -212,6 +226,7 @@ impl Spawner for TrampolineSpawner {
                 timeout: line.timeout_s.map(Duration::from_secs),
                 capture,
                 control: &line.control,
+                access: LineAccess::of(&allowed),
             },
             events,
         )
@@ -220,17 +235,37 @@ impl Spawner for TrampolineSpawner {
 
 impl TrampolineSpawner {
     /// Steps 0 to 5 of the module documentation for `line`.
-    pub(crate) fn run(&self, mut line: LineToRun<'_>, events: &dyn LineEvents) -> SpawnReport {
-        // Step 0. Revoked when `_revoke` is dropped: after the line has ended, or on any early return. Revoking is
+    pub(crate) fn run(&self, line: LineToRun<'_>, events: &dyn LineEvents) -> SpawnReport {
+        // Step 0. Revoked once the line has ended (`finish`), or on a panic when `revoke` is dropped. Revoking is
         // harmless when nothing was issued.
-        let _revoke = RevokeOnDrop {
+        let revoke = RevokeOnDrop {
             proxy: self.proxy.as_ref(),
             record_id: line.record_id,
+            revoked: false,
         };
-        let Ok(credential) = self.proxy.issue_line(line.session_id, line.record_id) else {
-            return self.not_run(None, SpawnFailure::ProxyCredentials, line.record_id);
+        let issued = self.proxy.issue_line(
+            line.session_id,
+            line.record_id,
+            &line.profile.network,
+            line.access.clone(),
+        );
+        let mut report = match issued {
+            Ok(credential) => self.run_with(line, credential.as_ref(), events),
+            Err(_) => self.not_run(None, SpawnFailure::ProxyCredentials, line.record_id),
         };
-        let env = command_env(line.env, credential.as_ref());
+        // After revocation the proxy has reported every connection the line made (FR-NET-09).
+        report.network = revoke.finish();
+        report
+    }
+
+    /// Steps 1 to 5 for `line`, whose proxy credentials (step 0) are `credential`.
+    fn run_with(
+        &self,
+        mut line: LineToRun<'_>,
+        credential: Option<&ProxyCredential>,
+        events: &dyn LineEvents,
+    ) -> SpawnReport {
+        let env = command_env(line.env, credential);
 
         // Step 1. The file stays until `compiled` is dropped, after the line has ended.
         let text = compile(&ProfileInput {
@@ -239,7 +274,7 @@ impl TrampolineSpawner {
             profile: line.profile,
             home: &self.home,
             executables: line.binaries,
-            proxy_port: credential.as_ref().map(ProxyCredential::port),
+            proxy_port: credential.map(ProxyCredential::port),
         });
         let Ok(compiled) = self.files.write(&line.profile.name, &text) else {
             return self.not_run(None, SpawnFailure::ProfileFile, line.record_id);
@@ -302,6 +337,7 @@ impl TrampolineSpawner {
             sandbox_profile,
             outcome,
             output,
+            network: Vec::new(),
         }
     }
 
@@ -403,6 +439,7 @@ impl TrampolineSpawner {
             sandbox_profile,
             outcome: Err(failure),
             output: None,
+            network: Vec::new(),
         }
     }
 }

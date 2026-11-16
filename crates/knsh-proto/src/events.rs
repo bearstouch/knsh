@@ -316,6 +316,13 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
             .with("command", command.expose().as_str())?
             .with("cwd", path(cwd))?
             .with("until", until.to_string()),
+        EventData::ProxyDenied {
+            record_id,
+            protocol,
+            host,
+            port,
+            reason,
+        } => proxy_denied(*record_id, *protocol, host.as_ref(), *port, reason),
         EventData::DecisionCancelled { request_id, reason } => Object::new()
             .with("request_id", request_id.map(|id| id.to_string()).to_json()?)?
             .with("reason", reason.as_str()),
@@ -351,6 +358,23 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
                 crate::records::bytes(u64::try_from(bytes.expose().len()).unwrap_or(u64::MAX)),
             ),
     }
+}
+
+/// The `proxy.denied` payload (KNSH-060, FR-NET-09): `record_id` is null for the envelope's own connections, which
+/// belong to the session alone; `host` was redacted before it was published.
+fn proxy_denied(
+    record_id: Option<knsh_core::RecordId>,
+    protocol: Option<&str>,
+    host: Option<&knsh_core::Redacted<String>>,
+    port: Option<u16>,
+    reason: &str,
+) -> Result<Object, JsonError> {
+    Object::new()
+        .with("record_id", record_id.map(|id| id.to_string()).to_json()?)?
+        .with("protocol", protocol.map(str::to_owned).to_json()?)?
+        .with("host", redacted(host).to_json()?)?
+        .with("port", port.to_json()?)?
+        .with("reason", reason)
 }
 
 /// An optional text that was redacted before it was published, as it is emitted.
@@ -638,6 +662,41 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    // KNSH-060 (FR-NET-09): `proxy.denied` names the record for a line's refusal and none for the envelope's.
+    #[test]
+    fn proxy_denied_payload() {
+        let record = RecordId::from_ulid(Ulid::from_u128(5));
+        let agent = || Actor::Agent(AgentId::new("claude-code").unwrap());
+        let data =
+            |data: EventData| written(event_notification(SubscriptionId::new(1), &event(data, agent())).unwrap());
+        let proxy_denied = data(EventData::ProxyDenied {
+            record_id: Some(record),
+            protocol: Some("socks5"),
+            host: Some(Redacted::new("github.com".to_owned())),
+            port: Some(443),
+            reason: "approval_required",
+        });
+        assert!(proxy_denied.contains(r#""method":"proxy.denied""#), "{proxy_denied}");
+        assert!(
+            proxy_denied.contains(&format!(
+                r#""data":{{"record_id":"{record}","protocol":"socks5","host":"github.com","port":443,"reason":"approval_required"}}"#
+            )),
+            "{proxy_denied}"
+        );
+        let envelope_denied = data(EventData::ProxyDenied {
+            record_id: None,
+            protocol: None,
+            host: None,
+            port: None,
+            reason: "malformed",
+        });
+        assert!(
+            envelope_denied
+                .contains(r#""data":{"record_id":null,"protocol":null,"host":null,"port":null,"reason":"malformed"}"#),
+            "{envelope_denied}"
+        );
     }
 
     // KNSH-047 (FR-SBX-08): `sandbox.violation` carries the violation's own object.

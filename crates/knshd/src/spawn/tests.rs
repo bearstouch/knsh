@@ -301,6 +301,7 @@ struct Line {
     timeout: Option<Duration>,
     control: LineControl,
     capture: Option<CapturePlan>,
+    access: LineAccess,
 }
 
 impl Line {
@@ -316,6 +317,7 @@ impl Line {
             timeout: None,
             control: LineControl::default(),
             capture: None,
+            access: LineAccess::default(),
         }
     }
 
@@ -334,6 +336,7 @@ impl Line {
             timeout: self.timeout,
             capture: self.capture.clone(),
             control: &self.control,
+            access: self.access.clone(),
         }
     }
 }
@@ -520,6 +523,33 @@ fn line_gets_its_own_proxy_credentials() {
     let record = RecordId::from_ulid(Ulid::from_u128(7));
     assert_eq!(*proxy.lines.lock().unwrap(), [record]);
     assert_eq!(*proxy.revoked_lines.lock().unwrap(), [record]);
+}
+
+// KNSH-060 (FR-NET-03, FR-NET-09): the line's credentials are scoped by what it presents to the host rules, and what
+// the proxy reported for it when its credentials were revoked is handed back for its record.
+#[test]
+fn line_credentials_carry_its_access_and_return_its_network() {
+    let mut fixture = fixture(exits(0));
+    let proxy = Arc::new(crate::proxy::tests::FakeProxy::new(41_000));
+    proxy.network.lock().unwrap().push(knsh_core::NetworkEntry::new(
+        knsh_core::Redacted::new("registry.npmjs.org".to_owned()),
+        443,
+        knsh_core::NetworkResult::Contacted,
+    ));
+    fixture.spawner.proxy = proxy.clone();
+    let mut line = Line::new(Interpreter::Bash);
+    line.access = LineAccess {
+        classes: vec![knsh_core::NetworkClass::Fetch],
+        dynamic: false,
+        approved: true,
+    };
+    let (report, _) = fixture.run(&line);
+    assert_eq!(ran(&report).status, LineStatus::Exited(0));
+    assert_eq!(*proxy.accesses.lock().unwrap(), [line.access.clone()]);
+    assert_eq!(report.network.len(), 1);
+    assert_eq!(report.network[0].host.expose(), "registry.npmjs.org");
+    // Revoked exactly once, when the network was collected.
+    assert_eq!(proxy.revoked_lines.lock().unwrap().len(), 1);
 }
 
 // FR-NET-01, fail closed: a line whose credentials cannot be issued never starts, and nothing is left issued.
@@ -921,6 +951,7 @@ mod platform {
             timeout,
             capture: None,
             control: &LineControl::default(),
+            access: LineAccess::default(),
         };
         let report = spawner.run(line, &Seen::default());
         let mut out = String::new();
@@ -950,6 +981,7 @@ mod platform {
             timeout: None,
             capture: Some(super::capture_plan(knsh_core::DEFAULT_OUTPUT_CAP)),
             control,
+            access: LineAccess::default(),
         };
         spawner.run(line, &Seen::default())
     }

@@ -61,9 +61,9 @@ use std::time::{Duration, Instant};
 use knsh_core::{
     Actor, Allowed, AskAnswer, AskReply, AskRequest, Authority, BinaryLookup, Caller, CancelReason, CanonicalPath,
     Counted, Decision, DecisionSource, DenialLimiter, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR,
-    LineInput, LineKey, LocalApprovals, Observer, Outcome, OutputRedaction, OutputStream, Profile, ProfileName,
-    Proposal, RateLimits, RecordDetails, RecordId, Redacted, Refusal, RefusalKind, RequestId, SessionId, Timestamp,
-    Ulid, argv_of, decide, redact,
+    LineInput, LineKey, LocalApprovals, NetworkEntry, Observer, Outcome, OutputRedaction, OutputStream, Profile,
+    ProfileName, Proposal, RateLimits, RecordDetails, RecordId, Redacted, Refusal, RefusalKind, RequestId, SessionId,
+    Timestamp, Ulid, argv_of, decide, redact,
 };
 use knsh_json::{Object, ToJson, Value};
 use knsh_platform::{Clock, ProcessGroupId, Processes, Random};
@@ -141,6 +141,8 @@ pub(crate) struct SpawnReport {
     pub(crate) outcome: Result<Ran, SpawnFailure>,
     /// Its captured output, when it was captured and the line was spawned.
     pub(crate) output: Option<LineOutput>,
+    /// The hosts the proxy let the line contact or refused it: the record's `network` field (FR-NET-09, KNSH-060).
+    pub(crate) network: Vec<NetworkEntry>,
 }
 
 /// A line that ran and was reaped.
@@ -641,6 +643,7 @@ impl Lifecycle {
                 argv: argv_of(&allowed.classification),
                 signal,
                 sandbox_profile: report.sandbox_profile.clone(),
+                network: report.network.clone(),
                 // `pipestatus` stays empty: the line runs in a separate bash whose `PIPESTATUS` is not reported back
                 // yet (KNSH-100). `secrets_injected` stays empty: no secret is injected in phase 2 (FR-REC-11).
                 ..RecordDetails::default()

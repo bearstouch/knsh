@@ -585,6 +585,34 @@ fn system_services_denied() {
     assert!(!text.contains("user-preference-write"));
 }
 
+// KNSH-060, FR-NET-08: the DNS resolver (its Mach service and its socket) is denied in every profile, whoever it
+// is for, whatever the network mode and whether a proxy serves it, and the denies come after the broad allows they
+// carve out of, so commands cannot resolve names (and cannot carry data out in DNS queries) themselves.
+#[test]
+fn dns_resolver_denied_in_every_profile() {
+    for network in [
+        "",
+        "[network]\nmode = \"allowlist\"\nhosts = [\"example.com\"]\nloopback = [53]\n",
+    ] {
+        for command in [CommandTag::Envelope, CommandTag::Line(record())] {
+            for proxy_port in [None, Some(41_000)] {
+                let text = compiled_with(&profile(network), command, &[], proxy_port);
+                let dns = denies_tagged(&text, "services.dns");
+                assert_eq!(dns.len(), 2, "{network} {command:?} {proxy_port:?}");
+                assert_eq!(dns[0].words[..2], ["deny", "mach-lookup"]);
+                assert_eq!(dns[0].strings[0], b"com.apple.dnssd.service");
+                assert_eq!(dns[1].words[..2], ["deny", "network-outbound"]);
+                assert_eq!(dns[1].strings[0], b"/private/var/run/mDNSResponder");
+                let service_deny = text.find("com.apple.dnssd.service").unwrap();
+                assert!(text.find("(allow mach-lookup)").unwrap() < service_deny);
+                if let Some(outbound) = text.find("(allow network-outbound") {
+                    assert!(outbound < text.find("/private/var/run/mDNSResponder").unwrap());
+                }
+            }
+        }
+    }
+}
+
 // FR-SBX-05: `user.sock` is denied in every profile, after everything else that touches sockets, even for an
 // envelope (which may connect to `agent.sock`) and whatever the profile allows.
 #[test]

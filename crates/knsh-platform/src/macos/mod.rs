@@ -16,6 +16,7 @@ mod log;
 mod probe;
 mod process;
 mod random;
+mod resolver;
 mod shell_host;
 
 pub use ancestry::SystemProcessTree;
@@ -30,6 +31,7 @@ pub use log::UnifiedLog;
 pub use probe::SystemProbes;
 pub use process::SystemProcesses;
 pub use random::SystemRandom;
+pub use resolver::SystemResolver;
 pub use shell_host::{JobSignalsIgnored, TelemetryPipe, reraise_default};
 
 /// The effective user id of this process: the only owner whose engine paths are used (KNSH-011, NFR-SEC-08).

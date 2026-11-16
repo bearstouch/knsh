@@ -129,6 +129,8 @@ pub(super) struct FakeSpawner {
     pub(super) long_running: bool,
     /// What the line writes to stdout and stderr, one chunk each, when its output is captured.
     pub(super) writes: (&'static [u8], &'static [u8]),
+    /// What the proxy reported for the line: the record's `network` field (KNSH-060).
+    pub(super) network: Vec<knsh_core::NetworkEntry>,
 }
 
 impl FakeSpawner {
@@ -142,6 +144,7 @@ impl FakeSpawner {
             }),
             long_running: false,
             writes: (b"", b""),
+            network: Vec::new(),
         }
     }
 }
@@ -188,6 +191,7 @@ impl Spawner for FakeSpawner {
             sandbox_profile: Some(format!("{}@0123456789abcdef", plan.profile.name)),
             outcome: self.outcome,
             output,
+            network: self.network.clone(),
         }
     }
 }
@@ -737,6 +741,7 @@ fn spawning(daemon: &Daemon, outcome: Result<Ran, SpawnFailure>, long_running: b
             outcome,
             long_running,
             writes: (b"", b""),
+            network: Vec::new(),
         }),
         ..Setup::default()
     })
@@ -939,6 +944,7 @@ fn writes_one_record_per_line_reaching_parse() {
                 outcome: Err(SpawnFailure::Trampoline(66)),
                 long_running: false,
                 writes: (b"", b""),
+                network: Vec::new(),
             }),
             ..Setup::default()
         },
@@ -1114,6 +1120,7 @@ fn exit_code_null_for_denied_line() {
         }),
         long_running: false,
         writes: (b"", b""),
+        network: Vec::new(),
     };
     daemon
         .next(
@@ -1540,4 +1547,41 @@ fn limits_a_rewrite_into_a_limited_line() {
         .find(|r| r.details.rewritten_from.is_some())
         .unwrap();
     assert_eq!(record.command.expose(), "rm -rf build");
+}
+
+// KNSH-060 (FR-NET-09): the hosts the proxy reported for the line are written to its record's `network` field.
+#[test]
+fn record_carries_the_lines_network() {
+    let daemon = Daemon::new();
+    let mut spawner = FakeSpawner::new(Arc::clone(&daemon.journal));
+    spawner.network = vec![
+        knsh_core::NetworkEntry::new(
+            Redacted::new("registry.npmjs.org".to_owned()),
+            443,
+            knsh_core::NetworkResult::Contacted,
+        ),
+        knsh_core::NetworkEntry::new(
+            Redacted::new("github.com".to_owned()),
+            443,
+            knsh_core::NetworkResult::Refused("approval_required".to_owned()),
+        ),
+    ];
+    daemon
+        .lifecycle(Setup {
+            spawner: Some(spawner),
+            ..Setup::default()
+        })
+        .run(daemon.line("ls"), &StillWaiting)
+        .unwrap();
+    let [record] = <[ExecutionRecord; 1]>::try_from(daemon.records()).unwrap();
+    let hosts: Vec<(&str, Option<&str>)> = record
+        .details
+        .network
+        .iter()
+        .map(|entry| (entry.host.expose().as_str(), entry.result.reason()))
+        .collect();
+    assert_eq!(
+        hosts,
+        [("registry.npmjs.org", None), ("github.com", Some("approval_required"))]
+    );
 }

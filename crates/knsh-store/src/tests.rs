@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use knsh_core::{
     Actor, AgentId, ArgvClass, ArgvEntry, CanonicalPath, CheckpointId, DecisionSource, DecisionVerdict, DenialReport,
-    DenialTag, ExecutionRecord, OutputStream, ProfileName, RecordDecision, RecordDetails, RecordId, Redacted,
-    SandboxViolation, Session, SessionId, SessionSpec, TaggedCommand, Timestamp, Ulid, encode_decision,
+    DenialTag, ExecutionRecord, NetworkEntry, NetworkResult, OutputStream, ProfileName, RecordDecision, RecordDetails,
+    RecordId, Redacted, SandboxViolation, Session, SessionId, SessionSpec, TaggedCommand, Timestamp, Ulid,
+    encode_decision,
 };
 use knsh_platform::macos::{RealFs, effective_uid};
 use knsh_platform::sqlite::{Connection, DEFAULT_BUSY_TIMEOUT, Step, Value};
@@ -143,6 +144,24 @@ fn full_details() -> RecordDetails {
                 arguments_complete: true,
             },
         ],
+        network: vec![
+            NetworkEntry::new(
+                Redacted::new(String::from("registry.npmjs.org")),
+                443,
+                NetworkResult::Contacted,
+            ),
+            NetworkEntry::new(
+                Redacted::new(String::from("github.com")),
+                443,
+                NetworkResult::Refused(String::from("approval_required")),
+            ),
+            // A repeat of the first: written merged, with its count.
+            NetworkEntry::new(
+                Redacted::new(String::from("registry.npmjs.org")),
+                443,
+                NetworkResult::Contacted,
+            ),
+        ],
     }
 }
 
@@ -264,6 +283,26 @@ fn human_record_drops_non_telemetry_fields() {
     assert_eq!(details.decision, full_details().decision);
     // KNSH-052: each argv entry reads back with its path, class, reason and wrapper link.
     assert_eq!(argv_summary(&details.argv), argv_summary(&full_details().argv));
+    // KNSH-060: the network list reads back merged, in order, with counts and reasons.
+    let network: Vec<(&str, u16, Option<&str>, u32)> = details
+        .network
+        .iter()
+        .map(|entry| {
+            (
+                entry.host.expose().as_str(),
+                entry.port,
+                entry.result.reason(),
+                entry.count,
+            )
+        })
+        .collect();
+    assert_eq!(
+        network,
+        [
+            ("registry.npmjs.org", 443, None, 2),
+            ("github.com", 443, Some("approval_required"), 1)
+        ]
+    );
     assert_eq!(stored.stdout.map(|info| info.stored), Some(3));
     assert_eq!(stored.stderr.map(|info| info.stored), Some(0));
 }

@@ -76,7 +76,7 @@ Outside the subset, and rejected as such: dates and times, floats (including `in
 | `exec.trusted_tools` | list of patterns | Tools run without a per-command profile, after an approval or grant (FR-SBX-09). **Proposed** (KNSH-039) |
 | `exec.bash` | path | The bash that runs agent lines. **Proposed** (KNSH-039) |
 | `network.mode` | `none` \| `allowlist` | |
-| `network.hosts` | list | Open to every command |
+| `network.hosts` | list | Open to every command. Entries are names, `*.` wildcards (every name strictly below) or IP addresses ([matching](../03-functional-requirements/network-proxy.md#host-rules-name-resolution-and-address-checks-knsh-060)) |
 | `network.approval_hosts` | list | Only for commands whose class or approval includes them |
 | `network.class_hosts.fetch`, `network.class_hosts.publish` | list | Approval hosts a line reaches by its class alone, without an approval: each must be in `network.approval_hosts`. Presets may add to them. **Proposed** (KNSH-058) |
 | `network.loopback` | list of ports | Loopback ports allowed |

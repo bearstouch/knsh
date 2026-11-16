@@ -8,8 +8,9 @@
 //! plain members; the fields only agent records carry are grouped in [`RecordDetails`], so the store can drop them
 //! as one unit for human sessions. `sandbox_violations` is filled by the violation reader (KNSH-047), and `decision`
 //! ([`RecordDecision`]) and `argv` ([`ArgvEntry`], from the line's classification) by the supervisor (KNSH-050,
-//! KNSH-052). Fields that later phases fill (`children`, `files_changed`, `network`, …) have columns in the store's
-//! schema but no member here yet: they are always empty in phase 2.
+//! KNSH-052). `network` ([`NetworkEntry`]) lists the hosts the proxy let the line contact or refused it (KNSH-060,
+//! FR-NET-09). Fields that later phases fill (`children`, `files_changed`, …) have columns in the store's schema but
+//! no member here yet: they are always empty in phase 2.
 
 use std::fmt;
 use std::str::FromStr;
@@ -393,6 +394,188 @@ pub fn decode_argv(text: &str) -> Result<Vec<ArgvEntry>, CoreError> {
     if linked { Ok(argv) } else { Err(CoreError::InvalidArgv) }
 }
 
+/// The most distinct entries one record's `network` keeps (FR-NET-09). Repeats of a kept entry only add to its
+/// count; further distinct ones are dropped, so a command that tries many hosts cannot grow its record without
+/// bound.
+pub const MAX_NETWORK_ENTRIES: usize = 256;
+
+/// The longest refusal reason a stored `network` entry may carry: far above the proxy's fixed names.
+const MAX_NETWORK_REASON_LEN: usize = 64;
+
+/// What the proxy did with one connection of the line (KNSH-060).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NetworkResult {
+    /// Every check passed and the tunnel opened.
+    Contacted,
+    /// The proxy refused the connection, for this fixed reason (`host_not_allowed`, `approval_required`, …).
+    Refused(String),
+}
+
+impl NetworkResult {
+    /// `contacted` or `refused`.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Contacted => "contacted",
+            Self::Refused(_) => "refused",
+        }
+    }
+
+    /// The refusal reason, for a refused connection.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Contacted => None,
+            Self::Refused(reason) => Some(reason),
+        }
+    }
+}
+
+/// One element of a record's `network` field: a host and port the line asked the proxy to reach, what the proxy
+/// did, and how many times (FR-NET-09, KNSH-060).
+///
+/// # Invariants
+///
+/// - `count` is at least 1.
+/// - A refusal reason is 1 to 64 lower-case ASCII letters and `_`: one of the proxy's fixed names, never free text.
+#[derive(Debug, Clone)]
+pub struct NetworkEntry {
+    /// The host as the line named it: a normalised name or an IP literal, redacted like every text a record keeps.
+    pub host: Redacted<String>,
+    /// The port.
+    pub port: u16,
+    /// Contacted, or refused and why.
+    pub result: NetworkResult,
+    /// How many connections this entry stands for.
+    pub count: u32,
+}
+
+impl NetworkEntry {
+    /// One connection to `host:port` with `result`.
+    #[must_use]
+    pub fn new(host: Redacted<String>, port: u16, result: NetworkResult) -> Self {
+        Self {
+            host,
+            port,
+            result,
+            count: 1,
+        }
+    }
+
+    /// Whether `other` is a repeat of this entry: same host, port and result.
+    #[must_use]
+    pub fn same_connection(&self, other: &Self) -> bool {
+        self.host.expose() == other.host.expose() && self.port == other.port && self.result == other.result
+    }
+}
+
+impl ToJson for NetworkEntry {
+    /// `{host, port, result, reason, count}`, with `reason` `null` for a contacted host.
+    fn to_json(&self) -> Result<Value, JsonError> {
+        Ok(Value::Object(
+            Object::new()
+                .with("host", self.host.expose().as_str())?
+                .with("port", self.port)?
+                .with("result", self.result.code())?
+                .with("reason", self.result.reason().map(str::to_owned).to_json()?)?
+                .with("count", self.count)?,
+        ))
+    }
+}
+
+impl FromJson for NetworkEntry {
+    /// Reads the object [`ToJson`] writes: every member present, nothing else, a reason exactly when refused, and
+    /// a count of at least 1.
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let invalid = |field| JsonError::OutOfRange { field: Some(field) };
+        let mut fields = Fields::new(value)?;
+        let host: String = fields.required("host")?;
+        let port: u16 = fields.required("port")?;
+        let result: String = fields.required("result")?;
+        let reason: Option<String> = fields.required("reason")?;
+        let count: u32 = fields.required("count")?;
+        fields.finish_closed()?;
+        if host.is_empty() {
+            return Err(invalid("host"));
+        }
+        if count == 0 {
+            return Err(invalid("count"));
+        }
+        let result = match (result.as_str(), reason) {
+            ("contacted", None) => NetworkResult::Contacted,
+            ("refused", Some(reason)) if is_reason(&reason) => NetworkResult::Refused(reason),
+            _ => return Err(invalid("result")),
+        };
+        Ok(Self {
+            host: Redacted::new(host),
+            port,
+            result,
+            count,
+        })
+    }
+}
+
+/// Whether `reason` has the shape of one of the proxy's fixed refusal names.
+fn is_reason(reason: &str) -> bool {
+    !reason.is_empty()
+        && reason.len() <= MAX_NETWORK_REASON_LEN
+        && reason.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+}
+
+/// Adds `incoming` to `kept`, merging repeats of an entry already there and keeping at most `limit` distinct ones.
+/// Returns how many distinct entries did not fit and were dropped.
+pub fn merge_network(kept: &mut Vec<NetworkEntry>, incoming: Vec<NetworkEntry>, limit: usize) -> usize {
+    let mut dropped = 0;
+    for entry in incoming {
+        if let Some(existing) = kept.iter_mut().find(|existing| existing.same_connection(&entry)) {
+            existing.count = existing.count.saturating_add(entry.count);
+        } else if kept.len() < limit {
+            kept.push(entry);
+        } else {
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
+/// The stored form of a record's `network`: its JSON array as text.
+///
+/// # Errors
+///
+/// [`CoreError::InvalidNetwork`] if an entry breaks its invariants (a zero count, a reason that is not a fixed
+/// name), so nothing the engine could not read back is stored.
+pub fn encode_network(network: &[NetworkEntry]) -> Result<String, CoreError> {
+    let valid = network
+        .iter()
+        .all(|entry| entry.count > 0 && !entry.host.expose().is_empty() && entry.result.reason().is_none_or(is_reason));
+    if !valid {
+        return Err(CoreError::InvalidNetwork);
+    }
+    let values = network
+        .iter()
+        .map(ToJson::to_json)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CoreError::InvalidNetwork)?;
+    knsh_json::write(&Value::Array(values)).map_err(|_| CoreError::InvalidNetwork)
+}
+
+/// Reads the stored form written by [`encode_network`].
+///
+/// # Errors
+///
+/// [`CoreError::InvalidNetwork`] for text that is not such an array.
+pub fn decode_network(text: &str) -> Result<Vec<NetworkEntry>, CoreError> {
+    let value = knsh_json::parse(text.as_bytes(), text.len()).map_err(|_| CoreError::InvalidNetwork)?;
+    let Value::Array(items) = value else {
+        return Err(CoreError::InvalidNetwork);
+    };
+    items
+        .iter()
+        .map(NetworkEntry::from_json)
+        .collect::<Result<_, _>>()
+        .map_err(|_| CoreError::InvalidNetwork)
+}
+
 /// The fields of an execution record that only agent records carry.
 ///
 /// A human telemetry record keeps none of them (FR-REC-09): the store replaces them with
@@ -419,6 +602,9 @@ pub struct RecordDetails {
     /// Each simple command of the line with what it resolved to and its class (KNSH-052). Empty only for a line
     /// refused before it was parsed.
     pub argv: Vec<ArgvEntry>,
+    /// The hosts the proxy let the line contact or refused it, as it reported them (FR-NET-09, KNSH-060). Empty for
+    /// a line that asked the proxy for nothing.
+    pub network: Vec<NetworkEntry>,
 }
 
 impl RecordDetails {
@@ -435,6 +621,7 @@ impl RecordDetails {
             sandbox_violations,
             decision,
             argv,
+            network,
         } = self;
         rewritten_from.is_none()
             && pipestatus.is_empty()
@@ -445,6 +632,7 @@ impl RecordDetails {
             && sandbox_violations.is_empty()
             && decision.is_none()
             && argv.is_empty()
+            && network.is_empty()
     }
 }
 
@@ -500,6 +688,84 @@ pub struct OutputInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(host: &str, port: u16, result: NetworkResult) -> NetworkEntry {
+        NetworkEntry::new(Redacted::new(host.to_owned()), port, result)
+    }
+
+    // KNSH-060 (FR-NET-09): a record's `network` list round-trips its stored form, and repeats merge with counts.
+    #[test]
+    fn network_round_trips_and_merges_repeats() {
+        let refused = || NetworkResult::Refused("approval_required".to_owned());
+        let mut kept = Vec::new();
+        let dropped = merge_network(
+            &mut kept,
+            vec![
+                entry("registry.npmjs.org", 443, NetworkResult::Contacted),
+                entry("github.com", 443, refused()),
+                entry("registry.npmjs.org", 443, NetworkResult::Contacted),
+                // Another port or another result is another entry.
+                entry("registry.npmjs.org", 8443, NetworkResult::Contacted),
+                entry("github.com", 443, NetworkResult::Contacted),
+            ],
+            MAX_NETWORK_ENTRIES,
+        );
+        assert_eq!(dropped, 0);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(kept[0].count, 2);
+        let text = encode_network(&kept).unwrap();
+        assert_eq!(
+            text.split("},{").next().unwrap(),
+            r#"[{"host":"registry.npmjs.org","port":443,"result":"contacted","reason":null,"count":2"#
+        );
+        let back = decode_network(&text).unwrap();
+        assert_eq!(back.len(), kept.len());
+        for (back, kept) in back.iter().zip(&kept) {
+            assert!(back.same_connection(kept));
+            assert_eq!(back.count, kept.count);
+        }
+    }
+
+    // Bounded: past the limit, new distinct entries are dropped and counted; repeats still merge.
+    #[test]
+    fn network_keeps_at_most_the_limit() {
+        let mut kept = Vec::new();
+        let many = (1..=5)
+            .map(|port| entry("a.test", port, NetworkResult::Contacted))
+            .collect();
+        assert_eq!(merge_network(&mut kept, many, 3), 2);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(
+            merge_network(&mut kept, vec![entry("a.test", 1, NetworkResult::Contacted)], 3),
+            0
+        );
+        assert_eq!(kept[0].count, 2);
+    }
+
+    // Only what the engine writes is read back: anything else is refused, never repaired.
+    #[test]
+    fn network_refuses_what_the_engine_never_writes() {
+        for bad in [
+            "{}",
+            "[1]",
+            r#"[{"host":"a","port":1,"result":"contacted","reason":"x","count":1}]"#,
+            r#"[{"host":"a","port":1,"result":"refused","reason":null,"count":1}]"#,
+            r#"[{"host":"a","port":1,"result":"refused","reason":"Not A Name","count":1}]"#,
+            r#"[{"host":"a","port":1,"result":"contacted","reason":null,"count":0}]"#,
+            r#"[{"host":"","port":1,"result":"contacted","reason":null,"count":1}]"#,
+            r#"[{"host":"a","port":70000,"result":"contacted","reason":null,"count":1}]"#,
+            r#"[{"host":"a","port":1,"result":"contacted","reason":null,"count":1,"extra":true}]"#,
+        ] {
+            assert_eq!(decode_network(bad).unwrap_err(), CoreError::InvalidNetwork, "{bad}");
+        }
+        let mut zero = entry("a", 1, NetworkResult::Contacted);
+        zero.count = 0;
+        assert_eq!(encode_network(&[zero]), Err(CoreError::InvalidNetwork));
+        assert_eq!(
+            encode_network(&[entry("a", 1, NetworkResult::Refused("free text".to_owned()))]),
+            Err(CoreError::InvalidNetwork)
+        );
+    }
 
     #[test]
     fn output_stream_round_trips_its_wire_form() {

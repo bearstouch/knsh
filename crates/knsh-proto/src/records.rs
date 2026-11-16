@@ -288,6 +288,8 @@ impl ToJson for RecordEntry<'_> {
             object.insert("decision", details.decision.to_json()?)?;
             // Each simple command with what it resolved to and its class (KNSH-052, `execution-record.md`).
             object.insert("argv", details.argv.to_json()?)?;
+            // The hosts the proxy let the line contact or refused it (KNSH-060, FR-NET-09).
+            object.insert("network", details.network.to_json()?)?;
         }
         object.insert("stdout", self.stdout.as_ref().map(output_info).transpose()?.to_json()?)?;
         object.insert("stderr", self.stderr.as_ref().map(output_info).transpose()?.to_json()?)?;
@@ -566,6 +568,8 @@ mod tests {
         // KNSH-052: secret names only, and an empty list in phase 2 (FR-REC-11); `argv` is always an array.
         assert!(text.contains(r#""secrets_injected":[]"#), "{text}");
         assert!(text.contains(r#""argv":[]"#), "{text}");
+        // KNSH-060: `network` is always an array.
+        assert!(text.contains(r#""network":[]"#), "{text}");
         let mut classified = record(Actor::Agent(AgentId::new("codex").unwrap()));
         classified.details.argv = vec![
             knsh_core::ArgvEntry {

@@ -725,7 +725,14 @@ fn no_proxy_means_no_proxy_settings() {
     let names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, ["PATH", "SHELL", SESSION_TOKEN_VAR]);
     let session = session_id(5);
-    assert!(crate::proxy::NoProxy.issue(session).unwrap().is_none());
+    let network = knsh_core::NetworkPolicy {
+        mode: knsh_core::NetworkMode::None,
+        hosts: Vec::new(),
+        approval_hosts: Vec::new(),
+        class_hosts: knsh_core::ClassHosts::default(),
+        loopback: Vec::new(),
+    };
+    assert!(crate::proxy::NoProxy.issue(session, &network).unwrap().is_none());
 }
 
 /// A fixed session id, numbered `n`.
