@@ -14,9 +14,10 @@
 //! # Capabilities
 //!
 //! What the line may receive when it runs ([`LineCapabilities`]): the hosts open to it, the approval hosts it may
-//! reach once its classes or an approval allow (KNSH-060 decides each connection), the loopback ports, the network
-//! classes it may present to host rules, and the secrets it is eligible for (KNSH-092 asks and injects). A denied line
-//! receives nothing.
+//! reach once its classes or an approval allow (KNSH-060 decides each connection), the approval hosts its classes
+//! alone open under `network.class_hosts` (FR-NET-03, KNSH-058), the loopback ports, the network classes it may
+//! present to host rules, and the secrets it is eligible for (KNSH-092 asks and injects). A denied line receives
+//! nothing.
 //!
 //! If **any** part of the line is dynamic, the whole line is clamped (FR-POL-20, FR-POL-21): network is limited to
 //! `network.hosts` (and the loopback ports, which are open to every command alike), no approval hosts, no secrets and
@@ -167,6 +168,11 @@ pub struct LineCapabilities {
     /// Hosts the line may reach only once its classes or an approval allow: `network.approval_hosts`; none for
     /// dynamic code (FR-POL-21) and under `network.mode = "none"`.
     pub approval_hosts: Vec<String>,
+    /// The approval hosts the line reaches by its classes alone, without an approval: those every class it presents
+    /// that connects lists under `network.class_hosts` (FR-NET-03). A subset of
+    /// [`approval_hosts`](Self::approval_hosts), in its order; none when that is empty or the line presents no
+    /// class that connects.
+    pub class_hosts: Vec<String>,
     /// Loopback ports open to the line: `network.loopback`.
     pub loopback: Vec<u16>,
     /// The network classes the line may present to host rules, in order of first appearance; none for dynamic code
@@ -443,9 +449,16 @@ fn capabilities(profile: &Profile, classification: &Classification) -> LineCapab
     } else {
         (line_classes(commands), eligible_secrets(profile, commands))
     };
+    // FR-NET-03: dynamic code has no approval hosts and no classes above, so it never reaches one by class.
+    let class_hosts = approval_hosts
+        .iter()
+        .filter(|host| network.class_hosts.allows(&classes, host))
+        .cloned()
+        .collect();
     LineCapabilities {
         hosts,
         approval_hosts,
+        class_hosts,
         loopback: network.loopback.clone(),
         classes,
         secrets,

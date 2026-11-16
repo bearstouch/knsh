@@ -78,6 +78,7 @@ Outside the subset, and rejected as such: dates and times, floats (including `in
 | `network.mode` | `none` \| `allowlist` | |
 | `network.hosts` | list | Open to every command |
 | `network.approval_hosts` | list | Only for commands whose class or approval includes them |
+| `network.class_hosts.fetch`, `network.class_hosts.publish` | list | Approval hosts a line reaches by its class alone, without an approval: each must be in `network.approval_hosts`. Presets may add to them. **Proposed** (KNSH-058) |
 | `network.loopback` | list of ports | Loopback ports allowed |
 | `approvals.irreversible` | `allow` \| `ask` \| `deny` | Treatment of irreversible lines |
 | `approvals.irreversible_commands` | list of patterns | Commands the profile adds to the irreversible list. **Proposed** (KNSH-039) |

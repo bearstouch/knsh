@@ -1,3 +1,9 @@
-# Preset `generic`: only the project (FR-AGT-32). The profile must name the agent's model host itself.
+# Preset `generic`: only the project (FR-AGT-32), for agent CLIs without a preset of their own.
+# It grants no model host and no configuration folder: the profile names them. The loader refuses a profile using
+# this preset that names no model host (`network.hosts` under `network.mode = "allowlist"`) and no local model port
+# (`network.loopback`).
 [fs]
+# Added to `fs.read` only when the profile lists its reads (the default, "all", already covers them): a write
+# root that cannot be read is of no use to the CLI.
+read = ["${PROJECT}"]
 write = ["${PROJECT}"]

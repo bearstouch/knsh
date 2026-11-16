@@ -1,7 +1,17 @@
-# Preset `codex-cli`: what Codex CLI itself needs inside an envelope (FR-AGT-04).
-# Provisional: KNSH-058 verifies the model host and configuration folder per release.
+# Preset `codex-cli`: what Codex CLI itself needs inside an envelope (FR-AGT-04, KNSH-058).
+# Read from Codex CLI 0.165.0; checked again per release (agent-clis.md, per-release checklist).
+#
+# Proxy: Codex reads HTTPS_PROXY and HTTP_PROXY itself, so the envelope's proxy settings (decision 14) are enough.
+# Its own sandbox must be off: `--sandbox danger-full-access`, or `sandbox_mode = "danger-full-access"` in
+# ~/.codex/config.toml.
 [fs]
+# Added to `fs.read` only when the profile lists its reads (the default, "all", already covers them): a write
+# root that cannot be read is of no use to the CLI.
+read = ["${PROJECT}", "~/.codex"]
+# The project, and `~/.codex` (CODEX_HOME by default): configuration, sign-in (auth.json), sessions and logs.
 write = ["${PROJECT}", "~/.codex"]
 
 [network]
-hosts = ["api.openai.com"]
+# api.openai.com: the model API with an API key. chatgpt.com: the model API with ChatGPT sign-in
+# (chatgpt.com/backend-api/codex). auth.openai.com: token refresh for ChatGPT sign-in.
+hosts = ["api.openai.com", "chatgpt.com", "auth.openai.com"]

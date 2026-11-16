@@ -164,6 +164,7 @@ fn agent(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
             return ExitCode::from(refusal.status());
         }
     };
+    warn_if_cli_sandboxed(&params);
     let socket = match user_socket() {
         Ok(socket) => socket,
         Err(code) => return code,
@@ -180,6 +181,34 @@ fn agent(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
             report(&agent::failure_message(&error));
             ExitCode::FAILURE
         }
+    }
+}
+
+/// FR-AGT-05 (KNSH-058): warns on stderr when the agent CLI's own sandbox is still on, or cannot be checked. Never
+/// stops the CLI: the warning says how to turn the sandbox off.
+#[cfg(target_os = "macos")]
+fn warn_if_cli_sandboxed(params: &knsh_proto::SessionStartAgentParams) {
+    use knsh::cli::agent_sandbox::{Cli, check, read_file, warning};
+
+    let Some(cli) = params.command.first().and_then(|program| Cli::of_program(program)) else {
+        return;
+    };
+    // Without HOME the CLI's user settings cannot be found; `check` then reports the files it could not read.
+    let home = params
+        .env
+        .iter()
+        .find(|(name, _)| name == "HOME")
+        .map_or_else(std::path::PathBuf::new, |(_, home)| std::path::PathBuf::from(home));
+    let state = check(
+        cli,
+        &params.command,
+        &params.env,
+        &home,
+        params.cwd.as_path(),
+        &read_file,
+    );
+    if let Some(text) = warning(cli, &state) {
+        report(&text);
     }
 }
 

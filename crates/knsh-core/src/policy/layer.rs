@@ -68,6 +68,10 @@ pub(crate) struct Layer {
     pub(crate) network_mode: Option<NetworkMode>,
     pub(crate) network_hosts: Option<Vec<String>>,
     pub(crate) network_approval_hosts: Option<Vec<String>>,
+    /// `network.class_hosts.fetch`: approval hosts that `network:fetch` lines reach without an approval.
+    pub(crate) network_class_hosts_fetch: Option<Vec<String>>,
+    /// `network.class_hosts.publish`: approval hosts that `network:publish` lines reach without an approval.
+    pub(crate) network_class_hosts_publish: Option<Vec<String>>,
     pub(crate) network_loopback: Option<Vec<u16>>,
     pub(crate) approvals_irreversible: Option<RuleAction>,
     pub(crate) approvals_irreversible_commands: Option<Vec<String>>,
@@ -208,10 +212,16 @@ impl Layer {
     }
 
     fn read_network(&mut self, network: &Section<'_>) -> Result<(), ProfileError> {
-        network.check_keys(&["mode", "hosts", "approval_hosts", "loopback"])?;
+        network.check_keys(&["mode", "hosts", "approval_hosts", "class_hosts", "loopback"])?;
         self.network_mode = network.optional("mode", network_mode)?;
         self.network_hosts = network.list("hosts", host)?;
         self.network_approval_hosts = network.list("approval_hosts", host)?;
+        // FR-NET-03: one list per class that connects. `network:none` connects nowhere, so it has no key.
+        if let Some(class_hosts) = network.section("class_hosts")? {
+            class_hosts.check_keys(&["fetch", "publish"])?;
+            self.network_class_hosts_fetch = class_hosts.list("fetch", host)?;
+            self.network_class_hosts_publish = class_hosts.list("publish", host)?;
+        }
         self.network_loopback = network.list("loopback", port)?;
         Ok(())
     }
@@ -238,7 +248,8 @@ impl Layer {
     }
 
     /// Presets may only add to the path and host lists (`fs.read` as a list, `fs.write`, `fs.deny`,
-    /// `exec.trusted_folders`, `network.hosts`, `network.approval_hosts`, `network.loopback`, `checkpoints.roots`):
+    /// `exec.trusted_folders`, `network.hosts`, `network.approval_hosts`, `network.class_hosts`, `network.loopback`,
+    /// `checkpoints.roots`):
     /// they grant what an agent CLI itself needs and must never weaken a profile's choices.
     fn check_preset_keys(&self) -> Result<(), ProfileError> {
         let forbidden: &[(&str, bool)] = &[

@@ -136,6 +136,7 @@ fn dynamic_part_clamps_network_to_hosts() {
     let clamped = LineCapabilities {
         hosts: vec!["registry.npmjs.org".to_owned()],
         approval_hosts: Vec::new(),
+        class_hosts: Vec::new(),
         loopback: vec![3000],
         classes: Vec::new(),
         secrets: Vec::new(),
@@ -191,6 +192,30 @@ fn line_classes_need_every_connecting_command_classified() {
     let p = profile("[exec]\nallow = [\"git\"]\n[network]\nhosts = [\"a.example\"]\napproval_hosts = [\"b.example\"]");
     let capabilities = decide_line(&p, "git fetch").capabilities;
     assert!(capabilities.hosts.is_empty() && capabilities.approval_hosts.is_empty());
+}
+
+// FR-NET-03, KNSH-058: a class rule opens its approval host to lines presenting only that class; a line with another
+// class that connects, no classes, or dynamic code gets none, and under `network.mode = "none"` nothing.
+#[test]
+fn class_hosts_follow_line_classes() {
+    let rules = "[network.class_hosts]\nfetch = [\"github.com\"]\n";
+    let p = profile(&format!("{NETWORKED}{rules}"));
+    let class_hosts = |line: &str| decide_line(&p, line).capabilities.class_hosts;
+    assert_eq!(class_hosts("git fetch origin"), ["github.com"]);
+    assert_eq!(class_hosts("cd repo && git status && git fetch"), ["github.com"]);
+    for line in [
+        "git push origin main",
+        "git fetch && git push",
+        "git fetch && curl https://github.com",
+        "git fetch && python3 -c 'x'",
+        "git status",
+    ] {
+        assert!(class_hosts(line).is_empty(), "{line}");
+    }
+    let off = profile(&format!(
+        "[exec]\nallow = [\"git\"]\n[network]\napproval_hosts = [\"github.com\"]\n{rules}"
+    ));
+    assert_eq!(decide_line(&off, "git fetch").capabilities.class_hosts.len(), 0);
 }
 
 // FR-POL-20: dynamic code nothing else decides is decided by `exec.default`.

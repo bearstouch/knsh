@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use knsh_bash::NetworkClass;
+
 use super::paths::testing::FakeFs;
 use super::*;
 
@@ -79,13 +81,15 @@ fn loads_web_app_example_profile() {
     assert_eq!(profile.extends, [name("base")]);
     assert_eq!(profile.preset.as_deref(), Some("claude-code"));
     assert_eq!(profile.fs.read, ReadScope::All);
-    // `${PROJECT}` and `${TMPDIR}` expand canonically; the preset adds `~/.claude` after the profile's own roots.
+    // `${PROJECT}` and `${TMPDIR}` expand canonically; the preset adds `~/.claude` and `~/.claude.json` after the
+    // profile's own roots (the project is already there).
     assert_eq!(
         profile.fs.write,
         [
             canonical("/Users/u/src/app"),
             canonical("/private/var/folders/xy/T"),
             canonical("/Users/u/.claude"),
+            canonical("/Users/u/.claude.json"),
         ]
     );
     assert_eq!(profile.fs.deny[0], canonical("/Users/u/.ssh"));
@@ -98,7 +102,12 @@ fn loads_web_app_example_profile() {
     assert_eq!(profile.network.mode, NetworkMode::Allowlist);
     assert_eq!(
         profile.network.hosts,
-        ["registry.npmjs.org", "pypi.org", "api.anthropic.com"]
+        [
+            "registry.npmjs.org",
+            "pypi.org",
+            "api.anthropic.com",
+            "platform.claude.com"
+        ]
     );
     assert_eq!(profile.network.approval_hosts, ["github.com"]);
     assert_eq!(profile.network.loopback, [3000, 5432]);
@@ -370,18 +379,14 @@ fn invalid_profile_is_not_partially_applied() {
 #[test]
 fn presets_are_shipped_data_and_only_add() {
     for (preset, _) in PRESETS {
-        let text = format!("name = \"p\"\npreset = \"{preset}\"\n[network]\nhosts = [\"own.example\"]\n");
+        let text = format!(
+            "name = \"p\"\npreset = \"{preset}\"\n[network]\nmode = \"allowlist\"\nhosts = [\"own.example\"]\n"
+        );
         let profile = load(&Source::default().with("p", &text), "p").unwrap();
         assert_eq!(profile.network.hosts[0], "own.example", "{preset}");
         assert!(profile.fs.write.contains(&canonical("/Users/u/src/app")), "{preset}");
         assert_eq!(profile.exec.default, RuleAction::Ask, "{preset}");
     }
-    let generic = load(
-        &Source::default().with("p", "name = \"p\"\npreset = \"generic\"\n"),
-        "p",
-    )
-    .unwrap();
-    assert_eq!(generic.network.hosts, Vec::<String>::new());
 
     let unknown = Source::default().with("p", "name = \"p\"\npreset = \"made-up\"\n");
     let error = load(&unknown, "p").unwrap_err();
@@ -396,9 +401,10 @@ fn preset_is_inherited_and_overridable_through_extends() {
         .with("child", "name = \"child\"\nextends = \"base\"\n")
         .with("other", "name = \"other\"\nextends = \"base\"\npreset = \"generic\"\n");
     assert_eq!(load(&source, "child").unwrap().preset.as_deref(), Some("claude-code"));
-    let other = load(&source, "other").unwrap();
-    assert_eq!(other.preset.as_deref(), Some("generic"));
-    assert_eq!(other.network.hosts, Vec::<String>::new());
+    // `generic` grants no model host, and `other` names none (FR-AGT-32).
+    let error = load(&source, "other").unwrap_err();
+    assert_eq!(error.kind(), &ProfileErrorKind::MissingKey);
+    assert_eq!(error.key(), Some("network.hosts"));
 }
 
 // KNSH-039: the resolved profile is a value type that can be compared and hashed.
@@ -530,4 +536,135 @@ fn unattended_profile_is_built_in_and_strict() {
     let source = Source::default().with("unattended", "name = \"unattended\"\n[exec]\ndefault = \"allow\"\n");
     assert_eq!(load_unattended(&context(), &mac_fs()).unwrap(), profile);
     assert_ne!(load(&source, "unattended").unwrap(), profile);
+}
+
+// FR-AGT-04: the `claude-code` preset grants the model API host (and the OAuth refresh host), and read and write to
+// `~/.claude`, `~/.claude.json` and the project, even under a profile that lists its reads.
+#[test]
+fn claude_code_preset_grants_api_host_and_config_folder() {
+    let text = "name = \"p\"\npreset = \"claude-code\"\n[fs]\nread = [\"/usr\"]\nwrite = []\n";
+    let profile = load(&Source::default().with("p", text), "p").unwrap();
+    let granted = [
+        canonical("/Users/u/src/app"),
+        canonical("/Users/u/.claude"),
+        canonical("/Users/u/.claude.json"),
+    ];
+    assert_eq!(profile.fs.write, granted);
+    let mut read = vec![canonical("/usr")];
+    read.extend(granted);
+    assert_eq!(profile.fs.read, ReadScope::Paths(read));
+    assert_eq!(profile.network.hosts, ["api.anthropic.com", "platform.claude.com"]);
+    // A preset grants hosts, never a mode: the profile still decides whether the network is on at all.
+    assert_eq!(profile.network.mode, NetworkMode::None);
+    assert_eq!(profile.network.approval_hosts.len(), 0);
+}
+
+// FR-AGT-04, FR-AGT-32: the `codex-cli` preset grants its model hosts (API key and ChatGPT sign-in), its sign-in
+// refresh host, `~/.codex` and the project.
+#[test]
+fn codex_cli_preset_grants_model_hosts_and_config_folder() {
+    let text = "name = \"p\"\npreset = \"codex-cli\"\n";
+    let profile = load(&Source::default().with("p", text), "p").unwrap();
+    assert_eq!(
+        profile.fs.write,
+        [canonical("/Users/u/src/app"), canonical("/Users/u/.codex")]
+    );
+    assert_eq!(
+        profile.network.hosts,
+        ["api.openai.com", "chatgpt.com", "auth.openai.com"]
+    );
+}
+
+// FR-AGT-32: `generic` grants only the project, and the profile must name the model host itself: a remote one under
+// `allowlist`, or a local model's loopback port.
+#[test]
+fn generic_preset_grants_no_model_host() {
+    let load_text = |text: &str| {
+        load(
+            &Source::default().with("p", &format!("name = \"p\"\npreset = \"generic\"\n{text}")),
+            "p",
+        )
+    };
+
+    let profile = load_text("[network]\nmode = \"allowlist\"\nhosts = [\"api.example.com\"]\n").unwrap();
+    assert_eq!(profile.network.hosts, ["api.example.com"]);
+    assert_eq!(profile.fs.write, [canonical("/Users/u/src/app")]);
+    assert_eq!(profile.network.approval_hosts.len(), 0);
+    let local = load_text("[network]\nloopback = [11434]\n").unwrap();
+    assert_eq!(local.network.hosts.len(), 0);
+
+    // No host at all, a host the network mode keeps closed, and a model host only behind approval: all refused.
+    for text in [
+        "",
+        "[network]\nhosts = [\"api.example.com\"]\n",
+        "[network]\nmode = \"allowlist\"\nhosts = []\napproval_hosts = [\"api.example.com\"]\n",
+    ] {
+        let error = load_text(text).unwrap_err();
+        assert_eq!(error.kind(), &ProfileErrorKind::MissingKey, "{text}");
+        assert_eq!(error.key(), Some("network.hosts"), "{text}");
+    }
+}
+
+/// A preset as the engine would ship it, applied to `profile` (which must not name a preset of its own).
+fn load_with_preset(profile: &str, preset: &str) -> Result<Profile, ProfileError> {
+    let mut layer = Layer::parse(profile.as_bytes(), LayerKind::Profile)?;
+    merge_preset(&mut layer, Layer::parse(preset.as_bytes(), LayerKind::Preset)?);
+    build(layer, name("p"), Vec::new(), &context(), &mac_fs())
+}
+
+// FR-NET-03: a preset can let a class reach an approval host: `network:fetch` lines (`git fetch`) reach github.com
+// without an approval, while `network:publish` (`git push`) and a line presenting both still need one.
+#[test]
+fn preset_class_allows_git_fetch_to_github() {
+    let preset = "[network]\napproval_hosts = [\"github.com\"]\n[network.class_hosts]\nfetch = [\"github.com\"]\n";
+    let profile = load_with_preset("name = \"p\"\n[network]\nmode = \"allowlist\"\n", preset).unwrap();
+    let rules = &profile.network.class_hosts;
+    assert_eq!(rules.fetch, ["github.com"]);
+    assert_eq!(rules.publish.len(), 0);
+    assert!(rules.allows(&[NetworkClass::Fetch], "github.com"));
+    assert!(rules.allows(&[NetworkClass::None, NetworkClass::Fetch], "github.com"));
+    assert!(!rules.allows(&[NetworkClass::Fetch], "gitlab.com"));
+    assert!(!rules.allows(&[NetworkClass::Publish], "github.com"));
+    assert!(!rules.allows(&[NetworkClass::Fetch, NetworkClass::Publish], "github.com"));
+    // No class that connects, no class at all (dynamic code, unclassified programs): never by class.
+    assert!(!rules.allows(&[NetworkClass::None], "github.com"));
+    assert!(!rules.allows(&[], "github.com"));
+
+    // A profile's own class rules are appended to, not replaced, by the preset's.
+    let own =
+        "name = \"p\"\n[network]\napproval_hosts = [\"gitlab.com\"]\n[network.class_hosts]\nfetch = [\"gitlab.com\"]\n";
+    let merged = load_with_preset(own, preset).unwrap();
+    assert_eq!(merged.network.class_hosts.fetch, ["gitlab.com", "github.com"]);
+}
+
+// FR-NET-03: a class rule must name an approval host, so it never opens a host the profile does not name; and only
+// the classes that connect have a key.
+#[test]
+fn class_hosts_must_be_approval_hosts() {
+    let source = Source::default().with(
+        "p",
+        "name = \"p\"\n[network]\napproval_hosts = [\"github.com\"]\n[network.class_hosts]\nfetch = [\"github.com\"]\npublish = [\"evil.example\"]\n",
+    );
+    let error = load(&source, "p").unwrap_err();
+    assert_eq!(
+        error.kind(),
+        &ProfileErrorKind::InvalidValue {
+            expected: "a host listed in network.approval_hosts"
+        }
+    );
+    assert_eq!(error.key(), Some("network.class_hosts.publish[0]"));
+
+    let source = Source::default().with("p", "name = \"p\"\n[network.class_hosts]\nnone = []\n");
+    assert_eq!(load(&source, "p").unwrap_err().key(), Some("network.class_hosts.none"));
+    // An approval host inherited from a parent counts.
+    let source = Source::default()
+        .with(
+            "base",
+            "name = \"base\"\n[network]\napproval_hosts = [\"github.com\"]\n",
+        )
+        .with(
+            "p",
+            "name = \"p\"\nextends = \"base\"\n[network.class_hosts]\nfetch = [\"github.com\"]\n",
+        );
+    assert_eq!(load(&source, "p").unwrap().network.class_hosts.fetch, ["github.com"]);
 }
