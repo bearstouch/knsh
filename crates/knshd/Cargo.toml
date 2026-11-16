@@ -20,10 +20,14 @@ knsh-sandbox = { path = "../knsh-sandbox" }
 knsh-proxy = { path = "../knsh-proxy" }
 knsh-store = { path = "../knsh-store" }
 knsh-checkpoint = { path = "../knsh-checkpoint" }
+# The hook registrations in the user's configuration file (KNSH-062).
+knsh-toml = { path = "../knsh-toml" }
 
 [dev-dependencies]
 # Fakes for socket activation, peer credentials and the system log (KNSH-012). Test builds only.
 knsh-platform = { path = "../knsh-platform", features = ["testing"] }
+# Classified lines for the hook runner tests (KNSH-062). Test builds only.
+knsh-bash = { path = "../knsh-bash" }
 
 [lints]
 workspace = true

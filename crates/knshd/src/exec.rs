@@ -531,6 +531,7 @@ mod tests {
                 source: knsh_core::DecisionSource::Rule,
                 rule_id: Some("exec.allow[0]".to_owned()),
                 decided_by: None,
+                hooks: Vec::new(),
             },
             duration_ms: 42,
             default_mode: mode,

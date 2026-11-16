@@ -85,6 +85,9 @@ mod hello;
 // Pause, resume and human control (KNSH-054): owned by the session registry.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod holds;
+// The user's `command.proposed` hooks (KNSH-062), run by the supervisor.
+#[cfg(target_os = "macos")]
+mod hooks;
 // Lines started with exec.start (KNSH-053), built with `exec`.
 #[cfg(target_os = "macos")]
 mod jobs;
@@ -480,13 +483,14 @@ fn start_proxy(
 #[cfg(target_os = "macos")]
 impl Supervision<'_> {
     /// The `exec.run` handler: the orchestrator over the real spawner, the `knsh-exec` installed next to this binary
-    /// (the one the sandbox probe checked). No hooks, authority or local approvals are wired yet (KNSH-062,
-    /// KNSH-069, KNSH-066): every line policy asks about waits and is denied at the timeout. When `knsh-exec` or a
+    /// (the one the sandbox probe checked), with the user's hooks ([`hooks::HookRunner`], KNSH-062). No authority or
+    /// local approvals are wired yet (KNSH-069, KNSH-066): every line policy asks about waits and is denied at the
+    /// timeout. When `knsh-exec` or a
     /// canonical home cannot be found it is logged, and every call is `-32005` ([`exec::unserved_handlers`]).
     fn exec_run_handlers(self, proxy: std::sync::Arc<dyn proxy::ProxyIssuer>) -> dispatch::Handlers {
         use std::sync::Arc;
 
-        use knsh_core::{CanonicalPath, NoAuthority, NoHooks};
+        use knsh_core::{CanonicalPath, NoAuthority};
         use knsh_platform::macos::{RealFs, SystemProcesses, sha256};
 
         use crate::probe::SandboxProbe;
@@ -507,6 +511,14 @@ impl Supervision<'_> {
             );
             return exec::unserved_handlers();
         };
+        // KNSH-062: the user's hooks, read from the configuration file for every agent line.
+        let hook_runner = hooks::HookRunner::new(
+            Arc::new(RealFs::new()),
+            Arc::new(SystemProcesses::new()),
+            self.paths.config_file(),
+            home.as_path().to_path_buf(),
+            self.uid,
+        );
         let files = profiles::ProfileFiles::new(Arc::new(RealFs::new()), self.paths.profiles_dir(), self.uid, sha256);
         let spawner = TrampolineSpawner {
             processes: Arc::new(SystemProcesses::new()),
@@ -525,7 +537,7 @@ impl Supervision<'_> {
             store: self.store,
             clock: self.clock,
             random: self.random,
-            hooks: Arc::new(NoHooks),
+            hooks: Arc::new(hook_runner),
             authority: Arc::new(NoAuthority),
             approvals: Arc::new(DenyAtTimeout::default()),
             spawner: Arc::new(spawner),

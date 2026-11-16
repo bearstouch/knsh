@@ -70,6 +70,7 @@ dependencies = [
 name = "knsh-proto"
 version = "0.0.0"
 dependencies = [
+ "knsh-bash",
  "knsh-core",
  "knsh-json",
 ]
@@ -105,6 +106,7 @@ version = "0.0.0"
 name = "knshd"
 version = "0.0.0"
 dependencies = [
+ "knsh-bash",
  "knsh-checkpoint",
  "knsh-core",
  "knsh-json",
@@ -113,6 +115,7 @@ dependencies = [
  "knsh-proxy",
  "knsh-sandbox",
  "knsh-store",
+ "knsh-toml",
 ]
 
 [[package]]

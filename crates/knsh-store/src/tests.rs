@@ -118,6 +118,7 @@ fn full_details() -> RecordDetails {
             rule_id: Some(String::from("exec.ask[0]")),
             decided_by: Some(String::from("Example Authority")),
             latency_ms: 1200,
+            hooks: Vec::new(),
         }),
         argv: vec![
             ArgvEntry {
@@ -860,6 +861,7 @@ fn denials_and_approvals_follow_the_same_retention() {
                 rule_id: None,
                 decided_by: None,
                 latency_ms: 1,
+                hooks: Vec::new(),
             })
             .unwrap()
         };

@@ -120,7 +120,7 @@ pub use error::{EnvelopeFault, ProtoError};
 pub use error_code::ErrorCode;
 pub use events::{
     EVENTS_LOST, EventsSubscribeParams, EventsSubscribeResult, EventsUnsubscribeParams, event_envelope,
-    event_notification, event_notification_with_bytes, lost_notification,
+    event_notification, event_notification_with_bytes, hook_input, lost_notification,
 };
 pub use exec::{
     Denial, ExecHandleParams, ExecKillResult, ExecOutcome, ExecRunParams, ExecRunResult, ExecStartResult, ExecStdio,

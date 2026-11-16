@@ -8,7 +8,7 @@
 //!
 //! `seq` values are JSON integers: they count events of one session and stay far below 2^53.
 
-use knsh_core::{Actor, Event, EventData, Lost, SessionId, Subscribed, SubscriptionId};
+use knsh_core::{Actor, Event, EventData, Lost, Proposal, SessionId, Subscribed, SubscriptionId};
 use knsh_json::{Fields, FromJson, JsonError, Object, ToJson, Value};
 
 use crate::envelope::Notification;
@@ -147,6 +147,28 @@ impl ToJson for EventsUnsubscribeParams {
 /// [`JsonError`] if a value cannot be written (a `seq` beyond ±2^53, which a real session never reaches).
 pub fn event_envelope(event: &Event) -> Result<Object, JsonError> {
     envelope_with(event, data(&event.data)?)
+}
+
+/// The `command.proposed` event as a hook reads it on stdin (`specs/05-models/hook.md#input`, FR-HOOK-02): the
+/// envelope's `event`, `session_id`, `actor` and `data`, without `id`, `seq` or `ts`, since it is not a delivery from
+/// the event bus. The payload is written by the same code as the published event's, so the two cannot drift apart;
+/// every text in it was redacted before the proposal was made (FR-SEC-11).
+///
+/// # Errors
+///
+/// [`JsonError`] if the object cannot be written, which a valid proposal always can.
+pub fn hook_input(proposal: &Proposal<'_>) -> Result<Vec<u8>, JsonError> {
+    let payload = EventData::CommandProposed {
+        command: proposal.command.clone(),
+        cwd: proposal.cwd.clone(),
+        rewritten_from: proposal.rewritten_from.cloned(),
+    };
+    let object = Object::new()
+        .with("event", payload.name())?
+        .with("session_id", proposal.session_id.to_string())?
+        .with("actor", actor(proposal.actor)?)?
+        .with("data", data(&payload)?)?;
+    knsh_json::write(&Value::Object(object)).map(String::into_bytes)
 }
 
 /// The envelope of `event` with `data` as its `data` member.
@@ -570,6 +592,51 @@ mod tests {
                 .contains(r#""data":{"profile":"default","envelope":false,"recording":true,"parent_session_id":null}"#),
             "{started}"
         );
+    }
+
+    // FR-HOOK-02 (KNSH-062): a hook reads the `command.proposed` payload, with the session and actor, on stdin.
+    #[test]
+    fn hook_input_is_the_proposed_event() {
+        let actor = Actor::Agent(AgentId::new("claude-code").unwrap());
+        let command = Redacted::new("rm -rf \"build\"".to_owned());
+        let from = Redacted::new("rm -rf /".to_owned());
+        let cwd = CanonicalPath::new("/Users/me/app").unwrap();
+        let line = "rm -rf build";
+        let classification = knsh_bash::classify(
+            &knsh_bash::parse_line(line),
+            line,
+            &NoResolver,
+            &knsh_bash::Interpreters::defaults(),
+        );
+        let proposal = Proposal {
+            session_id: SessionId::from_ulid(Ulid::from_u128(1)),
+            actor: &actor,
+            command: &command,
+            cwd: &cwd,
+            rewritten_from: Some(&from),
+            classification: &classification,
+        };
+        let text = String::from_utf8(hook_input(&proposal).unwrap()).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                r#"{{"event":"command.proposed","session_id":"{}","actor":{{"kind":"agent","agent_id":"claude-code"}},"data":{{"command":"rm -rf \"build\"","cwd":"/Users/me/app","rewritten_from":"rm -rf /"}}}}"#,
+                SessionId::from_ulid(Ulid::from_u128(1))
+            )
+        );
+    }
+
+    /// Resolves nothing: the hook input does not depend on the classification.
+    struct NoResolver;
+
+    impl knsh_bash::Resolver for NoResolver {
+        fn resolve(&self, _name: &str, _lookup: knsh_bash::Lookup) -> knsh_bash::Program {
+            knsh_bash::Program::NotFound
+        }
+
+        fn source_file(&self, _path: &str) -> knsh_bash::SourceFile {
+            knsh_bash::SourceFile::Unresolved
+        }
     }
 
     // KNSH-050 (FR-LC-07, FR-LC-32, FR-LC-41): the lifecycle payloads of `specs/05-models/event.md`.

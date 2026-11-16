@@ -28,7 +28,8 @@ const LAYOUT: &[(&str, &[&str])] = &[
     ("knsh-bash", &[]),
     ("knsh-json", &[]),
     ("knsh-toml", &[]),
-    ("knsh-proto", &["knsh-json", "knsh-core"]),
+    // knsh-bash only as a dev-dependency: a classified line for the hook input test (KNSH-062).
+    ("knsh-proto", &["knsh-json", "knsh-core", "knsh-bash"]),
     // knsh-json reads the sandbox violation reader's `log stream` entries (KNSH-047).
     ("knsh-platform", &["knsh-core", "knsh-json", "libc"]),
     ("knsh-sandbox", &["knsh-core"]),
@@ -47,6 +48,10 @@ const LAYOUT: &[(&str, &[&str])] = &[
             "knsh-proxy",
             "knsh-store",
             "knsh-checkpoint",
+            // The `[[hooks]]` of the user's configuration file (KNSH-062).
+            "knsh-toml",
+            // Dev-dependency only: classified lines for the hook runner tests (KNSH-062).
+            "knsh-bash",
         ],
     ),
     // knsh-platform for engine paths and the launchd agent behind `knsh daemon install` (KNSH-012).

@@ -607,6 +607,7 @@ mod tests {
             rule_id: None,
             decided_by: Some("guard".to_owned()),
             latency_ms: 3,
+            hooks: Vec::new(),
         });
         let text_decided = json(&RecordEntry {
             record: &decided,
@@ -615,7 +616,7 @@ mod tests {
         });
         assert!(
             text_decided.contains(
-                r#""decision":{"verdict":"deny","source":"hook","rule_id":null,"decided_by":"guard","latency_ms":3}"#
+                r#""decision":{"verdict":"deny","source":"hook","rule_id":null,"decided_by":"guard","latency_ms":3,"hooks":[]}"#
             ),
             "{text_decided}"
         );

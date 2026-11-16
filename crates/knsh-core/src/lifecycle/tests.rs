@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use super::*;
 use crate::policy::paths::testing::FakeFs;
 use crate::policy::{LookupError, PathContext, ProfileSource, load_profile_text, load_unattended};
+use crate::record::HookResult;
 use crate::resolve::BinaryLookup;
 use crate::session::AgentId;
 use crate::ulid::Ulid;
@@ -96,6 +97,8 @@ impl Observer for Events<'_> {
 struct ScriptedHooks<'a> {
     journal: &'a Journal,
     script: RefCell<Vec<Option<HookVerdict>>>,
+    /// Whether each answer lists one hook run, `guard`, taking 5 ms.
+    report_runs: bool,
 }
 
 impl Hooks for ScriptedHooks<'_> {
@@ -111,7 +114,24 @@ impl Hooks for ScriptedHooks<'_> {
             panic!("hook runner bug");
         };
         let hook = (verdict != HookVerdict::Allow).then(|| "guard".to_owned());
-        HookOutcome { verdict, hook }
+        let result = match &verdict {
+            HookVerdict::Allow => HookResult::Allow,
+            HookVerdict::Ask => HookResult::Ask,
+            HookVerdict::Deny { .. } => HookResult::Deny,
+            HookVerdict::Rewrite { .. } => HookResult::Rewrite,
+            HookVerdict::Failed => HookResult::Error,
+        };
+        let runs = if self.report_runs {
+            vec![HookRun {
+                hook: "guard".to_owned(),
+                result,
+                duration_ms: 5,
+                labels: Vec::new(),
+            }]
+        } else {
+            Vec::new()
+        };
+        HookOutcome { verdict, hook, runs }
     }
 }
 
@@ -181,6 +201,7 @@ struct Harness {
     caller_checks: usize,
     profile: Profile,
     limited: Vec<LineKey>,
+    report_runs: bool,
 }
 
 /// Rate limits that limit exactly the listed lines, in any session.
@@ -202,7 +223,13 @@ impl Harness {
             caller_checks: usize::MAX,
             profile: profile(),
             limited: Vec::new(),
+            report_runs: false,
         }
+    }
+
+    fn report_runs(mut self) -> Self {
+        self.report_runs = true;
+        self
     }
 
     fn hooks(mut self, script: Vec<Option<HookVerdict>>) -> Self {
@@ -250,6 +277,7 @@ impl Harness {
         let hooks = ScriptedHooks {
             journal: &self.journal,
             script: RefCell::new(self.hooks.clone()),
+            report_runs: self.report_runs,
         };
         let authority = ScriptedAsker {
             name: "authority",
@@ -299,6 +327,7 @@ fn decision(verdict: DecisionVerdict, source: DecisionSource, rule_id: Option<&s
         source,
         rule_id: rule_id.map(str::to_owned),
         decided_by: by.map(str::to_owned),
+        hooks: Vec::new(),
     }
 }
 
@@ -485,6 +514,35 @@ fn reevaluates_rewritten_line_once() {
     assert_eq!(refusal.command, "rm -rf /");
     assert_eq!(refusal.rewritten_from.as_deref(), Some("ls"));
     assert_eq!(refusal.decision.rule_id.as_deref(), Some("exec.deny[0]"));
+}
+
+// FR-HOOK-05 (KNSH-062): the decision lists every hook run of every pass, whichever way it went, for the record.
+#[test]
+fn decision_lists_hook_runs_of_every_pass() {
+    let rewrite = Some(HookVerdict::Rewrite {
+        command: "ls -a".to_owned(),
+    });
+    let outcome = Harness::new()
+        .report_runs()
+        .hooks(vec![rewrite, Some(HookVerdict::Allow)])
+        .decide("ls");
+    let results: Vec<_> = outcome.decision().hooks.iter().map(|run| run.result).collect();
+    assert_eq!(results, [HookResult::Rewrite, HookResult::Allow]);
+    let record = outcome.decision().to_record(9);
+    assert_eq!(record.hooks.len(), 2);
+    assert_eq!(record.hooks[0].duration_ms, 5);
+
+    let refusal = refused(
+        Harness::new()
+            .report_runs()
+            .hooks(vec![Some(HookVerdict::Failed)])
+            .decide("ls"),
+    );
+    assert_eq!(refusal.decision.hooks[0].result, HookResult::Error);
+
+    // A rate-limited line runs no hooks, so it lists none.
+    let refusal = refused(Harness::new().report_runs().limited(&["/bin/ls"]).decide("ls"));
+    assert_eq!(refusal.decision.hooks.len(), 0);
 }
 
 // FR-AUTH-31: a second rewrite, by a hook or the authority, denies the line.

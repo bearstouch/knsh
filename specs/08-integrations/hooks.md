@@ -26,6 +26,9 @@ timeout_ms = 2000
 ## Safety rules for hook authors
 
 - Hook input contains agent-controlled text. Treat it as untrusted and **never pass it to a shell**.
+- Put the hook executable in `~/.config/knsh/` (for example `~/.config/knsh/hooks/`), owned by you and writable by
+  no one else. Anywhere else an agent might rewrite it, so `knshd` refuses it and denies the lines it matches. Do
+  not have the hook run files from agent-writable places either.
 - Keep hooks fast: their run time is added to every matching command and reported per record (the performance target for decisions excludes hooks).
 - A rewrite cannot contain a redaction marker's real value; lines with markers cannot be rewritten.
 - A malicious hook installed by the user is outside the threat model; review hooks as you would any code running with your privileges.
