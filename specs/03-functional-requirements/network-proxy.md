@@ -94,7 +94,44 @@ connection that passed every check and whose tunnel opened) are collected while 
 the revocation that ends its line returns, so every connection the line made is in its record; a connection revoked
 while its destination was still being checked may report its refusal later, which is published but not recorded.
 
-`hello` reports `network_filter: none` until the TLS server-name check (FR-NET-06, KNSH-061) is in force too.
+## TLS server-name check (KNSH-061)
+
+A tunnel opened for one host must not be usable to talk to another: a front end that serves many names (a CDN, a
+shared host) routes by the name in the TLS handshake, so `CONNECT github.com:443` followed by a handshake naming
+another host would otherwise reach that host (FR-NET-06).
+
+1. **When.** Once the destination passed the checks above and the proxy connected to it, the proxy answers success
+   (`200`, or the SOCKS5 success reply): a TLS client sends its ClientHello only after that answer. It then reads the
+   client's first bytes, under a fresh handshake timeout and at most 20 KiB
+   ([limits](../09-reference/defaults-and-limits.md)), and forwards none of them before the check passed. Bytes sent
+   right behind the CONNECT head are the start of what is read.
+2. **What is read.** The bytes must be TLS handshake records (type 22, record version 3.0 to 3.3, each 1 to 2^14
+   bytes) holding a ClientHello of at most 16 KiB, possibly split across several records. Its `server_name`
+   extension must hold exactly one `host_name`, a valid DNS name (not an IP literal). The parser is hand-written,
+   checks every length against its parent, refuses repeated extensions and other record types before the hello is
+   complete, and is fuzzed (`tls_client_hello`). It never decrypts anything.
+3. **The match.** The tunnel opens only if the name equals the requested host, both normalised (ASCII lower case, no
+   trailing dot). An IP-literal destination (allowlisted, FR-NET-05) has no name to compare and RFC 6066 forbids
+   naming an address, so its tunnel opens only for a hello that names no server.
+4. **Refusals.** Data that is not TLS, a malformed or oversized ClientHello, or a client that closes after sending
+   part of one is `not_tls`; a hello without a server name, or one offering **Encrypted Client Hello** (extension
+   `0xfe0d`, whose clear name is the provider's public name, not the host meant), is `server_name_missing`; another
+   name is `server_name_mismatch`; no complete hello within the timeout is `timeout`. Success was already answered,
+   so a refusal closes the connection; it is reported like every refusal (FR-NET-09) with the requested host, and
+   nothing reached the destination. A client that closes without sending anything is not reported.
+5. **Contact.** The contact (FR-NET-09) is reported once the check passed, before the hello is forwarded.
+
+**Exemptions.** No check is made, and the tunnel opens as before, for:
+
+- a host listed in `network.non_tls_hosts` (matched like every host entry; listing a host there never lets a
+  command reach it, it only lets its tunnels carry something other than TLS, such as plain HTTP, SSH or a database
+  protocol). Only a profile may list them, never a preset, and a nested session's list must be a subset of its
+  parent's ([strictness](../05-models/session.md#profile-strictness));
+- a loopback port of `network.loopback` (step 1 above): the sandbox profile lets the command reach it without the
+  proxy, so the check would add nothing.
+
+`hello` reports `network_filter: none` until the probe claims it: host rules, address checks (KNSH-060) and the
+server-name check (KNSH-061) are in force, but the capability is claimed in a later change.
 
 ## Known limits
 
@@ -109,4 +146,15 @@ while its destination was still being checked may report its refusal later, whic
 - Plain-HTTP requests through the proxy (absolute-URI form) are refused (`405`); curl and Node send `http://` URLs
   that way (KNSH-027), so plain-HTTP fetches fail until a `Host`-header check exists.
 - A client that uses Encrypted Client Hello shows a public name in its handshake, not the requested host, and is
-  refused by FR-NET-06. None of curl, git, npm, pip, cargo or Node did on macOS 26.6 (C10).
+  refused by FR-NET-06 (`server_name_missing`). None of curl, git, npm, pip, cargo or Node did on macOS 26.6 (C10).
+  Chrome's TLS stack (BoringSSL, also in Electron apps) sends a GREASE `0xfe0d` extension even without an ECH
+  configuration, so such clients are refused too; Node (OpenSSL), curl, Go and rustls defaults are not affected.
+- Only the first ClientHello is checked. A second one after a HelloRetryRequest, or a TLS 1.2 renegotiation (encrypted),
+  cannot be read; the server is still bound to the name in the first hello for the connection's certificate.
+- The check binds the TLS name to the requested host; it does not see the HTTP `Host` header inside the encrypted
+  stream. A front end that routes by that header rather than by the TLS name could still be fronted through an
+  allowed host; keeping such shared front ends out of `network.hosts` is the profile's choice.
+- A protocol where the server speaks first (SMTP, FTP, some databases) never sends a ClientHello and times out
+  unless its host is in `network.non_tls_hosts`. So do plain `http://` tunnels and STARTTLS.
+- A refusal after the success answer cannot carry a status code: the client sees its TLS handshake fail as the
+  connection closes. The reason is in `proxy.denied` and the record's `network` field.

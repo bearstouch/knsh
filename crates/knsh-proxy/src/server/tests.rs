@@ -14,11 +14,13 @@ use knsh_platform::macos::{SystemClock, SystemRandom};
 use super::*;
 use crate::credentials::USER_PREFIX;
 
-/// Routes names to addresses; allowlists IP literals; records every question.
+/// Routes names to addresses; allowlists IP literals; exempts the `non_tls` hosts from the server-name check;
+/// records every question.
 #[derive(Default)]
 struct TestGate {
     routes: HashMap<String, Vec<SocketAddr>>,
     allowed_ips: Vec<IpAddr>,
+    non_tls: Vec<String>,
     checked: Mutex<Vec<(Owner, Target)>>,
 }
 
@@ -33,6 +35,10 @@ impl ConnectionGate for TestGate {
 
     fn allows_ip_literal(&self, _owner: &Owner, ip: IpAddr, _port: NonZeroU16) -> bool {
         self.allowed_ips.contains(&ip)
+    }
+
+    fn checks_server_name(&self, _owner: &Owner, target: &Target) -> bool {
+        !self.non_tls.contains(&target.host.to_string())
     }
 }
 
@@ -119,6 +125,13 @@ fn fixture_with(config: Config) -> Fixture {
     gate.routes
         .insert("fallback.test".to_owned(), vec![closed_port(), echo]);
     gate.allowed_ips.push("127.0.0.1".parse().unwrap());
+    // The tests that tunnel plain bytes use these; `tls.test` and `other.test` are checked
+    // (FR-NET-06).
+    gate.non_tls = ["allowed.test", "silent.test", "fallback.test", "127.0.0.1"]
+        .map(str::to_owned)
+        .to_vec();
+    gate.routes.insert("tls.test".to_owned(), vec![echo]);
+    gate.routes.insert("other.test".to_owned(), vec![echo]);
     let gate = Arc::new(gate);
     let report = Arc::new(Recorder::default());
     let proxy = Proxy::start(
@@ -680,4 +693,148 @@ fn reports_contacts_before_revocation_returns() {
     let refusals = fixture.report.refusals(1);
     assert_eq!(refusals[0].refusal, Refusal::HostNotAllowed);
     assert_eq!(refusals[0].owner, Some(line_owner()));
+}
+
+/// Waits for the client side of `stream` to be closed by the proxy, reading and discarding nothing: a refused
+/// tunnel never echoes a byte.
+fn closed_without_data(stream: &mut TcpStream) -> bool {
+    let mut buf = [0; 64];
+    matches!(stream.read(&mut buf), Ok(0) | Err(_))
+}
+
+// KNSH-061 (FR-NET-06): a ClientHello naming the requested host (case and trailing dot aside) opens the tunnel; the
+// hello itself is forwarded, and the contact is reported only once the name was checked.
+#[test]
+fn opens_tunnel_when_server_name_matches() {
+    let fixture = fixture();
+    let auth = basic_for(&fixture.proxy, line_owner());
+    let (mut stream, head) = connect(&fixture.proxy, "tls.test:443", Some(&auth));
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert!(
+        fixture.report.1.lock().unwrap().is_empty(),
+        "contact reported before the hello was checked"
+    );
+    let hello = crate::tls::tests::hello_for("TLS.test.");
+    assert!(echoes(&mut stream, &hello), "the hello reached the destination");
+    assert!(echoes(&mut stream, b"after the hello"));
+    let contacted = fixture.report.1.lock().unwrap().clone();
+    assert_eq!(contacted.len(), 1);
+    assert_eq!(contacted[0].1.to_string(), "tls.test:443");
+    assert!(fixture.report.0.lock().unwrap().is_empty());
+}
+
+// KNSH-061 forged SNI (FR-NET-06): `CONNECT tls.test:443` followed by a hello naming another host (curl
+// `--connect-to`) is refused before a byte reaches the destination, and reported with the requested target.
+#[test]
+fn refuses_tunnel_with_forged_server_name() {
+    let fixture = fixture();
+    let auth = basic_for(&fixture.proxy, line_owner());
+    let (mut stream, head) = connect(&fixture.proxy, "tls.test:443", Some(&auth));
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    stream.write_all(&crate::tls::tests::hello_for("other.test")).unwrap();
+    assert!(closed_without_data(&mut stream));
+    let refusals = fixture.report.refusals(1);
+    assert_eq!(refusals.len(), 1);
+    assert_eq!(refusals[0].refusal, Refusal::ServerNameMismatch);
+    assert_eq!(refusals[0].owner, Some(line_owner()));
+    assert_eq!(refusals[0].protocol, Some(Protocol::Http));
+    assert_eq!(
+        refusals[0].target.as_ref().map(ToString::to_string).as_deref(),
+        Some("tls.test:443")
+    );
+    assert!(
+        fixture.report.1.lock().unwrap().is_empty(),
+        "a refused tunnel is never a contact"
+    );
+}
+
+// KNSH-061 (FR-NET-06): plain text, or a hello with no server name, in a checked tunnel is refused.
+#[test]
+fn refuses_plain_text_and_missing_server_name() {
+    let fixture = fixture();
+    let auth = basic_for(&fixture.proxy, line_owner());
+    let (mut plain, head) = connect(&fixture.proxy, "tls.test:80", Some(&auth));
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    plain.write_all(b"GET / HTTP/1.1\r\nHost: tls.test\r\n\r\n").unwrap();
+    assert!(closed_without_data(&mut plain));
+    assert_eq!(fixture.report.refusals(1)[0].refusal, Refusal::NotTls);
+
+    let (mut nameless, head) = connect(&fixture.proxy, "tls.test:443", Some(&auth));
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    nameless.write_all(&crate::tls::tests::hello_without_name()).unwrap();
+    assert!(closed_without_data(&mut nameless));
+    assert_eq!(fixture.report.refusals(2)[1].refusal, Refusal::ServerNameMissing);
+    assert!(fixture.report.1.lock().unwrap().is_empty());
+}
+
+// KNSH-061: a hello sent right behind the CONNECT head, without waiting for the answer, is checked the same way.
+#[test]
+fn checks_hello_pipelined_with_connect() {
+    let fixture = fixture();
+    let auth = basic_for(&fixture.proxy, line_owner());
+    let mut stream = open(&fixture.proxy);
+    let mut request = format!("CONNECT tls.test:443 HTTP/1.1\r\nProxy-Authorization: {auth}\r\n\r\n").into_bytes();
+    let hello = crate::tls::tests::hello_for("tls.test");
+    request.extend_from_slice(&hello);
+    stream.write_all(&request).unwrap();
+    assert!(response_head(&mut stream).starts_with("HTTP/1.1 200 "));
+    let mut back = vec![0; hello.len()];
+    stream.read_exact(&mut back).unwrap();
+    assert_eq!(back, hello);
+}
+
+// KNSH-061 (FR-NET-01, FR-NET-06): revoked while the proxy waits for the hello, the connection closes, nothing is
+// forwarded or reported as a contact, and the revocation is not reported as the client's refusal.
+#[test]
+fn revocation_while_waiting_for_hello_opens_nothing() {
+    let fixture = fixture();
+    let auth = basic_for(&fixture.proxy, line_owner());
+    let (mut stream, head) = connect(&fixture.proxy, "tls.test:443", Some(&auth));
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    fixture.proxy.revoke_line(record(10));
+    assert!(closed_without_data(&mut stream));
+    let started = Instant::now();
+    while fixture.proxy.live_connections() > 0 && started.elapsed() < SHORT {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(fixture.proxy.live_connections(), 0);
+    // Too late: the hello is never read, let alone forwarded.
+    let _ = stream.write_all(&crate::tls::tests::hello_for("tls.test"));
+    assert!(fixture.report.1.lock().unwrap().is_empty(), "no contact");
+    assert!(fixture.report.0.lock().unwrap().is_empty(), "no refusal reported");
+}
+
+// KNSH-061: a client that sends nothing after the answer is closed at the handshake timeout and reported.
+#[test]
+fn closes_tunnels_without_a_hello_in_time() {
+    let fixture = fixture_with(Config {
+        handshake_timeout: Duration::from_millis(300),
+        connect_timeout: SHORT,
+        ..Config::DEFAULT
+    });
+    let auth = basic_for(&fixture.proxy, line_owner());
+    let (mut stream, head) = connect(&fixture.proxy, "tls.test:443", Some(&auth));
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert!(closed_without_data(&mut stream));
+    assert_eq!(fixture.report.refusals(1)[0].refusal, Refusal::Timeout);
+}
+
+// KNSH-061 (FR-NET-06): SOCKS5 tunnels are checked like CONNECT ones.
+#[test]
+fn checks_server_name_over_socks5() {
+    let fixture = fixture();
+    let credentials = login(&fixture.proxy.issue(line_owner()).unwrap());
+    let mut good = socks5_authenticated(&fixture.proxy, &credentials);
+    good.write_all(b"\x05\x01\x00\x03\x08tls.test\x01\xbb").unwrap();
+    assert_eq!(socks5_reply(&mut good), [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    assert!(echoes(&mut good, &crate::tls::tests::hello_for("tls.test")));
+
+    let mut forged = socks5_authenticated(&fixture.proxy, &credentials);
+    forged.write_all(b"\x05\x01\x00\x03\x08tls.test\x01\xbb").unwrap();
+    assert_eq!(socks5_reply(&mut forged), [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    forged.write_all(&crate::tls::tests::hello_for("other.test")).unwrap();
+    assert!(closed_without_data(&mut forged));
+    let refusals = fixture.report.refusals(1);
+    assert_eq!(refusals[0].refusal, Refusal::ServerNameMismatch);
+    assert_eq!(refusals[0].protocol, Some(Protocol::Socks5));
 }

@@ -175,7 +175,7 @@ pub use policy::{
     PRESETS, PathContext, PolicyFs, Profile, ProfileSource, RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy,
     Requester, RuleAction, RuleId, SecretInjection, UNATTENDED_PROFILE, UNATTENDED_PROFILE_TEXT, USER_SOCKET,
     at_least_as_strict, check_host, check_line, evaluate_command, evaluate_line, evaluate_line_with_grants,
-    host_matches, load_profile, load_profile_text, load_unattended, project_root,
+    host_matches, is_non_tls_host, load_profile, load_profile_text, load_unattended, project_root,
 };
 pub use ratelimit::{
     Counted, DenialLimiter, LIMIT_DENIALS, LIMIT_DURATION, LIMIT_WINDOW, LineKey, MAX_TRACKED_LINES,

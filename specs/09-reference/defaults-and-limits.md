@@ -18,6 +18,7 @@
 | Proxy request head | Request line 4096 bytes, header line 8192 bytes, 64 header lines, 16 KiB in all; over a limit is `431` | — | [network proxy](../03-functional-requirements/network-proxy.md#proxy-core-knsh-059) |
 | Proxy connect | 10 s to reach the destination, then `504` (SOCKS5 `0x06`) | — | [network proxy](../03-functional-requirements/network-proxy.md#proxy-core-knsh-059) |
 | Proxy tunnel timeouts | Closed after 5 minutes without a byte either way, and 4 hours after it opened | — | [network proxy](../03-functional-requirements/network-proxy.md#proxy-core-knsh-059) |
+| Proxy TLS ClientHello | After the success answer, 10 s (a fresh handshake timeout) and at most 20 KiB of records for a complete ClientHello of at most 16 KiB; otherwise the tunnel is refused (`timeout`, `not_tls`) | — | [network proxy](../03-functional-requirements/network-proxy.md#tls-server-name-check-knsh-061) |
 | Proxy connections | 512 at once; further connections are closed on accept and reported | — | [network proxy](../03-functional-requirements/network-proxy.md#proxy-core-knsh-059) |
 | Proxy credentials | 65,536 live at once; a command whose credentials cannot be issued does not start | — | [network proxy](../03-functional-requirements/network-proxy.md#proxy-core-knsh-059) |
 | `session.idle` | 5 s at a human prompt | — | [sessions](../03-functional-requirements/sessions.md) |

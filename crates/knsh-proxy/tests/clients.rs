@@ -1,9 +1,12 @@
-//! Real clients through the proxy (KNSH-059; FR-NET-01, decision 14; the client matrix of KNSH-027).
+//! Real clients through the proxy (KNSH-059, KNSH-061; FR-NET-01, FR-NET-06, decision 14; the client matrix of
+//! KNSH-027, claim C10).
 //!
 //! Each test runs the system's tool with a clean environment against a proxy whose test gate routes the name
-//! `allowed.test` to a local HTTP server, so nothing leaves the machine. A tool that is not installed skips its test
-//! with a note rather than failing. The matrix's other clients (npm, pip, cargo, Node) need real hosts and TLS,
-//! which arrive with host rules (KNSH-060) and the server-name check (KNSH-061).
+//! `allowed.test` to a local HTTP server (exempt from the server-name check, like a host in
+//! `network.non_tls_hosts`) and `tls.test` to a local server that records the first bytes it receives (checked), so
+//! nothing leaves the machine. The recording server speaks no TLS, so a TLS client fails after its `ClientHello`: what
+//! is checked is that the hello it sent named the requested host and passed the proxy, or that a forged one never
+//! reached the destination. A tool that is not installed skips its test with a note rather than failing.
 
 #![cfg(target_os = "macos")]
 // The whole file is test code.
@@ -18,15 +21,18 @@ use std::time::{Duration, Instant};
 
 use knsh_core::{RecordId, SessionId, Ulid};
 use knsh_platform::macos::{SystemClock, SystemRandom};
+use knsh_proxy::tls::{self, HelloState, ServerName};
 use knsh_proxy::{
     Config, ConnectionGate, Denial, Host, Owner, Parts, Proxy, ProxyReport, Refusal, Target, USER_PREFIX,
 };
 
 const BODY: &str = "hello through knsh";
 
-/// Routes `allowed.test` to the local server and records who asked.
+/// Routes `allowed.test` to the HTTP server and `tls.test` to the recording server, and records who asked. Only
+/// `allowed.test` is exempt from the server-name check.
 struct Gate {
     server: SocketAddr,
+    recorder: SocketAddr,
     checked: Mutex<Vec<Owner>>,
 }
 
@@ -35,20 +41,58 @@ impl ConnectionGate for Gate {
         self.checked.lock().unwrap().push(*owner);
         match &target.host {
             Host::Name(name) if name == "allowed.test" => Ok(vec![self.server]),
+            Host::Name(name) if name == "tls.test" => Ok(vec![self.recorder]),
             Host::Name(_) | Host::Ip(_) => Err(Refusal::HostNotAllowed),
         }
     }
+
+    fn checks_server_name(&self, _owner: &Owner, target: &Target) -> bool {
+        target.host != Host::Name("allowed.test".to_owned())
+    }
+}
+
+/// What the recording server received: the first bytes of each connection, up to a complete `ClientHello`.
+type Received = Arc<Mutex<Vec<Vec<u8>>>>;
+
+/// A local server that reads each connection's first bytes until they form a `ClientHello` (or are refused, or 10 s
+/// pass), records them, and closes without answering.
+fn recording_server() -> (SocketAddr, Received) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let received: Received = Arc::default();
+    let sink = Arc::clone(&received);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let sink = Arc::clone(&sink);
+            std::thread::spawn(move || {
+                stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut data = Vec::new();
+                let mut buf = [0; 4096];
+                while tls::read_client_hello(&data) == HelloState::Incomplete {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => data.extend_from_slice(&buf[..read]),
+                    }
+                }
+                sink.lock().unwrap().push(data);
+            });
+        }
+    });
+    (address, received)
 }
 
 #[derive(Default)]
-struct Recorder(Mutex<Vec<Denial>>);
+struct Recorder(Mutex<Vec<Denial>>, Mutex<Vec<Target>>);
 
 impl ProxyReport for Recorder {
     fn denied(&self, denial: &Denial) {
         self.0.lock().unwrap().push(denial.clone());
     }
 
-    fn contacted(&self, _owner: &Owner, _target: &Target) {}
+    fn contacted(&self, _owner: &Owner, target: &Target) {
+        self.1.lock().unwrap().push(target.clone());
+    }
 }
 
 /// A local HTTP server: every connection gets a fixed `200` after its first read.
@@ -76,14 +120,17 @@ struct Fixture {
     proxy: Proxy,
     gate: Arc<Gate>,
     report: Arc<Recorder>,
+    received: Received,
     owner: Owner,
     user: String,
     token: String,
 }
 
 fn fixture() -> Fixture {
+    let (recorder, received) = recording_server();
     let gate = Arc::new(Gate {
         server: http_server(),
+        recorder,
         checked: Mutex::new(Vec::new()),
     });
     let report = Arc::new(Recorder::default());
@@ -108,6 +155,7 @@ fn fixture() -> Fixture {
         proxy,
         gate,
         report,
+        received,
         owner,
         user,
         token,
@@ -137,11 +185,16 @@ fn tool(path: &str) -> Option<&str> {
 }
 
 /// Runs `command` with a clean environment and an empty home, killed after 30 s.
-fn run(mut command: Command, home: &Path) -> Output {
+fn run(command: Command, home: &Path) -> Output {
+    run_with_path(command, home, "/usr/bin:/bin")
+}
+
+/// [`run`] with another `PATH`.
+fn run_with_path(mut command: Command, home: &Path, path: &str) -> Output {
     command
         .env_clear()
         .env("HOME", home)
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -252,4 +305,156 @@ fn git_authenticates_after_the_challenge() {
             .all(|denial| denial.refusal == Refusal::MissingCredentials),
         "{refusals:?}"
     );
+}
+
+impl Fixture {
+    /// The server names of the `ClientHello` messages that reached the destination, waiting up to 10 s for at least one.
+    fn names_received(&self) -> Vec<HelloState> {
+        let started = Instant::now();
+        while self.received.lock().unwrap().is_empty() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|data| tls::read_client_hello(data))
+            .collect()
+    }
+
+    /// Asserts that `tool`'s TLS connection to `tls.test` named it, passed the proxy's check and was reported as a
+    /// contact, with no refusal but the `407` challenge.
+    fn assert_named_tls_test(&self, tool: &str, output: &Output) {
+        let names = self.names_received();
+        assert!(
+            !names.is_empty(),
+            "{tool}'s ClientHello never reached the destination: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for name in &names {
+            assert_eq!(
+                *name,
+                HelloState::Complete(ServerName::Name("tls.test".to_owned())),
+                "{tool}"
+            );
+        }
+        let refusals = self.report.0.lock().unwrap().clone();
+        assert!(
+            refusals
+                .iter()
+                .all(|denial| denial.refusal == Refusal::MissingCredentials),
+            "{tool}: {refusals:?}"
+        );
+        assert!(
+            self.report
+                .1
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|target| target.to_string() == "tls.test:443"),
+            "{tool}"
+        );
+    }
+}
+
+// KNSH-061 (FR-NET-06, C10): curl's ClientHello names the requested host and passes the check.
+#[test]
+fn curl_https_names_the_requested_host() {
+    let Some(curl) = tool("/usr/bin/curl") else { return };
+    let fixture = fixture();
+    let mut command = Command::new(curl);
+    command
+        .args(["-sS", "--max-time", "20", "-x"])
+        .arg(fixture.url("http"))
+        .arg("https://tls.test/");
+    let output = run(command, &home());
+    assert!(!output.status.success(), "the recording server speaks no TLS");
+    fixture.assert_named_tls_test("curl", &output);
+}
+
+// KNSH-061 forged SNI (FR-NET-06, C10 negative control): `--connect-to` makes curl send `CONNECT tls.test:443` and
+// a ClientHello naming `example.test`; the proxy refuses it and the destination receives nothing.
+#[test]
+fn curl_forged_server_name_is_refused() {
+    let Some(curl) = tool("/usr/bin/curl") else { return };
+    let fixture = fixture();
+    let mut command = Command::new(curl);
+    command
+        .args([
+            "-sS",
+            "--max-time",
+            "20",
+            "--connect-to",
+            "example.test:443:tls.test:443",
+            "-x",
+        ])
+        .arg(fixture.url("http"))
+        .arg("https://example.test/");
+    let output = run(command, &home());
+    assert!(!output.status.success());
+    let started = Instant::now();
+    while fixture.report.0.lock().unwrap().is_empty() && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let refusals = fixture.report.0.lock().unwrap().clone();
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].refusal, Refusal::ServerNameMismatch);
+    assert_eq!(
+        refusals[0].target.as_ref().map(ToString::to_string).as_deref(),
+        Some("tls.test:443")
+    );
+    // The recording server may have recorded an empty read at most: no byte of the forged hello reached it.
+    assert!(
+        fixture.received.lock().unwrap().iter().all(Vec::is_empty),
+        "the forged hello reached the destination"
+    );
+    assert!(
+        fixture.report.1.lock().unwrap().is_empty(),
+        "a refused tunnel is never a contact"
+    );
+}
+
+// KNSH-061 (FR-NET-06, C10): git's ClientHello (after the `407` challenge) names the requested host.
+#[test]
+fn git_https_names_the_requested_host() {
+    let Some(git) = tool("/usr/bin/git") else { return };
+    let fixture = fixture();
+    let home = home();
+    let mut command = Command::new(git);
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-c")
+        .arg(format!("http.proxy={}", fixture.url("http")))
+        .args(["ls-remote", "https://tls.test/repo.git"]);
+    let output = run(command, &home);
+    if String::from_utf8_lossy(&output.stderr).contains("xcode-select") {
+        eprintln!("skipped: git needs the command line tools");
+        return;
+    }
+    assert!(!output.status.success(), "the recording server speaks no TLS");
+    fixture.assert_named_tls_test("git", &output);
+}
+
+// KNSH-061 (FR-NET-06, C10): npm's ClientHello names the requested host.
+#[test]
+fn npm_https_names_the_requested_host() {
+    let Some(bin) = ["/opt/homebrew/bin", "/usr/local/bin"]
+        .into_iter()
+        .find(|dir| Path::new(dir).join("npm").exists() && Path::new(dir).join("node").exists())
+    else {
+        eprintln!("skipped: npm is not installed in /opt/homebrew/bin or /usr/local/bin");
+        return;
+    };
+    let fixture = fixture();
+    let mut command = Command::new(Path::new(bin).join("npm"));
+    command
+        .args(["view", "left-pad", "version", "--registry", "https://tls.test/"])
+        .args(["--fetch-retries", "0", "--fetch-timeout", "10000", "--cache"])
+        .arg(home().join("npm-cache"))
+        .arg("--https-proxy")
+        .arg(fixture.url("http"));
+    let output = run_with_path(command, &home(), &format!("{bin}:/usr/bin:/bin"));
+    assert!(!output.status.success(), "the recording server speaks no TLS");
+    fixture.assert_named_tls_test("npm", &output);
 }

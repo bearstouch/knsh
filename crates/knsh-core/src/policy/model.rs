@@ -157,6 +157,10 @@ pub struct NetworkPolicy {
     pub class_hosts: ClassHosts,
     /// `network.loopback`: loopback ports allowed. Default none.
     pub loopback: Vec<u16>,
+    /// `network.non_tls_hosts`: hosts whose tunnels may carry anything, not only TLS naming the host, so the proxy
+    /// skips the server-name check for them (FR-NET-06). Matched like every host entry; listing a host here never
+    /// lets a command reach it. Default none.
+    pub non_tls_hosts: Vec<String>,
 }
 
 /// `[network.class_hosts]`: the approval hosts a line reaches by its network classes alone, without an approval

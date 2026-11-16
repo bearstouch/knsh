@@ -50,7 +50,7 @@ by key. Where two values cannot be compared exactly, only the same value counts,
 | `exec.trusted_folders`, `exec.trusted_tools` | a subset of the parent's |
 | `exec.interpreters`, `exec.bash` | equal |
 | `network.mode` | `none`, or both `allowlist` |
-| `network.hosts`, `network.loopback` | a subset of the parent's |
+| `network.hosts`, `network.loopback`, `network.non_tls_hosts` | a subset of the parent's |
 | `network.approval_hosts` | a subset of the parent's `hosts` and `approval_hosts` |
 | `network.class_hosts` | per class, a subset of the parent's `hosts` and of the parent's `class_hosts` for that class |
 | `approvals.irreversible_commands` | a superset of the parent's |

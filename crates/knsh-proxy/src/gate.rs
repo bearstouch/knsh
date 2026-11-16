@@ -7,7 +7,9 @@
 //! [`RefuseAll`] refuses every destination.
 //!
 //! IP literals are refused by the core before the gate is asked for a connection, unless
-//! [`ConnectionGate::allows_ip_literal`] says the address is allowlisted (FR-NET-05).
+//! [`ConnectionGate::allows_ip_literal`] says the address is allowlisted (FR-NET-05). Once a tunnel is granted, its
+//! first bytes must be a TLS `ClientHello` naming the host unless [`ConnectionGate::checks_server_name`] says
+//! otherwise (FR-NET-06).
 //!
 //! Every refusal, whatever the protocol and however early, is passed to the [`ProxyReport`], and so is every
 //! destination a command was let through to (FR-NET-09). A report names the owner when the credentials were known,
@@ -58,6 +60,16 @@ pub enum Refusal {
     Timeout,
     /// The proxy is serving its connection limit.
     Busy,
+    /// After the tunnel was granted, the client sent bytes that are not a well-formed TLS `ClientHello` within the
+    /// size limit, or closed before one was complete; the host is not configured for non-TLS use (FR-NET-06,
+    /// [`crate::tls`]).
+    NotTls,
+    /// The `ClientHello` names no server, or offers Encrypted Client Hello, whose clear name is not the host the
+    /// client means (FR-NET-06).
+    ServerNameMissing,
+    /// The `ClientHello` names another server than the requested host (FR-NET-06): a tunnel opened for one host is
+    /// never used to talk to another.
+    ServerNameMismatch,
 }
 
 impl Refusal {
@@ -81,6 +93,9 @@ impl Refusal {
             Self::Unreachable => "unreachable",
             Self::Timeout => "timeout",
             Self::Busy => "busy",
+            Self::NotTls => "not_tls",
+            Self::ServerNameMissing => "server_name_missing",
+            Self::ServerNameMismatch => "server_name_mismatch",
         }
     }
 }
@@ -108,6 +123,15 @@ pub trait ConnectionGate: Send + Sync {
     fn allows_ip_literal(&self, owner: &Owner, ip: IpAddr, port: NonZeroU16) -> bool {
         let _ = (owner, ip, port);
         false
+    }
+
+    /// Whether `owner`'s tunnel to `target`, already allowed by [`ConnectionGate::check`], must start with a TLS
+    /// `ClientHello` naming the host (FR-NET-06, [`crate::tls`]). Yes by default (fail closed); a gate says no only
+    /// for a host explicitly configured for non-TLS use, or a destination the command could reach without the
+    /// proxy anyway.
+    fn checks_server_name(&self, owner: &Owner, target: &Target) -> bool {
+        let _ = (owner, target);
+        true
     }
 }
 

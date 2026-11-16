@@ -73,6 +73,8 @@ pub(crate) struct Layer {
     /// `network.class_hosts.publish`: approval hosts that `network:publish` lines reach without an approval.
     pub(crate) network_class_hosts_publish: Option<Vec<String>>,
     pub(crate) network_loopback: Option<Vec<u16>>,
+    /// `network.non_tls_hosts`: hosts exempt from the TLS server-name check (FR-NET-06).
+    pub(crate) network_non_tls_hosts: Option<Vec<String>>,
     pub(crate) approvals_irreversible: Option<RuleAction>,
     pub(crate) approvals_irreversible_commands: Option<Vec<String>>,
     pub(crate) checkpoints_roots: Option<Vec<PathTemplate>>,
@@ -212,7 +214,14 @@ impl Layer {
     }
 
     fn read_network(&mut self, network: &Section<'_>) -> Result<(), ProfileError> {
-        network.check_keys(&["mode", "hosts", "approval_hosts", "class_hosts", "loopback"])?;
+        network.check_keys(&[
+            "mode",
+            "hosts",
+            "approval_hosts",
+            "class_hosts",
+            "loopback",
+            "non_tls_hosts",
+        ])?;
         self.network_mode = network.optional("mode", network_mode)?;
         self.network_hosts = network.list("hosts", host)?;
         self.network_approval_hosts = network.list("approval_hosts", host)?;
@@ -223,6 +232,7 @@ impl Layer {
             self.network_class_hosts_publish = class_hosts.list("publish", host)?;
         }
         self.network_loopback = network.list("loopback", port)?;
+        self.network_non_tls_hosts = network.list("non_tls_hosts", host)?;
         Ok(())
     }
 
@@ -265,6 +275,8 @@ impl Layer {
             ("exec.trusted_tools", self.exec_trusted_tools.is_some()),
             ("exec.bash", self.exec_bash.is_some()),
             ("network.mode", self.network_mode.is_some()),
+            // Lifting the server-name check weakens the proxy: a profile's choice, never a preset's.
+            ("network.non_tls_hosts", self.network_non_tls_hosts.is_some()),
             ("approvals.irreversible", self.approvals_irreversible.is_some()),
             (
                 "approvals.irreversible_commands",
@@ -667,6 +679,7 @@ mod tests {
             ("[exec]\ndefault = \"allow\"", "exec.default"),
             ("[fs]\nread = \"all\"", "fs.read"),
             ("[network]\nmode = \"allowlist\"", "network.mode"),
+            ("[network]\nnon_tls_hosts = [\"x.test\"]", "network.non_tls_hosts"),
         ] {
             let error = Layer::parse(text.as_bytes(), LayerKind::Preset).unwrap_err();
             assert_eq!(error.kind(), &ProfileErrorKind::NotAllowedInPreset, "{text}");

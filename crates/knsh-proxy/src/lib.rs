@@ -13,20 +13,24 @@
 //! | [`gate`] | The [`ConnectionGate`] that decides destinations, and the [`ProxyReport`] for refusals and contacts |
 //! | [`rules`] | [`HostRules`]: the gate `knshd` runs, with host rules, name resolution and address checks |
 //! | [`address`] | Which addresses are internal (loopback, link-local, private, …) |
+//! | [`tls`] | The TLS server-name reader: the `ClientHello`'s `server_name`, read without decrypting, and the match |
 //! | [`relay`] | Byte-for-byte tunnels with idle and total timeouts |
 //! | `server` | The listener, the kqueue accept loop and one thread per connection ([`Proxy`], macOS) |
 //!
 //! Built on standard threads and the platform's kqueue, with no third-party crate: every parser of client bytes is
 //! hand-written, bounded before it allocates, refuses malformed input instead of repairing it, and is fuzzed
-//! (`fuzz/fuzz_targets/proxy_handshake.rs`).
+//! (`fuzz/fuzz_targets/proxy_handshake.rs`, `fuzz/fuzz_targets/tls_client_hello.rs`).
 //!
 //! # Boundaries
 //!
 //! The proxy enforces; it does not author rules. Which destinations a command may reach is the [`ConnectionGate`]'s
 //! answer: `knshd` runs [`HostRules`] (KNSH-060), which applies the session profile's host rules
 //! ([`knsh_core::check_host`]), resolves names itself through `knsh-platform`'s [`knsh_platform::Resolver`] and
-//! refuses internal addresses. The TLS server-name check is KNSH-061. The proxy makes no requests of its own
-//! (FR-NET-13): it only connects on a client's behalf, after every check passed. Plain-HTTP requests in absolute-URI
+//! refuses internal addresses. Once a tunnel is granted, its first bytes must be a TLS `ClientHello` naming the requested
+//! host ([`tls`], KNSH-061), unless the gate exempts the destination (a host configured for non-TLS use, a loopback
+//! port). The proxy makes no requests of its own
+//! (FR-NET-13): it only connects on a client's behalf, once the destination checks passed, and forwards nothing until
+//! the server-name check has passed too. Plain-HTTP requests in absolute-URI
 //! form are refused (`405`), not forwarded.
 //!
 //! Depends on `knsh-core` (identifiers, host rules, [`knsh_core::Redacted`]) and `knsh-platform` (clock, random
@@ -35,11 +39,10 @@
 //!
 //! # Specification
 //!
-//! - `specs/03-functional-requirements/network-proxy.md`: FR-NET-01 to FR-NET-05, FR-NET-07, FR-NET-09, FR-NET-11,
-//!   FR-NET-13
+//! - `specs/03-functional-requirements/network-proxy.md`: FR-NET-01 to FR-NET-07, FR-NET-09, FR-NET-11, FR-NET-13
 //! - `specs/09-reference/decisions.md`, decision 14 (credential transport, `407` with Basic, SOCKS5)
 //! - `specs/04-non-functional-requirements/security.md`: NFR-SEC-05, NFR-SEC-07
-//! - `specs/07-testing/fuzzing.md` (HTTP CONNECT and SOCKS handling)
+//! - `specs/07-testing/fuzzing.md` (HTTP CONNECT and SOCKS handling, TLS `ClientHello` reader)
 //! - `specs/09-reference/defaults-and-limits.md` (handshake, connect, idle and total timeouts; connection limit)
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -58,6 +61,7 @@ pub mod rules;
 mod server;
 pub mod socks5;
 pub mod target;
+pub mod tls;
 
 pub use credentials::{Credentials, Issued, MAX_CREDENTIALS, Owner, TOKEN_LEN, USER_PREFIX};
 pub use error::ProxyError;
