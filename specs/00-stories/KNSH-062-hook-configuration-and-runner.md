@@ -17,25 +17,25 @@ allow, deny, ask, rewrite or annotate agent lines.
 **Acceptance criteria**
 *Hook configuration*
 
-- [ ] `[[hooks]]` entries with `event`, optional `match` (`binary` list), `run` and `timeout_ms` are loaded in
+- [x] `[[hooks]]` entries with `event`, optional `match` (`binary` list), `run` and `timeout_ms` are loaded in
       declared order.
-- [ ] Only `event = "command.proposed"` is accepted. Other events and unknown keys are configuration errors.
-- [ ] `run` is resolved (`~` expanded) to an absolute path that must exist and be executable. Otherwise the hook is
+- [x] Only `event = "command.proposed"` is accepted. Other events and unknown keys are configuration errors.
+- [x] `run` is resolved (`~` expanded) to an absolute path that must exist and be executable. Otherwise the hook is
       invalid.
-- [ ] An invalid hook configuration denies every agent line that the hook would match, rather than silently dropping
+- [x] An invalid hook configuration denies every agent line that the hook would match, rather than silently dropping
       the hook (fail closed).
-- [ ] The configuration lives under `~/.config/knsh/`, which every profile denies to envelopes.
+- [x] The configuration lives under `~/.config/knsh/`, which every profile denies to envelopes.
 
 *Hook runner*
 
-- [ ] Hooks run only for supervised agent lines, in the supervisor, before policy. Human sessions run none.
-- [ ] The hook executable is spawned directly (never through a shell), with the `command.proposed` event as JSON on
+- [x] Hooks run only for supervised agent lines, in the supervisor, before policy. Human sessions run none.
+- [x] The hook executable is spawned directly (never through a shell), with the `command.proposed` event as JSON on
       stdin.
-- [ ] Stdout is parsed as a verdict (`allow`, `deny`, `ask`, `rewrite`, `annotate`) under a size limit.
-- [ ] Empty stdout uses the exit code: 0 is allow, 2 is deny. Any other exit code is an error.
-- [ ] Any error, unparsable output or timeout (`timeout_ms`) is a **deny**. The hook's process group is killed on
+- [x] Stdout is parsed as a verdict (`allow`, `deny`, `ask`, `rewrite`, `annotate`) under a size limit.
+- [x] Empty stdout uses the exit code: 0 is allow, 2 is deny. Any other exit code is an error.
+- [x] Any error, unparsable output or timeout (`timeout_ms`) is a **deny**. The hook's process group is killed on
       timeout.
-- [ ] Each hook's run time is stored per record.
+- [x] Each hook's run time is stored per record.
 
 **Unit tests**
 *Hook configuration*
@@ -59,10 +59,16 @@ allow, deny, ask, rewrite or annotate agent lines.
 **Notes**
 *Hook configuration*
 
-- Spec gap: the configuration file name and whether it is signed like policy files are not specified. Propose
-  `~/.config/knsh/config.toml`, integrity-protected the same way as policies (FR-POL-40).
+- Spec gap, resolved: hooks live in `~/.config/knsh/config.toml` ([hook model](../05-models/hook.md)), read by
+  `knshd` for every agent line. Integrity protection like policies (FR-POL-40) is **pending**: it arrives with policy
+  signing ([KNSH-065](KNSH-065-policy-file-signing-and-knsh-policy-edit.md)). Until then the file is protected only by
+  the fixed deny of the configuration directory in every envelope profile (FR-HOOK-07).
 
 *Hook runner*
 
-- Spec gap: the exact stdout format (plain word or JSON object with `verdict`, `reason`, `command`, `labels`) is not
-  defined. Propose JSON, and define it in [hook model](../05-models/hook.md) before implementing.
+- Spec gap, resolved: stdout is one JSON object (`verdict`, `reason`, `command`, `labels`), defined with its limits
+  in [hook model](../05-models/hook.md#output). Each hook's run time is stored in the record's `decision.hooks`
+  ([execution record](../05-models/execution-record.md#decision)).
+- A `rewrite` ends the chain of its pass; the rewritten line gets a pass of its own in which every hook runs again,
+  so later hooks see the new line (FR-HOOK-10). The finer combination rules are
+  [KNSH-063](KNSH-063-verdict-combination-and-rewrite-chain.md)'s.

@@ -93,7 +93,11 @@ impl Hooks for FakeHooks {
             script.remove(0)
         };
         let hook = (verdict != HookVerdict::Allow).then(|| "guard".to_owned());
-        HookOutcome { verdict, hook }
+        HookOutcome {
+            verdict,
+            hook,
+            runs: Vec::new(),
+        }
     }
 }
 
@@ -499,6 +503,7 @@ fn decision_source_matches_deciding_component() {
             rule_id: Some("exec.ask[0]".to_owned()),
             decided_by: Some("Example Authority".to_owned()),
             latency_ms: 25,
+            hooks: Vec::new(),
         })
     );
 

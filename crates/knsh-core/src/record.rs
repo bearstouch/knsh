@@ -129,6 +129,9 @@ pub struct RecordDecision {
     pub decided_by: Option<String>,
     /// Time from receiving the line to the final decision, in milliseconds.
     pub latency_ms: u64,
+    /// The hooks that ran for the line, in order, with their run times (FR-HOOK-05, KNSH-062). Empty when none
+    /// matched, and for records written before hooks were recorded.
+    pub hooks: Vec<HookRun>,
 }
 
 impl ToJson for RecordDecision {
@@ -140,7 +143,8 @@ impl ToJson for RecordDecision {
                 .with("source", self.source.code())?
                 .with("rule_id", self.rule_id.to_json()?)?
                 .with("decided_by", self.decided_by.to_json()?)?
-                .with("latency_ms", self.latency_ms.to_json()?)?,
+                .with("latency_ms", self.latency_ms.to_json()?)?
+                .with("hooks", self.hooks.to_json()?)?,
         ))
     }
 }
@@ -155,13 +159,126 @@ impl FromJson for RecordDecision {
         let rule_id: Option<String> = fields.required("rule_id")?;
         let decided_by: Option<String> = fields.required("decided_by")?;
         let latency_ms: u64 = fields.required("latency_ms")?;
+        // Optional: records written before KNSH-062 have no `hooks` member, and read back with none.
+        let hooks: Option<Vec<HookRun>> = fields.optional("hooks")?;
         fields.finish_closed()?;
+        let hooks = hooks.unwrap_or_default();
+        if hooks.len() > MAX_HOOK_RUNS {
+            return Err(invalid("hooks"));
+        }
         Ok(Self {
             verdict: verdict.parse().map_err(|_| invalid("verdict"))?,
             source: DecisionSource::from_code(&source).ok_or_else(|| invalid("source"))?,
             rule_id,
             decided_by,
             latency_ms,
+            hooks,
+        })
+    }
+}
+
+/// Most hook runs one record lists: every registered hook on both evaluation passes of a rewritten line
+/// (`specs/05-models/hook.md`: at most 32 hooks, FR-LC-11: at most one rewrite).
+pub const MAX_HOOK_RUNS: usize = 64;
+
+/// How one hook ended, as its record shows it (`specs/05-models/execution-record.md#decision`, `decision.hooks`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HookResult {
+    /// It answered `allow`, or printed nothing and exited 0.
+    Allow,
+    /// It answered `deny`, or printed nothing and exited 2.
+    Deny,
+    /// It answered `ask`.
+    Ask,
+    /// It answered `rewrite`.
+    Rewrite,
+    /// It answered `annotate`.
+    Annotate,
+    /// It could not be started, printed something unreadable, or exited abnormally: a deny (FR-HOOK-04).
+    Error,
+    /// It was still running at its timeout and was killed: a deny (FR-HOOK-04).
+    Timeout,
+    /// It was not run because its registration is invalid: a deny of every line it would match (FR-HOOK-04).
+    Invalid,
+}
+
+impl HookResult {
+    /// The record spelling: `allow`, `deny`, `ask`, `rewrite`, `annotate`, `error`, `timeout` or `invalid`.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Ask => "ask",
+            Self::Rewrite => "rewrite",
+            Self::Annotate => "annotate",
+            Self::Error => "error",
+            Self::Timeout => "timeout",
+            Self::Invalid => "invalid",
+        }
+    }
+
+    /// Parses [`code`](Self::code) exactly.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            Self::Allow,
+            Self::Deny,
+            Self::Ask,
+            Self::Rewrite,
+            Self::Annotate,
+            Self::Error,
+            Self::Timeout,
+            Self::Invalid,
+        ]
+        .into_iter()
+        .find(|result| result.code() == code)
+    }
+}
+
+/// One hook's part in a line's decision: which hook, how it ended, how long it ran (FR-HOOK-05) and, for an
+/// `annotate`, its labels.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HookRun {
+    /// The hook's name, `hooks[N]` by its place in the configuration, or `hooks` when the whole configuration was
+    /// invalid.
+    pub hook: String,
+    /// How it ended.
+    pub result: HookResult,
+    /// How long it ran, in milliseconds, at most its timeout; 0 for a hook that was not run.
+    pub duration_ms: u64,
+    /// The labels of an `annotate`; empty otherwise. Already checked against the label charset, so they hold no
+    /// line text.
+    pub labels: Vec<String>,
+}
+
+impl ToJson for HookRun {
+    /// `{hook, result, duration_ms, labels}`.
+    fn to_json(&self) -> Result<Value, JsonError> {
+        Ok(Value::Object(
+            Object::new()
+                .with("hook", self.hook.as_str())?
+                .with("result", self.result.code())?
+                .with("duration_ms", self.duration_ms.to_json()?)?
+                .with("labels", self.labels.to_json()?)?,
+        ))
+    }
+}
+
+impl FromJson for HookRun {
+    /// Reads the object [`ToJson`] writes: every member present, nothing else.
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let mut fields = Fields::new(value)?;
+        let hook: String = fields.required("hook")?;
+        let result: String = fields.required("result")?;
+        let duration_ms: u64 = fields.required("duration_ms")?;
+        let labels: Vec<String> = fields.required("labels")?;
+        fields.finish_closed()?;
+        Ok(Self {
+            hook,
+            result: HookResult::from_code(&result).ok_or(JsonError::OutOfRange { field: Some("result") })?,
+            duration_ms,
+            labels,
         })
     }
 }
@@ -801,6 +918,20 @@ mod tests {
             rule_id: Some("exec.ask[0]".to_owned()),
             decided_by: None,
             latency_ms: 42,
+            hooks: vec![
+                HookRun {
+                    hook: "hooks[0]".to_owned(),
+                    result: HookResult::Annotate,
+                    duration_ms: 7,
+                    labels: vec!["reviewed".to_owned()],
+                },
+                HookRun {
+                    hook: "hooks[1]".to_owned(),
+                    result: HookResult::Allow,
+                    duration_ms: 0,
+                    labels: Vec::new(),
+                },
+            ],
         };
         let value = decision.to_json().unwrap();
         assert_eq!(RecordDecision::from_json(&value).unwrap(), decision);
@@ -814,10 +945,33 @@ mod tests {
             r#"{"verdict":"allow","source":"nobody","rule_id":null,"decided_by":null,"latency_ms":1}"#,
             r#"{"verdict":"allow","source":"rule","rule_id":null,"decided_by":null,"latency_ms":-1}"#,
             r#"{"verdict":"allow","source":"rule","decided_by":null,"latency_ms":1}"#,
+            r#"{"verdict":"allow","source":"rule","rule_id":null,"decided_by":null,"latency_ms":1,"hooks":[{"hook":"hooks[0]","result":"maybe","duration_ms":1,"labels":[]}]}"#,
+            r#"{"verdict":"allow","source":"rule","rule_id":null,"decided_by":null,"latency_ms":1,"hooks":[{"hook":"hooks[0]","result":"allow","duration_ms":1}]}"#,
         ] {
             let value = knsh_json::parse(bad.as_bytes(), bad.len()).unwrap();
             assert!(RecordDecision::from_json(&value).is_err(), "{bad}");
         }
+        for result in [
+            HookResult::Allow,
+            HookResult::Deny,
+            HookResult::Ask,
+            HookResult::Rewrite,
+            HookResult::Annotate,
+            HookResult::Error,
+            HookResult::Timeout,
+            HookResult::Invalid,
+        ] {
+            assert_eq!(HookResult::from_code(result.code()), Some(result));
+        }
+    }
+
+    // A decision stored before KNSH-062 has no `hooks` member and reads back with none.
+    #[test]
+    fn decision_without_hooks_member_reads_back_empty() {
+        let old = r#"{"verdict":"deny","source":"hook","rule_id":null,"decided_by":"guard","latency_ms":3}"#;
+        let decision = decode_decision(old).unwrap();
+        assert_eq!(decision.hooks.len(), 0);
+        assert_eq!(decision.decided_by.as_deref(), Some("guard"));
     }
 
     /// Resolves every name in `/usr/bin`, except `./tool`, a project executable, and `cd`, a builtin.

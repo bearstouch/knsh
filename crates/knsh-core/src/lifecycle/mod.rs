@@ -50,6 +50,7 @@
 #[cfg(test)]
 mod tests;
 
+use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
 
 use knsh_bash::{Classification, ParseOutcome, classify, parse_line, reserialise};
@@ -61,7 +62,7 @@ use crate::policy::{
     evaluate_line, evaluate_line_with_grants,
 };
 use crate::ratelimit::LineKey;
-use crate::record::{DecisionVerdict, RecordDecision};
+use crate::record::{DecisionVerdict, HookRun, RecordDecision};
 use crate::redacted::{REDACTED_MARKER, Redacted};
 use crate::resolve::BinaryLookup;
 use crate::session::{Actor, ProfileName};
@@ -143,6 +144,9 @@ pub struct HookOutcome {
     pub verdict: HookVerdict,
     /// The hook that decided it (the first `deny`, the failing hook, the rewriting or asking hook), if any.
     pub hook: Option<String>,
+    /// Every hook that ran (or was invalid), in order, with its run time (FR-HOOK-05): the record's
+    /// `decision.hooks`.
+    pub runs: Vec<HookRun>,
 }
 
 impl HookOutcome {
@@ -150,6 +154,7 @@ impl HookOutcome {
     pub const ALLOW: Self = Self {
         verdict: HookVerdict::Allow,
         hook: None,
+        runs: Vec::new(),
     };
 }
 
@@ -318,6 +323,8 @@ pub struct Decision {
     pub rule_id: Option<String>,
     /// The hook, authority or user that decided, when not a rule.
     pub decided_by: Option<String>,
+    /// The hooks that ran for the line, across its evaluation passes (FR-HOOK-05).
+    pub hooks: Vec<HookRun>,
 }
 
 impl Decision {
@@ -330,6 +337,7 @@ impl Decision {
             source,
             rule_id,
             decided_by,
+            hooks: Vec::new(),
         }
     }
 
@@ -342,6 +350,7 @@ impl Decision {
             rule_id: self.rule_id.clone(),
             decided_by: self.decided_by.clone(),
             latency_ms,
+            hooks: self.hooks.clone(),
         }
     }
 }
@@ -502,6 +511,9 @@ struct Pipeline<'i, 'e> {
     effects: &'e Effects<'e>,
     /// The received line, once a rewrite has replaced it (the record's `rewritten_from`, FR-REC-04).
     rewritten_from: Option<String>,
+    /// The hooks run so far, over every pass, for the decision's `hooks` (FR-HOOK-05). A cell because passes borrow
+    /// the pipeline shared; it is never borrowed across a call out.
+    hook_runs: RefCell<Vec<HookRun>>,
 }
 
 impl<'i, 'e> Pipeline<'i, 'e> {
@@ -510,11 +522,23 @@ impl<'i, 'e> Pipeline<'i, 'e> {
             input,
             effects,
             rewritten_from: None,
+            hook_runs: RefCell::new(Vec::new()),
         }
     }
 
-    /// Passes until one decides: the received line, then at most [`MAX_REWRITES`] rewritten ones.
+    /// The pipeline's outcome, its decision listing every hook that ran (FR-HOOK-05).
     fn run(mut self) -> Outcome {
+        let mut outcome = self.passes();
+        let runs = self.hook_runs.take();
+        match &mut outcome {
+            Outcome::Run(allowed) => allowed.decision.hooks = runs,
+            Outcome::Refused(refusal) => refusal.decision.hooks = runs,
+        }
+        outcome
+    }
+
+    /// Passes until one decides: the received line, then at most [`MAX_REWRITES`] rewritten ones.
+    fn passes(&mut self) -> Outcome {
         let mut line = self.input.command.to_owned();
         loop {
             match self.pass(line) {
@@ -556,7 +580,8 @@ impl<'i, 'e> Pipeline<'i, 'e> {
         self.effects.observer.proposed(&proposal);
 
         // Step 4. The first deny stops the chain inside the runner; here a deny or a failure ends the pass.
-        let hooks = self.effects.hooks.run(&proposal);
+        let mut hooks = self.effects.hooks.run(&proposal);
+        self.hook_runs.borrow_mut().append(&mut hooks.runs);
         if self.effects.caller.gone() {
             return Step::Done(self.cancelled(&pass, None));
         }
@@ -606,6 +631,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
                     source: policy.source,
                     rule_id,
                     decided_by: None,
+                    hooks: Vec::new(),
                 };
                 Step::Done(self.allow(&pass, decision, policy.capabilities, false))
             }
@@ -688,6 +714,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
                     source: answered_by,
                     rule_id,
                     decided_by: answer.decided_by,
+                    hooks: Vec::new(),
                 };
                 Step::Done(self.allow(pass, decision, capabilities, true))
             }

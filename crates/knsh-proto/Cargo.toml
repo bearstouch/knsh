@@ -11,5 +11,9 @@ license.workspace = true
 knsh-json = { path = "../knsh-json" }
 knsh-core = { path = "../knsh-core" }
 
+[dev-dependencies]
+# A classified line for the hook input test (KNSH-062). Test builds only.
+knsh-bash = { path = "../knsh-bash" }
+
 [lints]
 workspace = true

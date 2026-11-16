@@ -8,7 +8,9 @@
 | Write to a client | 30 s blocked, then the connection is closed | — | [process model](../02-architecture/process-model.md) |
 | Shutdown grace | 5 s for in-flight requests, then connections are closed | — | [process model](../02-architecture/process-model.md) |
 | Authority decision timeout | 90 s, then deny | Yes; set shorter than the agent CLI's tool timeout | [authority](../03-functional-requirements/authority.md) |
-| Hook timeout | `timeout_ms` per hook (example 2000) | Per hook | [hooks](../03-functional-requirements/hooks.md) |
+| Hook timeout | `timeout_ms` per hook (example 2000), 1 to 60000 | Per hook | [hook](../05-models/hook.md) |
+| Hooks registered | At most 32 | — | [hook](../05-models/hook.md) |
+| Hook stdout | At most 256 KiB; `reason` 1024 bytes; 16 labels of 64 bytes | — | [hook](../05-models/hook.md) |
 | Rate limit | 5 denials of the same normalised line in 60 s → denied for 10 minutes | — | [hooks](../03-functional-requirements/hooks.md) |
 | `command.long_running` | 30 s | Yes (`Limits` in `knshd`; no configuration file key yet) | [command lifecycle](../03-functional-requirements/command-lifecycle.md) |
 | Timeout kill grace | At `timeout_s`, `SIGTERM` to the line's process group, then `SIGKILL` after 2 s if anything is left; the group is killed once more before its leader is reaped | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md#spawning-knsh-051) |

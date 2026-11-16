@@ -123,6 +123,14 @@
 //! [`decide`] asks [`RateLimits`] right after the parse and denies a limited line with source `rate_limit`, before
 //! hooks or asks. Time comes from the caller's injected clock.
 //!
+//! # Hooks (KNSH-062)
+//!
+//! [`parse_hooks`] reads the `[[hooks]]` registrations of the user's configuration into a [`HookConfig`], keeping a
+//! registration it cannot use as invalid so it denies every line it would match (FR-HOOK-04). [`run_hooks`] runs the
+//! matching hooks of one evaluation pass in declared order through a [`HookExecutor`] (processes are `knshd`'s), reads
+//! each answer with [`judge`], and returns the chain's [`HookOutcome`] with every hook's run time ([`HookRun`],
+//! FR-HOOK-05), which the pipeline puts in the record's `decision.hooks`. Human sessions run no hooks (FR-HOOK-01).
+//!
 //! Failures are reported through [`CoreError`], except the profile loader's, which are [`ProfileError`] because they
 //! must name the key at fault.
 
@@ -132,6 +140,7 @@
 
 mod error;
 mod event;
+mod hook;
 mod id;
 mod lifecycle;
 mod output;
@@ -151,6 +160,11 @@ pub use error::{CoreError, MAX_KEY_DISPLAY_LEN, ProfileError, ProfileErrorKind, 
 pub use event::{
     BusLimits, CancelReason, Delivery, EVENT_BUFFER_LEN, Event, EventBus, EventData, EventScope, Lost,
     MAX_ENDED_BUFFERS, Published, Subscribed, SubscriptionId,
+};
+pub use hook::{
+    ConfigProblem, Ended, Execution, HOOK_EVENT, HOOKS_KEY, HookConfig, HookEntry, HookExecutor, HookExit, HookId,
+    HookMatch, HookProblem, HookReply, HookSpec, MAX_HOOK_LABEL_LEN, MAX_HOOK_LABELS, MAX_HOOK_OUTPUT,
+    MAX_HOOK_REASON_LEN, MAX_HOOK_TIMEOUT_MS, MAX_HOOKS, MAX_MATCH_BINARIES, judge, parse_hooks, run_hooks,
 };
 pub use id::{CheckpointId, EventId, GrantId, RecordId, RequestId, SessionId};
 /// The network classes of the subcommand table (FR-LC-06), as lines present them to host rules ([`LineAccess`]).
@@ -182,9 +196,9 @@ pub use ratelimit::{
     MAX_TRACKED_SESSIONS,
 };
 pub use record::{
-    ArgvClass, ArgvEntry, DecisionVerdict, ExecutionRecord, MAX_NETWORK_ENTRIES, NetworkEntry, NetworkResult,
-    OutputInfo, OutputStream, RecordDecision, RecordDetails, argv_of, decode_argv, decode_decision, decode_network,
-    encode_argv, encode_decision, encode_network, merge_network,
+    ArgvClass, ArgvEntry, DecisionVerdict, ExecutionRecord, HookResult, HookRun, MAX_HOOK_RUNS, MAX_NETWORK_ENTRIES,
+    NetworkEntry, NetworkResult, OutputInfo, OutputStream, RecordDecision, RecordDetails, argv_of, decode_argv,
+    decode_decision, decode_network, encode_argv, encode_decision, encode_network, merge_network,
 };
 pub use redacted::{REDACTED_MARKER, Redacted};
 pub use registry::{EqualProfileOnly, ProfileOrder, SessionRegistry};

@@ -36,6 +36,7 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 | `rule_id` | e.g. `exec.allow[1]`, `exec.ask[0]` |
 | `decided_by` | Who decided (hook, authority, user) |
 | `latency_ms` | Time to decide: from receiving the line to its final decision, in milliseconds |
+| `hooks` | The hooks that ran for the line, in order, across both evaluation passes of a rewritten line (FR-HOOK-05, KNSH-062). Each element: `hook` (`hooks[N]`, or `hooks` when the whole hook configuration was invalid), `result` (`allow`, `deny`, `ask`, `rewrite`, `annotate`, `error`, `timeout`, or `invalid` for a hook that was not run because its registration is invalid), `duration_ms` (its run time, at most its timeout) and `labels` (an `annotate`'s labels, otherwise empty). Empty when no hook matched; absent from records written before KNSH-062 and read back as empty |
 
 The supervisor builds the record's `decision` from the pipeline's own decision, so the two always agree (KNSH-050).
 A line cancelled because its caller disconnected (FR-LC-41) is recorded as `deny` with source `standalone`: nobody
