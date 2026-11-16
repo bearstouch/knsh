@@ -15,6 +15,8 @@ use knsh_platform::{Signal, SpawnRequest};
 use knsh_store::{PageSize, RecordQuery, Scope};
 
 use super::tests::{WEB, filesystem, forwarded};
+use knsh_core::ProfileName;
+
 use super::*;
 use crate::events::Subscriber;
 use crate::holds::GroupKind;

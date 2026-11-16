@@ -91,6 +91,10 @@ pub enum Operation {
     ProcessInfo,
     /// Resolving a host name to addresses (`getaddrinfo`; the network proxy, KNSH-060).
     Resolve,
+    /// Reading a Keychain item (`SecItemCopyMatching`; the policy signing key, KNSH-065).
+    KeychainRead,
+    /// Creating a Keychain item (`SecItemAdd`; the policy signing key, KNSH-065).
+    KeychainAdd,
 }
 
 impl Operation {
@@ -134,6 +138,8 @@ impl Operation {
             Self::SandboxLog => "sandbox log",
             Self::ProcessInfo => "read process information",
             Self::Resolve => "resolve host name",
+            Self::KeychainRead => "read keychain item",
+            Self::KeychainAdd => "add keychain item",
         }
     }
 }
@@ -306,6 +312,17 @@ pub enum PlatformError {
         /// The exit status.
         status: Option<i32>,
     },
+    /// A Keychain call failed (KNSH-065). Carries the `OSStatus` (for example `-25293`, the status a would-be
+    /// "allow access" dialog becomes when user interaction is disabled), never the item's value.
+    Keychain {
+        /// What was being done.
+        operation: Operation,
+        /// The `OSStatus` the Security framework returned.
+        status: i32,
+    },
+    /// A Keychain item exists but its value is not what the engine stores there (for example a signing key of the
+    /// wrong length). Treated like a read failure: tampering, fail closed (decision 11).
+    KeychainValueInvalid,
 }
 
 impl PlatformError {
@@ -333,7 +350,9 @@ impl PlatformError {
             | Self::UnexpectedKind
             | Self::ExclusionNotVerified
             | Self::InvalidLaunchAgent
-            | Self::Launchctl { .. } => None,
+            | Self::Launchctl { .. }
+            | Self::Keychain { .. }
+            | Self::KeychainValueInvalid => None,
         }
     }
 
@@ -353,7 +372,9 @@ impl PlatformError {
             | Self::UnexpectedKind
             | Self::ExclusionNotVerified
             | Self::InvalidLaunchAgent
-            | Self::Launchctl { .. } => None,
+            | Self::Launchctl { .. }
+            | Self::Keychain { .. }
+            | Self::KeychainValueInvalid => None,
         }
     }
 
@@ -391,6 +412,8 @@ impl fmt::Display for PlatformError {
             ),
             Self::Launchctl { status: Some(status) } => write!(f, "launchctl exited with status {status}"),
             Self::Launchctl { status: None } => f.write_str("launchctl was ended by a signal"),
+            Self::Keychain { operation, status } => write!(f, "{} failed: OSStatus {status}", operation.as_str()),
+            Self::KeychainValueInvalid => f.write_str("keychain item does not hold a value the engine wrote"),
         }
     }
 }
@@ -410,7 +433,9 @@ impl std::error::Error for PlatformError {
             | Self::UnexpectedKind
             | Self::ExclusionNotVerified
             | Self::InvalidLaunchAgent
-            | Self::Launchctl { .. } => None,
+            | Self::Launchctl { .. }
+            | Self::Keychain { .. }
+            | Self::KeychainValueInvalid => None,
         }
     }
 }

@@ -62,8 +62,8 @@ use knsh_core::{
     Actor, Allowed, AskAnswer, AskReply, AskRequest, Authority, BinaryLookup, Caller, CancelReason, CanonicalPath,
     Counted, Decision, DecisionSource, DenialLimiter, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR,
     LineInput, LineKey, LocalApprovals, NetworkEntry, Observer, Outcome, OutputRedaction, OutputStream, Profile,
-    ProfileName, Proposal, RateLimits, RecordDetails, RecordId, Redacted, Refusal, RefusalKind, RequestId, SessionId,
-    Timestamp, Ulid, argv_of, decide, redact,
+    Proposal, RateLimits, RecordDetails, RecordId, Redacted, Refusal, RefusalKind, RequestId, SessionId, Timestamp,
+    Ulid, argv_of, decide, redact,
 };
 use knsh_json::{Object, ToJson, Value};
 use knsh_platform::{Clock, ProcessGroupId, Processes, Random};
@@ -87,6 +87,9 @@ const CALLER_POLL: Duration = Duration::from_millis(100);
 /// Reasons for denials the driver makes itself, before the pipeline decides. Fixed texts.
 const NO_STORE: &str = "the record store is unavailable, so the line cannot be recorded and was denied (fail closed)";
 const NO_PROFILE: &str = "the session's profile could not be loaded, so the line was denied (fail closed)";
+/// Reason for a line whose profile file (or a parent's) has a missing or bad signature (FR-POL-42, KNSH-065).
+const INVALID_PROFILE: &str =
+    "the session's policy file has a missing or bad signature and was ignored, so the line was denied (fail closed)";
 const NO_CLOCK: &str = "the supervisor could not read its clock or random source, so the line was denied (fail closed)";
 /// Reason for a line allowed by the pipeline whose session was paused or taken over before it could be spawned
 /// (FR-SES-10, FR-SES-12). The client sends the line again and it is decided afresh.
@@ -362,8 +365,21 @@ impl Lifecycle {
         if parts.store.is_none() {
             return Err(self.refuse_early(line, &actor, record, NO_STORE));
         }
-        let Some(profile) = self.profile(&profile_name, line) else {
-            return Err(self.refuse_early(line, &actor, record, NO_PROFILE));
+        let profile = match self.parts.profiles.load(&profile_name, line.proposal.cwd.as_path()) {
+            Ok(profile) => profile,
+            Err(error) => {
+                // FR-POL-42: a policy file with a missing or bad signature is reported on the session, and the line
+                // is denied; the session never falls back to another profile.
+                let reason = match crate::policy::invalid_profile(&error) {
+                    Some(invalid) => {
+                        let data = EventData::PolicyInvalid { profile: invalid };
+                        let _ = self.parts.events.publish(line.session_id, &actor, data);
+                        INVALID_PROFILE
+                    }
+                    None => NO_PROFILE,
+                };
+                return Err(self.refuse_early(line, &actor, record, reason));
+            }
         };
 
         let observer = ProposedEvents {
@@ -454,11 +470,6 @@ impl Lifecycle {
         self.parts.random.fill(&mut random).ok()?;
         let ulid = Ulid::new(now.as_unix_millis(), random).ok()?;
         Some((now, RecordId::from_ulid(ulid)))
-    }
-
-    /// The session's profile, or `None` if it cannot be loaded.
-    fn profile(&self, name: &ProfileName, line: &ForwardedLine) -> Option<Profile> {
-        self.parts.profiles.load(name, line.proposal.cwd.as_path()).ok()
     }
 
     /// Milliseconds since `then` on the injected clock; 0 if the clock cannot be read or stepped back.

@@ -29,7 +29,7 @@ const TOOL: ProcessIdentity = ProcessIdentity::new(202, 1);
 const OUTSIDER: ProcessIdentity = ProcessIdentity::new(300, 1);
 
 /// The dispatcher `knshd` serves, over `fixture`'s sessions and store: `hello` and the record, event, session and
-/// policy handlers, and `exec.run` without a supervisor. Shared with the socket-level tests in `platform_tests`.
+/// policy handlers (`policy.edit` with a prompt nobody answers), and `exec.run` without a supervisor. Shared with the socket-level tests in `platform_tests`.
 pub(crate) fn dispatcher(fixture: &Fixture) -> Dispatcher {
     let mut handlers = crate::records::Records::new(Some(fixture.store.clone())).handlers();
     handlers.extend(fixture.hub.handlers());
@@ -37,6 +37,7 @@ pub(crate) fn dispatcher(fixture: &Fixture) -> Dispatcher {
     handlers.extend(
         crate::policy::tests::service(Arc::clone(&fixture.sessions), knsh_platform::testing::MemFs::new()).handlers(),
     );
+    handlers.extend(crate::policy_edit::tests::idle_handlers());
     handlers.extend(crate::exec::unserved_handlers());
     handlers.extend(crate::start_agent::unserved_handlers());
     crate::hello::dispatcher_with_violations(

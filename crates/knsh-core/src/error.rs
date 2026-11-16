@@ -174,6 +174,9 @@ pub enum ProfileErrorKind {
     ProfileNotFound,
     /// The profile source has the profile but could not read it.
     ProfileUnreadable,
+    /// The profile file's signature is missing or bad, so the file is ignored (FR-POL-42, KNSH-065). The session
+    /// never falls back to another profile.
+    SignatureInvalid,
     /// `preset` names no preset the engine ships.
     UnknownPreset,
     /// A preset sets a key presets may not set: presets only add to lists (`fs.write`, `network.hosts`, …).
@@ -207,6 +210,7 @@ impl fmt::Display for ProfileErrorKind {
             Self::ExtendsTooDeep => write!(f, "extends chain is longer than {} profiles", crate::MAX_EXTENDS_DEPTH),
             Self::ProfileNotFound => f.write_str("profile not found"),
             Self::ProfileUnreadable => f.write_str("profile could not be read"),
+            Self::SignatureInvalid => f.write_str("profile file has a missing or bad signature"),
             Self::UnknownPreset => f.write_str("unknown preset"),
             Self::NotAllowedInPreset => f.write_str("presets may only add to path and host lists"),
             Self::UnknownVariable => {

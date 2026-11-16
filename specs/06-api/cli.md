@@ -13,7 +13,7 @@ The `knsh` binary wraps the API. Every command takes `--json` for machine-readab
 | `knsh approvals` | `user.sock` | List pending asks |
 | `knsh approve <request_id>` | `user.sock` | Approve an ask; `knshd` shows Touch ID or password prompt |
 | `knsh policy check` | `user.sock` | Dry-run a line against policy |
-| `knsh policy edit` | `user.sock` | Edit a policy file; saving needs Touch ID or password |
+| `knsh policy edit <profile>` | `user.sock` | Edit a policy file; saving needs Touch ID or password ([below](#policy-edit)) |
 | `knsh profile use <profile>` | `user.sock` | Select a local profile; needs Touch ID |
 | `knsh authority trust --team-id <id> --identifier <bundle-id> --min-version <v>` | `user.sock` | Trust an authority; needs Touch ID or password |
 | `knsh forget [--session <id> \| --since <date>] [--with-checkpoints]` | `user.sock` | Delete records and optionally checkpoints |
@@ -43,6 +43,25 @@ the CLI in an envelope on those streams; `knsh agent` runs nothing itself.
 - **Limit (KNSH-057):** the CLI runs in a process group of `knshd`, not in the terminal's foreground group.
   Terminal-generated signals (Ctrl-C with `ISIG` on, `SIGWINCH`) reach `knsh agent`, not the CLI; agent CLIs run the
   terminal in raw mode and read Ctrl-C as input.
+
+## Policy edit
+
+`knsh policy edit <profile>` (KNSH-065, FR-POL-41) edits `~/.config/knsh/policies/<profile>.toml`. `knshd` alone
+signs and writes policy files ([integrity](../03-functional-requirements/policy.md#integrity)):
+
+1. It calls [`policy.read`](user-socket.md#policyread) and, when the file is `invalid` (missing or bad signature, or
+   an unreadable key), warns on stderr that `knshd` ignores it and that saving signs it, so the user reviews the text.
+2. It writes the text (without the signature line) to a new `0600` file in `TMPDIR` and runs `$VISUAL`, else
+   `$EDITOR`, else `vi`, through `/bin/sh -c '<editor> "$1"'`. The connection is closed meanwhile.
+3. If the editor fails, nothing is sent. If the text is unchanged and the file is `valid`, it prints
+   `No changes to profile <p>.` and sends nothing.
+4. Otherwise it prints the size and the first 16 hex digits of the SHA-256 of the text (with a final newline), which
+   the prompt on the Mac's screen also shows, and calls [`policy.edit`](user-socket.md#policyedit). Success prints
+   `Signed and saved profile <p>.` (`--json`: `{"profile","changed"}`).
+
+A profile name outside `[A-Za-z0-9._-]{1,64}` is a usage error (exit 2). A failed editor, a refused prompt
+(`-32001`), text that does not load (`-32602`, with the loader's reason) or any other failure exits with 1; the edited
+text is then kept in its temporary file and the path printed. `unattended` is built in and cannot be edited.
 
 ## Version and the advisory label
 

@@ -273,6 +273,10 @@ fn actor(actor: &Actor) -> Result<Object, JsonError> {
 }
 
 /// The `data` member of each phase 1 event (`specs/05-models/event.md#phase-1-payloads`).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flat arm per event variant, each mirroring its payload in the spec"
+)]
 fn data(data: &EventData) -> Result<Object, JsonError> {
     match data {
         EventData::SessionStarted {
@@ -379,6 +383,8 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
                 "size",
                 crate::records::bytes(u64::try_from(bytes.expose().len()).unwrap_or(u64::MAX)),
             ),
+        // KNSH-065 (FR-POL-42): a profile name is `[A-Za-z0-9._-]`, so it needs no redaction.
+        EventData::PolicyInvalid { profile } => Object::new().with("profile", profile.as_str()),
     }
 }
 
@@ -698,6 +704,12 @@ mod tests {
             cancelled.contains(r#""data":{"request_id":null,"reason":"caller_gone"}"#),
             "{cancelled}"
         );
+        // KNSH-065 (FR-POL-42): the profile whose file failed its signature check.
+        let invalid = data(EventData::PolicyInvalid {
+            profile: knsh_core::ProfileName::new("web-app").unwrap(),
+        });
+        assert!(invalid.contains(r#""event":"policy.invalid""#), "{invalid}");
+        assert!(invalid.contains(r#""data":{"profile":"web-app"}"#), "{invalid}");
         // KNSH-051 (FR-LC-17): `command.started` and `command.long_running` share one shape.
         let started_at = Timestamp::from_unix_micros(1_700_000_000_000_000).unwrap();
         for (event, name) in [

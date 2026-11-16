@@ -1,8 +1,11 @@
-//! SHA-256 through `CommonCrypto`, part of `libSystem` (no extra library, no crate).
+//! SHA-256 and HMAC-SHA-256 through `CommonCrypto`, part of `libSystem` (no extra library, no crate).
 //!
-//! Used to name each compiled sandbox profile by the hash of its bytes (FR-SBX-07, KNSH-045), so a record's
+//! SHA-256 names each compiled sandbox profile by the hash of its bytes (FR-SBX-07, KNSH-045), so a record's
 //! `sandbox_profile` names exactly what ran. The incremental `Init`/`Update`/`Final` calls take lengths as 32-bit
 //! values, so input is fed in chunks of at most `u32::MAX` bytes and any length is hashed whole.
+//!
+//! HMAC-SHA-256 signs policy files with the key `knshd` keeps in the Keychain (FR-POL-40, KNSH-065). `CCHmac` takes
+//! `size_t` lengths, so it is one call.
 
 use std::ffi::c_void;
 
@@ -23,6 +26,38 @@ unsafe extern "C" {
     fn CC_SHA256_Init(context: *mut Sha256Context) -> i32;
     fn CC_SHA256_Update(context: *mut Sha256Context, data: *const c_void, len: u32) -> i32;
     fn CC_SHA256_Final(digest: *mut u8, context: *mut Sha256Context) -> i32;
+    fn CCHmac(
+        algorithm: u32,
+        key: *const c_void,
+        key_length: usize,
+        data: *const c_void,
+        data_length: usize,
+        mac_out: *mut c_void,
+    );
+}
+
+/// `kCCHmacAlgSHA256` from `<CommonCrypto/CommonHMAC.h>`.
+const CC_HMAC_ALG_SHA256: u32 = 2;
+
+/// The HMAC-SHA-256 of `data` under `key` (RFC 2104). Any key length is accepted; the policy signing key is 32
+/// bytes. No failure mode: `CCHmac` returns nothing and only reads its inputs.
+#[must_use]
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; SHA256_LEN] {
+    let mut mac = [0u8; SHA256_LEN];
+    // SAFETY: `key` and `data` are readable regions of exactly the lengths passed, alive for the call (an empty
+    // slice's dangling but non-null pointer is never read for length 0). `mac` is a writable region of
+    // `CC_SHA256_DIGEST_LENGTH` (32) bytes, the size `CCHmac` writes for `kCCHmacAlgSHA256`.
+    unsafe {
+        CCHmac(
+            CC_HMAC_ALG_SHA256,
+            key.as_ptr().cast(),
+            key.len(),
+            data.as_ptr().cast(),
+            data.len(),
+            mac.as_mut_ptr().cast(),
+        );
+    }
+    mac
 }
 
 /// The SHA-256 digest of `data`.
@@ -66,6 +101,26 @@ mod tests {
             let _ = write!(text, "{byte:02x}");
             text
         })
+    }
+
+    // RFC 4231 test cases 1, 2 and 6 (a key longer than the block size). FR-POL-40.
+    #[test]
+    fn hmac_matches_rfc4231_vectors() {
+        assert_eq!(
+            hex(hmac_sha256(&[0x0b; 20], b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            hex(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        assert_eq!(
+            hex(hmac_sha256(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
     }
 
     // FIPS 180-4 example vectors.

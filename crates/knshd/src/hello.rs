@@ -148,7 +148,8 @@ pub(crate) mod tests {
     }
 
     /// Every handler besides `hello`: records without a store, events on an empty bus, sessions that cannot record
-    /// (no store), `policy.check` over an empty filesystem, and `exec.run` without a supervisor.
+    /// (no store), `policy.check`, `policy.read` and `policy.edit` over an empty filesystem (with a prompt nobody
+    /// answers), and `exec.run` without a supervisor.
     pub(crate) fn handlers() -> Handlers {
         let mut handlers = crate::records::Records::unavailable().handlers();
         let hub = crate::events::tests::hub();
@@ -156,6 +157,7 @@ pub(crate) mod tests {
         let sessions = sessions();
         handlers.extend(sessions.handlers());
         handlers.extend(crate::policy::tests::service(sessions, knsh_platform::testing::MemFs::new()).handlers());
+        handlers.extend(crate::policy_edit::tests::idle_handlers());
         handlers.extend(crate::exec::unserved_handlers());
         handlers.extend(crate::start_agent::unserved_handlers());
         handlers

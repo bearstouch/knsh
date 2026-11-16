@@ -25,6 +25,8 @@
 //! - `specs/06-api/user-socket.md#human-sessions`, FR-SES-21, FR-SES-24, FR-SES-25, FR-REC-09, NFR-PRIV-05 (human
 //!   sessions, telemetry and `session.info`, KNSH-021)
 //! - `specs/06-api/agent-socket.md#policycheck`, FR-POL-70 (`policy.check` dry runs, KNSH-043)
+//! - FR-POL-40 to FR-POL-42, NFR-SEC-04, `specs/06-api/user-socket.md#policyedit` (signed policy files,
+//!   `policy.invalid`, and `policy.read` and `policy.edit` for `knsh policy edit`, KNSH-065)
 //! - FR-SBX-07 (compiled profile files named by hash, collected when unused, KNSH-045)
 //! - FR-SBX-06, FR-SBX-08, decision 9 (sandbox violation reader, KNSH-047)
 //! - FR-AGT-23, FR-SES-02, NFR-SEC-02, `specs/06-api/agent-socket.md` (`agent.sock`: session tokens, the envelope
@@ -55,7 +57,8 @@
 //! which later stories provide. It exits after ten idle minutes ([`lifetime`]) or when launchd stops it, finishing
 //! in-flight requests and committing pending writes first. A session can be paused or taken over by a human
 //! ([`holds`], KNSH-054): its new lines are held with `-32007`, and a pause stops its envelope's and running lines'
-//! process groups.
+//! process groups. Policy files are accepted only with `knshd`'s signature, made with a Keychain key after Touch ID or
+//! the password ([`policy_edit`], KNSH-065).
 //! The supervisor arrives in later stories.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -96,6 +99,9 @@ mod lifetime;
 // Reads the session registry, so built where it is.
 #[cfg(target_os = "macos")]
 mod policy;
+// `knsh policy edit` (KNSH-065): signs with the Keychain key after the LocalAuthentication prompt, both macOS only.
+#[cfg(target_os = "macos")]
+mod policy_edit;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod probe;
 // Hashes with CommonCrypto, so built on macOS: the start-up sweep and each supervised line's profile (KNSH-051).
@@ -214,7 +220,7 @@ fn start() -> Result<(), StartError> {
     use knsh_platform::{EnginePaths, Field, Level, SystemLog, Value, ensure_engine_dirs};
 
     use crate::events::EventHub;
-    use crate::policy::{PolicyCheck, ProfileLoader};
+    use crate::policy::PolicyCheck;
     use crate::records::Records;
     use crate::server::{Config, Exit, Server, Services};
     use crate::sessions::Sessions;
@@ -258,20 +264,14 @@ fn start() -> Result<(), StartError> {
             random.clone(),
             processes,
         );
-        // Dry runs read profiles and binaries through the real filesystem. `TMPDIR` is set by launchd for the agent;
-        // without it `${TMPDIR}` is the system's `/tmp`.
-        let tmpdir = std::env::var_os("TMPDIR").map_or_else(|| "/tmp".into(), std::path::PathBuf::from);
-        let profiles = ProfileLoader::new(
-            Arc::new(RealFs::new()),
-            paths.policies_dir(),
-            paths.home().to_path_buf(),
-            tmpdir,
-        );
+        let profiles = profile_loader(&paths, random.clone(), &log);
         let policy = PolicyCheck::new(Arc::clone(&sessions), profiles.clone());
+        let editor = policy_editor(&profiles, &log);
         let mut handlers = records.handlers();
         handlers.extend(events.handlers());
         handlers.extend(sessions.handlers());
         handlers.extend(policy.handlers());
+        handlers.extend(editor.handlers());
         // `exec.run` (KNSH-051), listed only when the sandbox probe passes; without `knsh-exec` nothing can run.
         let supervision = Supervision {
             paths: &paths,
@@ -390,6 +390,56 @@ fn start_violation_reader(
         unavailable();
     }
     reader
+}
+
+/// The profile loader `policy.check`, `policy.edit` and the supervisor share. Profiles and binaries are read through
+/// the real filesystem. `TMPDIR` is set by launchd for the agent; without it `${TMPDIR}` is the system's `/tmp`.
+///
+/// Policy files are accepted only with knshd's signature (KNSH-065, FR-POL-40): the key lives in the login keychain
+/// and is read once, then kept in memory; it is created on the first `knsh policy edit`.
+#[cfg(target_os = "macos")]
+fn profile_loader(
+    paths: &knsh_platform::EnginePaths,
+    random: std::sync::Arc<knsh_platform::macos::SystemRandom>,
+    log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+) -> crate::policy::ProfileLoader {
+    use std::sync::Arc;
+
+    use knsh_platform::macos::{KeychainSigningKey, RealFs, hmac_sha256};
+
+    let tmpdir = std::env::var_os("TMPDIR").map_or_else(|| "/tmp".into(), std::path::PathBuf::from);
+    let signer = Arc::new(knsh_platform::PolicySigner::new(
+        Arc::new(KeychainSigningKey::new()),
+        random,
+        hmac_sha256,
+    ));
+    crate::policy::ProfileLoader::new(
+        Arc::new(RealFs::new()),
+        paths.policies_dir(),
+        paths.home().to_path_buf(),
+        tmpdir,
+        signer,
+        Arc::clone(log),
+    )
+}
+
+/// `policy.read` and `policy.edit` for `knsh policy edit`: knshd shows the Touch ID or password prompt itself before
+/// signing (FR-POL-41).
+#[cfg(target_os = "macos")]
+fn policy_editor(
+    profiles: &crate::policy::ProfileLoader,
+    log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+) -> std::sync::Arc<crate::policy_edit::PolicyEditor> {
+    use std::sync::Arc;
+
+    use knsh_platform::macos::{LocalAuthentication, sha256};
+
+    crate::policy_edit::PolicyEditor::new(
+        profiles.clone(),
+        Arc::new(LocalAuthentication::new()),
+        sha256,
+        Arc::clone(log),
+    )
 }
 
 /// The record store. One that cannot be opened (newer schema, foreign or unsafe file) is reported and left

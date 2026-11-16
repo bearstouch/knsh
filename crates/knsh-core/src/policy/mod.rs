@@ -85,14 +85,16 @@ pub const MAX_PROFILE_LEN: usize = knsh_toml::MAX_INPUT_LEN;
 pub const MAX_EXTENDS_DEPTH: usize = 8;
 
 /// Where profiles are read from by name: `<name>.toml` in the policies directory in `knsh-platform` (FR-POL-01), an
-/// in-memory map in tests. Signature checks (KNSH-065) belong here, so the loader only ever sees accepted text.
+/// in-memory map in tests. Signature checks (KNSH-065, FR-POL-40 to FR-POL-42) sit in the source, so the loader only
+/// ever sees text whose signature verified.
 pub trait ProfileSource {
     /// The text of the profile called `name`.
     ///
     /// # Errors
     ///
     /// [`LookupError::NotFound`] if there is no such profile; [`LookupError::Failed`] if it exists but cannot be
-    /// read (or is larger than [`MAX_PROFILE_LEN`]).
+    /// read (or is larger than [`MAX_PROFILE_LEN`]); [`LookupError::SignatureInvalid`] if its signature is missing
+    /// or bad.
     fn read_profile(&self, name: &ProfileName) -> Result<Vec<u8>, LookupError>;
 }
 
@@ -139,6 +141,7 @@ fn read_named<S: ProfileSource + ?Sized>(name: &ProfileName, source: &S) -> Resu
         let kind = match error {
             LookupError::NotFound => ProfileErrorKind::ProfileNotFound,
             LookupError::Failed => ProfileErrorKind::ProfileUnreadable,
+            LookupError::SignatureInvalid => ProfileErrorKind::SignatureInvalid,
         };
         ProfileError::new(kind).in_origin(&origin)
     })?;

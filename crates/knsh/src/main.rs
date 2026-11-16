@@ -50,6 +50,7 @@ fn main() -> ExitCode {
             ["daemon", action @ ("install" | "uninstall")] => daemon(action, parsed.json()),
             ["forget"] => forget(&parsed),
             ["history"] => history(&parsed),
+            ["policy", "edit"] => policy_edit(&parsed),
             ["events"] => events(&parsed),
             ["shell", "install"] => shell_install(parsed.json()),
             _ => not_implemented(&format!("'knsh {}'", parsed.path.join(" "))),
@@ -135,6 +136,148 @@ fn forget(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
 #[cfg(not(unix))]
 fn forget(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
     not_implemented("'knsh forget' on this platform")
+}
+
+/// Runs `knsh policy edit <profile>` (KNSH-065, FR-POL-41): reads the profile from `knshd`, opens it in the user's
+/// editor in a private temporary file, and sends the result to be signed; `knshd` shows the Touch ID or password
+/// prompt itself. A bad profile name is a usage error (exit 2); a failed editor or call exits with 1, nothing saved,
+/// and the edited text is kept in its temporary file. The connection is closed while the editor runs, so a long edit
+/// never holds `knshd` or meets a read timeout.
+#[cfg(target_os = "macos")]
+fn policy_edit(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    use knsh::cli::{client, policy};
+
+    let profile = match policy::profile(parsed) {
+        Ok(profile) => profile,
+        Err(error) => return usage(&error, "policy edit"),
+    };
+    let socket = match user_socket() {
+        Ok(socket) => socket,
+        Err(code) => return code,
+    };
+    let current = match client::connect_user(&socket).and_then(|mut client| policy::read(&mut client, &profile)) {
+        Ok(current) => current,
+        Err(error) => {
+            report(&policy::failure_message(&error));
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(warning) = policy::state_warning(&current) {
+        report(&warning);
+    }
+    let path = match edit_file::create(&profile, &current.text) {
+        Ok(path) => path,
+        Err(error) => {
+            report(&format!("knsh: policy edit: cannot create a temporary file: {error}\n"));
+            return ExitCode::FAILURE;
+        }
+    };
+    // Every failure after the file exists reports why, then where the edited text is kept, so no work is lost.
+    let not_saved = |message: &str| {
+        report(message);
+        report(&format!("knsh: policy edit: your text is kept in {}\n", path.display()));
+        ExitCode::FAILURE
+    };
+    let visual = std::env::var("VISUAL").ok();
+    let editor = std::env::var("EDITOR").ok();
+    let editor = policy::editor(visual.as_deref(), editor.as_deref());
+    let status = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(policy::editor_script(&editor))
+        .arg("knsh-policy-edit")
+        .arg(&path)
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            return not_saved(&format!(
+                "knsh: policy edit: the editor exited with {status}; nothing was saved\n"
+            ));
+        }
+        Err(error) => {
+            return not_saved(&format!(
+                "knsh: policy edit: cannot run the editor: {error}; nothing was saved\n"
+            ));
+        }
+    }
+    let edited = match edit_file::read(&path) {
+        Ok(text) => policy::as_signed(&text),
+        Err(error) => return not_saved(&format!("knsh: policy edit: {error}; nothing was saved\n")),
+    };
+    let result = if policy::unchanged(&current, &edited) {
+        Ok(knsh_proto::PolicyEditResult {
+            profile: profile.clone(),
+            changed: false,
+        })
+    } else {
+        let sha256 = knsh_platform::macos::sha256(edited.as_bytes());
+        report(&policy::confirm_notice(&profile, edited.len(), &sha256));
+        client::connect_user(&socket).and_then(|mut client| policy::save(&mut client, &profile, edited))
+    };
+    match result {
+        Ok(result) => {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::io::stdout().write_all(policy::report(&result, parsed.json()).as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(error) => not_saved(&policy::failure_message(&error)),
+    }
+}
+
+/// Policy files are signed by `knshd` with the Keychain and Touch ID: macOS only so far.
+#[cfg(not(target_os = "macos"))]
+fn policy_edit(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    not_implemented("'knsh policy edit' on this platform")
+}
+
+/// The private temporary file `knsh policy edit` opens in the editor.
+#[cfg(target_os = "macos")]
+mod edit_file {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::PathBuf;
+
+    use knsh_core::ProfileName;
+
+    /// Creates `<TMPDIR>/knsh-policy-<profile>-<pid>-<n>.toml`, new and owner-only (`0600`), holding `text`. Never
+    /// opens an existing file, so nothing planted at the name is followed or reused.
+    pub(super) fn create(profile: &ProfileName, text: &str) -> std::io::Result<PathBuf> {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let mut attempt = 0u32;
+        loop {
+            let path = dir.join(format!("knsh-policy-{profile}-{pid}-{attempt}.toml"));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    file.write_all(text.as_bytes())?;
+                    return Ok(path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < 100 => attempt += 1,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// The edited text: UTF-8, at most the profile limit.
+    pub(super) fn read(path: &std::path::Path) -> Result<String, String> {
+        let limit = knsh_proto::MAX_POLICY_TEXT_LEN;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| {
+                file.take(u64::try_from(limit).unwrap_or(u64::MAX) + 1)
+                    .read_to_end(&mut bytes)
+            })
+            .map_err(|error| format!("cannot read the edited file: {error}"))?;
+        if bytes.len() > limit {
+            return Err(format!("the edited text is longer than {limit} bytes"));
+        }
+        String::from_utf8(bytes).map_err(|_| String::from("the edited text is not UTF-8"))
+    }
 }
 
 /// Runs `knsh agent` (KNSH-056): checks the command line, asks `knshd` over `user.sock` to start the agent CLI on
