@@ -22,6 +22,12 @@
 //! 5. The checked addresses, with the port, are what the proxy connects to, in order, and nothing else: the name is
 //!    never resolved again (FR-NET-07).
 //!
+//! # The server-name check ([`Scope::checks_server_name`])
+//!
+//! Every tunnel must start with a TLS `ClientHello` naming its host (FR-NET-06, [`crate::tls`]), except to a host
+//! listed in `network.non_tls_hosts`, and to step 1's loopback ports, which the sandbox profile lets the command
+//! reach without the proxy, so checking them adds nothing. An owner with no scope is checked (fail closed).
+//!
 //! The decision is a pure function of the scope, the target and the resolver's answer; [`decide`] takes the
 //! resolver as a function so tests can answer anything.
 //!
@@ -34,7 +40,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use knsh_core::{HostRefusal, NetworkPolicy, RecordId, Requester, SessionId, check_host};
+use knsh_core::{HostRefusal, NetworkPolicy, RecordId, Requester, SessionId, check_host, is_non_tls_host};
 use knsh_platform::{MAX_ADDRESSES, Resolver};
 
 use crate::address::{is_internal, is_loopback};
@@ -66,6 +72,21 @@ impl Scope {
     #[must_use]
     pub fn allows_ip_literal(&self, ip: IpAddr, port: NonZeroU16) -> bool {
         self.loopback_port(ip, port) || self.lists_address(ip)
+    }
+
+    /// Whether a tunnel to `target` must start with a `ClientHello` naming its host (module documentation, "The
+    /// server-name check"): yes unless the target is a loopback port or listed in `network.non_tls_hosts`.
+    #[must_use]
+    pub fn checks_server_name(&self, target: &Target) -> bool {
+        let port = target.port;
+        let exempt = match &target.host {
+            Host::Ip(ip) => self.loopback_port(*ip, port) || is_non_tls_host(&self.network, &ip.to_string()),
+            Host::Name(name) => {
+                (is_localhost(name) && self.network.loopback.contains(&port.get()))
+                    || is_non_tls_host(&self.network, name)
+            }
+        };
+        !exempt
     }
 
     /// Step 4: whether a name may resolve to `ip`: a public address, or an internal one allowlisted.
@@ -190,6 +211,10 @@ impl ConnectionGate for HostRules {
     fn allows_ip_literal(&self, owner: &Owner, ip: IpAddr, port: NonZeroU16) -> bool {
         self.scope(owner).is_some_and(|scope| scope.allows_ip_literal(ip, port))
     }
+
+    fn checks_server_name(&self, owner: &Owner, target: &Target) -> bool {
+        self.scope(owner).is_none_or(|scope| scope.checks_server_name(target))
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +240,7 @@ mod tests {
                 publish: Vec::new(),
             },
             loopback: vec![3000],
+            non_tls_hosts: vec!["git.corp".to_owned(), "*.plain.test".to_owned()],
         }
     }
 
@@ -503,5 +529,31 @@ mod tests {
             None
         });
         assert_eq!(asked.get(), 0);
+    }
+
+    // FR-NET-06: every tunnel is checked for a TLS server name, except to `network.non_tls_hosts` and to the
+    // loopback ports (which the profile lets the command reach directly); an owner without a scope is checked.
+    #[test]
+    fn checks_server_name_unless_non_tls_or_loopback_port() {
+        let scope = plain(NetworkMode::Allowlist);
+        assert!(scope.checks_server_name(&target("registry.npmjs.org:443")));
+        assert!(scope.checks_server_name(&target("github.com:443")));
+        assert!(scope.checks_server_name(&target("10.1.2.3:443")));
+        assert!(!scope.checks_server_name(&target("git.corp:9418")));
+        assert!(!scope.checks_server_name(&target("GIT.corp.:443")));
+        assert!(!scope.checks_server_name(&target("a.plain.test:80")));
+        assert!(scope.checks_server_name(&target("plain.test:80")));
+        assert!(!scope.checks_server_name(&target("localhost:3000")));
+        assert!(!scope.checks_server_name(&target("127.0.0.1:3000")));
+        assert!(!scope.checks_server_name(&target("[::1]:3000")));
+        assert!(scope.checks_server_name(&target("localhost:3001")));
+
+        let rules = HostRules::new(Arc::new(FakeResolver::new()));
+        let session = SessionId::from_ulid(Ulid::from_u128(1));
+        let envelope = Owner { session, line: None };
+        assert!(rules.checks_server_name(&envelope, &target("git.corp:9418")));
+        rules.set(envelope, plain(NetworkMode::Allowlist));
+        assert!(!rules.checks_server_name(&envelope, &target("git.corp:9418")));
+        assert!(rules.checks_server_name(&envelope, &target("registry.npmjs.org:443")));
     }
 }

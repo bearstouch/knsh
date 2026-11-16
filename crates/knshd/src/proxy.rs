@@ -24,8 +24,9 @@
 //! and loses it when they are revoked. An envelope's scope is its session profile's `[network]` policy, with the
 //! envelope as requester (it reaches `network.hosts` only); a line's is the profile its decision was made under,
 //! with the line's classes, dynamic flag and approval ([`LineAccess`]). The gate applies the host rules, resolves
-//! names itself and refuses internal addresses (`knsh-proxy`'s `rules` module). `hello` keeps reporting
-//! `network_filter: none` until the TLS server-name check (FR-NET-06, KNSH-061) is in force too.
+//! names itself and refuses internal addresses (`knsh-proxy`'s `rules` module), and requires every tunnel to start
+//! with a TLS `ClientHello` naming its host, except to `network.non_tls_hosts` and the loopback ports (FR-NET-06,
+//! KNSH-061). `hello` keeps reporting `network_filter: none` until the probe claims it.
 //!
 //! # Reporting ([`NetworkReport`])
 //!
@@ -561,6 +562,7 @@ pub(crate) mod tests {
             approval_hosts: vec!["github.com".to_owned()],
             class_hosts: knsh_core::ClassHosts::default(),
             loopback: Vec::new(),
+            non_tls_hosts: Vec::new(),
         }
     }
 
@@ -572,6 +574,7 @@ pub(crate) mod tests {
             approval_hosts: Vec::new(),
             class_hosts: knsh_core::ClassHosts::default(),
             loopback: Vec::new(),
+            non_tls_hosts: Vec::new(),
         }
     }
 
@@ -847,7 +850,10 @@ pub(crate) mod tests {
         resolver.answer("registry.test", &[server.ip()]);
         let running = live_with(Arc::clone(&resolver));
         // The test server is on loopback: listing its address allowlists it (FR-NET-07).
-        let network = allowlist(&["registry.test", "127.0.0.1"]);
+        let mut network = allowlist(&["registry.test", "127.0.0.1"]);
+        // The test server speaks no TLS and the client sends nothing: exempt it from the server-name check
+        // (FR-NET-06), which would otherwise hold the contact until a `ClientHello` arrives.
+        network.non_tls_hosts = vec!["registry.test".to_owned()];
         let line = running
             .proxy
             .issue_line(session(1), record(5), &network, LineAccess::default())

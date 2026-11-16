@@ -80,6 +80,7 @@ Outside the subset, and rejected as such: dates and times, floats (including `in
 | `network.approval_hosts` | list | Only for commands whose class or approval includes them |
 | `network.class_hosts.fetch`, `network.class_hosts.publish` | list | Approval hosts a line reaches by its class alone, without an approval: each must be in `network.approval_hosts`. Presets may add to them. **Proposed** (KNSH-058) |
 | `network.loopback` | list of ports | Loopback ports allowed |
+| `network.non_tls_hosts` | list | Hosts whose tunnels may carry anything, not only TLS naming the host: the proxy skips the server-name check for them ([FR-NET-06](../03-functional-requirements/network-proxy.md#tls-server-name-check-knsh-061)). Matched like `network.hosts` entries; never makes a host reachable. Not allowed in presets. **Proposed** (KNSH-061) |
 | `approvals.irreversible` | `allow` \| `ask` \| `deny` | Treatment of irreversible lines |
 | `approvals.irreversible_commands` | list of patterns | Commands the profile adds to the irreversible list. **Proposed** (KNSH-039) |
 | `checkpoints.roots` | list of paths | Protected roots |

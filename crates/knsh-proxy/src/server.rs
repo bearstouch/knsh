@@ -1,5 +1,5 @@
 //! The proxy server: one loopback listener for HTTP CONNECT and SOCKS5, per-command credentials, and tunnels
-//! (FR-NET-01, FR-NET-05, FR-NET-13).
+//! (FR-NET-01, FR-NET-05, FR-NET-06, FR-NET-13).
 //!
 //! # Threads
 //!
@@ -17,10 +17,17 @@
 //!    (git sends credentials only after it), or the SOCKS5 refusals. Live credentials give the [`Owner`].
 //! 4. **Destination.** An IP literal is refused unless the gate allowlists it; otherwise the [`ConnectionGate`] gives
 //!    the exact addresses to connect to, or a refusal. Both protocols take this one path.
-//! 5. **Tunnel.** The proxy connects to those addresses in order, the first that answers winning, all within
-//!    [`Config::connect_timeout`], and never to any other: the name is not resolved again (FR-NET-07). It then
-//!    reports the contact, answers success, forwards any bytes the client sent after its request, and relays byte
-//!    for byte under the idle and total timeouts.
+//! 5. **Connect.** The proxy connects to those addresses in order, the first that answers winning, all within
+//!    [`Config::connect_timeout`], and never to any other: the name is not resolved again (FR-NET-07).
+//! 6. **Server name** (FR-NET-06). Unless the gate says the destination is exempt
+//!    ([`ConnectionGate::checks_server_name`]: a host configured for non-TLS use, a loopback port), the proxy
+//!    answers success, then reads the client's first bytes, under a fresh [`Config::handshake_timeout`] and at most
+//!    [`tls::MAX_HELLO_BYTES`], and parses them as a TLS `ClientHello` ([`crate::tls`]). The tunnel opens only if
+//!    the hello names the requested host. Otherwise nothing has reached the destination: the refusal is reported
+//!    and the connection closed (success was already answered, since a TLS client sends its hello only after it).
+//! 7. **Tunnel.** The proxy reports the contact, answers success if it has not yet, forwards the bytes the client
+//!    sent so far (the `ClientHello`, or anything sent after its request), and relays byte for byte under the idle
+//!    and total timeouts.
 //!
 //! Every refusal and every contact is reported to the [`ProxyReport`] (FR-NET-09). The proxy opens a connection only
 //! for a client's request that passed every check, and sends nothing of its own on it (FR-NET-13).
@@ -69,6 +76,7 @@ use crate::http::{self, Authorization, HeadState, HttpError, MAX_HEAD, Response}
 use crate::relay::{Timeouts, relay};
 use crate::socks5::{self, Command, Reply, SocksError};
 use crate::target::{Host, Target};
+use crate::tls::{self, HelloState};
 
 /// The kqueue token of the listener.
 const LISTENER: usize = 1;
@@ -331,6 +339,15 @@ impl Shared {
         }
     }
 
+    /// Whether connection `id` was revoked (or is gone): its client socket was shut down by the revocation, so a
+    /// read that failed on it is not the client's doing.
+    fn revoked(&self, id: u64) -> bool {
+        self.lock_live()
+            .connections
+            .get(&id)
+            .is_none_or(|connection| connection.revoked)
+    }
+
     /// Forgets a connection that has ended.
     fn unregister(&self, id: u64) {
         self.lock_live().connections.remove(&id);
@@ -507,13 +524,18 @@ fn refuse_http(shared: &Shared, stream: &TcpStream, owner: Option<Owner>, target
         Refusal::MissingCredentials | Refusal::UnknownCredentials => Response::ProxyAuthenticationRequired,
         Refusal::Malformed | Refusal::UnsupportedCommand => Response::BadRequest,
         Refusal::UnsupportedProtocol => Response::MethodNotAllowed,
+        // The server-name refusals come after success was answered and only close the connection
+        // (`check_client_hello`); they are listed for completeness.
         Refusal::IpLiteral
         | Refusal::HostNotAllowed
         | Refusal::NetworkOff
         | Refusal::ApprovalRequired
         | Refusal::DynamicCode
         | Refusal::AddressNotAllowed
-        | Refusal::NoHostRules => Response::Forbidden,
+        | Refusal::NoHostRules
+        | Refusal::NotTls
+        | Refusal::ServerNameMissing
+        | Refusal::ServerNameMismatch => Response::Forbidden,
         Refusal::Unresolved | Refusal::Unreachable => Response::BadGateway,
         Refusal::Timeout => Response::GatewayTimeout,
         Refusal::Busy => Response::ServiceUnavailable,
@@ -587,18 +609,17 @@ fn serve_http(shared: &Shared, id: u64, stream: &TcpStream, reader: &mut Handsha
         Ok(upstream) => upstream,
         Err(refusal) => return refuse_http(shared, stream, Some(owner), Some(&target), refusal),
     };
-    // Revoked while the destination was checked or connected: the client socket is already shut down.
-    if !shared.attach_upstream(id, &owner, &target, &upstream) {
-        return;
-    }
-    if (&*stream).write_all(Response::Established.bytes()).is_err() {
-        return;
-    }
-    // Bytes the client sent after its head (a ClientHello sent without waiting) belong to the tunnel.
-    if (&upstream).write_all(&buf[head_len..]).is_err() {
-        return;
-    }
-    tunnel(shared, stream, &upstream);
+    // Bytes the client sent after its head (a ClientHello sent without waiting) belong to the tunnel, and are the
+    // start of what the server-name check reads.
+    let pending = buf.split_off(head_len);
+    let opening = Opening {
+        id,
+        protocol: Protocol::Http,
+        owner,
+        target: &target,
+        success: Response::Established.bytes(),
+    };
+    open_tunnel(shared, stream, &opening, &upstream, pending);
 }
 
 /// A SOCKS5 refusal: the reply, and the report.
@@ -611,7 +632,10 @@ fn refuse_socks5(shared: &Shared, stream: &TcpStream, owner: Owner, target: Opti
         | Refusal::ApprovalRequired
         | Refusal::DynamicCode
         | Refusal::AddressNotAllowed
-        | Refusal::NoHostRules => Reply::NotAllowed,
+        | Refusal::NoHostRules
+        | Refusal::NotTls
+        | Refusal::ServerNameMissing
+        | Refusal::ServerNameMismatch => Reply::NotAllowed,
         Refusal::Unresolved | Refusal::Unreachable => Reply::HostUnreachable,
         Refusal::Timeout => Reply::TtlExpired,
         Refusal::MissingCredentials
@@ -681,13 +705,112 @@ fn serve_socks5(shared: &Shared, id: u64, stream: &TcpStream, reader: &mut Hands
         Ok(upstream) => upstream,
         Err(refusal) => return refuse_socks5(shared, stream, owner, Some(&target), refusal),
     };
-    if !shared.attach_upstream(id, &owner, &target, &upstream) {
+    let success = Reply::Succeeded.bytes();
+    let opening = Opening {
+        id,
+        protocol: Protocol::Socks5,
+        owner,
+        target: &target,
+        success: &success,
+    };
+    // The SOCKS5 reader takes exact lengths, so nothing the client sent after its request is buffered.
+    open_tunnel(shared, stream, &opening, &upstream, Vec::new());
+}
+
+/// A connection whose destination passed the gate and is connected: what steps 6 and 7 need to know.
+struct Opening<'a> {
+    id: u64,
+    protocol: Protocol,
+    owner: Owner,
+    target: &'a Target,
+    /// The protocol's success answer: `200 Connection established`, or the SOCKS5 success reply.
+    success: &'a [u8],
+}
+
+/// Steps 6 and 7: checks the server name unless the gate exempts the destination, then reports the contact, answers
+/// success, forwards `pending` (the client's bytes read so far) and relays.
+fn open_tunnel(shared: &Shared, stream: &TcpStream, opening: &Opening<'_>, upstream: &TcpStream, pending: Vec<u8>) {
+    let pending = if shared.gate.checks_server_name(&opening.owner, opening.target) {
+        // A TLS client sends its ClientHello only once it has the success answer, so the answer must come first.
+        // Nothing reaches the destination until the hello is checked.
+        if (&*stream).write_all(opening.success).is_err() {
+            return;
+        }
+        let Some(hello) = check_client_hello(shared, stream, opening, pending) else {
+            return;
+        };
+        // Revoked while the hello was read: the client socket is already shut down.
+        if !shared.attach_upstream(opening.id, &opening.owner, opening.target, upstream) {
+            return;
+        }
+        hello
+    } else {
+        // Exempt: no hello to wait for, so attach first and answer success only if the connection is still live.
+        // Revoked while the destination was checked or connected: the client socket is already shut down.
+        if !shared.attach_upstream(opening.id, &opening.owner, opening.target, upstream)
+            || (&*stream).write_all(opening.success).is_err()
+        {
+            return;
+        }
+        pending
+    };
+    if (&*upstream).write_all(&pending).is_err() {
         return;
     }
-    if writer.write_all(&Reply::Succeeded.bytes()).is_err() {
-        return;
+    tunnel(shared, stream, upstream);
+}
+
+/// Step 6 (FR-NET-06): reads the client's first bytes, starting with `pending`, until they form a complete
+/// `ClientHello` or are refused, and checks its server name against the requested host. Returns every byte read, to
+/// be forwarded, or `None` once the connection is refused (reported, then shut down) or the client went away.
+fn check_client_hello(shared: &Shared, stream: &TcpStream, opening: &Opening<'_>, mut buf: Vec<u8>) -> Option<Vec<u8>> {
+    // A fresh deadline: resolving and connecting may have used most of the request's.
+    let deadline = shared
+        .clock
+        .monotonic()
+        .checked_add(shared.config.handshake_timeout)
+        .unwrap_or_else(|| shared.clock.monotonic());
+    let mut reader = Handshake {
+        stream,
+        clock: shared.clock.as_ref(),
+        deadline,
+    };
+    let mut chunk = [0; READ_CHUNK];
+    let refusal = loop {
+        match tls::read_client_hello(&buf) {
+            HelloState::Complete(name) => match tls::check_server_name(&opening.target.host, &name) {
+                Ok(()) => return Some(buf),
+                Err(refusal) => break refusal,
+            },
+            HelloState::Refused(_) => break Refusal::NotTls,
+            HelloState::Incomplete => {}
+        }
+        // `read_client_hello` refuses at `MAX_HELLO_BYTES`, so `buf` never grows past it and `room` is at least 1
+        // here; the lower clamp only guards against a zero-length read, which would look like the client closing.
+        let room = tls::MAX_HELLO_BYTES.saturating_sub(buf.len()).clamp(1, READ_CHUNK);
+        match reader.read(&mut chunk[..room]) {
+            Ok(read) if read > 0 => buf.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                break Refusal::Timeout;
+            }
+            // Closed (or reset) before the hello was complete: a client that sent nothing just gave up; one that
+            // sent part of a hello is refused as not TLS.
+            Ok(_) | Err(_) if buf.is_empty() => return None,
+            Ok(_) | Err(_) => break Refusal::NotTls,
+        }
+    };
+    // A revocation shuts the client socket down, which ends the read: that is not the client's refusal.
+    if !shared.revoked(opening.id) {
+        shared.deny(
+            Some(opening.owner),
+            Some(opening.protocol),
+            Some(opening.target),
+            refusal,
+        );
     }
-    tunnel(shared, stream, &upstream);
+    let _ = stream.shutdown(Shutdown::Both);
+    None
 }
 
 /// Step 5's relay, once success has been answered.

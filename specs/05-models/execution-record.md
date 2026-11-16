@@ -73,7 +73,7 @@ appearance. The envelope's own connections belong to the session and are in no r
 | `host` | The host the line named: a normalised name (lower case, no trailing dot) or an IP literal |
 | `port` | The port it named |
 | `result` | `contacted` (every check passed and the tunnel opened) or `refused` |
-| `reason` | For a refused connection, the proxy's reason: `host_not_allowed`, `network_off`, `approval_required`, `dynamic_code`, `ip_literal`, `address_not_allowed`, `unresolved`, `unreachable`, `timeout`, `no_host_rules`, …; `null` when contacted |
+| `reason` | For a refused connection, the proxy's reason: `host_not_allowed`, `network_off`, `approval_required`, `dynamic_code`, `ip_literal`, `address_not_allowed`, `unresolved`, `unreachable`, `timeout`, `no_host_rules`, `not_tls`, `server_name_missing`, `server_name_mismatch`, …; `null` when contacted |
 | `count` | How many connections this element stands for, at least 1 |
 
 Repeats (same host, port, result and reason) merge into one element with their count. A record keeps at most 256

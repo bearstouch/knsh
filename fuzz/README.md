@@ -16,6 +16,7 @@ everything else.
 
 | `sandbox_log` | No panic; deterministic; an attributed entry is within its size limit, has exactly a report line and a tag line, its tag is that last line and reads back to itself, and its process, operation and argument are bounded and free of control characters with a count of at least 1 (KNSH-047) |
 | `proxy_handshake` | No panic; deterministic; the same bytes read as an HTTP request head and as a SOCKS5 handshake; a head is delimited within its limits and ends with CRLF CRLF; accepted requests are within the grammar; every accepted destination prints back to itself, names normalised (KNSH-059) |
+| `tls_client_hello` | No panic; deterministic; waits only below the 20 KiB read limit; an extracted server name is a normalised host name that matches itself only; no name and Encrypted Client Hello never match; trailing bytes never change a complete hello's result, and its prefixes are never refused; run with `-malloc_limit_mb=1` (KNSH-061) |
 
 ## Running
 
@@ -53,6 +54,11 @@ local runs.
   `crates/knsh-proxy/tests/fuzz_regressions.rs`, so it depends only on `knsh-proxy` and `std`. Its seeds in
   `corpus/proxy_handshake/` are CONNECT requests (with and without credentials, malformed and oversized) and SOCKS5
   handshakes (CONNECT by name and address, BIND, UDP ASSOCIATE, no-authentication greetings) and a SOCKS4 request.
+- `src/tls_checks.rs` — the TLS ClientHello property. Also compiled on stable by
+  `crates/knsh-proxy/tests/tls_fuzz_regressions.rs`. Its seeds in `corpus/tls_client_hello/` are hand-built hellos
+  (one record, split into 1- and 7-byte records, no name, no extensions, Encrypted Client Hello, repeated or
+  address names, truncated, oversized), non-TLS bytes (HTTP, SSH, an alert) and a real ClientHello captured from the
+  system curl on loopback (`curl_real`).
 - `regressions/<target>/` — crashing inputs kept forever. When a run fails, libFuzzer saves the input in
   `artifacts/<target>/` (CI uploads it as the `fuzz-crashes` artefact); fix the bug, copy the input here, and
   `cargo test` replays it on stable (`fuzz_regressions_replay`).

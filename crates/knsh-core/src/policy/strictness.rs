@@ -21,7 +21,7 @@
 //! | `exec.trusted_folders`, `exec.trusted_tools` | the child's are a subset of the parent's |
 //! | `exec.interpreters`, `exec.bash` | equal |
 //! | `network.mode` | `none`, or both `allowlist` |
-//! | `network.hosts`, `network.loopback` | a subset of the parent's |
+//! | `network.hosts`, `network.loopback`, `network.non_tls_hosts` | a subset of the parent's |
 //! | `network.approval_hosts` | a subset of the parent's hosts and approval hosts |
 //! | `network.class_hosts` | per class, a subset of the parent's hosts and of the parent's hosts for that class |
 //! | `approvals.irreversible_commands` | a superset of the parent's |
@@ -132,6 +132,8 @@ fn network_no_looser(child: &NetworkPolicy, parent: &NetworkPolicy) -> bool {
             .iter()
             .all(|host| parent.hosts.contains(host) || parent.approval_hosts.contains(host))
         && child.loopback.iter().all(|port| parent.loopback.contains(port))
+        // A non-TLS host skips the server-name check (FR-NET-06): the parent must already skip it.
+        && child.non_tls_hosts.iter().all(|host| parent.non_tls_hosts.contains(host))
         // A class rule opens an approval host without an approval (FR-NET-03): the parent must already open that
         // host to the class, or to every command.
         && [NetworkClass::Fetch, NetworkClass::Publish].into_iter().all(|class| {
@@ -289,7 +291,7 @@ loopback = [3000]
     #[test]
     fn any_extra_allowance_is_looser() {
         let parent = parent();
-        let loosen: [fn(&mut Profile); 14] = [
+        let loosen: [fn(&mut Profile); 15] = [
             |p| p.exec.allow.push("curl *".to_owned()),
             |p| p.exec.ask.push("make *".to_owned()),
             |p| p.exec.deny.clear(),
@@ -302,6 +304,7 @@ loopback = [3000]
             |p| p.fs.deny.clear(),
             |p| p.network.hosts.push("example.com".to_owned()),
             |p| p.network.loopback.push(8080),
+            |p| p.network.non_tls_hosts.push("registry.npmjs.org".to_owned()),
             |p| p.approvals.irreversible = RuleAction::Allow,
             |p| p.recording.commands = false,
         ];

@@ -530,6 +530,10 @@ fn unattended_profile_is_built_in_and_strict() {
     assert_eq!(profile.network.mode, NetworkMode::None);
     assert!(profile.network.hosts.is_empty() && profile.network.approval_hosts.is_empty());
     assert_eq!(profile.network.loopback.len(), 0);
+    assert!(
+        profile.network.non_tls_hosts.is_empty(),
+        "every tunnel is TLS-checked by default (FR-NET-06)"
+    );
     assert_eq!(profile.approvals.irreversible, RuleAction::Deny);
     assert_eq!(profile.secrets.len(), 0);
     // A file of the same name in the policies directory is never read in its place.
@@ -667,4 +671,14 @@ fn class_hosts_must_be_approval_hosts() {
             "name = \"p\"\nextends = \"base\"\n[network.class_hosts]\nfetch = [\"github.com\"]\n",
         );
     assert_eq!(load(&source, "p").unwrap().network.class_hosts.fetch, ["github.com"]);
+}
+
+// FR-NET-06 (KNSH-061): `network.non_tls_hosts` is read as a host list and inherited like the other host lists.
+#[test]
+fn reads_non_tls_hosts() {
+    let load_text = |text: &str| load(&Source::default().with("p", &format!("name = \"p\"\n{text}")), "p");
+    let profile =
+        load_text("[network]\nmode = \"allowlist\"\nhosts = [\"git.corp\"]\nnon_tls_hosts = [\"git.corp\"]\n").unwrap();
+    assert_eq!(profile.network.non_tls_hosts, ["git.corp"]);
+    assert!(load_text("[network]\nnon_tls_hosts = [3]\n").is_err());
 }

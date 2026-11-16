@@ -731,6 +731,7 @@ fn no_proxy_means_no_proxy_settings() {
         approval_hosts: Vec::new(),
         class_hosts: knsh_core::ClassHosts::default(),
         loopback: Vec::new(),
+        non_tls_hosts: Vec::new(),
     };
     assert!(crate::proxy::NoProxy.issue(session, &network).unwrap().is_none());
 }

@@ -10,12 +10,12 @@
 decrypting, so that a tunnel opened for one host cannot be used to talk to another.
 
 **Acceptance criteria**
-- [ ] After CONNECT, the proxy reads the first TLS record(s) up to a fixed limit and parses the ClientHello SNI
+- [x] After CONNECT, the proxy reads the first TLS record(s) up to a fixed limit and parses the ClientHello SNI
       extension with a hand-written parser.
-- [ ] The tunnel opens only if the SNI matches the CONNECT host (case-insensitive, no trailing dot).
-- [ ] A missing SNI, a mismatched SNI, a malformed ClientHello or data that is not TLS is refused, unless the host is
+- [x] The tunnel opens only if the SNI matches the CONNECT host (case-insensitive, no trailing dot).
+- [x] A missing SNI, a mismatched SNI, a malformed ClientHello or data that is not TLS is refused, unless the host is
       explicitly configured for non-TLS use.
-- [ ] The parser never panics and never allocates beyond the record-size limit. It has a fuzz target.
+- [x] The parser never panics and never allocates beyond the record-size limit. It has a fuzz target.
 
 **Unit tests**
 - `extracts_sni_from_client_hello` — FR-NET-06.
@@ -29,7 +29,14 @@ decrypting, so that a tunnel opened for one host cannot be used to talk to anoth
 
 **Notes**
 - Spec gap: Encrypted Client Hello (ECH) hides the real SNI. Propose treating ECH as a missing SNI (refuse), and say
-  so in the spec.
+  so in the spec. Done: `server_name_missing` ([network proxy](../03-functional-requirements/network-proxy.md#tls-server-name-check-knsh-061)).
+- Non-TLS use is configured per host with `network.non_tls_hosts` (profile only, never a preset); loopback ports are
+  exempt because the sandbox lets the command reach them directly. An allowlisted IP-literal destination opens only
+  for a hello that names no server (RFC 6066 forbids naming an address).
+- Integration (`crates/knsh-proxy/tests/clients.rs`, macOS 26.6): curl, git and npm (Homebrew Node 25) through the
+  proxy sent a `ClientHello` naming the requested host, which passed the check; curl `--connect-to` (forged name) was
+  refused with `server_name_mismatch` and no byte reached the destination. The local destination speaks no TLS, so
+  the handshake itself is not completed; a full HTTPS fetch against a real host is pending (KNSH-076).
 - KNSH-027 (C10) on macOS 26.6: curl, git, npm, pip, cargo and Node each sent a ClientHello that fitted in one record,
   with the requested host as SNI, offered TLS 1.3 and no ECH. `spikes/knsh-027-proxy/helpers/proxy.py` has a throwaway
   reference parser, and `results/c9-c10-26.6.2-connections.jsonl` the observed handshakes. For the forged-SNI test,

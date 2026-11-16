@@ -22,7 +22,7 @@ cd "$(dirname "$0")/.."
 
 # Pinned so a CI failure is reproducible; bump deliberately, like rust-toolchain.toml.
 readonly TOOLCHAIN="${KNSH_FUZZ_TOOLCHAIN:-nightly-2026-11-01}"
-readonly ALL_TARGETS=(json_reader json_writer_roundtrip frame_reader toml_parser bash_lex bash_parse sandbox_log proxy_handshake)
+readonly ALL_TARGETS=(json_reader json_writer_roundtrip frame_reader toml_parser bash_lex bash_parse sandbox_log proxy_handshake tls_client_hello)
 
 # The fuzz dependencies are vendored in vendor/ like everything else (NFR-SUP-03).
 export CARGO_NET_OFFLINE=true
@@ -44,6 +44,9 @@ target_flags() {
         # 2 MiB, whatever length prefix the input declares (libFuzzer counts whole MiB
         # and already flags an allocation of exactly 1 MiB at a 1 MiB limit).
         frame_reader) echo "-malloc_limit_mb=2" ;;
+        # NFR-SEC-07: the ClientHello reader allocates at most one hello (16 KiB and its header),
+        # whatever a length field claims, so no allocation may reach 1 MiB.
+        tls_client_hello) echo "-malloc_limit_mb=1" ;;
         json_reader | json_writer_roundtrip | toml_parser | bash_lex | bash_parse | sandbox_log | proxy_handshake) echo "" ;;
         *) echo "unknown fuzz target: $1" >&2; exit 2 ;;
     esac

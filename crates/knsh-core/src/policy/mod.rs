@@ -64,7 +64,7 @@ pub use model::{
     DEFAULT_RETENTION_DAYS, ExecPolicy, FsPolicy, NetworkMode, NetworkPolicy, OutputMode, OutputPolicy, Profile,
     RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy, RuleAction, SecretInjection,
 };
-pub use network::{HostAccess, HostRefusal, LineAccess, Requester, check_host, host_matches};
+pub use network::{HostAccess, HostRefusal, LineAccess, Requester, check_host, host_matches, is_non_tls_host};
 pub use paths::{LookupError, PathContext, PolicyFs, project_root};
 use paths::{PathTemplate, Variables};
 pub use presets::PRESETS;
@@ -237,6 +237,7 @@ fn override_layer(parent: Layer, child: Layer) -> Layer {
         network_class_hosts_fetch: child.network_class_hosts_fetch.or(parent.network_class_hosts_fetch),
         network_class_hosts_publish: child.network_class_hosts_publish.or(parent.network_class_hosts_publish),
         network_loopback: child.network_loopback.or(parent.network_loopback),
+        network_non_tls_hosts: child.network_non_tls_hosts.or(parent.network_non_tls_hosts),
         approvals_irreversible: child.approvals_irreversible.or(parent.approvals_irreversible),
         approvals_irreversible_commands: child
             .approvals_irreversible_commands
@@ -323,6 +324,31 @@ fn class_hosts(
     })
 }
 
+/// The `[network]` keys of a merged layer, as set or unset.
+struct NetworkLayer {
+    mode: Option<NetworkMode>,
+    hosts: Option<Vec<String>>,
+    approval_hosts: Option<Vec<String>>,
+    class_hosts_fetch: Option<Vec<String>>,
+    class_hosts_publish: Option<Vec<String>>,
+    loopback: Option<Vec<u16>>,
+    non_tls_hosts: Option<Vec<String>>,
+}
+
+/// `[network]` with its defaults: the mode `none`, every list empty.
+fn network_policy(layer: NetworkLayer) -> Result<NetworkPolicy, ProfileError> {
+    let approval_hosts = layer.approval_hosts.unwrap_or_default();
+    let class_hosts = class_hosts(layer.class_hosts_fetch, layer.class_hosts_publish, &approval_hosts)?;
+    Ok(NetworkPolicy {
+        mode: layer.mode.unwrap_or(NetworkMode::None),
+        hosts: layer.hosts.unwrap_or_default(),
+        class_hosts,
+        approval_hosts,
+        loopback: layer.loopback.unwrap_or_default(),
+        non_tls_hosts: layer.non_tls_hosts.unwrap_or_default(),
+    })
+}
+
 /// Appends `added` to `list`, treating an unset list as its default (empty for every list a preset may set).
 fn append<T: PartialEq>(list: &mut Option<Vec<T>>, added: Option<Vec<T>>) {
     if let Some(added) = added {
@@ -372,12 +398,15 @@ fn build<F: PolicyFs + ?Sized>(
         None => CanonicalPath::new(DEFAULT_AGENT_BASH)
             .map_err(|_| ProfileError::new(ProfileErrorKind::PathUnresolvable).at_key("exec.bash"))?,
     };
-    let approval_hosts = layer.network_approval_hosts.unwrap_or_default();
-    let class_hosts = class_hosts(
-        layer.network_class_hosts_fetch,
-        layer.network_class_hosts_publish,
-        &approval_hosts,
-    )?;
+    let network = network_policy(NetworkLayer {
+        mode: layer.network_mode,
+        hosts: layer.network_hosts,
+        approval_hosts: layer.network_approval_hosts,
+        class_hosts_fetch: layer.network_class_hosts_fetch,
+        class_hosts_publish: layer.network_class_hosts_publish,
+        loopback: layer.network_loopback,
+        non_tls_hosts: layer.network_non_tls_hosts,
+    })?;
     let mut interpreters = knsh_bash::Interpreters::defaults();
     for (family, entry) in layer.exec_interpreters {
         interpreters.extend(entry).map_err(|_| {
@@ -408,13 +437,7 @@ fn build<F: PolicyFs + ?Sized>(
             trusted_tools: layer.exec_trusted_tools.unwrap_or_default(),
             bash,
         },
-        network: NetworkPolicy {
-            mode: layer.network_mode.unwrap_or(NetworkMode::None),
-            hosts: layer.network_hosts.unwrap_or_default(),
-            class_hosts,
-            approval_hosts,
-            loopback: layer.network_loopback.unwrap_or_default(),
-        },
+        network,
         approvals: ApprovalsPolicy {
             irreversible: layer.approvals_irreversible.unwrap_or(RuleAction::Ask),
             irreversible_commands: layer.approvals_irreversible_commands.unwrap_or_default(),

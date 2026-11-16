@@ -161,6 +161,14 @@ pub fn check_host(network: &NetworkPolicy, requester: &Requester, host: &str) ->
     Err(HostRefusal::ApprovalRequired)
 }
 
+/// Whether `host` is listed in `network.non_tls_hosts`, so the proxy lets its tunnels carry anything instead of
+/// checking that they start with a TLS `ClientHello` naming the host (FR-NET-06). It says nothing about whether the
+/// host may be reached: that is [`check_host`]'s answer alone. Matched like every entry ([`host_matches`]).
+#[must_use]
+pub fn is_non_tls_host(network: &NetworkPolicy, host: &str) -> bool {
+    listed(&network.non_tls_hosts, host)
+}
+
 /// Whether a line presenting `classes` reaches `host` by class alone: it presents a class that connects, and every
 /// class it presents that connects lists an entry matching `host` (the `ClassHosts` rule, with [`host_matches`]).
 fn class_allows(network: &NetworkPolicy, classes: &[NetworkClass], host: &str) -> bool {
@@ -241,6 +249,7 @@ mod tests {
                 publish: Vec::new(),
             },
             loopback: vec![3000],
+            non_tls_hosts: vec!["*.corp.example".to_owned(), "10.0.0.5".to_owned()],
         }
     }
 
@@ -403,5 +412,19 @@ mod tests {
             assert!(!host_matches(entry, "a.example.com"), "{entry}");
             assert!(!host_matches(entry, "example.com"), "{entry}");
         }
+    }
+
+    // FR-NET-06: `network.non_tls_hosts` is matched like every host entry, and listing a host there never opens it.
+    #[test]
+    fn non_tls_hosts_exempt_only_listed_hosts() {
+        let network = policy(NetworkMode::Allowlist);
+        assert!(is_non_tls_host(&network, "git.corp.example"));
+        assert!(is_non_tls_host(&network, "10.0.0.5"));
+        assert!(!is_non_tls_host(&network, "corp.example"));
+        assert!(!is_non_tls_host(&network, "registry.npmjs.org"));
+        assert_eq!(
+            check_host(&network, &Requester::Envelope, "git.corp.example"),
+            Err(HostRefusal::NotListed)
+        );
     }
 }
