@@ -89,6 +89,8 @@ pub enum Operation {
     /// Reading another process's identity or parent (`proc_pidinfo`; matching `agent.sock` peers to envelopes,
     /// KNSH-048).
     ProcessInfo,
+    /// Resolving a host name to addresses (`getaddrinfo`; the network proxy, KNSH-060).
+    Resolve,
 }
 
 impl Operation {
@@ -131,6 +133,7 @@ impl Operation {
             Self::SignalDisposition => "set signal disposition",
             Self::SandboxLog => "sandbox log",
             Self::ProcessInfo => "read process information",
+            Self::Resolve => "resolve host name",
         }
     }
 }

@@ -40,6 +40,7 @@ mod grant;
 mod layer;
 mod line;
 mod model;
+mod network;
 pub(crate) mod paths;
 mod presets;
 mod rules;
@@ -63,6 +64,7 @@ pub use model::{
     DEFAULT_RETENTION_DAYS, ExecPolicy, FsPolicy, NetworkMode, NetworkPolicy, OutputMode, OutputPolicy, Profile,
     RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy, RuleAction, SecretInjection,
 };
+pub use network::{HostAccess, HostRefusal, LineAccess, Requester, check_host, host_matches};
 pub use paths::{LookupError, PathContext, PolicyFs, project_root};
 use paths::{PathTemplate, Variables};
 pub use presets::PRESETS;

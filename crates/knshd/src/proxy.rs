@@ -1,4 +1,5 @@
-//! Proxy credentials for envelopes and lines (KNSH-057, KNSH-059; FR-AGT-03, FR-NET-01, decision 14).
+//! Proxy credentials, host rules and reporting for envelopes and lines (KNSH-057, KNSH-059, KNSH-060; FR-AGT-03,
+//! FR-NET-01 to FR-NET-05, FR-NET-07, FR-NET-09, FR-NET-11, decision 14).
 //!
 //! Every envelope and every supervised line reaches the network only through `knshd`'s proxy (`knsh-proxy`): their
 //! sandbox profiles allow outbound TCP to the proxy's loopback port and the profile's `network.loopback` ports,
@@ -19,10 +20,21 @@
 //!
 //! # What it lets through
 //!
-//! Until host rules, name resolution and address checks exist (KNSH-060), the proxy's gate is
-//! [`knsh_proxy::RefuseAll`]: every destination is refused, and reported. Envelopes and lines therefore reach no
-//! more than they did without a proxy, while credentials, the `407` challenge and both protocols are exercised end
-//! to end. `hello` keeps reporting `network_filter: none` until the rules are in force.
+//! The proxy's gate is [`knsh_proxy::HostRules`]: each owner of credentials gets a [`Scope`] when they are issued,
+//! and loses it when they are revoked. An envelope's scope is its session profile's `[network]` policy, with the
+//! envelope as requester (it reaches `network.hosts` only); a line's is the profile its decision was made under,
+//! with the line's classes, dynamic flag and approval ([`LineAccess`]). The gate applies the host rules, resolves
+//! names itself and refuses internal addresses (`knsh-proxy`'s `rules` module). `hello` keeps reporting
+//! `network_filter: none` until the TLS server-name check (FR-NET-06, KNSH-061) is in force too.
+//!
+//! # Reporting ([`NetworkReport`])
+//!
+//! Every refusal is logged (fixed fields, never a host name or a credential, NFR-PRIV-02). A refusal whose
+//! credentials were live is also published as `proxy.denied` for the owner's session, naming the record for a line
+//! and none for the envelope, whose connections belong to the session alone (FR-NET-09). A line's refusals and
+//! contacts are also collected for its record's `network` field while the line runs, and handed to the spawner when
+//! its credentials are revoked ([`ProxyIssuer::revoke_line`]); the proxy reports a connection before the revocation
+//! that ends it returns, so nothing reported for a running line is missed.
 //!
 //! # The environment
 //!
@@ -32,13 +44,19 @@
 //! its envelope's credentials, which would attribute its connections to the session instead of its record
 //! ([`command_env`]).
 
+use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU16;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use knsh_core::{RecordId, Redacted, SessionId};
+use knsh_core::{
+    EventData, LineAccess, MAX_NETWORK_ENTRIES, NetworkEntry, NetworkPolicy, NetworkResult, RecordId, Redacted,
+    Requester, SessionId, merge_network, redact,
+};
 use knsh_platform::{Field, Level, SystemLog, Value};
-use knsh_proxy::{Denial, Owner, Proxy, ProxyReport};
+use knsh_proxy::{Denial, HostRules, Owner, Proxy, ProxyReport, Scope, Target};
+
+use crate::events::EventHub;
 
 /// The variables that carry the proxy URL (decision 14): curl, git, pip, cargo and Node (with
 /// [`NODE_USE_ENV_PROXY`]) read one of them.
@@ -132,24 +150,32 @@ pub(crate) struct ProxyUnavailable;
 /// Issues and revokes envelope and line credentials (module documentation, "Who issues them"). Object safe, so
 /// tests can issue fixed credentials.
 pub(crate) trait ProxyIssuer: Send + Sync {
-    /// Credentials for the envelope of `session`, or `None` when no proxy runs: the envelope then gets no proxy
-    /// settings and its profile no proxy port.
+    /// Credentials for the envelope of `session`, whose connections may reach what `network` opens to the envelope,
+    /// or `None` when no proxy runs: the envelope then gets no proxy settings and its profile no proxy port.
     ///
     /// # Errors
     ///
     /// A proxy runs but could not issue credentials: the envelope must not start.
-    fn issue(&self, session: SessionId) -> Result<Option<ProxyCredential>, ProxyUnavailable>;
+    fn issue(&self, session: SessionId, network: &NetworkPolicy) -> Result<Option<ProxyCredential>, ProxyUnavailable>;
 
-    /// Credentials for the line `record` of `session`, or `None` when no proxy runs.
+    /// Credentials for the line `record` of `session`, whose connections may reach what `network` opens to a line
+    /// presenting `access`, or `None` when no proxy runs.
     ///
     /// # Errors
     ///
     /// A proxy runs but could not issue credentials: the line must not start.
-    fn issue_line(&self, session: SessionId, record: RecordId) -> Result<Option<ProxyCredential>, ProxyUnavailable>;
+    fn issue_line(
+        &self,
+        session: SessionId,
+        record: RecordId,
+        network: &NetworkPolicy,
+        access: LineAccess,
+    ) -> Result<Option<ProxyCredential>, ProxyUnavailable>;
 
-    /// Revokes the credentials of the line `record` and closes its connections. Called once the line has ended,
-    /// whether or not [`ProxyIssuer::issue_line`] succeeded.
-    fn revoke_line(&self, record: RecordId);
+    /// Revokes the credentials of the line `record` and closes its connections, and returns its record's `network`
+    /// field: the hosts it contacted or was refused (FR-NET-09). Called once the line has ended, whether or not
+    /// [`ProxyIssuer::issue_line`] succeeded.
+    fn revoke_line(&self, record: RecordId) -> Vec<NetworkEntry>;
 
     /// Revokes every credential issued for `session` (its envelope's and its lines'). Called once its envelope has
     /// ended, whether or not [`ProxyIssuer::issue`] succeeded, so it must accept a session it issued nothing for.
@@ -161,32 +187,48 @@ pub(crate) trait ProxyIssuer: Send + Sync {
 pub(crate) struct NoProxy;
 
 impl ProxyIssuer for NoProxy {
-    fn issue(&self, _session: SessionId) -> Result<Option<ProxyCredential>, ProxyUnavailable> {
+    fn issue(
+        &self,
+        _session: SessionId,
+        _network: &NetworkPolicy,
+    ) -> Result<Option<ProxyCredential>, ProxyUnavailable> {
         Ok(None)
     }
 
-    fn issue_line(&self, _session: SessionId, _record: RecordId) -> Result<Option<ProxyCredential>, ProxyUnavailable> {
+    fn issue_line(
+        &self,
+        _session: SessionId,
+        _record: RecordId,
+        _network: &NetworkPolicy,
+        _access: LineAccess,
+    ) -> Result<Option<ProxyCredential>, ProxyUnavailable> {
         Ok(None)
     }
 
-    fn revoke_line(&self, _record: RecordId) {}
+    fn revoke_line(&self, _record: RecordId) -> Vec<NetworkEntry> {
+        Vec::new()
+    }
 
     fn revoke(&self, _session: SessionId) {}
 }
 
-/// The running proxy (`knsh-proxy`) as the [`ProxyIssuer`].
+/// The running proxy (`knsh-proxy`) as the [`ProxyIssuer`], with the gate and the report it was started with.
 pub(crate) struct LiveProxy {
     proxy: Proxy,
+    rules: Arc<HostRules>,
+    report: Arc<NetworkReport>,
 }
 
 impl LiveProxy {
-    /// Wraps a started proxy.
-    pub(crate) fn new(proxy: Proxy) -> Self {
-        Self { proxy }
+    /// Wraps a proxy started with `rules` as its gate and `report` as its report.
+    pub(crate) fn new(proxy: Proxy, rules: Arc<HostRules>, report: Arc<NetworkReport>) -> Self {
+        Self { proxy, rules, report }
     }
 
-    /// Issues credentials for `owner` in the URL form of decision 14.
-    fn issue_for(&self, owner: Owner) -> Result<Option<ProxyCredential>, ProxyUnavailable> {
+    /// Sets `owner`'s scope, then issues its credentials in the URL form of decision 14. The scope is set first, so
+    /// no connection with the credentials meets a gate that does not know them.
+    fn issue_for(&self, owner: Owner, scope: Scope) -> Result<Option<ProxyCredential>, ProxyUnavailable> {
+        self.rules.set(owner, scope);
         let issued = self.proxy.issue(owner).map_err(|_| ProxyUnavailable)?;
         // The proxy issues decimal ids and letter-and-digit tokens, so this holds; if it ever did not, the command
         // must not start without its credentials (fail closed).
@@ -197,41 +239,113 @@ impl LiveProxy {
 }
 
 impl ProxyIssuer for LiveProxy {
-    fn issue(&self, session: SessionId) -> Result<Option<ProxyCredential>, ProxyUnavailable> {
-        self.issue_for(Owner { session, line: None })
+    fn issue(&self, session: SessionId, network: &NetworkPolicy) -> Result<Option<ProxyCredential>, ProxyUnavailable> {
+        let scope = Scope {
+            network: network.clone(),
+            requester: Requester::Envelope,
+        };
+        self.issue_for(Owner { session, line: None }, scope)
     }
 
-    fn issue_line(&self, session: SessionId, record: RecordId) -> Result<Option<ProxyCredential>, ProxyUnavailable> {
-        self.issue_for(Owner {
+    fn issue_line(
+        &self,
+        session: SessionId,
+        record: RecordId,
+        network: &NetworkPolicy,
+        access: LineAccess,
+    ) -> Result<Option<ProxyCredential>, ProxyUnavailable> {
+        // Collected from the first connection on; forgotten by `revoke_line` whatever happens next.
+        self.report.track(session, record);
+        let scope = Scope {
+            network: network.clone(),
+            requester: Requester::Line(access),
+        };
+        let owner = Owner {
             session,
             line: Some(record),
-        })
+        };
+        self.issue_for(owner, scope)
     }
 
-    fn revoke_line(&self, record: RecordId) {
+    fn revoke_line(&self, record: RecordId) -> Vec<NetworkEntry> {
+        // Revoking closes the line's connections, and the proxy has reported each before this returns ("Reporting"),
+        // so the collected list is complete for every connection the line made while it ran.
         self.proxy.revoke_line(record);
+        self.rules.forget_line(record);
+        self.report.take(record)
     }
 
     fn revoke(&self, session: SessionId) {
         self.proxy.revoke_session(session);
+        self.rules.forget_session(session);
+        self.report.forget_session(session);
     }
 }
 
-/// Reports the proxy's refusals to the system log: session, record, protocol, port and reason, never a credential
-/// or a host name (NFR-PRIV-02). `proxy.denied` events and the record's `network` field arrive with KNSH-060.
-pub(crate) struct LoggedDenials {
+/// The network entries collected for each running line: its session, and its entries so far.
+type Running = HashMap<RecordId, (SessionId, Vec<NetworkEntry>)>;
+
+/// The proxy's report (module documentation, "Reporting"): the system log, `proxy.denied` events and the lines'
+/// `network` fields.
+///
+/// Only lines being tracked ([`NetworkReport::track`] to [`NetworkReport::take`]) collect entries, so the map holds
+/// no more lines than are running, and a report that arrives after a line was taken is not kept.
+pub(crate) struct NetworkReport {
     log: Arc<dyn SystemLog>,
+    events: Arc<EventHub>,
+    running: Mutex<Running>,
 }
 
-impl LoggedDenials {
-    /// Reports to `log`.
-    pub(crate) fn new(log: Arc<dyn SystemLog>) -> Self {
-        Self { log }
+impl NetworkReport {
+    /// Reports to `log` and publishes to `events`.
+    pub(crate) fn new(log: Arc<dyn SystemLog>, events: Arc<EventHub>) -> Arc<Self> {
+        Arc::new(Self {
+            log,
+            events,
+            running: Mutex::new(HashMap::new()),
+        })
     }
-}
 
-impl ProxyReport for LoggedDenials {
-    fn denied(&self, denial: &Denial) {
+    /// Takes the lock even if a thread panicked while holding it: every update is one map operation.
+    fn lock(&self) -> MutexGuard<'_, Running> {
+        self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Starts collecting the line `record` of `session`.
+    pub(crate) fn track(&self, session: SessionId, record: RecordId) {
+        self.lock().entry(record).or_insert_with(|| (session, Vec::new()));
+    }
+
+    /// Stops collecting the line `record` and returns what was collected.
+    pub(crate) fn take(&self, record: RecordId) -> Vec<NetworkEntry> {
+        self.lock()
+            .remove(&record)
+            .map(|(_, entries)| entries)
+            .unwrap_or_default()
+    }
+
+    /// Stops collecting every line of `session` (its lines are taken one by one when they end; this only guards
+    /// against one that never was).
+    pub(crate) fn forget_session(&self, session: SessionId) {
+        self.lock().retain(|_, (owner, _)| *owner != session);
+    }
+
+    /// Adds one entry to the record of `owner`'s line, if it is being collected for that session. Envelope
+    /// connections have no record (FR-NET-09).
+    fn collect(&self, owner: &Owner, target: &Target, result: NetworkResult) {
+        let Some(record) = owner.line else {
+            return;
+        };
+        let entry = NetworkEntry::new(redact(&target.host.to_string()), target.port.get(), result);
+        if let Some((session, entries)) = self.lock().get_mut(&record)
+            && *session == owner.session
+        {
+            merge_network(entries, vec![entry], MAX_NETWORK_ENTRIES);
+        }
+    }
+
+    /// The system log entry for a refusal: fixed fields only.
+    fn log_denial(&self, denial: &Denial) {
         let mut fields = vec![Field::new("reason", Value::Static(denial.refusal.reason()))];
         if let Some(protocol) = denial.protocol {
             fields.push(Field::new("protocol", Value::Static(protocol.name())));
@@ -246,6 +360,33 @@ impl ProxyReport for LoggedDenials {
             fields.push(Field::new("port", Value::U64(u64::from(target.port.get()))));
         }
         self.log.log(Level::Notice, "proxy refused a connection", &fields);
+    }
+}
+
+impl ProxyReport for NetworkReport {
+    fn denied(&self, denial: &Denial) {
+        self.log_denial(denial);
+        // Before credentials were checked there is no session to publish to: the log entry is the report.
+        let Some(owner) = denial.owner else {
+            return;
+        };
+        let reason = denial.refusal.reason();
+        let data = EventData::ProxyDenied {
+            record_id: owner.line,
+            protocol: denial.protocol.map(knsh_proxy::Protocol::name),
+            host: denial.target.as_ref().map(|target| redact(&target.host.to_string())),
+            port: denial.target.as_ref().map(|target| target.port.get()),
+            reason,
+        };
+        // Best effort: a session that has ended (or is not this engine's) gets no event.
+        let _ = self.events.publish_for_session(owner.session, data);
+        if let Some(target) = &denial.target {
+            self.collect(&owner, target, NetworkResult::Refused(reason.to_owned()));
+        }
+    }
+
+    fn contacted(&self, owner: &Owner, target: &Target) {
+        self.collect(owner, target, NetworkResult::Contacted);
     }
 }
 
@@ -284,10 +425,15 @@ pub(crate) fn proxy_env(credential: Option<&ProxyCredential>) -> Vec<(String, St
 pub(crate) mod tests {
     use std::sync::Mutex;
 
+    use knsh_core::{Delivery, EventScope};
+    use knsh_platform::testing::{FakeResolver, RecordingLog};
+
     use super::*;
+    use crate::events::Subscriber;
 
     /// A proxy on `port` that issues `knsh-<n>:<token>` per session, numbered from 1, and `knsh-line<n>:<token>`
-    /// per line, and records revocations.
+    /// per line, records what each line presented and every revocation, and returns `network` when a line is
+    /// revoked.
     pub(crate) struct FakeProxy {
         pub(crate) port: NonZeroU16,
         /// When set, issuing fails.
@@ -295,7 +441,9 @@ pub(crate) mod tests {
         pub(crate) issued: Mutex<Vec<SessionId>>,
         pub(crate) revoked: Mutex<Vec<SessionId>>,
         pub(crate) lines: Mutex<Vec<RecordId>>,
+        pub(crate) accesses: Mutex<Vec<LineAccess>>,
         pub(crate) revoked_lines: Mutex<Vec<RecordId>>,
+        pub(crate) network: Mutex<Vec<NetworkEntry>>,
     }
 
     impl FakeProxy {
@@ -310,13 +458,19 @@ pub(crate) mod tests {
                 issued: Mutex::new(Vec::new()),
                 revoked: Mutex::new(Vec::new()),
                 lines: Mutex::new(Vec::new()),
+                accesses: Mutex::new(Vec::new()),
                 revoked_lines: Mutex::new(Vec::new()),
+                network: Mutex::new(Vec::new()),
             }
         }
     }
 
     impl ProxyIssuer for FakeProxy {
-        fn issue(&self, session: SessionId) -> Result<Option<ProxyCredential>, ProxyUnavailable> {
+        fn issue(
+            &self,
+            session: SessionId,
+            _network: &NetworkPolicy,
+        ) -> Result<Option<ProxyCredential>, ProxyUnavailable> {
             if self.broken {
                 return Err(ProxyUnavailable);
             }
@@ -334,10 +488,13 @@ pub(crate) mod tests {
             &self,
             _session: SessionId,
             record: RecordId,
+            _network: &NetworkPolicy,
+            access: LineAccess,
         ) -> Result<Option<ProxyCredential>, ProxyUnavailable> {
             if self.broken {
                 return Err(ProxyUnavailable);
             }
+            self.accesses.lock().unwrap().push(access);
             let mut lines = self.lines.lock().unwrap();
             lines.push(record);
             let id = format!("line{}", lines.len());
@@ -348,8 +505,9 @@ pub(crate) mod tests {
             ))
         }
 
-        fn revoke_line(&self, record: RecordId) {
+        fn revoke_line(&self, record: RecordId) -> Vec<NetworkEntry> {
             self.revoked_lines.lock().unwrap().push(record);
+            self.network.lock().unwrap().clone()
         }
 
         fn revoke(&self, session: SessionId) {
@@ -357,32 +515,93 @@ pub(crate) mod tests {
         }
     }
 
-    /// The real proxy with the gate `knshd` runs, reporting to a recording log.
-    fn live() -> (LiveProxy, Arc<knsh_platform::testing::RecordingLog>) {
-        use knsh_platform::macos::{SystemClock, SystemRandom};
-        use knsh_proxy::{Config, Parts, RefuseAll};
+    /// The real proxy with the gate `knshd` runs (host rules over `resolver`), reporting to a recording log and to
+    /// an event hub.
+    struct Live {
+        proxy: LiveProxy,
+        log: Arc<RecordingLog>,
+        hub: Arc<EventHub>,
+    }
 
-        let log = Arc::new(knsh_platform::testing::RecordingLog::new());
+    fn live_with(resolver: Arc<FakeResolver>) -> Live {
+        use knsh_platform::macos::{SystemClock, SystemRandom};
+        use knsh_proxy::{Config, Parts};
+
+        let log = Arc::new(RecordingLog::new());
+        let hub = crate::events::tests::hub();
+        let rules = Arc::new(HostRules::new(resolver));
+        let report = NetworkReport::new(Arc::clone(&log) as Arc<dyn SystemLog>, Arc::clone(&hub));
         let proxy = Proxy::start(
             Config::DEFAULT,
             Parts {
-                gate: Arc::new(RefuseAll),
-                report: Arc::new(LoggedDenials::new(Arc::clone(&log) as Arc<dyn SystemLog>)),
+                gate: Arc::clone(&rules) as Arc<dyn knsh_proxy::ConnectionGate>,
+                report: Arc::clone(&report) as Arc<dyn ProxyReport>,
                 random: Arc::new(SystemRandom::new()),
                 clock: Arc::new(SystemClock::new()),
             },
         )
         .unwrap();
-        (LiveProxy::new(proxy), log)
+        Live {
+            proxy: LiveProxy::new(proxy, rules, report),
+            log,
+            hub,
+        }
+    }
+
+    fn live() -> (LiveProxy, Arc<RecordingLog>) {
+        let live = live_with(Arc::new(FakeResolver::new()));
+        (live.proxy, live.log)
+    }
+
+    /// `network.mode = "allowlist"` with `hosts` open to every command and `github.com` for approval.
+    fn allowlist(hosts: &[&str]) -> NetworkPolicy {
+        NetworkPolicy {
+            mode: knsh_core::NetworkMode::Allowlist,
+            hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
+            approval_hosts: vec!["github.com".to_owned()],
+            class_hosts: knsh_core::ClassHosts::default(),
+            loopback: Vec::new(),
+        }
+    }
+
+    /// The default `[network]`: `mode = "none"`.
+    fn no_network() -> NetworkPolicy {
+        NetworkPolicy {
+            mode: knsh_core::NetworkMode::None,
+            hosts: Vec::new(),
+            approval_hosts: Vec::new(),
+            class_hosts: knsh_core::ClassHosts::default(),
+            loopback: Vec::new(),
+        }
+    }
+
+    /// A server on loopback that accepts connections and holds them open.
+    fn accepting_server() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                held.push(stream);
+            }
+        });
+        address
     }
 
     /// Sends a CONNECT for `example.com:443` with the user and password of `credential`'s URL (or none), and
     /// returns the status line.
     fn connect_status(port: NonZeroU16, credential: Option<&ProxyCredential>) -> String {
+        connect_to(port, "example.com:443", credential)
+    }
+
+    /// Sends a CONNECT for `target` with the user and password of `credential`'s URL (or none), and returns the
+    /// status line.
+    fn connect_to(port: NonZeroU16, target: &str, credential: Option<&ProxyCredential>) -> String {
         use std::io::{BufRead, BufReader, Write};
 
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", port.get())).unwrap();
-        let mut request = "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n".to_owned();
+        let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
         if let Some(credential) = credential {
             let url = credential.url().expose().clone();
             let userinfo = &url["http://".len()..url.find('@').unwrap()];
@@ -427,12 +646,15 @@ pub(crate) mod tests {
     }
 
     // FR-NET-01: the live proxy issues distinct credentials per envelope and line, on its own loopback port; they
-    // authenticate until revoked, and every destination is refused while no host rules exist (KNSH-060).
+    // authenticate until revoked, and meet the session's host rules (here `network.mode = "none"`, FR-NET-04).
     #[test]
     fn live_proxy_issues_and_revokes_envelope_and_line_credentials() {
         let (proxy, log) = live();
-        let envelope = proxy.issue(session(1)).unwrap().unwrap();
-        let line = proxy.issue_line(session(1), record(5)).unwrap().unwrap();
+        let envelope = proxy.issue(session(1), &no_network()).unwrap().unwrap();
+        let line = proxy
+            .issue_line(session(1), record(5), &no_network(), LineAccess::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(envelope.port(), proxy.proxy.port());
         assert_eq!(line.port(), envelope.port());
         assert_ne!(envelope.url().expose(), line.url().expose());
@@ -453,7 +675,7 @@ pub(crate) mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let entries = format!("{:?}", log.entries());
-        assert!(entries.contains("no_host_rules"), "{entries}");
+        assert!(entries.contains("network_off"), "{entries}");
         assert!(entries.contains("missing_credentials"), "{entries}");
         assert!(entries.contains("unknown_credentials"), "{entries}");
         assert!(entries.contains(&record(5).ulid().to_string()), "{entries}");
@@ -537,9 +759,168 @@ pub(crate) mod tests {
         assert_eq!(proxy_env(None), []);
         assert!(
             NoProxy
-                .issue(SessionId::from_ulid(knsh_core::Ulid::from_u128(1)))
+                .issue(SessionId::from_ulid(knsh_core::Ulid::from_u128(1)), &no_network())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// One `proxy.denied` as published: `(record_id, protocol, host, port, reason)`.
+    type Published = (Option<RecordId>, Option<String>, Option<String>, Option<u16>, String);
+
+    /// The `proxy.denied` events `subscriber` received so far.
+    fn proxy_denied(subscriber: &Subscriber) -> Vec<Published> {
+        subscriber
+            .take(1_000)
+            .into_iter()
+            .filter_map(|(_, delivery)| match delivery {
+                Delivery::Event(event) => match &event.data {
+                    EventData::ProxyDenied {
+                        record_id,
+                        protocol,
+                        host,
+                        port,
+                        reason,
+                    } => Some((
+                        *record_id,
+                        protocol.map(str::to_owned),
+                        host.as_ref().map(|host| host.expose().clone()),
+                        *port,
+                        (*reason).to_owned(),
+                    )),
+                    _ => None,
+                },
+                Delivery::Lost(_) => None,
+            })
+            .collect()
+    }
+
+    // KNSH-060 emits_proxy_denied_with_reason (FR-NET-09): a refusal of a line's connection is published as
+    // `proxy.denied` for its session, with the record, protocol, host, port and reason. A refusal before
+    // credentials are known has no session, so it is only logged.
+    #[test]
+    fn emits_proxy_denied_with_reason() {
+        let running = live_with(Arc::new(FakeResolver::new()));
+        crate::events::tests::start(&running.hub, 1);
+        let subscriber = Subscriber::new();
+        subscriber
+            .subscribe(&running.hub, EventScope::Session(session(1)), None)
+            .unwrap();
+        let line = running
+            .proxy
+            .issue_line(session(1), record(5), &allowlist(&[]), LineAccess::default())
+            .unwrap()
+            .unwrap();
+        let port = line.port();
+        assert!(connect_to(port, "github.com:443", Some(&line)).starts_with("HTTP/1.1 403 "));
+        assert!(connect_to(port, "example.com:8443", Some(&line)).starts_with("HTTP/1.1 403 "));
+        assert!(connect_to(port, "example.com:443", None).starts_with("HTTP/1.1 407 "));
+        let _ = running.proxy.revoke_line(record(5));
+        let denied = proxy_denied(&subscriber);
+        assert_eq!(
+            denied,
+            [
+                (
+                    Some(record(5)),
+                    Some("http".to_owned()),
+                    Some("github.com".to_owned()),
+                    Some(443),
+                    "approval_required".to_owned()
+                ),
+                (
+                    Some(record(5)),
+                    Some("http".to_owned()),
+                    Some("example.com".to_owned()),
+                    Some(8443),
+                    "host_not_allowed".to_owned()
+                ),
+            ]
+        );
+    }
+
+    // KNSH-060 record_lists_contacted_and_refused_hosts (FR-NET-09): a line's record gets every host it contacted
+    // and every host it was refused, repeats counted, and nothing of another line or of the envelope.
+    #[test]
+    fn record_lists_contacted_and_refused_hosts() {
+        let server = accepting_server();
+        let resolver = Arc::new(FakeResolver::new());
+        resolver.answer("registry.test", &[server.ip()]);
+        let running = live_with(Arc::clone(&resolver));
+        // The test server is on loopback: listing its address allowlists it (FR-NET-07).
+        let network = allowlist(&["registry.test", "127.0.0.1"]);
+        let line = running
+            .proxy
+            .issue_line(session(1), record(5), &network, LineAccess::default())
+            .unwrap()
+            .unwrap();
+        let other = running
+            .proxy
+            .issue_line(session(1), record(6), &network, LineAccess::default())
+            .unwrap()
+            .unwrap();
+        let envelope = running.proxy.issue(session(1), &network).unwrap().unwrap();
+        let port = line.port();
+        let contacted = format!("registry.test:{}", server.port());
+        assert!(connect_to(port, &contacted, Some(&line)).starts_with("HTTP/1.1 200 "));
+        assert!(connect_to(port, "github.com:443", Some(&line)).starts_with("HTTP/1.1 403 "));
+        assert!(connect_to(port, "github.com:443", Some(&line)).starts_with("HTTP/1.1 403 "));
+        assert!(connect_to(port, "elsewhere.test:443", Some(&other)).starts_with("HTTP/1.1 403 "));
+        assert!(connect_to(port, "envelope.test:443", Some(&envelope)).starts_with("HTTP/1.1 403 "));
+
+        let network = running.proxy.revoke_line(record(5));
+        let shown: Vec<(String, u16, Option<String>, u32)> = network
+            .iter()
+            .map(|entry| {
+                (
+                    entry.host.expose().clone(),
+                    entry.port,
+                    entry.result.reason().map(str::to_owned),
+                    entry.count,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("registry.test".to_owned(), server.port(), None, 1),
+                ("github.com".to_owned(), 443, Some("approval_required".to_owned()), 2),
+            ]
+        );
+        assert_eq!(network[0].result, NetworkResult::Contacted);
+        // Taken once: a second revocation finds nothing.
+        assert!(running.proxy.revoke_line(record(5)).is_empty());
+        assert_eq!(running.proxy.revoke_line(record(6)).len(), 1);
+    }
+
+    // KNSH-060 envelope_connection_attributed_to_session (FR-NET-09): the envelope's own refused connection is
+    // published for the session with no record, and lands in no line's record.
+    #[test]
+    fn envelope_connection_attributed_to_session() {
+        let running = live_with(Arc::new(FakeResolver::new()));
+        crate::events::tests::start(&running.hub, 1);
+        let subscriber = Subscriber::new();
+        subscriber
+            .subscribe(&running.hub, EventScope::Session(session(1)), None)
+            .unwrap();
+        let envelope = running.proxy.issue(session(1), &allowlist(&[])).unwrap().unwrap();
+        let _line = running
+            .proxy
+            .issue_line(session(1), record(5), &allowlist(&[]), LineAccess::default())
+            .unwrap()
+            .unwrap();
+        // The envelope never reaches an approval host: it has no classes and is never approved (FR-NET-03).
+        assert!(connect_to(envelope.port(), "github.com:443", Some(&envelope)).starts_with("HTTP/1.1 403 "));
+        assert!(running.proxy.revoke_line(record(5)).is_empty());
+        running.proxy.revoke(session(1));
+        assert_eq!(
+            proxy_denied(&subscriber),
+            [(
+                None,
+                Some("http".to_owned()),
+                Some("github.com".to_owned()),
+                Some(443),
+                "approval_required".to_owned()
+            )]
         );
     }
 }

@@ -22,7 +22,7 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 | `stdout`, `stderr` | blob reference | Only when output recording is on; capped at 1 MB each by default, then head and tail kept |
 | `children` | array | Processes seen in the command's process groups, best effort |
 | `files_changed` | array | Paths created, modified or deleted under checkpoint roots, with post-image identity |
-| `network` | array | Hosts contacted or refused, as reported by the proxy |
+| `network` | array | Hosts contacted or refused, as reported by the proxy ([below](#network)) |
 | `checkpoint_id` | ID or null | Checkpoint holding the pre-images |
 | `irreversible` | bool + reasons | From classification and observed behaviour |
 | `sandbox_violations` | array | Denials the system reported for this command, best effort |
@@ -62,6 +62,23 @@ summaries. Denials arriving after the record was written are appended to it, mer
 they repeat one. A record keeps at most 256 distinct elements. A denial is never attached to a record its tag does
 not name exactly (another session's record, an unknown record, a human record). Some denials are never reported by
 the system (signals, `ENOENT` cases, dropped entries, built-in refusals: [verification claims](../07-testing/verification-claims.md#c2-denials-in-the-unified-log)).
+
+## `network`
+
+The hosts the line asked the proxy to reach, as the proxy reported them (FR-NET-09, KNSH-060), in order of first
+appearance. The envelope's own connections belong to the session and are in no record. Each element:
+
+| Field | Values |
+| --- | --- |
+| `host` | The host the line named: a normalised name (lower case, no trailing dot) or an IP literal |
+| `port` | The port it named |
+| `result` | `contacted` (every check passed and the tunnel opened) or `refused` |
+| `reason` | For a refused connection, the proxy's reason: `host_not_allowed`, `network_off`, `approval_required`, `dynamic_code`, `ip_literal`, `address_not_allowed`, `unresolved`, `unreachable`, `timeout`, `no_host_rules`, …; `null` when contacted |
+| `count` | How many connections this element stands for, at least 1 |
+
+Repeats (same host, port, result and reason) merge into one element with their count. A record keeps at most 256
+distinct elements. A refusal decided after the line ended (its connection was still being checked when its
+credentials were revoked) is published as `proxy.denied` but not added to the record.
 
 ## `argv`
 

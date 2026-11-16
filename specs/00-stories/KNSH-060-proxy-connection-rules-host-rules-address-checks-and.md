@@ -20,27 +20,27 @@ record, so that network behaviour is auditable per command.
 **Acceptance criteria**
 *Proxy host rules*
 
-- [ ] `network.hosts` is open to every command in the session.
-- [ ] `network.approval_hosts` is reachable only by commands whose class allows it, or that were approved or are
+- [x] `network.hosts` is open to every command in the session.
+- [x] `network.approval_hosts` is reachable only by commands whose class allows it, or that were approved or are
       covered by a grant.
-- [ ] `network.mode = "none"` refuses every outbound connection except allowed loopback ports.
-- [ ] Dynamic code is limited to `hosts` and never reaches `approval_hosts`, even if the line was approved.
-- [ ] The rule check is a pure function of (session profile, line classes, approvals, host).
+- [x] `network.mode = "none"` refuses every outbound connection except allowed loopback ports.
+- [x] Dynamic code is limited to `hosts` and never reaches `approval_hosts`, even if the line was approved.
+- [x] The rule check is a pure function of (session profile, line classes, approvals, host).
 
 *Name resolution and address checks*
 
-- [ ] IP-literal destinations are refused unless allowlisted.
-- [ ] The proxy resolves the name itself and refuses it if any chosen address is loopback, link-local or private
+- [x] IP-literal destinations are refused unless allowlisted.
+- [x] The proxy resolves the name itself and refuses it if any chosen address is loopback, link-local or private
       (IPv4 and IPv6), unless allowlisted.
-- [ ] The proxy connects to the exact address it checked. It never re-resolves between the check and the connect.
-- [ ] The DNS resolver service is denied inside every profile (checked against KNSH-045 output).
-- [ ] The resolver sits behind a platform trait, so tests use a fake resolver.
+- [x] The proxy connects to the exact address it checked. It never re-resolves between the check and the connect.
+- [x] The DNS resolver service is denied inside every profile (checked against KNSH-045 output).
+- [x] The resolver sits behind a platform trait, so tests use a fake resolver.
 
 *Proxy reporting: `proxy.denied` and record network field*
 
-- [ ] Each refusal emits `proxy.denied` with session, record (when known), host, port and reason.
-- [ ] The record's `network` field lists hosts contacted and refused for that line.
-- [ ] Envelope-level connections are attributed to the session, not to any record.
+- [x] Each refusal emits `proxy.denied` with session, record (when known), host, port and reason.
+- [x] The record's `network` field lists hosts contacted and refused for that line.
+- [x] Envelope-level connections are attributed to the session, not to any record.
 
 **Unit tests**
 *Proxy host rules*
@@ -70,3 +70,29 @@ record, so that network behaviour is auditable per command.
 
 - The spec says "private". Propose covering RFC 1918, fc00::/7, fe80::/10, 169.254/16, 127/8, ::1, 0.0.0.0/8 and
   carrier-grade NAT 100.64/10, and listing these ranges in the spec.
+
+**Implementation status (KNSH-060)**
+
+- `knsh-core`: `check_host` (`policy/network.rs`), the pure host rule check over (network policy, requester, host),
+  with `LineAccess::of` taking a line's classes, dynamic flag and approval (an approval, or a grant that answered the
+  rules' ask); `host_matches` for profile entries (names, `*.` wildcards, IP addresses). The record's `network` field
+  (`NetworkEntry`, merged and capped at 256) and the `proxy.denied` event.
+- `knsh-platform`: the `Resolver` trait, `SystemResolver` (`getaddrinfo` through the standard library) and
+  `testing::FakeResolver`.
+- `knsh-proxy`: `HostRules`, the gate `knshd` runs (`rules.rs`): loopback ports, IP-literal allowlist, host rules,
+  one resolution per connection and the internal-address check (`address.rs`); the proxy connects only to the
+  checked addresses, in order. Contacts are reported as well as refusals, under the connection lock, so a line's
+  reports precede its revocation.
+- `knshd`: each envelope's and line's credentials carry a scope; `NetworkReport` logs every refusal, publishes
+  `proxy.denied` for live credentials (no record for the envelope) and collects a line's `network` entries, which
+  the spawner takes when it revokes the line's credentials and the supervisor writes to the record.
+- `knsh-store` and `knsh-proto`: the reserved `network` column is written and read; `records.query` and the event
+  notification show it.
+- Decisions written into the spec ([network proxy](../03-functional-requirements/network-proxy.md#host-rules-name-resolution-and-address-checks-knsh-060),
+  [execution record](../05-models/execution-record.md#network), [event](../05-models/event.md#phase-2-payloads)):
+  the internal ranges (the note's proposal plus `192.0.0.0/24`, `198.18.0.0/15`, multicast and reserved, site-local
+  and NAT64 / IPv4-mapped forms); one internal address refuses a name; an address listed in a host rule allowlists it
+  as a literal and as a resolved address; `localhost` and loopback addresses on `network.loopback` ports are allowed
+  in either mode; the envelope never reaches `approval_hosts`; refusals before credentials are known are only logged.
+- Pending: `hello` keeps `network_filter: none` until the TLS server-name check (KNSH-061). End-to-end runs of npm,
+  pip, cargo and Node through the proxy against real hosts were not run in this change.

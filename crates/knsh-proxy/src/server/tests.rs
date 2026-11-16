@@ -17,31 +17,35 @@ use crate::credentials::USER_PREFIX;
 /// Routes names to addresses; allowlists IP literals; records every question.
 #[derive(Default)]
 struct TestGate {
-    routes: HashMap<String, SocketAddr>,
+    routes: HashMap<String, Vec<SocketAddr>>,
     allowed_ips: Vec<IpAddr>,
     checked: Mutex<Vec<(Owner, Target)>>,
 }
 
 impl ConnectionGate for TestGate {
-    fn check(&self, owner: &Owner, target: &Target) -> Result<SocketAddr, Refusal> {
+    fn check(&self, owner: &Owner, target: &Target) -> Result<Vec<SocketAddr>, Refusal> {
         self.checked.lock().unwrap().push((*owner, target.clone()));
         match &target.host {
-            Host::Name(name) => self.routes.get(name).copied().ok_or(Refusal::HostNotAllowed),
-            Host::Ip(ip) => Ok(SocketAddr::new(*ip, target.port.get())),
+            Host::Name(name) => self.routes.get(name).cloned().ok_or(Refusal::HostNotAllowed),
+            Host::Ip(ip) => Ok(vec![SocketAddr::new(*ip, target.port.get())]),
         }
     }
 
-    fn allows_ip_literal(&self, _owner: &Owner, ip: IpAddr) -> bool {
+    fn allows_ip_literal(&self, _owner: &Owner, ip: IpAddr, _port: NonZeroU16) -> bool {
         self.allowed_ips.contains(&ip)
     }
 }
 
 #[derive(Default)]
-struct Recorder(Mutex<Vec<Denial>>);
+struct Recorder(Mutex<Vec<Denial>>, Mutex<Vec<(Owner, Target)>>);
 
 impl ProxyReport for Recorder {
     fn denied(&self, denial: &Denial) {
         self.0.lock().unwrap().push(denial.clone());
+    }
+
+    fn contacted(&self, owner: &Owner, target: &Target) {
+        self.1.lock().unwrap().push((*owner, target.clone()));
     }
 }
 
@@ -77,6 +81,12 @@ fn echo_server() -> SocketAddr {
     address
 }
 
+/// A loopback address where nothing listens: connecting is refused at once.
+fn closed_port() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap()
+}
+
 /// A server on loopback that accepts connections and never reads, writes or closes them.
 fn silent_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -103,8 +113,11 @@ const SHORT: Duration = Duration::from_secs(5);
 fn fixture_with(config: Config) -> Fixture {
     let echo = echo_server();
     let mut gate = TestGate::default();
-    gate.routes.insert("allowed.test".to_owned(), echo);
-    gate.routes.insert("silent.test".to_owned(), silent_server());
+    gate.routes.insert("allowed.test".to_owned(), vec![echo]);
+    gate.routes.insert("silent.test".to_owned(), vec![silent_server()]);
+    // The first address refuses connections; the second, also checked, answers.
+    gate.routes
+        .insert("fallback.test".to_owned(), vec![closed_port(), echo]);
     gate.allowed_ips.push("127.0.0.1".parse().unwrap());
     let gate = Arc::new(gate);
     let report = Arc::new(Recorder::default());
@@ -620,4 +633,51 @@ fn revocation_closes_tunnels_to_silent_destinations() {
         0,
         "the tunnel ended with its credentials"
     );
+}
+
+// KNSH-060 connects_to_checked_address_without_reresolving (FR-NET-07): the proxy connects only to the addresses
+// the gate checked, in order (here the first refuses and the second answers), and reports the contact once.
+#[test]
+fn connects_only_to_checked_addresses_in_order() {
+    let fixture = fixture();
+    let (user, token) = login(&fixture.proxy.issue(line_owner()).unwrap());
+    let (mut stream, head) = connect(&fixture.proxy, "fallback.test:443", Some(&basic(&user, &token)));
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert!(echoes(&mut stream, b"through the second address"));
+    assert_eq!(
+        fixture.gate.checked.lock().unwrap().len(),
+        1,
+        "one decision, no second lookup"
+    );
+    let contacted = fixture.report.1.lock().unwrap().clone();
+    assert_eq!(
+        contacted,
+        [(line_owner(), Target::parse_authority(b"fallback.test:443").unwrap())]
+    );
+}
+
+// FR-NET-09: a contact is reported before the revocation that ends its line returns, and a refused request is
+// never reported as contacted.
+#[test]
+fn reports_contacts_before_revocation_returns() {
+    let fixture = fixture();
+    let (user, token) = login(&fixture.proxy.issue(line_owner()).unwrap());
+    let (_tunnel, head) = connect(&fixture.proxy, "allowed.test:443", Some(&basic(&user, &token)));
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    let (_refused, head) = connect(&fixture.proxy, "refused.test:443", Some(&basic(&user, &token)));
+    assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+    // Reported before the client got its answer: no wait is needed (a command that exits on its `403` is revoked at
+    // once, and its record must still list the refusal).
+    assert_eq!(
+        fixture.report.0.lock().unwrap().len(),
+        1,
+        "refusal reported before the 403"
+    );
+    fixture.proxy.revoke_line(line_owner().line.unwrap());
+    let contacted = fixture.report.1.lock().unwrap().clone();
+    assert_eq!(contacted.len(), 1);
+    assert_eq!(contacted[0].1.to_string(), "allowed.test:443");
+    let refusals = fixture.report.refusals(1);
+    assert_eq!(refusals[0].refusal, Refusal::HostNotAllowed);
+    assert_eq!(refusals[0].owner, Some(line_owner()));
 }

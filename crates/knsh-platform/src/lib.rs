@@ -105,6 +105,7 @@
 //! - FR-SBX-07 (profile files: directory listing, profiles directory, SHA-256, KNSH-045)
 //! - FR-POL-01, FR-POL-10, FR-POL-11 (profile source and path canonicalisation for the policy loader, KNSH-039)
 //! - FR-SBX-06, FR-SBX-08, decision 9 (sandbox denials from the unified log, KNSH-047)
+//! - FR-NET-07 (name resolution for the network proxy, KNSH-060)
 //! - FR-AGT-23, `specs/02-architecture/endpoints.md` (audit tokens and process ancestry for `agent.sock`, KNSH-048)
 //! - FR-AGT-10, FR-OUT-04, `specs/06-api/wire-format.md#descriptors` (descriptor passing and the shim directory,
 //!   KNSH-049)
@@ -126,6 +127,7 @@ mod policy_source;
 pub mod probe;
 mod process;
 mod random;
+mod resolver;
 pub mod violation;
 
 #[cfg(target_os = "macos")]
@@ -152,4 +154,5 @@ pub use policy_source::PolicyDirectory;
 pub use probe::{ProbeFailure, SystemProbe};
 pub use process::{ExitStatus, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest, Stdio};
 pub use random::Random;
+pub use resolver::{MAX_ADDRESSES, Resolver};
 pub use violation::{CanaryNonce, DenialLog, DenialStream, LogEntry, StreamStopper};

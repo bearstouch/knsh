@@ -12,9 +12,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use knsh_core::{
-    Actor, ActorKind, AgentId, ArgvEntry, CanonicalPath, CappedOutput, CheckpointId, ExecutionRecord, OutputInfo,
-    OutputStream, RecordDecision, RecordDetails, RecordId, Redacted, SandboxViolation, Session, SessionId, Timestamp,
-    decode_argv, decode_decision, decode_violations, encode_argv, encode_decision, encode_violations, merge_into,
+    Actor, ActorKind, AgentId, ArgvEntry, CanonicalPath, CappedOutput, CheckpointId, ExecutionRecord,
+    MAX_NETWORK_ENTRIES, NetworkEntry, OutputInfo, OutputStream, RecordDecision, RecordDetails, RecordId, Redacted,
+    SandboxViolation, Session, SessionId, Timestamp, decode_argv, decode_decision, decode_network, decode_violations,
+    encode_argv, encode_decision, encode_network, encode_violations, merge_into, merge_network,
 };
 use knsh_platform::sqlite::{Connection, DATABASE_MODE, DEFAULT_BUSY_TIMEOUT, Statement, Step, Value};
 use knsh_platform::{FileKind, Fs};
@@ -56,7 +57,7 @@ impl RecordedOutput {
 /// The columns [`read_record`] expects, in order.
 const RECORD_COLUMNS: &str = "record_id, session_id, actor_kind, agent_id, command, rewritten_from, cwd, started_at, \
      ended_at, exit_code, pipestatus, signal, sandbox_profile, secrets_injected, checkpoint_id, sandbox_violations, \
-     decision, argv";
+     decision, argv, network";
 
 /// The most distinct sandbox violations one record keeps (FR-SBX-08). Repeats of a kept one only add to its count;
 /// further distinct ones are dropped, so one noisy command cannot grow its record without bound.
@@ -144,7 +145,7 @@ impl Database {
         transaction.execute(
             &format!(
                 "INSERT INTO records ({RECORD_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-                 ?13, ?14, ?15, ?16, ?17, ?18)"
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19)"
             ),
             &encoded.values(&record),
         )?;
@@ -483,6 +484,7 @@ struct Encoded {
     sandbox_violations: Option<String>,
     decision: Option<String>,
     argv: Option<String>,
+    network: Option<String>,
     started_at: i64,
     ended_at: Option<i64>,
 }
@@ -527,6 +529,15 @@ impl Encoded {
             .then(|| encode_argv(&details.argv))
             .transpose()
             .map_err(|_| StoreError::InvalidRecord("argv"))?;
+        // The `network` array as JSON text (KNSH-060); the column was reserved, always NULL, before. Merged and
+        // capped like violations, so a record never holds more than the limit. Empty is NULL.
+        let network = if details.network.is_empty() {
+            None
+        } else {
+            let mut kept = Vec::new();
+            merge_network(&mut kept, details.network.clone(), MAX_NETWORK_ENTRIES);
+            Some(encode_network(&kept).map_err(|_| StoreError::InvalidRecord("network"))?)
+        };
         Ok(Self {
             record_id: record.record_id.to_string(),
             session_id: record.session_id.to_string(),
@@ -536,13 +547,14 @@ impl Encoded {
             sandbox_violations,
             decision,
             argv,
+            network,
             started_at: micros(record.started_at)?,
             ended_at: record.ended_at.map(micros).transpose()?,
         })
     }
 
     /// The bound values, in [`RECORD_COLUMNS`] order.
-    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 18] {
+    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 19] {
         let details = &record.details;
         [
             Value::Text(&self.record_id),
@@ -565,6 +577,7 @@ impl Encoded {
             optional_text(self.sandbox_violations.as_deref()),
             optional_text(self.decision.as_deref()),
             optional_text(self.argv.as_deref()),
+            optional_text(self.network.as_deref()),
         ]
     }
 }
@@ -622,6 +635,7 @@ fn read_record(statement: &Statement<'_>) -> Result<ExecutionRecord, StoreError>
             sandbox_violations: stored_violations(statement.column_text(15)?.as_deref())?,
             decision: stored_decision(statement.column_text(16)?.as_deref())?,
             argv: stored_argv(statement.column_text(17)?.as_deref())?,
+            network: stored_network(statement.column_text(18)?.as_deref())?,
         },
     })
 }
@@ -670,6 +684,15 @@ fn stored_decision(text: Option<&str>) -> Result<Option<RecordDecision>, StoreEr
 /// written before KNSH-052), and text the engine could not have written is [`StoreError::Corrupt`].
 fn stored_argv(text: Option<&str>) -> Result<Vec<ArgvEntry>, StoreError> {
     text.map(decode_argv)
+        .transpose()
+        .map_err(|_| StoreError::Corrupt)
+        .map(Option::unwrap_or_default)
+}
+
+/// A record's stored `network` column: `NULL` is an empty list (a line that asked the proxy for nothing, or one
+/// written before KNSH-060), and text the engine could not have written is [`StoreError::Corrupt`].
+fn stored_network(text: Option<&str>) -> Result<Vec<NetworkEntry>, StoreError> {
+    text.map(decode_network)
         .transpose()
         .map_err(|_| StoreError::Corrupt)
         .map(Option::unwrap_or_default)

@@ -16,12 +16,23 @@
 //! 3. **Credentials.** Missing or unknown credentials are refused: `407` with `Proxy-Authenticate: Basic realm="knsh"`
 //!    (git sends credentials only after it), or the SOCKS5 refusals. Live credentials give the [`Owner`].
 //! 4. **Destination.** An IP literal is refused unless the gate allowlists it; otherwise the [`ConnectionGate`] gives
-//!    the exact address to connect to, or a refusal. Both protocols take this one path.
-//! 5. **Tunnel.** The proxy connects to that address within [`Config::connect_timeout`], answers success, forwards
-//!    any bytes the client sent after its request, and relays byte for byte under the idle and total timeouts.
+//!    the exact addresses to connect to, or a refusal. Both protocols take this one path.
+//! 5. **Tunnel.** The proxy connects to those addresses in order, the first that answers winning, all within
+//!    [`Config::connect_timeout`], and never to any other: the name is not resolved again (FR-NET-07). It then
+//!    reports the contact, answers success, forwards any bytes the client sent after its request, and relays byte
+//!    for byte under the idle and total timeouts.
 //!
-//! Every refusal is reported to the [`ProxyReport`]. The proxy opens a connection only for a client's request that
-//! passed every check, and sends nothing of its own on it (FR-NET-13).
+//! Every refusal and every contact is reported to the [`ProxyReport`] (FR-NET-09). The proxy opens a connection only
+//! for a client's request that passed every check, and sends nothing of its own on it (FR-NET-13).
+//!
+//! # Reports and revocation
+//!
+//! The report of an authenticated connection (a refusal after its credentials were checked, or its contact) is made
+//! under the `live` lock, the lock revocation takes. So everything reported for a line's connections that were not
+//! yet revoked is reported before [`Proxy::revoke_line`] returns, and `knshd` can collect the line's `network` field
+//! right after revoking. A refusal is reported before the client is answered, so a command that exits on its refusal
+//! cannot have its credentials revoked before the report. A connection revoked while its destination was being
+//! checked may still report its refusal afterwards; its tunnel never opens.
 //!
 //! # Revocation
 //!
@@ -34,8 +45,8 @@
 //!
 //! # Lock order
 //!
-//! `live`, then the credential table's lock. Neither is held across I/O, except `shutdown(2)` calls, which do not
-//! block.
+//! `live`, then the credential table's lock; `live`, then whatever the [`ProxyReport`] locks. Neither is held across
+//! I/O, except `shutdown(2)` calls, which do not block.
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
@@ -45,7 +56,7 @@ use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use knsh_core::{RecordId, SessionId};
 use knsh_platform::macos::Kqueue;
@@ -299,9 +310,10 @@ impl Shared {
         Some(id)
     }
 
-    /// Records the destination socket of connection `id`, so a revocation shuts it down too. `false` if the
-    /// connection was revoked meanwhile (or the socket cannot be kept): the tunnel must not open.
-    fn attach_upstream(&self, id: u64, upstream: &TcpStream) -> bool {
+    /// Records the destination socket of connection `id`, so a revocation shuts it down too, and reports the
+    /// contact under the same lock ("Reports and revocation"). `false` if the connection was revoked meanwhile (or
+    /// the socket cannot be kept): the tunnel must not open, and nothing is reported as contacted.
+    fn attach_upstream(&self, id: u64, owner: &Owner, target: &Target, upstream: &TcpStream) -> bool {
         let mut live = self.lock_live();
         let Some(connection) = live.connections.get_mut(&id) else {
             return false;
@@ -312,6 +324,7 @@ impl Shared {
         match upstream.try_clone() {
             Ok(clone) => {
                 connection.upstream = Some(clone);
+                self.report.contacted(owner, target);
                 true
             }
             Err(_) => false,
@@ -331,8 +344,10 @@ impl Shared {
         Some(owner)
     }
 
-    /// Reports a refusal.
+    /// Reports a refusal. One that names an owner is reported under the `live` lock, so it is ordered before any
+    /// revocation of the owner's credentials ("Reports and revocation").
     fn deny(&self, owner: Option<Owner>, protocol: Option<Protocol>, target: Option<&Target>, refusal: Refusal) {
+        let _live = owner.is_some().then(|| self.lock_live());
         self.report.denied(&Denial {
             owner,
             protocol,
@@ -341,11 +356,11 @@ impl Shared {
         });
     }
 
-    /// Step 4: the address to connect to, or why not. IP literals are refused here unless allowlisted, for both
+    /// Step 4: the addresses to connect to, or why not. IP literals are refused here unless allowlisted, for both
     /// protocols, before the gate is asked for an address (FR-NET-05).
-    fn decide(&self, owner: &Owner, target: &Target) -> Result<SocketAddr, Refusal> {
+    fn decide(&self, owner: &Owner, target: &Target) -> Result<Vec<SocketAddr>, Refusal> {
         if let Host::Ip(ip) = target.host
-            && !self.gate.allows_ip_literal(owner, ip)
+            && !self.gate.allows_ip_literal(owner, ip, target.port)
         {
             return Err(Refusal::IpLiteral);
         }
@@ -357,12 +372,27 @@ impl Shared {
         self.decide(owner, target).and_then(|address| self.connect(address))
     }
 
-    /// Step 5's connect, to exactly the address the gate gave.
-    fn connect(&self, address: SocketAddr) -> Result<TcpStream, Refusal> {
-        TcpStream::connect_timeout(&address, self.config.connect_timeout).map_err(|error| match error.kind() {
-            ErrorKind::TimedOut | ErrorKind::WouldBlock => Refusal::Timeout,
-            _ => Refusal::Unreachable,
-        })
+    /// Step 5's connect: to the gate's addresses in order, and to nothing else, until one answers, all within
+    /// [`Config::connect_timeout`]. The refusal is the last attempt's; no address at all is [`Refusal::Unresolved`].
+    fn connect(&self, addresses: Vec<SocketAddr>) -> Result<TcpStream, Refusal> {
+        let deadline = Instant::now() + self.config.connect_timeout;
+        let mut refusal = Refusal::Unresolved;
+        for address in addresses {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Refusal::Timeout);
+            }
+            match TcpStream::connect_timeout(&address, left) {
+                Ok(stream) => return Ok(stream),
+                Err(error) => {
+                    refusal = match error.kind() {
+                        ErrorKind::TimedOut | ErrorKind::WouldBlock => Refusal::Timeout,
+                        _ => Refusal::Unreachable,
+                    };
+                }
+            }
+        }
+        Err(refusal)
     }
 
     /// The tunnel's limits.
@@ -477,15 +507,21 @@ fn refuse_http(shared: &Shared, stream: &TcpStream, owner: Option<Owner>, target
         Refusal::MissingCredentials | Refusal::UnknownCredentials => Response::ProxyAuthenticationRequired,
         Refusal::Malformed | Refusal::UnsupportedCommand => Response::BadRequest,
         Refusal::UnsupportedProtocol => Response::MethodNotAllowed,
-        Refusal::IpLiteral | Refusal::HostNotAllowed | Refusal::AddressNotAllowed | Refusal::NoHostRules => {
-            Response::Forbidden
-        }
+        Refusal::IpLiteral
+        | Refusal::HostNotAllowed
+        | Refusal::NetworkOff
+        | Refusal::ApprovalRequired
+        | Refusal::DynamicCode
+        | Refusal::AddressNotAllowed
+        | Refusal::NoHostRules => Response::Forbidden,
         Refusal::Unresolved | Refusal::Unreachable => Response::BadGateway,
         Refusal::Timeout => Response::GatewayTimeout,
         Refusal::Busy => Response::ServiceUnavailable,
     };
-    let _ = (&*stream).write_all(response.bytes());
+    // Reported before the client can see the answer: a command that exits on its `403` and has its credentials
+    // revoked must find the refusal already reported ("Reports and revocation").
     shared.deny(owner, Some(Protocol::Http), target, refusal);
+    let _ = (&*stream).write_all(response.bytes());
 }
 
 /// An HTTP head over its size limit: `431` rather than [`refuse_http`]'s `400`, reported as malformed.
@@ -552,7 +588,7 @@ fn serve_http(shared: &Shared, id: u64, stream: &TcpStream, reader: &mut Handsha
         Err(refusal) => return refuse_http(shared, stream, Some(owner), Some(&target), refusal),
     };
     // Revoked while the destination was checked or connected: the client socket is already shut down.
-    if !shared.attach_upstream(id, &upstream) {
+    if !shared.attach_upstream(id, &owner, &target, &upstream) {
         return;
     }
     if (&*stream).write_all(Response::Established.bytes()).is_err() {
@@ -569,9 +605,13 @@ fn serve_http(shared: &Shared, id: u64, stream: &TcpStream, reader: &mut Handsha
 fn refuse_socks5(shared: &Shared, stream: &TcpStream, owner: Owner, target: Option<&Target>, refusal: Refusal) {
     let reply = match refusal {
         Refusal::UnsupportedCommand => Reply::CommandNotSupported,
-        Refusal::IpLiteral | Refusal::HostNotAllowed | Refusal::AddressNotAllowed | Refusal::NoHostRules => {
-            Reply::NotAllowed
-        }
+        Refusal::IpLiteral
+        | Refusal::HostNotAllowed
+        | Refusal::NetworkOff
+        | Refusal::ApprovalRequired
+        | Refusal::DynamicCode
+        | Refusal::AddressNotAllowed
+        | Refusal::NoHostRules => Reply::NotAllowed,
         Refusal::Unresolved | Refusal::Unreachable => Reply::HostUnreachable,
         Refusal::Timeout => Reply::TtlExpired,
         Refusal::MissingCredentials
@@ -580,18 +620,20 @@ fn refuse_socks5(shared: &Shared, stream: &TcpStream, owner: Owner, target: Opti
         | Refusal::UnsupportedProtocol
         | Refusal::Busy => Reply::GeneralFailure,
     };
-    let _ = (&*stream).write_all(&reply.bytes());
+    // Reported before the client can see the reply ("Reports and revocation").
     shared.deny(Some(owner), Some(Protocol::Socks5), target, refusal);
+    let _ = (&*stream).write_all(&reply.bytes());
 }
 
 /// A SOCKS5 connection: steps 2 to 5 (`socks5` module documentation).
 fn serve_socks5(shared: &Shared, id: u64, stream: &TcpStream, reader: &mut Handshake<'_>) {
     let mut writer = stream;
     let deny = |owner, refusal| shared.deny(owner, Some(Protocol::Socks5), None, refusal);
-    // A refusal before the request is judged: `answer` is best effort (the client may be gone), the report is not.
+    // A refusal before the request is judged: `answer` is best effort (the client may be gone), the report is not,
+    // and comes first ("Reports and revocation").
     let refuse = |answer: &[u8], owner, refusal| {
-        let _ = (&*stream).write_all(answer);
         deny(owner, refusal);
+        let _ = (&*stream).write_all(answer);
     };
     let offered = match socks5::read_greeting(&mut [socks5::VERSION].as_slice().chain(&mut *reader)) {
         Ok(offered) => offered,
@@ -639,7 +681,7 @@ fn serve_socks5(shared: &Shared, id: u64, stream: &TcpStream, reader: &mut Hands
         Ok(upstream) => upstream,
         Err(refusal) => return refuse_socks5(shared, stream, owner, Some(&target), refusal),
     };
-    if !shared.attach_upstream(id, &upstream) {
+    if !shared.attach_upstream(id, &owner, &target, &upstream) {
         return;
     }
     if writer.write_all(&Reply::Succeeded.bytes()).is_err() {

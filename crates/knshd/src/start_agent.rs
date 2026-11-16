@@ -358,7 +358,10 @@ impl AgentStarter {
     ) -> Result<LineStatus, RpcError> {
         let processes = self.launcher.processes();
         // A proxy that runs but cannot issue credentials stops the launch: no envelope runs untied to its session.
-        let proxy = self.proxy.issue(session_id).map_err(|_| internal_error())?;
+        let proxy = self
+            .proxy
+            .issue(session_id, &profile.network)
+            .map_err(|_| internal_error())?;
         let envelope = self
             .launcher
             .launch(Launch {

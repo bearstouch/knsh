@@ -436,31 +436,36 @@ struct Supervision<'a> {
     random: std::sync::Arc<knsh_platform::macos::SystemRandom>,
 }
 
-/// Starts the network proxy (KNSH-059) on a loopback port, refusing every destination until host rules exist
-/// (KNSH-060) and logging each refusal. One that cannot start is logged, and envelopes and lines then get no proxy
-/// settings and no proxy port ([`proxy::NoProxy`]): they reach only their loopback ports (fail closed).
+/// Starts the network proxy (KNSH-059) on a loopback port with the host rules, the system resolver and address
+/// checks as its gate (KNSH-060), reporting refusals to the system log and as `proxy.denied` on `events`. One that
+/// cannot start is logged, and envelopes and lines then get no proxy settings and no proxy port
+/// ([`proxy::NoProxy`]): they reach only their loopback ports (fail closed).
 #[cfg(target_os = "macos")]
 fn start_proxy(
     clock: std::sync::Arc<knsh_platform::macos::SystemClock>,
     random: std::sync::Arc<knsh_platform::macos::SystemRandom>,
     log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+    events: &std::sync::Arc<events::EventHub>,
 ) -> std::sync::Arc<dyn proxy::ProxyIssuer> {
     use std::sync::Arc;
 
+    use knsh_platform::macos::SystemResolver;
     use knsh_platform::{Field, Level, Value};
-    use knsh_proxy::{Config, Parts, Proxy, RefuseAll};
+    use knsh_proxy::{Config, HostRules, Parts, Proxy};
 
+    let rules = Arc::new(HostRules::new(Arc::new(SystemResolver::new())));
+    let report = proxy::NetworkReport::new(Arc::clone(log), Arc::clone(events));
     let started = Proxy::start(
         Config::DEFAULT,
         Parts {
-            gate: Arc::new(RefuseAll),
-            report: Arc::new(proxy::LoggedDenials::new(Arc::clone(log))),
+            gate: Arc::clone(&rules) as Arc<dyn knsh_proxy::ConnectionGate>,
+            report: Arc::clone(&report) as Arc<dyn knsh_proxy::ProxyReport>,
             random,
             clock,
         },
     );
     match started {
-        Ok(running) => Arc::new(proxy::LiveProxy::new(running)),
+        Ok(running) => Arc::new(proxy::LiveProxy::new(running, rules, report)),
         Err(error) => {
             log.log(
                 Level::Error,
@@ -537,7 +542,7 @@ impl Supervision<'_> {
     /// profiles and clock.
     fn handlers(self) -> dispatch::Handlers {
         // One proxy issues every envelope's and line's credentials (KNSH-059).
-        let proxy = start_proxy(self.clock.clone(), self.random.clone(), self.log);
+        let proxy = start_proxy(self.clock.clone(), self.random.clone(), self.log, self.events);
         let mut handlers = self.start_agent_handlers(&proxy);
         handlers.extend(self.exec_run_handlers(proxy));
         handlers

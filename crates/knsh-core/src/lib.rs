@@ -153,6 +153,8 @@ pub use event::{
     MAX_ENDED_BUFFERS, Published, Subscribed, SubscriptionId,
 };
 pub use id::{CheckpointId, EventId, GrantId, RecordId, RequestId, SessionId};
+/// The network classes of the subcommand table (FR-LC-06), as lines present them to host rules ([`LineAccess`]).
+pub use knsh_bash::NetworkClass;
 pub use lifecycle::{
     Allowed, AskAnswer, AskReply, AskRequest, Authority, Caller, Decision, Effects, HookOutcome, HookVerdict, Hooks,
     INTERNAL_ERROR, LineInput, LineProfile, LocalApprovals, MAX_LINE_LEN, MAX_REWRITES, NoAuthority, NoHooks,
@@ -165,22 +167,24 @@ pub use output::{
 };
 pub use path::CanonicalPath;
 pub use policy::{
-    AGENT_SOCKET, ApprovalsPolicy, CONTROL_SERVICE, CheckpointPolicy, CommandVerdict, DEFAULT_AGENT_BASH,
+    AGENT_SOCKET, ApprovalsPolicy, CONTROL_SERVICE, CheckpointPolicy, ClassHosts, CommandVerdict, DEFAULT_AGENT_BASH,
     DEFAULT_CHECKPOINT_EXCLUDES, DEFAULT_RETENTION_DAYS, DecisionSource, ENGINE_CONFIG_DIR, ENGINE_DATA_DIR,
-    ENGINE_RUN_DIR, ExecPolicy, FixedDenies, FsPolicy, Grant, GrantScope, GrantSet, LineCapabilities, LineCheck,
-    LineDecision, LineReason, LineResolver, LoadedProfiles, LookupError, MAX_EXTENDS_DEPTH, MAX_GRANTS,
-    MAX_PROFILE_LEN, MatchedRule, NetworkMode, NetworkPolicy, OutputMode, OutputPolicy, PRESETS, PathContext, PolicyFs,
-    Profile, ProfileSource, RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy, RuleAction, RuleId, SecretInjection,
-    UNATTENDED_PROFILE, UNATTENDED_PROFILE_TEXT, USER_SOCKET, at_least_as_strict, check_line, evaluate_command,
-    evaluate_line, evaluate_line_with_grants, load_profile, load_profile_text, load_unattended, project_root,
+    ENGINE_RUN_DIR, ExecPolicy, FixedDenies, FsPolicy, Grant, GrantScope, GrantSet, HostAccess, HostRefusal,
+    LineAccess, LineCapabilities, LineCheck, LineDecision, LineReason, LineResolver, LoadedProfiles, LookupError,
+    MAX_EXTENDS_DEPTH, MAX_GRANTS, MAX_PROFILE_LEN, MatchedRule, NetworkMode, NetworkPolicy, OutputMode, OutputPolicy,
+    PRESETS, PathContext, PolicyFs, Profile, ProfileSource, RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy,
+    Requester, RuleAction, RuleId, SecretInjection, UNATTENDED_PROFILE, UNATTENDED_PROFILE_TEXT, USER_SOCKET,
+    at_least_as_strict, check_host, check_line, evaluate_command, evaluate_line, evaluate_line_with_grants,
+    host_matches, load_profile, load_profile_text, load_unattended, project_root,
 };
 pub use ratelimit::{
     Counted, DenialLimiter, LIMIT_DENIALS, LIMIT_DURATION, LIMIT_WINDOW, LineKey, MAX_TRACKED_LINES,
     MAX_TRACKED_SESSIONS,
 };
 pub use record::{
-    ArgvClass, ArgvEntry, DecisionVerdict, ExecutionRecord, OutputInfo, OutputStream, RecordDecision, RecordDetails,
-    argv_of, decode_argv, decode_decision, encode_argv, encode_decision,
+    ArgvClass, ArgvEntry, DecisionVerdict, ExecutionRecord, MAX_NETWORK_ENTRIES, NetworkEntry, NetworkResult,
+    OutputInfo, OutputStream, RecordDecision, RecordDetails, argv_of, decode_argv, decode_decision, decode_network,
+    encode_argv, encode_decision, encode_network, merge_network,
 };
 pub use redacted::{REDACTED_MARKER, Redacted};
 pub use registry::{EqualProfileOnly, ProfileOrder, SessionRegistry};

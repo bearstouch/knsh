@@ -43,13 +43,63 @@
   connect to.
 - **Tunnels.** Bytes are relayed unchanged both ways, half closes included, under the idle and total timeouts.
 - **Reporting.** Every refusal is reported with its reason, protocol, session and record when known, and port; never
-  the credentials. Until KNSH-060 the report goes to the system log (`proxy refused a connection`), and `proxy.denied`
-  follows with it.
-- **Until host rules exist (KNSH-060)** the proxy refuses every destination, so envelopes and lines reach nothing
-  but their loopback ports, and `hello` reports `network_filter: none`.
+  the credentials. The system log entry (`proxy refused a connection`) names no host; `proxy.denied` and the
+  record's `network` field (KNSH-060, below) do.
+
+## Host rules, name resolution and address checks (KNSH-060)
+
+Each envelope and each line has a scope, set when its credentials are issued and dropped when they are revoked: the
+session profile's `[network]` policy (for a line, the profile its decision was made under) and who asks. A connection
+whose credentials have no scope is refused (`no_host_rules`). For each connection, in order:
+
+1. **Loopback ports.** A loopback address (`127.0.0.0/8`, `::1`) or the name `localhost` (or a name below it, RFC
+   6761) on a port in `network.loopback` is allowed in either mode: the sandbox profile already lets the command reach
+   that port (FR-NET-04). `localhost` is never resolved; it is `127.0.0.1`, then `::1`.
+2. **IP literals** are refused (`ip_literal`) unless allowlisted: an address listed in a host rule the requester may
+   use (FR-NET-05).
+3. **Host rules** (`knsh-core`'s `check_host`, a pure function of the network policy, the requester and the host):
+   - `network.mode = "none"`: every host is refused (`network_off`, FR-NET-04).
+   - `network.hosts`: open to every command of the session, the envelope included (FR-NET-02).
+   - `network.approval_hosts`: refused to the envelope, which has no classes and is never approved; refused to a line
+     holding dynamic code, even approved (`dynamic_code`, FR-NET-11, FR-POL-21); reached by a line whose classes open
+     it under `network.class_hosts`, or that was approved (by the authority or the user) or allowed by a grant;
+     otherwise refused (`approval_required`, FR-NET-03).
+   - Any other host: refused (`host_not_allowed`).
+4. **Resolution.** An allowed name is resolved by the proxy itself (`getaddrinfo` in `knshd`; commands never
+   resolve, FR-NET-08). No address, or a resolver error, is `unresolved`. If **any** address is internal (below) and
+   not allowlisted, the name is refused (`address_not_allowed`, FR-NET-07). An internal address is allowlisted when it
+   is listed in a host rule the requester may use, or is a loopback address on a `network.loopback` port.
+5. **Connect.** The proxy connects to the checked addresses, in the resolver's order, the first that answers winning,
+   all within the connect timeout. It never resolves the name again, so a later answer (DNS rebinding) cannot change
+   where this connection goes.
+
+**Host entries.** `network.hosts`, `network.approval_hosts` and `network.class_hosts.*` entries match a host as
+follows: a name matches the same name (ASCII case and one trailing dot ignored); `*.example.com` matches every name
+strictly below `example.com` (not `example.com` itself); an IP address, written plainly or in brackets (`10.0.0.5`,
+`[fd00::1]`), matches that address however it is spelled, and is how a profile allowlists an IP literal or an internal
+address. Any other entry (a `*` elsewhere, a port) matches nothing. A class host is matched the same way.
+
+**Internal addresses** (FR-NET-07). IPv4: `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10` (carrier-grade NAT),
+`127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24`, `192.168.0.0/16`, `198.18.0.0/15`, and
+`224.0.0.0` and above (multicast, reserved, broadcast). IPv6: `::`, `::1`, `fc00::/7`, `fe80::/10`, `fec0::/10`,
+`ff00::/8`, and IPv4-mapped (`::ffff:0:0/96`), IPv4-compatible (`::/96`) and NAT64 (`64:ff9b::/96`) addresses, judged
+by the IPv4 address they carry.
+
+**Reporting** (FR-NET-09). A refusal whose credentials were live is published as `proxy.denied` for the owner's
+session ([event](../05-models/event.md#phase-2-payloads)): `record_id` names the line, and is `null` for the
+envelope's own connections, which are attributed to the session alone. Refusals before credentials are known (missing
+or unknown credentials, a malformed greeting) have no session and are only logged. A line's refusals and contacts (a
+connection that passed every check and whose tunnel opened) are collected while it runs and written to its record's
+`network` field ([execution record](../05-models/execution-record.md#network)). The proxy reports a connection before
+the revocation that ends its line returns, so every connection the line made is in its record; a connection revoked
+while its destination was still being checked may report its refusal later, which is published but not recorded.
+
+`hello` reports `network_filter: none` until the TLS server-name check (FR-NET-06, KNSH-061) is in force too.
 
 ## Known limits
 
+- Name resolution blocks the connection's thread (`getaddrinfo` has no timeout of its own); a slow resolver delays
+  only that connection, and connections are bounded by the proxy's connection limit.
 - An allowlisted host that accepts uploads (a package registry, a git host) can receive data. Keep upload-capable hosts in `approval_hosts`, and let irreversible flags gate publishing commands.
 - Tools that ignore proxy settings (ssh git remotes, some Node and Java HTTP clients) are blocked, not leaked.
 - Credentials travel as the user and password of an HTTP proxy URL and arrive as `Proxy-Authorization: Basic`. git

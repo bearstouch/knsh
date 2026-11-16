@@ -50,6 +50,7 @@ impl Spawner for GroupSpawner {
                 timed_out: false,
             }),
             output: None,
+            network: Vec::new(),
         }
     }
 }
