@@ -194,6 +194,12 @@ pub enum EventData {
         /// Why it ended.
         reason: CancelReason,
     },
+    /// `policy.invalid`: a policy file the session needed has a missing or bad signature, so it was ignored and the
+    /// line refused, never run under another profile (FR-POL-42, KNSH-065).
+    PolicyInvalid {
+        /// The profile whose file failed its check: the session's own profile or a parent it `extends`.
+        profile: ProfileName,
+    },
 }
 
 /// Why a pending decision was cancelled (`decision.cancelled`).
@@ -234,6 +240,7 @@ impl EventData {
             | Self::CommandDenied { .. }
             | Self::CommandDeniedRepeatedly { .. }
             | Self::DecisionCancelled { .. }
+            | Self::PolicyInvalid { .. }
             | Self::CommandStarted { .. }
             | Self::CommandLongRunning { .. } => None,
         }
@@ -258,6 +265,7 @@ impl EventData {
             Self::CommandStarted { .. } => "command.started",
             Self::CommandLongRunning { .. } => "command.long_running",
             Self::CommandOutput { .. } => "command.output",
+            Self::PolicyInvalid { .. } => "policy.invalid",
         }
     }
 

@@ -16,7 +16,9 @@
 //!   (by name); neither is `-32602`.
 //!
 //! The profile is loaded as the supervisor will load it: `unattended` is the built-in profile, any other name is
-//! `<name>.toml` in the policies directory with its `extends` chain. Paths are expanded with `knshd`'s `HOME` and
+//! `<name>.toml` in the policies directory with its `extends` chain, each file accepted only when its signature
+//! verifies (KNSH-065, FR-POL-42). A file that does not verify is ignored, logged as `policy.invalid`, and the
+//! profile does not load: nothing falls back to another profile. Paths are expanded with `knshd`'s `HOME` and
 //! `TMPDIR`, and `${PROJECT}` is found from the line's `cwd`. A `profile` that does not exist is `-32602`; a profile
 //! that cannot be loaded (invalid, unreadable, a missing parent, or the session's own profile missing) is `-32603`,
 //! with no reason in the answer.
@@ -30,7 +32,7 @@ use knsh_core::{
     PathContext, Profile, ProfileError, ProfileErrorKind, ProfileName, ProfileOrigin, UNATTENDED_PROFILE, check_line,
     load_profile, load_unattended,
 };
-use knsh_platform::{Fs, PolicyDirectory};
+use knsh_platform::{Field, Fs, Level, PolicyDirectory, PolicySigner, SystemLog, Value};
 use knsh_proto::{
     DEFAULT_POLICY_CHECK_PATH, ErrorCode, PolicyCheckParams, PolicyCheckResult, PolicyCheckTarget, RpcError,
 };
@@ -53,22 +55,55 @@ pub(crate) struct ProfileLoader {
     home: PathBuf,
     /// `knshd`'s `TMPDIR`, for `${TMPDIR}`.
     tmpdir: PathBuf,
+    /// Checks every profile file's signature before the loader sees it (FR-POL-40, FR-POL-42).
+    signer: Arc<PolicySigner>,
+    /// Where an ignored file is reported when no session is there to receive `policy.invalid`.
+    log: Arc<dyn SystemLog>,
 }
 
 impl ProfileLoader {
-    /// Reads profiles from `policies` through `fs`, expanding paths with `home` and `tmpdir`.
-    pub(crate) fn new(fs: Arc<dyn Fs>, policies: PathBuf, home: PathBuf, tmpdir: PathBuf) -> Self {
+    /// Reads profiles from `policies` through `fs`, accepting only files `signer` verifies, expanding paths with
+    /// `home` and `tmpdir`, and reporting ignored files to `log`.
+    pub(crate) fn new(
+        fs: Arc<dyn Fs>,
+        policies: PathBuf,
+        home: PathBuf,
+        tmpdir: PathBuf,
+        signer: Arc<PolicySigner>,
+        log: Arc<dyn SystemLog>,
+    ) -> Self {
         Self {
             fs,
             policies,
             home,
             tmpdir,
+            signer,
+            log,
         }
     }
 
     /// The filesystem profiles and binaries are read through.
     pub(crate) fn fs(&self) -> &dyn Fs {
         &*self.fs
+    }
+
+    /// The policies directory, read through the loader's filesystem and checked by its signer.
+    pub(crate) fn directory(&self) -> PolicyDirectory<'_> {
+        PolicyDirectory::new(self.policies.clone(), &*self.fs, &self.signer)
+    }
+
+    /// `knshd`'s `HOME`.
+    pub(crate) fn home(&self) -> &std::path::Path {
+        &self.home
+    }
+
+    /// The path context for a profile used from `start_dir`.
+    pub(crate) fn context(&self, start_dir: &std::path::Path) -> PathContext {
+        PathContext {
+            home: self.home.clone(),
+            tmpdir: self.tmpdir.clone(),
+            start_dir: start_dir.to_path_buf(),
+        }
     }
 
     /// Loads `name` for a line whose working directory is `cwd` (which `${PROJECT}` is found from): `unattended` is
@@ -78,16 +113,37 @@ impl ProfileLoader {
     ///
     /// [`ProfileError`] for a profile that is missing, unreadable or invalid.
     pub(crate) fn load(&self, name: &ProfileName, cwd: &std::path::Path) -> Result<Profile, ProfileError> {
-        let context = PathContext {
-            home: self.home.clone(),
-            tmpdir: self.tmpdir.clone(),
-            start_dir: cwd.to_path_buf(),
-        };
+        let context = self.context(cwd);
         let fs: &dyn Fs = &*self.fs;
         if name.as_str() == UNATTENDED_PROFILE {
             return load_unattended(&context, fs);
         }
-        load_profile(name, &PolicyDirectory::new(self.policies.clone(), fs), &context, fs)
+        let loaded = load_profile(name, &self.directory(), &context, fs);
+        if let Err(error) = &loaded
+            && *error.kind() == ProfileErrorKind::SignatureInvalid
+        {
+            // FR-POL-42: reported every time the file is ignored. The log takes only static text, so the profile
+            // name travels in the session's `policy.invalid` event, where a session exists (`invalid_profile`).
+            self.log.log(
+                Level::Error,
+                "policy.invalid: a policy file has a missing or bad signature and was ignored",
+                &[Field::new("event", Value::Static("policy.invalid"))],
+            );
+        }
+        loaded
+    }
+}
+
+/// The profile whose file failed its signature check, when `error` is that failure (FR-POL-42): the profile itself
+/// or a parent in its `extends` chain. `None` for any other error.
+pub(crate) fn invalid_profile(error: &ProfileError) -> Option<ProfileName> {
+    if *error.kind() != ProfileErrorKind::SignatureInvalid {
+        return None;
+    }
+    match error.origin() {
+        Some(ProfileOrigin::Profile(name)) => Some(name.clone()),
+        // Presets are compiled in and carry no file signature.
+        Some(ProfileOrigin::Preset(_)) | None => None,
     }
 }
 
@@ -174,8 +230,10 @@ pub(crate) mod tests {
 
     use knsh_core::{Actor, EventData, SessionId};
     use knsh_json::Object;
-    use knsh_platform::EnginePaths;
-    use knsh_platform::testing::MemFs;
+    use std::time::Duration;
+
+    use knsh_platform::testing::{MemFs, MemKeyStore, RecordingLog, ScriptedPresence, SeededRandom};
+    use knsh_platform::{EnginePaths, PromptReason, UserPresence};
     use knsh_proto::{ByteTransport, MethodName, Request, RequestId};
     use knsh_store::{RecordQuery, Scope};
 
@@ -197,9 +255,49 @@ pub(crate) mod tests {
         PolicyCheck::new(sessions, loader(fs))
     }
 
-    /// Profiles from the fake home's policies directory on `fs`.
+    /// Profiles from the fake home's policies directory on `fs`, signed with the test key.
     pub(crate) fn loader(fs: MemFs) -> ProfileLoader {
-        ProfileLoader::new(Arc::new(fs), policies(), PathBuf::from(HOME), PathBuf::from("/tmp"))
+        loader_on(Arc::new(fs), Arc::new(RecordingLog::new()))
+    }
+
+    /// As [`loader`], on a filesystem the test keeps a handle to, reporting ignored files to `log`.
+    pub(crate) fn loader_on(fs: Arc<MemFs>, log: Arc<RecordingLog>) -> ProfileLoader {
+        ProfileLoader::new(
+            fs,
+            policies(),
+            PathBuf::from(HOME),
+            PathBuf::from("/tmp"),
+            test_signer(),
+            log,
+        )
+    }
+
+    /// The signing key every test profile is signed with.
+    const TEST_KEY: [u8; knsh_platform::SIGNING_KEY_LEN] = [0x5a; knsh_platform::SIGNING_KEY_LEN];
+
+    /// A signer holding [`TEST_KEY`], as `knshd` holds the Keychain's key.
+    pub(crate) fn test_signer() -> Arc<PolicySigner> {
+        Arc::new(PolicySigner::new(
+            Arc::new(MemKeyStore::with_key(TEST_KEY)),
+            Arc::new(SeededRandom::new(1)),
+            knsh_platform::macos::hmac_sha256,
+        ))
+    }
+
+    /// `text` signed as profile `name` with the test key, as `knsh policy edit` would write it: the only way a test
+    /// gets a proof is a scripted prompt that succeeded.
+    pub(crate) fn signed(name: &str, text: &str) -> Vec<u8> {
+        let presence = ScriptedPresence::new();
+        presence.approve_next();
+        let proof = presence
+            .authenticate(
+                &PromptReason::change("sign a test profile", name),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        test_signer()
+            .sign(&ProfileName::new(name).unwrap(), text.as_bytes(), proof)
+            .unwrap()
     }
 
     /// A Mac-like filesystem: trusted binaries, a project, the policies directory and the profiles given.
@@ -213,7 +311,7 @@ pub(crate) mod tests {
             fs.write(Path::new(binary), b"#!/bin/sh\n", 0o755).unwrap();
         }
         for (name, text) in profiles {
-            fs.write(&policies().join(format!("{name}.toml")), text.as_bytes(), 0o600)
+            fs.write(&policies().join(format!("{name}.toml")), &signed(name, text), 0o600)
                 .unwrap();
         }
         fs

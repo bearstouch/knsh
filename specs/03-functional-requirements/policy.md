@@ -186,6 +186,36 @@ remain intent filters: the sandbox (writes only to `${TMPDIR}`, no network) is t
 | FR-POL-41 | `knsh policy edit` opens the file; saving must require Touch ID or the user's password, checked by `knshd`, before it is signed. |
 | FR-POL-42 | A file with a missing or bad signature must be ignored and reported with `policy.invalid`. |
 
+**Signature format and key (KNSH-065, resolving the story's spec gap).**
+
+- **Algorithm:** HMAC-SHA-256 through `CommonCrypto` (`CCHmac`), with a 32-byte random key. Symmetric, because only
+  `knshd` both signs and verifies; KNSH-111 implements the same primitive for Linux so the format never diverges.
+- **Where:** an **embedded trailer**, the file's last line, exactly `# knsh-signature: v1 hmac-sha256 <64 lowercase
+  hex digits>` and a newline. Text and signature are one file, replaced atomically on save, so no reader sees new text
+  with an old signature and no sidecar can be lost or left behind. The trailer is a TOML comment.
+- **Coverage:** the MAC is over `knsh-policy-signature-v1`, NUL, the profile name, NUL, and the exact bytes before the
+  trailer (the body). Any byte change, a trailer that is not exactly the format (uppercase hex, trailing bytes), or
+  the file under another name invalidates it. A body without a final newline gets one before it is signed.
+  Comparison is constant time.
+- **Key:** a generic-password item (service `knsh.policy-signing`, account `hmac-sha256-v1`) in the file-based login
+  keychain, created by `knshd` with `SecItemAdd` on the **first signature** (never on a verification), with Keychain
+  user interaction disabled ([decision 11](../09-reference/decisions.md)). It is read once per `knshd` process and
+  kept in memory. A read failure on an existing item (tampering, a locked keychain) is never repaired: every file is
+  then ignored and nothing is signed (fail closed). An existing item is never overwritten.
+- **Ignored files:** the loader never sees an ignored file's text. A parent in the `extends` chain counts too. On a
+  session's line, `policy.invalid` names the profile on that session and the line is denied with the reason; starting
+  a session or `policy.check` with such a profile fails (`-32603`), logged as `policy.invalid` in the system log. No
+  session falls back to another profile.
+- **Editing:** [`knsh policy edit`](../06-api/cli.md#policy-edit) through [`policy.read` and
+  `policy.edit`](../06-api/user-socket.md#policy-files). The prompt names the profile, the text's size and the start
+  of its SHA-256. A file is signed only if it loads.
+- **Adoption:** files from before KNSH-065 are unsigned and ignored until saved once with `knsh policy edit`. Ad-hoc
+  and Homebrew-from-source builds lose the key on each upgrade (claim C5), so every file must be saved again.
+- **Not covered (pending):** recovering from a tampered key item (a new key needs Touch ID or the password, and a way
+  to replace an item `knshd` cannot read); rolling back a file to an older signed version of the same profile (a
+  same-user process outside envelopes can restore an old file; envelopes cannot write the policies directory);
+  signing the hook configuration (`config.toml`, FR-HOOK-07 relies on the fixed deny only).
+
 ## Lifetime of pushed policy
 
 | ID | Requirement |

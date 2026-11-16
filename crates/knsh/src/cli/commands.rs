@@ -99,7 +99,13 @@ pub static KNSH: Command = group(
             "Check or edit policy",
             &[
                 leaf("check", "Dry-run a line against policy"),
-                leaf("edit", "Edit a policy file; saving needs Touch ID or password"),
+                Command {
+                    positionals: &[Positional {
+                        name: "profile",
+                        help: "The profile to edit (its file in the policies directory); created if new",
+                    }],
+                    ..leaf("edit", "Edit a policy file; saving needs Touch ID or password")
+                },
             ],
         ),
         group(

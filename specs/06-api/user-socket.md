@@ -11,7 +11,8 @@ Reachable by the user's processes outside envelopes. Every envelope and command 
 | `checkpoint.*` | All checkpoint operations, including `restore` and `force` |
 | `approval.list`, `approval.approve`, `approval.deny` | Pending asks; approving needs Touch ID or password, checked by `knshd` |
 | `policy.check` | Dry run of a line against a named session's or profile's policy ([parameters](agent-socket.md#policycheck)); no authentication |
-| `policy.edit`, `profile.use`, `policy.grant` | Policy changes and grants need Touch ID or password |
+| `policy.read`, `policy.edit` | Read a policy file for editing, and save it signed after Touch ID or password ([below](#policy-files)) |
+| `profile.use`, `policy.grant` | Profile selection and grants need Touch ID or password |
 | `records.forget` | Delete records, optionally with checkpoints (`knsh forget`) |
 
 ## Authentication
@@ -228,3 +229,33 @@ Errors: malformed params, `since_seq` without `session_id`, `since_seq` newer th
 | `subscription_id` | int | A subscription made on the same connection |
 
 Result: `{}`. Nothing more is sent for the subscription after the answer. Another connection's subscription, or one already ended, is `-32602`. Closing the connection ends all its subscriptions.
+
+## Policy files
+
+`knsh policy edit` ([CLI](cli.md#policy-edit)) reads a profile's file and saves it signed (KNSH-065, FR-POL-40 to
+FR-POL-42). Both methods are on `user.sock` only; `agent.sock` never lists them. The format and the key are in
+[policy integrity](../03-functional-requirements/policy.md#integrity).
+
+### `policy.read`
+
+`{"profile": "<name>"}` → `{"profile", "text", "state", "reason"}`. `text` is the file without its signature line
+(empty for a new profile). `state` is `new` (no file), `valid`, or `invalid`, with `reason` `signature_missing`,
+`signature_bad` or `key_unavailable` (otherwise `null`). No authentication: the file is the user's own. A profile
+name outside `[A-Za-z0-9._-]{1,64}` or `unattended` (built in, no file) is `-32602`; a file that cannot be read or is
+not UTF-8 is `-32603`.
+
+### `policy.edit`
+
+`{"profile": "<name>", "text": "<toml>"}` → `{"profile", "changed"}`. `text` is at most 1 MiB (the profile limit)
+and gets a final newline if it lacks one. In order:
+
+1. Text equal to the file's and a `valid` file: `changed: false`; no prompt, no write.
+2. The text must load as profile `<name>` with its `extends` chain (parents must be signed) from `knshd`'s `HOME`;
+   otherwise `-32602` with the loader's reason in `data.reason`. Nothing broken is signed.
+3. `knshd` shows the Touch ID or password prompt itself: `change the policy profile: <name> (<n> bytes, sha256
+   <first 16 hex digits>)`, waiting at most 120 s. Any outcome but success is `-32001` with `source: "user"`,
+   `rule_id: null` and `reason: "not authenticated: …"`; nothing is written. No parameter skips the prompt.
+4. The signed file replaces the old one atomically (`0600`). The Keychain key is created on the first signature. A key
+   that cannot be read or created, or a failed write, is `-32603` and the old file is kept.
+
+Saves are serialised in `knshd`. `unattended` is `-32602`.

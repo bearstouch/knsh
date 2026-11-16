@@ -24,6 +24,9 @@ pub enum LookupError {
     NotFound,
     /// Something may exist but could not be read (permissions, I/O, symlink loops, oversized files).
     Failed,
+    /// A profile file exists but its signature is missing or does not verify (FR-POL-42, KNSH-065). Only a
+    /// [`ProfileSource`](crate::ProfileSource) reports it; the file's text is never handed to the loader.
+    SignatureInvalid,
 }
 
 /// The filesystem queries the profile loader needs. Implemented by `knsh-platform` over its `Fs` trait (and so by
@@ -96,7 +99,8 @@ pub fn project_root<F: PolicyFs + ?Sized>(start: &CanonicalPath, fs: &F) -> Resu
             // `dir` is an ancestor of a canonical path, so it is canonical too.
             Ok(_) => return CanonicalPath::new(dir).map_err(|_| LookupError::Failed),
             Err(LookupError::NotFound) => {}
-            Err(LookupError::Failed) => return Err(LookupError::Failed),
+            // A path lookup never reports a signature; any such answer is a failure all the same.
+            Err(LookupError::Failed | LookupError::SignatureInvalid) => return Err(LookupError::Failed),
         }
     }
     Ok(start.clone())
@@ -214,7 +218,8 @@ fn canonicalise_allowing_missing<F: PolicyFs + ?Sized>(path: &Path, fs: &F) -> R
                 missing.push(name);
                 existing = existing.parent().ok_or(LookupError::Failed)?;
             }
-            Err(LookupError::Failed) => return Err(LookupError::Failed),
+            // A path lookup never reports a signature; any such answer is a failure all the same.
+            Err(LookupError::Failed | LookupError::SignatureInvalid) => return Err(LookupError::Failed),
         }
     }
 }

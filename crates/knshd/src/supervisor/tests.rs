@@ -13,6 +13,8 @@ use knsh_platform::{EnginePaths, Fs};
 use knsh_proto::Interpreter;
 use knsh_store::{PageSize, RecordQuery, Scope};
 
+use knsh_core::ProfileName;
+
 use super::*;
 use crate::events::Subscriber;
 use crate::sessions::tests::{Fixture, fixture};
@@ -45,8 +47,12 @@ pub(super) fn filesystem(profiles: &[(&str, &str)]) -> MemFs {
     fs.write(&Path::new(PROJECT).join("build.sh"), b"#!/bin/sh\n", 0o755)
         .unwrap();
     for (name, text) in profiles {
-        fs.write(&policies.join(format!("{name}.toml")), text.as_bytes(), 0o600)
-            .unwrap();
+        fs.write(
+            &policies.join(format!("{name}.toml")),
+            &crate::policy::tests::signed(name, text),
+            0o600,
+        )
+        .unwrap();
     }
     fs
 }
@@ -230,6 +236,8 @@ struct Setup {
     approvals_timeout: Option<Duration>,
     no_store: bool,
     profiles: Option<Vec<(&'static str, &'static str)>>,
+    /// Profile files written as given, after the signed `profiles`: unsigned or tampered files (KNSH-065).
+    raw_files: Vec<(&'static str, Vec<u8>)>,
     /// The hooks count the `command.proposed` events delivered so far (and so take them off the subscriber).
     hooks_observe: bool,
     /// The spawner; one whose lines exit 0 by default.
@@ -279,9 +287,14 @@ impl Daemon {
             script: Mutex::new(setup.hooks),
             seen: setup.hooks_observe.then(|| Arc::clone(&self.subscriber)),
         });
+        let fs = filesystem(&profiles);
+        let policies = EnginePaths::for_home(Path::new(HOME)).unwrap().policies_dir();
+        for (name, bytes) in &setup.raw_files {
+            fs.write(&policies.join(format!("{name}.toml")), bytes, 0o600).unwrap();
+        }
         Lifecycle::new(Parts {
             sessions: Arc::clone(&self.fixture.sessions),
-            profiles: crate::policy::tests::loader(filesystem(&profiles)),
+            profiles: crate::policy::tests::loader(fs),
             events: Arc::clone(&self.fixture.hub),
             store: (!setup.no_store).then(|| self.fixture.store.clone()),
             clock: self.clock.clone(),
@@ -699,6 +712,43 @@ fn denies_on_internal_error_in_any_step() {
     assert_eq!(daemon.spawns(), Vec::<String>::new());
     // Every denial that could be recorded was: the profile failures and the hook failure, not the missing store.
     assert_eq!(daemon.records().len(), 3);
+}
+
+// FR-POL-42 (KNSH-065): a profile file with a missing or bad signature is ignored. The line is denied with a reason
+// that says so, `policy.invalid` names the profile on the session, nothing runs, and no other profile is used.
+#[test]
+fn ignores_file_with_bad_signature_and_emits_invalid() {
+    let daemon = Daemon::new();
+    // An agent-style edit: the signed file with its deny of `rm` removed, its old trailer kept.
+    let signed = crate::policy::tests::signed("web", WEB);
+    let tampered = String::from_utf8(signed)
+        .unwrap()
+        .replace("deny = [\"rm\"]", "deny = []");
+    let unsigned = WEB.as_bytes().to_vec();
+    for file in [tampered.into_bytes(), unsigned] {
+        let error = daemon
+            .lifecycle(Setup {
+                raw_files: vec![("web", file)],
+                ..Setup::default()
+            })
+            .run(daemon.line("rm -rf build"), &StillWaiting)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied);
+        assert_eq!(
+            Denial::from_error(&error).unwrap().reason.as_deref(),
+            Some(INVALID_PROFILE)
+        );
+        let events = daemon.events();
+        let invalid: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.data {
+                EventData::PolicyInvalid { profile } => Some(profile.as_str().to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(invalid, ["web"]);
+    }
+    assert_eq!(daemon.spawns(), Vec::<String>::new());
 }
 
 // A session that ended under the call is answered as such, and nothing is recorded or run.

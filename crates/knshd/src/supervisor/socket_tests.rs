@@ -16,6 +16,8 @@ use knsh_proto::{Message, decode};
 use knsh_store::{PageSize, RecordQuery, Scope};
 
 use super::tests::{FakeHooks, FakeSpawner, Journal};
+use knsh_core::ProfileName;
+
 use super::*;
 use crate::dispatch::{EXEC_RUN, Endpoint};
 use crate::endpoints::Listeners;

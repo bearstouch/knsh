@@ -713,16 +713,22 @@ mod tests {
         let policies = EnginePaths::for_home(Path::new(HOME)).unwrap().policies_dir();
         fs.add_dir_all(&policies).unwrap();
         let web = "name = \"web\"\n[exec]\nallow = [\"git status\"]\nask = [\"git push\"]\n";
-        fs.write(&policies.join("web.toml"), web.as_bytes(), 0o600).unwrap();
+        fs.write(
+            &policies.join("web.toml"),
+            &crate::policy::tests::signed("web", web),
+            0o600,
+        )
+        .unwrap();
         let context = PathContext {
             home: PathBuf::from(HOME),
             tmpdir: PathBuf::from("/tmp"),
             start_dir: PathBuf::from("/Users/u/app"),
         };
         let fs_ref: &dyn Fs = &fs;
+        let signer = crate::policy::tests::test_signer();
         let profile = load_profile(
             &knsh_core::ProfileName::new("web").unwrap(),
-            &PolicyDirectory::new(policies, fs_ref),
+            &PolicyDirectory::new(policies, fs_ref, &signer),
             &context,
             fs_ref,
         )

@@ -23,12 +23,16 @@
 //!
 //! - [`FakeResolver`]: host names resolved to the addresses the test sets, every question counted (KNSH-060).
 //!
+//! - [`MemKeyStore`]: the policy signing key in memory, with read and create failures injected as `OSStatus`
+//!   values, every call counted (KNSH-065).
+//!
 //! Locks in the fakes are independent (one per fake) and never held across calls into another fake.
 
 mod ancestry;
 mod clock;
 mod denials;
 mod fs;
+mod keychain;
 mod launchd;
 mod log;
 mod presence;
@@ -41,6 +45,7 @@ pub use ancestry::FakeProcessTree;
 pub use clock::FakeClock;
 pub use denials::{ScriptedDenialLog, kernel_entry};
 pub use fs::{DEFAULT_UID, MemFs};
+pub use keychain::MemKeyStore;
 pub use launchd::{FakeSocketActivation, FixedPeerCredentials, RecordingServiceManager, ServiceCall};
 pub use log::{Entry, RecordingLog};
 pub use presence::{Prompt, ScriptedPresence};

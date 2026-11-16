@@ -8,7 +8,8 @@
 //! [`events`] implement `knsh history` and `knsh events` (KNSH-023), printing engine text through [`terminal`] so it
 //! is always terminal-safe. [`shell`] implements `knsh shell install` (KNSH-022, Unix only); the other commands'
 //! behaviour arrives in later stories. [`version`] is the text of `knsh --version`, with the phase 1 advisory label
-//! (KNSH-024).
+//! (KNSH-024). [`policy`] implements `knsh policy edit` (KNSH-065): `knshd` signs the edited file after Touch ID or
+//! the password.
 
 #[cfg(unix)]
 pub mod agent;
@@ -21,6 +22,7 @@ pub mod daemon;
 pub mod events;
 pub mod forget;
 pub mod history;
+pub mod policy;
 #[cfg(unix)]
 pub mod shell;
 pub mod terminal;

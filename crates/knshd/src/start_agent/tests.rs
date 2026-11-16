@@ -136,8 +136,12 @@ fn filesystem() -> MemFs {
         ("proj", PROJ),
         ("claude", CLAUDE_PRESET),
     ] {
-        fs.write(&policies().join(format!("{name}.toml")), text.as_bytes(), 0o600)
-            .unwrap();
+        fs.write(
+            &policies().join(format!("{name}.toml")),
+            &crate::policy::tests::signed(name, text),
+            0o600,
+        )
+        .unwrap();
     }
     fs
 }
@@ -936,6 +940,8 @@ mod platform {
                 policies,
                 home.to_path_buf(),
                 PathBuf::from("/private/tmp"),
+                crate::policy::tests::test_signer(),
+                Arc::new(knsh_platform::testing::RecordingLog::new()),
             );
             let starter = AgentStarter::new(
                 Arc::clone(&fixture.sessions),
@@ -1012,7 +1018,10 @@ mod platform {
         );
         std::fs::write(
             policies.join("it.toml"),
-            format!("name = \"it\"\n[fs]\nwrite = [\"{}\"]\n", work.display()),
+            crate::policy::tests::signed(
+                "it",
+                &format!("name = \"it\"\n[fs]\nwrite = [\"{}\"]\n", work.display()),
+            ),
         )
         .unwrap();
         let home = std::fs::canonicalize(std::env::var_os("HOME").unwrap()).unwrap();
@@ -1237,16 +1246,13 @@ mod platform {
         let unlisted = http_listener(Arc::clone(&unlisted_seen));
         let proxy_port = http_listener(Arc::clone(&proxy_seen));
 
-        std::fs::write(
-            policies.join("it.toml"),
-            format!(
-                "name = \"it\"\n[fs]\nwrite = [\"{}\"]\n[exec]\ntrusted_folders = [\"{}\"]\n[network]\nloopback = \
-                 [{listed}]\n",
-                work.display(),
-                tools.display()
-            ),
-        )
-        .unwrap();
+        let profile = format!(
+            "name = \"it\"\n[fs]\nwrite = [\"{}\"]\n[exec]\ntrusted_folders = [\"{}\"]\n[network]\nloopback = \
+             [{listed}]\n",
+            work.display(),
+            tools.display()
+        );
+        std::fs::write(policies.join("it.toml"), crate::policy::tests::signed("it", &profile)).unwrap();
 
         let user_sock = paths.user_socket();
         let probes = format!(

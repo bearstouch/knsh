@@ -80,7 +80,17 @@
 //! | --- | --- | --- | --- |
 //! | [`UserPresence`] | Authenticate the user with a reason text | `LocalAuthentication` (`LAContext`) | `ScriptedPresence` |
 //!
-//! Later stories add Keychain, XPC, `FSEvents` and APFS clones to the same interface.
+//! The `signing` module (KNSH-065) signs and verifies policy files: an HMAC-SHA-256 trailer on each file, made with a
+//! key only `knshd` can read from the Keychain ([`PolicySigner`]). [`PolicyDirectory`] checks every file before the
+//! loader sees it, and saves a signed file only with an [`Authenticated`] proof.
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`SigningKeyStore`] | Read or create the policy signing key | `KeychainSigningKey` (legacy login keychain) | `MemKeyStore` |
+//!
+//! `macos::hmac_sha256` is `CommonCrypto`'s HMAC, the MAC the signer uses.
+//!
+//! Later stories add XPC, `FSEvents` and APFS clones to the same interface.
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
 //! in a fake. All failures use the single crate error, [`PlatformError`], whose messages never echo paths or other
@@ -119,6 +129,7 @@
 //! - FR-AGT-10, FR-OUT-04, `specs/06-api/wire-format.md#descriptors` (descriptor passing and the shim directory,
 //!   KNSH-049)
 //! - NFR-SEC-04, FR-AUTH-41, FR-AUTH-42, decision 12 (user presence through `LocalAuthentication`, KNSH-064)
+//! - FR-POL-40, FR-POL-41, FR-POL-42, decision 11 (policy file signatures, Keychain signing key, KNSH-065)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
@@ -139,6 +150,7 @@ pub mod probe;
 mod process;
 mod random;
 mod resolver;
+mod signing;
 pub mod violation;
 
 #[cfg(target_os = "macos")]
@@ -161,10 +173,14 @@ pub use error::{Operation, PlatformError, SqliteCode};
 pub use fs::{FileKind, Fs, Metadata};
 pub use launchd::{LaunchAgent, PeerCredentials, ServiceManager, SocketActivation, install_agent, uninstall_agent};
 pub use log::{Field, Level, SystemLog, Value, render};
-pub use policy_source::PolicyDirectory;
+pub use policy_source::{EditableProfile, FileState, PolicyDirectory};
 pub use presence::{Authenticated, NotAuthenticated, PromptReason, UserPresence};
 pub use probe::{ProbeFailure, SystemProbe};
 pub use process::{ExitStatus, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest, Stdio};
 pub use random::Random;
 pub use resolver::{MAX_ADDRESSES, Resolver};
+pub use signing::{
+    Mac, PolicySigner, SIGNATURE_LINE_LEN, SIGNATURE_PREFIX, SIGNING_KEY_LEN, SignatureFault, SigningKey,
+    SigningKeyStore, constant_time_eq, split_signed, strip_signature,
+};
 pub use violation::{CanaryNonce, DenialLog, DenialStream, LogEntry, StreamStopper};
