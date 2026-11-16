@@ -14,12 +14,14 @@ Reachable by the user's processes outside envelopes. Every envelope and command 
 | `policy.read`, `policy.edit` | Read a policy file for editing, and save it signed after Touch ID or password ([below](#policy-files)) |
 | `profile.use`, `policy.grant` | Profile selection and grants need Touch ID or password |
 | `records.forget` | Delete records, optionally with checkpoints (`knsh forget`) |
+| `authority.trust` | Trust one authority app after Touch ID or password ([below](#authoritytrust)) |
 
 ## Authentication
 
 - `approval.approve`, `policy.edit`, `profile.use` and `policy.grant` require Touch ID or the user's password. `knshd` shows the system authentication prompt itself, with the exact command or change in it.
 - The caller cannot claim that the user is present; no parameter skips the prompt.
-- `knsh authority trust` also requires Touch ID or password inside `knshd`.
+- `knsh authority trust` (`authority.trust`) also requires Touch ID or password inside `knshd`, for a first record and
+  for replacing one alike ([below](#authoritytrust)).
 
 ## Human sessions
 
@@ -220,6 +222,12 @@ Events of one session arrive in `seq` order; events of different sessions are no
 
 Every `seq` from `from_seq` to `to_seq` inclusive will never be delivered on this subscription. An event too large for one frame is announced the same way, as a range of one.
 
+**Engine events** (`authority.connected`, `authority.disconnected`; KNSH-068) belong to no session. They use the same
+envelope with `"session_id": null` and `"actor": null`, and their `seq` counts the engine's own events (from 1 per
+`knshd` run, gapless). They reach only subscriptions to every session (no `session_id`), in publication order with
+the session events, and are not buffered, so they cannot be resumed. Lost engine events are announced with
+`"session_id": null` in `events.lost`.
+
 Errors: malformed params, `since_seq` without `session_id`, `since_seq` newer than the session's latest event, and a connection that already holds 16 subscriptions are `-32602`. A session with no buffered events (never started, or ended and its buffer dropped) is `-32006` with `data.session_id`. The buffers of the 64 most recently ended sessions are kept, so a subscriber can still catch up on a session that just ended.
 
 ### `events.unsubscribe`
@@ -259,6 +267,39 @@ and gets a final newline if it lacks one. In order:
    that cannot be read or created, or a failed write, is `-32603` and the old file is kept.
 
 Saves are serialised in `knshd`. `unattended` is `-32602`.
+
+## Authority trust
+
+`knsh authority trust` ([CLI](cli.md#authority-trust)) trusts one authority app (KNSH-068, FR-AUTH-10, FR-AUTH-11).
+The control service then accepts only that app ([control service](control-service.md#verification)).
+
+### `authority.trust`
+
+| Param | Type | Meaning |
+| --- | --- | --- |
+| `team_id` | string | The Apple developer team ID: exactly ten characters from `A-Z` and `0-9` |
+| `identifier` | string | The app's signing identifier: 1 to 255 characters from `A-Z`, `a-z`, `0-9`, `.` and `-`, not starting or ending with `.` |
+| `min_version` | string | The oldest accepted `CFBundleVersion`: one to three dot-separated numbers of at most 9 digits (`2`, `1.4`, `10.0.3`) |
+
+1. Params that do not match are `-32602`, before anything else: no prompt is shown.
+2. `knshd` reads the current record. One that exists but cannot be read or is not in the engine's format (tampering,
+   or a locked keychain; decision 11) is `-32603`: no prompt, nothing written.
+3. Exactly the record already trusted: nothing is asked or written (`changed: false`).
+4. `knshd` shows the Touch ID or password prompt itself: `trust the authority app: <identifier> (team <team>, version
+   <v> or later)`, or `replace the trusted authority app: <old> with <new>` when one is trusted. Any outcome but
+   success is `-32001` with `source: "user"`; nothing is written.
+5. The record is stored as a generic-password item (service `knsh.authority-trust`, account `v1`) in the file-based
+   login keychain, created by `knshd` so only `knshd`'s designated requirement can read it (FR-AUTH-11). A
+   replacement updates the item's value in place. A failed write is `-32603`; the previous record stays in force.
+6. The running control service switches to the new record at once: every connection verified under the old one is
+   closed, so a registered authority disconnects (`authority.disconnected`).
+
+Result: `{"team_id", "identifier", "min_version", "changed", "replaced"}`, the record as stored (the version in its
+three-part form, `1.4.0`), whether anything was written, and whether a different record was replaced. Only on
+`user.sock`: `-32003` elsewhere.
+
+Removing trust is not specified yet (proposed: `knsh authority untrust`, with Touch ID). Until then an item that
+cannot be read is removed by hand with `security delete-generic-password -s knsh.authority-trust`.
 
 ## Approvals
 

@@ -9,13 +9,16 @@
 //! is always terminal-safe. [`shell`] implements `knsh shell install` (KNSH-022, Unix only); the other commands'
 //! behaviour arrives in later stories. [`version`] is the text of `knsh --version`, with the phase 1 advisory label
 //! (KNSH-024). [`policy`] implements `knsh policy edit` (KNSH-065): `knshd` signs the edited file after Touch ID or
-//! the password.
+//! the password. [`approvals`] implements `knsh approvals`, `knsh approve` and `knsh deny` (KNSH-066), and
+//! [`authority`] implements `knsh authority trust` (KNSH-068): `knshd` stores the trust record after Touch ID or the
+//! password.
 
 #[cfg(unix)]
 pub mod agent;
 pub mod agent_sandbox;
 pub mod approvals;
 pub mod args;
+pub mod authority;
 pub mod client;
 pub mod commands;
 #[cfg(target_os = "macos")]

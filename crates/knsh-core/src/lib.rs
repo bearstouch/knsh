@@ -44,6 +44,12 @@
 //! (FR-REC-09). [`OutputInfo`] describes a capped output stream (FR-REC-06) and [`OutputStream`] names it.
 //! [`Timestamp`] also parses its own text form, for time filters.
 //!
+//! # The trusted authority (KNSH-067, KNSH-068)
+//!
+//! [`TrustedAuthority`] is the authority the user trusted: a [`TeamId`], a [`SigningIdentifier`] and a minimum
+//! [`BundleVersion`], each validated by its type so none can inject code-signing requirement clauses (FR-AUTH-13),
+//! and the strict stored form of the record the Keychain item holds (FR-AUTH-11).
+//!
 //! # Events (KNSH-018)
 //!
 //! [`Event`] is the event envelope of `specs/05-models/event.md`, with an [`EventData`] payload whose text fields
@@ -138,6 +144,7 @@
 #![warn(clippy::pedantic)]
 #![forbid(unsafe_code)]
 
+mod authority;
 mod error;
 mod event;
 mod hook;
@@ -156,10 +163,11 @@ mod time;
 mod ulid;
 mod violation;
 
+pub use authority::{BundleVersion, MAX_TRUST_RECORD_LEN, SigningIdentifier, TeamId, TrustError, TrustedAuthority};
 pub use error::{CoreError, MAX_KEY_DISPLAY_LEN, ProfileError, ProfileErrorKind, ProfileOrigin};
 pub use event::{
-    BusLimits, CancelReason, Delivery, EVENT_BUFFER_LEN, Event, EventBus, EventData, EventScope, Lost,
-    MAX_ENDED_BUFFERS, Published, Subscribed, SubscriptionId,
+    BusLimits, CancelReason, Delivery, EVENT_BUFFER_LEN, EngineEvent, EngineEventData, EngineLost, Event, EventBus,
+    EventData, EventScope, Lost, MAX_ENDED_BUFFERS, Published, PublishedEngine, Subscribed, SubscriptionId,
 };
 pub use hook::{
     ConfigProblem, Ended, Execution, HOOK_EVENT, HOOKS_KEY, HookConfig, HookEntry, HookExecutor, HookExit, HookId,

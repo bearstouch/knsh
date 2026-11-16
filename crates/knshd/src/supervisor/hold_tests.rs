@@ -185,7 +185,7 @@ impl Daemon {
                     EventData::SessionStateChanged { from, to } => Some((from, to)),
                     _ => None,
                 },
-                Delivery::Lost(_) => None,
+                Delivery::Lost(_) | Delivery::Engine(_) | Delivery::EngineLost(_) => None,
             })
             .collect()
     }

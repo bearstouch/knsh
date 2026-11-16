@@ -117,6 +117,9 @@ pub(crate) struct Call<'a> {
     /// Whether the client that sent the request is still connected, for a handler that waits on a decision
     /// (FR-LC-41, KNSH-050).
     pub(crate) caller: &'a dyn knsh_core::Caller,
+    /// The control-service connection the call arrived on; `None` on the sockets. Identifies the authority for
+    /// `authority.register` (KNSH-068).
+    pub(crate) control: Option<knsh_platform::ConnectionId>,
 }
 
 /// A successful answer: the `result`, and raw bytes to send after it on [`Call::stream`]
@@ -417,6 +420,7 @@ pub(crate) mod tests {
             binding: binding(),
             descriptors: no_descriptors(),
             caller: &knsh_core::StillWaiting,
+            control: None,
         })
     }
 

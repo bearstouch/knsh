@@ -1,10 +1,11 @@
-//! The policy signing key in the Keychain (KNSH-065, FR-POL-40, decision 11).
+//! Engine secrets in the Keychain: the policy signing key (KNSH-065, FR-POL-40) and the authority trust record
+//! (KNSH-068, FR-AUTH-11), both under decision 11.
 //!
-//! A generic-password item in the **file-based (legacy) login keychain**, created with `SecItemAdd` and the default
-//! access list. Created by a Developer ID-signed `knshd`, the item trusts `knshd`'s designated requirement (identifier
-//! and team) with partition `teamid:<team>`, so later Developer ID builds read it and nothing else does (KNSH-026,
-//! claim C5). Ad-hoc and Homebrew-from-source builds are trusted by code hash, so each upgrade loses the key: every
-//! policy file must then be signed again with `knsh policy edit`.
+//! Each is a generic-password item in the **file-based (legacy) login keychain**, created with `SecItemAdd` and the
+//! default access list. Created by a Developer ID-signed `knshd`, the item trusts `knshd`'s designated requirement
+//! (identifier and team) with partition `teamid:<team>`, so later Developer ID builds read it and nothing else does
+//! (KNSH-026, claim C5). Ad-hoc and Homebrew-from-source builds are trusted by code hash, so each upgrade loses the
+//! key: every policy file must then be signed again with `knsh policy edit`.
 //!
 //! Rules from decision 11:
 //!
@@ -13,20 +14,36 @@
 //! - **A read failure on an existing item is tampering** (or a locked keychain). Any same-user process can overwrite
 //!   the value; code outside the team then changes the partition list and the read fails. The error is returned and
 //!   the caller fails closed; the item is never deleted or replaced from here.
-//! - **Never overwrite.** Only `SecItemAdd` is used: an item that already exists (`-25299`), perhaps planted by
-//!   someone else, is an error, not something to update.
+//! - **Never overwrite.** The signing key is only ever created (`SecItemAdd`): an item that already exists
+//!   (`-25299`), perhaps planted by someone else, is an error, not something to update.
+//!
+//! The trust record differs in one way: the user may replace it (`knsh authority trust` again, after Touch ID or the
+//! password). `knshd` replaces only a record it has just read successfully, so the item is one its own code can
+//! access, and uses `SecItemUpdate`, which keeps the item and its access list. A record that cannot be read is
+//! tampering and is never replaced from here (the caller refuses); one that reads but does not decode is refused
+//! the same way. Until the user removes such an item (`security delete-generic-password -s knsh.authority-trust`),
+//! no authority is trusted.
 //!
 //! The data-protection keychain is not used: it needs `knshd` inside an app bundle with a provisioning profile.
 
 use std::ffi::c_void;
 
+use knsh_core::{MAX_TRUST_RECORD_LEN, TrustedAuthority};
+
+use crate::control::TrustStore;
 use crate::error::{Operation, PlatformError};
+use crate::presence::Authenticated;
 use crate::signing::{SIGNING_KEY_LEN, SigningKey, SigningKeyStore};
 
 /// The item's service: names the engine and what the item is for.
 pub const SIGNING_KEY_SERVICE: &str = "knsh.policy-signing";
 /// The item's account: the key's format version, so a future key format can live beside this one.
 pub const SIGNING_KEY_ACCOUNT: &str = "hmac-sha256-v1";
+
+/// The trust record item's service (KNSH-068).
+pub const TRUST_SERVICE: &str = "knsh.authority-trust";
+/// The trust record item's account: the record's format version, as in its header line.
+pub const TRUST_ACCOUNT: &str = "v1";
 
 /// `errSecSuccess`.
 const ERR_SEC_SUCCESS: i32 = 0;
@@ -88,6 +105,7 @@ unsafe extern "C" {
 
     fn SecItemCopyMatching(query: CfRef, result: *mut CfRef) -> i32;
     fn SecItemAdd(attributes: CfRef, result: *mut CfRef) -> i32;
+    fn SecItemUpdate(query: CfRef, attributes: CfRef) -> i32;
     /// Deprecated, but the only switch for the legacy keychain's dialogs; process wide. Observed in KNSH-026.
     fn SecKeychainSetUserInteractionAllowed(allowed: u8) -> i32;
 }
@@ -148,24 +166,16 @@ fn cf_dictionary(pairs: &[(CfRef, CfRef)]) -> Option<Owned> {
     })
 }
 
-/// The policy signing key as a Keychain item (module documentation). Stateless: every call queries the Keychain;
-/// `PolicySigner` keeps the key in memory once read.
+/// One generic-password item, named by its service and account. Stateless: every call queries the Keychain, with
+/// user interaction disabled first (decision 11, rule 1).
 #[derive(Debug, Clone)]
-pub struct KeychainSigningKey {
+struct Item {
     service: String,
     account: String,
 }
 
-impl KeychainSigningKey {
-    /// The engine's item: [`SIGNING_KEY_SERVICE`], [`SIGNING_KEY_ACCOUNT`].
-    #[must_use]
-    pub fn new() -> Self {
-        Self::named(SIGNING_KEY_SERVICE, SIGNING_KEY_ACCOUNT)
-    }
-
-    /// An item with another service and account: for a manual check against a throwaway item, never the engine's.
-    #[must_use]
-    pub fn named(service: &str, account: &str) -> Self {
+impl Item {
+    fn new(service: &str, account: &str) -> Self {
         Self {
             service: service.to_owned(),
             account: account.to_owned(),
@@ -174,40 +184,20 @@ impl KeychainSigningKey {
 
     /// The service and account strings, which identify the item in every query.
     fn identity(&self, operation: Operation) -> Result<(Owned, Owned), PlatformError> {
-        let unusable = PlatformError::Keychain {
-            operation,
-            status: ERR_SEC_PARAM,
-        };
         Ok((
-            cf_string(&self.service).ok_or(unusable)?,
-            cf_string(&self.account).ok_or(unusable)?,
+            cf_string(&self.service).ok_or(unusable(operation))?,
+            cf_string(&self.account).ok_or(unusable(operation))?,
         ))
     }
-}
 
-impl Default for KeychainSigningKey {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Turns the legacy keychain's "allow access" dialog into an error for the whole process (decision 11, rule 1).
-///
-/// # Errors
-///
-/// The `OSStatus` if the switch was refused: no Keychain call is made then, since it might show the dialog.
-fn disable_user_interaction(operation: Operation) -> Result<(), PlatformError> {
-    // SAFETY: takes a `Boolean` by value and touches no memory of ours.
-    let status = unsafe { SecKeychainSetUserInteractionAllowed(0) };
-    if status == ERR_SEC_SUCCESS {
-        Ok(())
-    } else {
-        Err(PlatformError::Keychain { operation, status })
-    }
-}
-
-impl SigningKeyStore for KeychainSigningKey {
-    fn read(&self) -> Result<Option<SigningKey>, PlatformError> {
+    /// The item's value, or `None` when no item exists. A value longer than `max_len` is refused before it is
+    /// copied.
+    ///
+    /// # Errors
+    ///
+    /// Any other failure (tampering or a locked keychain, decision 11), or a value that is not data of at most
+    /// `max_len` bytes ([`PlatformError::KeychainValueInvalid`]).
+    fn read(&self, max_len: usize) -> Result<Option<Vec<u8>>, PlatformError> {
         let operation = Operation::KeychainRead;
         disable_user_interaction(operation)?;
         let (service, account) = self.identity(operation)?;
@@ -222,10 +212,7 @@ impl SigningKeyStore for KeychainSigningKey {
                 (kSecMatchLimit, kSecMatchLimitOne),
             ])
         }
-        .ok_or(PlatformError::Keychain {
-            operation,
-            status: ERR_SEC_PARAM,
-        })?;
+        .ok_or(unusable(operation))?;
         let mut result: CfRef = std::ptr::null();
         // SAFETY: `query` is a live dictionary; `result` is a writable pointer that receives a +1 reference on
         // success (owned below) and is left untouched otherwise.
@@ -246,8 +233,11 @@ impl SigningKeyStore for KeychainSigningKey {
         // spans the copy below.
         let bytes = unsafe {
             let length = usize::try_from(CFDataGetLength(data.0)).map_err(|_| PlatformError::KeychainValueInvalid)?;
-            if length != SIGNING_KEY_LEN {
+            if length > max_len {
                 return Err(PlatformError::KeychainValueInvalid);
+            }
+            if length == 0 {
+                return Ok(Some(Vec::new()));
             }
             let pointer = CFDataGetBytePtr(data.0);
             if pointer.is_null() {
@@ -255,21 +245,21 @@ impl SigningKeyStore for KeychainSigningKey {
             }
             std::slice::from_raw_parts(pointer, length)
         };
-        let mut key = [0u8; SIGNING_KEY_LEN];
-        key.copy_from_slice(bytes);
-        Ok(Some(SigningKey::from_bytes(key)))
+        Ok(Some(bytes.to_vec()))
     }
 
-    fn create(&self, key: &SigningKey) -> Result<(), PlatformError> {
+    /// Creates the item with `value`, labelled `label`, with the default access list (this code's designated
+    /// requirement).
+    ///
+    /// # Errors
+    ///
+    /// Any failure, including an item that already exists (`-25299`): never overwritten (decision 11, rule 3).
+    fn add(&self, label: &str, value: &[u8]) -> Result<(), PlatformError> {
         let operation = Operation::KeychainAdd;
         disable_user_interaction(operation)?;
         let (service, account) = self.identity(operation)?;
-        let unusable = PlatformError::Keychain {
-            operation,
-            status: ERR_SEC_PARAM,
-        };
-        let label = cf_string("knsh policy signing key").ok_or(unusable)?;
-        let value = cf_data(key.bytes()).ok_or(unusable)?;
+        let label = cf_string(label).ok_or(unusable(operation))?;
+        let value = cf_data(value).ok_or(unusable(operation))?;
         // SAFETY: as in `read`: the `kSec…` statics are constant framework objects.
         let attributes = unsafe {
             cf_dictionary(&[
@@ -280,15 +270,166 @@ impl SigningKeyStore for KeychainSigningKey {
                 (kSecValueData, value.0),
             ])
         }
-        .ok_or(unusable)?;
+        .ok_or(unusable(operation))?;
         // SAFETY: `attributes` is a live dictionary; a null result pointer asks for no result object.
         let status = unsafe { SecItemAdd(attributes.0, std::ptr::null_mut()) };
         if status == ERR_SEC_SUCCESS {
             Ok(())
         } else {
-            // Including `errSecDuplicateItem`: never overwrite an item someone else may have planted (rule 3).
             Err(PlatformError::Keychain { operation, status })
         }
+    }
+
+    /// Replaces the existing item's value with `value`. The item, its label and its access list are kept.
+    ///
+    /// # Errors
+    ///
+    /// Any failure, including no item (`-25300`): nothing is created here.
+    fn update(&self, value: &[u8]) -> Result<(), PlatformError> {
+        let operation = Operation::KeychainUpdate;
+        disable_user_interaction(operation)?;
+        let (service, account) = self.identity(operation)?;
+        let value = cf_data(value).ok_or(unusable(operation))?;
+        // SAFETY: as in `read`: the `kSec…` statics are constant framework objects.
+        let (query, changes) = unsafe {
+            (
+                cf_dictionary(&[
+                    (kSecClass, kSecClassGenericPassword),
+                    (kSecAttrService, service.0),
+                    (kSecAttrAccount, account.0),
+                ]),
+                cf_dictionary(&[(kSecValueData, value.0)]),
+            )
+        };
+        let (Some(query), Some(changes)) = (query, changes) else {
+            return Err(unusable(operation));
+        };
+        // SAFETY: both are live dictionaries for the call.
+        let status = unsafe { SecItemUpdate(query.0, changes.0) };
+        if status == ERR_SEC_SUCCESS {
+            Ok(())
+        } else {
+            Err(PlatformError::Keychain { operation, status })
+        }
+    }
+}
+
+/// `errSecParam` for `operation`: a query that could not even be built.
+const fn unusable(operation: Operation) -> PlatformError {
+    PlatformError::Keychain {
+        operation,
+        status: ERR_SEC_PARAM,
+    }
+}
+
+/// Turns the legacy keychain's "allow access" dialog into an error for the whole process (decision 11, rule 1).
+///
+/// # Errors
+///
+/// The `OSStatus` if the switch was refused: no Keychain call is made then, since it might show the dialog.
+fn disable_user_interaction(operation: Operation) -> Result<(), PlatformError> {
+    // SAFETY: takes a `Boolean` by value and touches no memory of ours.
+    let status = unsafe { SecKeychainSetUserInteractionAllowed(0) };
+    if status == ERR_SEC_SUCCESS {
+        Ok(())
+    } else {
+        Err(PlatformError::Keychain { operation, status })
+    }
+}
+
+/// The policy signing key as a Keychain item (module documentation). Stateless: every call queries the Keychain;
+/// `PolicySigner` keeps the key in memory once read.
+#[derive(Debug, Clone)]
+pub struct KeychainSigningKey {
+    item: Item,
+}
+
+impl KeychainSigningKey {
+    /// The engine's item: [`SIGNING_KEY_SERVICE`], [`SIGNING_KEY_ACCOUNT`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::named(SIGNING_KEY_SERVICE, SIGNING_KEY_ACCOUNT)
+    }
+
+    /// An item with another service and account: for a manual check against a throwaway item, never the engine's.
+    #[must_use]
+    pub fn named(service: &str, account: &str) -> Self {
+        Self {
+            item: Item::new(service, account),
+        }
+    }
+}
+
+impl Default for KeychainSigningKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SigningKeyStore for KeychainSigningKey {
+    fn read(&self) -> Result<Option<SigningKey>, PlatformError> {
+        let Some(bytes) = self.item.read(SIGNING_KEY_LEN)? else {
+            return Ok(None);
+        };
+        let key: [u8; SIGNING_KEY_LEN] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| PlatformError::KeychainValueInvalid)?;
+        Ok(Some(SigningKey::from_bytes(key)))
+    }
+
+    fn create(&self, key: &SigningKey) -> Result<(), PlatformError> {
+        // Including `errSecDuplicateItem`: never overwrite an item someone else may have planted (rule 3).
+        self.item.add("knsh policy signing key", key.bytes())
+    }
+}
+
+/// The authority trust record as a Keychain item (module documentation, FR-AUTH-11). Stateless: every call queries
+/// the Keychain.
+#[derive(Debug, Clone)]
+pub struct KeychainTrustStore {
+    item: Item,
+}
+
+impl KeychainTrustStore {
+    /// The engine's item: [`TRUST_SERVICE`], [`TRUST_ACCOUNT`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::named(TRUST_SERVICE, TRUST_ACCOUNT)
+    }
+
+    /// An item with another service and account: for a manual check against a throwaway item, never the engine's.
+    #[must_use]
+    pub fn named(service: &str, account: &str) -> Self {
+        Self {
+            item: Item::new(service, account),
+        }
+    }
+}
+
+impl Default for KeychainTrustStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrustStore for KeychainTrustStore {
+    fn read(&self) -> Result<Option<TrustedAuthority>, PlatformError> {
+        let Some(bytes) = self.item.read(MAX_TRUST_RECORD_LEN)? else {
+            return Ok(None);
+        };
+        // A value the engine did not write is refused like an unreadable one: nothing is trusted (fail closed).
+        TrustedAuthority::decode(&bytes)
+            .map(Some)
+            .map_err(|_| PlatformError::KeychainValueInvalid)
+    }
+
+    fn create(&self, record: &TrustedAuthority, _proof: Authenticated) -> Result<(), PlatformError> {
+        self.item.add("knsh trusted authority", &record.encode())
+    }
+
+    fn replace(&self, record: &TrustedAuthority, _proof: Authenticated) -> Result<(), PlatformError> {
+        self.item.update(&record.encode())
     }
 }
 
@@ -310,6 +451,29 @@ mod tests {
             store.create(&key),
             Err(PlatformError::Keychain { status: -25299, .. })
         ));
+    }
+
+    // Manual (KNSH-068, pending): creates, reads, replaces and reads a throwaway trust record. Delete it afterwards
+    // with `security delete-generic-password -s knsh.test.authority-trust`.
+    #[test]
+    #[ignore = "writes to the login keychain; manual check only"]
+    fn creates_replaces_and_reads_a_throwaway_trust_record() {
+        use knsh_core::{BundleVersion, SigningIdentifier, TeamId};
+
+        let store = KeychainTrustStore::named("knsh.test.authority-trust", "manual");
+        let first = TrustedAuthority {
+            team_id: TeamId::new("ABCDE12345").unwrap(),
+            identifier: SigningIdentifier::new("com.example.authority").unwrap(),
+            min_version: BundleVersion::parse("1.0").unwrap(),
+        };
+        store.create(&first, Authenticated::new()).unwrap();
+        assert_eq!(store.read().unwrap(), Some(first.clone()));
+        let second = TrustedAuthority {
+            min_version: BundleVersion::parse("2.1").unwrap(),
+            ..first
+        };
+        store.replace(&second, Authenticated::new()).unwrap();
+        assert_eq!(store.read().unwrap(), Some(second));
     }
 
     #[test]

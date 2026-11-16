@@ -7,8 +7,15 @@
 //! [`EVENTS_LOST`] notification per session and range.
 //!
 //! `seq` values are JSON integers: they count events of one session and stay far below 2^53.
+//!
+//! Engine events (`authority.connected`, `authority.disconnected`, KNSH-068) use the same envelope with
+//! `session_id` and `actor` set to `null` and `seq` counted in the engine's own sequence
+//! ([`engine_event_notification`]); their lost ranges are announced with `session_id: null`
+//! ([`engine_lost_notification`]).
 
-use knsh_core::{Actor, Event, EventData, Lost, Proposal, SessionId, Subscribed, SubscriptionId};
+use knsh_core::{
+    Actor, EngineEvent, EngineLost, Event, EventData, Lost, Proposal, SessionId, Subscribed, SubscriptionId,
+};
 use knsh_json::{Fields, FromJson, JsonError, Object, ToJson, Value};
 
 use crate::envelope::Notification;
@@ -253,6 +260,54 @@ pub fn lost_notification(subscription: SubscriptionId, lost: &Lost) -> Result<No
         Object::new()
             .with("subscription_id", subscription.get().to_json()?)?
             .with("session_id", lost.session_id.to_string())?
+            .with("from_seq", lost.from_seq.to_json()?)?
+            .with("to_seq", lost.to_seq.to_json()?)
+    })()
+    .map_err(ProtoError::Encode)?;
+    Ok(Notification {
+        method: MethodName::new(EVENTS_LOST)?,
+        params: Some(params),
+    })
+}
+
+/// The notification delivering an engine event (KNSH-068) to `subscription`: the event envelope with
+/// `session_id: null`, `actor: null` and an empty `data` object, plus `subscription_id`.
+///
+/// # Errors
+///
+/// [`ProtoError::Encode`] if the envelope cannot be built.
+pub fn engine_event_notification(
+    subscription: SubscriptionId,
+    event: &EngineEvent,
+) -> Result<Notification, ProtoError> {
+    let params = (|| {
+        Object::new()
+            .with("event", event.name())?
+            .with("id", event.id.to_string())?
+            .with("seq", event.seq.to_json()?)?
+            .with("ts", event.ts.to_string())?
+            .with("session_id", Value::Null)?
+            .with("actor", Value::Null)?
+            .with("data", Object::new())?
+            .with("subscription_id", subscription.get().to_json()?)
+    })()
+    .map_err(ProtoError::Encode)?;
+    Ok(Notification {
+        method: MethodName::new(event.name())?,
+        params: Some(params),
+    })
+}
+
+/// The [`EVENTS_LOST`] notification for engine events: `{subscription_id, session_id: null, from_seq, to_seq}`.
+///
+/// # Errors
+///
+/// [`ProtoError::Encode`] if the parameters cannot be built.
+pub fn engine_lost_notification(subscription: SubscriptionId, lost: &EngineLost) -> Result<Notification, ProtoError> {
+    let params = (|| {
+        Object::new()
+            .with("subscription_id", subscription.get().to_json()?)?
+            .with("session_id", Value::Null)?
             .with("from_seq", lost.from_seq.to_json()?)?
             .with("to_seq", lost.to_seq.to_json()?)
     })()
@@ -830,6 +885,30 @@ mod tests {
             format!(
                 r#"{{"jsonrpc":"2.0","method":"events.lost","params":{{"subscription_id":5,"session_id":"{session}","from_seq":2,"to_seq":16}}}}"#
             )
+        );
+    }
+
+    // FR-AUTH-02, KNSH-068: engine events have no session and no actor, and their lost ranges name no session.
+    #[test]
+    fn engine_events_have_null_session_and_actor() {
+        use knsh_core::{EngineEventData, EventId, Timestamp, Ulid};
+
+        let event = EngineEvent {
+            id: EventId::from_ulid(Ulid::from_u128(9)),
+            seq: 3,
+            ts: Timestamp::from_unix_micros(0).unwrap(),
+            data: EngineEventData::AuthorityConnected,
+        };
+        let id = event.id;
+        assert_eq!(
+            written(engine_event_notification(SubscriptionId::new(2), &event).unwrap()),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"authority.connected","params":{{"event":"authority.connected","id":"{id}","seq":3,"ts":"1970-01-01T00:00:00.000000Z","session_id":null,"actor":null,"data":{{}},"subscription_id":2}}}}"#
+            )
+        );
+        assert_eq!(
+            written(engine_lost_notification(SubscriptionId::new(2), &EngineLost { from_seq: 1, to_seq: 4 }).unwrap()),
+            r#"{"jsonrpc":"2.0","method":"events.lost","params":{"subscription_id":2,"session_id":null,"from_seq":1,"to_seq":4}}"#
         );
     }
 

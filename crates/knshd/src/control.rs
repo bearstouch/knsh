@@ -27,6 +27,7 @@ use knsh_platform::{
 };
 use knsh_proto::ByteTransport;
 
+use crate::authority::Registration;
 use crate::connection::{MessageConnection, Outgoing, delivery_message};
 use crate::dispatch::{Dispatcher, Endpoint};
 use crate::lifetime::Activity;
@@ -38,6 +39,8 @@ const PUMP_BATCH: usize = 64;
 pub(crate) struct ControlEndpoint {
     dispatcher: Arc<Dispatcher>,
     log: Arc<dyn SystemLog>,
+    /// Told when a connection ends, so the authority's place frees up (KNSH-068, FR-AUTH-01).
+    registration: Arc<Registration>,
     connections: Mutex<BTreeMap<ConnectionId, Arc<Connection>>>,
 }
 
@@ -52,11 +55,17 @@ struct Connection {
 }
 
 impl ControlEndpoint {
-    /// An endpoint dispatching through `dispatcher`, logging refusals to `log`.
-    pub(crate) fn new(dispatcher: Arc<Dispatcher>, log: Arc<dyn SystemLog>) -> Arc<Self> {
+    /// An endpoint dispatching through `dispatcher`, logging refusals to `log`, and telling `registration` when a
+    /// connection ends.
+    pub(crate) fn new(
+        dispatcher: Arc<Dispatcher>,
+        log: Arc<dyn SystemLog>,
+        registration: Arc<Registration>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             dispatcher,
             log,
+            registration,
             connections: Mutex::new(BTreeMap::new()),
         })
     }
@@ -91,7 +100,7 @@ impl ControlEndpoint {
 
 impl ControlHandler for ControlEndpoint {
     fn opened(&self, connection: ConnectionId, peer: Arc<dyn ControlPeer>) {
-        let state = MessageConnection::new(Endpoint::Control, Arc::clone(&self.dispatcher));
+        let state = MessageConnection::new(Endpoint::Control, connection, Arc::clone(&self.dispatcher));
         let opened = Arc::new(Connection {
             state: Mutex::new(state),
             peer,
@@ -125,6 +134,8 @@ impl ControlHandler for ControlEndpoint {
         let Some(closed) = lock(&self.connections).remove(&connection) else {
             return;
         };
+        // The authority's connection ending frees its place and publishes `authority.disconnected` (FR-AUTH-02).
+        self.registration.disconnected(connection);
         // Every subscription ends with the connection; the pump wakes, sees the close and returns.
         lock(&closed.state).close();
         let pump = lock(&closed.pump).take();
@@ -227,7 +238,11 @@ mod tests {
             .serving(Endpoint::Control, HELLO, ok_handler())
             .serving(Endpoint::Control, "records.query", ok_handler());
         let log = Arc::new(RecordingLog::new());
-        (ControlEndpoint::new(Arc::new(dispatcher), log.clone()), log)
+        let registration = Registration::new(crate::events::tests::hub(), log.clone());
+        (
+            ControlEndpoint::new(Arc::new(dispatcher), log.clone(), registration),
+            log,
+        )
     }
 
     fn open(endpoint: &ControlEndpoint, id: u64) -> ConnectionId {
@@ -298,6 +313,40 @@ mod tests {
         endpoint.closed(id);
         assert_eq!(endpoint.message(id, hello, &reply), AfterMessage::Close);
         assert_eq!(reply.taken(), Vec::<Json>::new());
+    }
+
+    // FR-AUTH-01, FR-AUTH-02 (KNSH-068): `authority.register` reaches the registration with the connection it came on,
+    // a second connection is refused with `-32003`, and the authority's connection closing frees its place.
+    #[test]
+    fn registration_follows_the_authority_connection() {
+        let log = Arc::new(RecordingLog::new());
+        let registration = Registration::new(crate::events::tests::hub(), log.clone());
+        let mut dispatcher =
+            Dispatcher::from_tables(Table::new(), Table::new()).serving(Endpoint::Control, HELLO, ok_handler());
+        for (name, handler) in registration.handlers() {
+            dispatcher = dispatcher.serving(Endpoint::Control, name, handler);
+        }
+        let endpoint = ControlEndpoint::new(Arc::new(dispatcher), log, Arc::clone(&registration));
+        let reply = Collect::default();
+        let hello = br#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{}}"#;
+        let register = br#"{"jsonrpc":"2.0","id":2,"method":"authority.register","params":{}}"#;
+
+        let first = open(&endpoint, 1);
+        let second = open(&endpoint, 2);
+        for id in [first, second] {
+            assert_eq!(endpoint.message(id, hello, &reply), AfterMessage::KeepOpen);
+        }
+        assert_eq!(endpoint.message(first, register, &reply), AfterMessage::KeepOpen);
+        assert_eq!(endpoint.message(second, register, &reply), AfterMessage::KeepOpen);
+        let answers = reply.taken();
+        assert!(field(&answers[2], "result").is_some(), "{answers:?}");
+        assert_eq!(error_code(&answers[3]), Some(-32003));
+
+        endpoint.closed(first);
+        assert!(!registration.is_registered());
+        assert_eq!(endpoint.message(second, register, &reply), AfterMessage::KeepOpen);
+        assert!(field(&reply.taken()[0], "result").is_some());
+        assert!(registration.is_registered());
     }
 
     // Refusals are logged with a fixed reason only.

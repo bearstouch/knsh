@@ -30,7 +30,10 @@
 use std::fmt;
 use std::sync::Arc;
 
+pub use knsh_core::{BundleVersion, SigningIdentifier, TeamId, TrustError, TrustedAuthority};
+
 use crate::error::PlatformError;
+use crate::presence::Authenticated;
 
 /// The dictionary key of the JSON-RPC message, an XPC data value.
 pub const JSON_KEY: &str = "json";
@@ -55,146 +58,37 @@ const CS_RUNTIME: u32 = 0x0001_0000;
 /// A debugger has attached, or the process was otherwise made debuggable at run time.
 const CS_DEBUGGED: u32 = 0x1000_0000;
 
-/// Longest signing identifier accepted. Bundle identifiers are limited to 255 characters by Apple.
-const MAX_IDENTIFIER: usize = 255;
-
-/// Most components a bundle version may have (`major.minor.patch`), as Apple documents `CFBundleVersion`.
-const MAX_VERSION_PARTS: usize = 3;
-
-/// Most digits in one version component, so every component fits a `u32`.
-const MAX_VERSION_DIGITS: usize = 9;
-
-/// Why a trust record's part was refused. Carries no input, so it can be shown and logged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrustError {
-    /// A team ID is exactly ten characters from `A-Z` and `0-9`.
-    TeamId,
-    /// An identifier is 1 to 255 characters from `A-Z`, `a-z`, `0-9`, `.` and `-`, not starting or ending with `.`.
-    Identifier,
-    /// A version is one to three dot-separated decimal numbers, each 1 to 9 digits (`2`, `1.4`, `10.0.3`).
-    Version,
-}
-
-impl fmt::Display for TrustError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::TeamId => "a team ID is ten characters from A-Z and 0-9",
-            Self::Identifier => "an identifier is 1 to 255 characters from A-Z, a-z, 0-9, '.' and '-'",
-            Self::Version => "a version is one to three dot-separated numbers, such as 1.4.2",
-        })
-    }
-}
-
-impl std::error::Error for TrustError {}
-
-/// An Apple developer team ID: ten characters from `A-Z` and `0-9`.
+/// Where the trust record is kept (FR-AUTH-11): on macOS a generic-password item in the file-based login keychain that
+/// only `knshd`'s designated requirement can read (`macos::KeychainTrustStore`, decision 11); in tests
+/// `testing::MemTrustStore`. Object safe: hold it as `Arc<dyn TrustStore>`.
 ///
-/// Invariant: only those characters, so it is safe inside a quoted string of the requirement language.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TeamId(String);
-
-impl TeamId {
-    /// Checks `text` and wraps it.
+/// Writing takes an [`Authenticated`] proof by value, which only a [`UserPresence`](crate::UserPresence) backend can
+/// make after the user passed Touch ID or the password: no code path can trust an authority, or replace the trusted
+/// one, without that prompt (FR-AUTH-10).
+pub trait TrustStore: Send + Sync {
+    /// The stored record, or `None` when no authority was ever trusted.
     ///
     /// # Errors
     ///
-    /// [`TrustError::TeamId`] if `text` is not ten characters from `A-Z` and `0-9`.
-    pub fn new(text: &str) -> Result<Self, TrustError> {
-        let valid = text.len() == 10
-            && text
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit());
-        valid.then(|| Self(text.to_owned())).ok_or(TrustError::TeamId)
-    }
+    /// Any failure to read a record that exists, or a value that is not a valid record
+    /// ([`TrustedAuthority::decode`]): tampering or a locked keychain (decision 11). The caller then trusts nothing.
+    /// Never shows a dialog.
+    fn read(&self) -> Result<Option<TrustedAuthority>, PlatformError>;
 
-    /// The team ID.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// A code-signing identifier, the authority's bundle identifier (for example `com.example.authority`).
-///
-/// Invariant: 1 to 255 characters from `A-Z`, `a-z`, `0-9`, `.` and `-`, not starting or ending with `.`. In
-/// particular no `"` or `\`, so it cannot end the quoted string it is written into and inject requirement clauses.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SigningIdentifier(String);
-
-impl SigningIdentifier {
-    /// Checks `text` and wraps it.
+    /// Stores `record` as a new item.
     ///
     /// # Errors
     ///
-    /// [`TrustError::Identifier`] if `text` breaks the invariant.
-    pub fn new(text: &str) -> Result<Self, TrustError> {
-        let valid = !text.is_empty()
-            && text.len() <= MAX_IDENTIFIER
-            && !text.starts_with('.')
-            && !text.ends_with('.')
-            && text
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-');
-        valid.then(|| Self(text.to_owned())).ok_or(TrustError::Identifier)
-    }
+    /// Any failure, including an item that already exists (someone created it since it was read: never overwritten
+    /// by a create).
+    fn create(&self, record: &TrustedAuthority, proof: Authenticated) -> Result<(), PlatformError>;
 
-    /// The identifier.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// A `CFBundleVersion`: one to three dot-separated decimal numbers. Ordered numerically component by component, a
-/// missing component counting as 0, so `1.10 > 1.9` and `2 == 2.0.0`.
-///
-/// Missing components are stored as 0, so the derived (lexicographic) order of the array is the version order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct BundleVersion([u32; MAX_VERSION_PARTS]);
-
-impl BundleVersion {
-    /// Parses `text`.
-    ///
-    /// Strict, because the peer's version comes from a signed `Info.plist` this process did not write: anything
-    /// that is not exactly this grammar (signs, spaces, empty components, letters, more than three components) is
-    /// refused rather than read leniently, so the peer is refused too.
+    /// Replaces the value of the existing item with `record`, keeping the item and its access list.
     ///
     /// # Errors
     ///
-    /// [`TrustError::Version`] if `text` does not match.
-    pub fn parse(text: &str) -> Result<Self, TrustError> {
-        let mut parts = [0_u32; MAX_VERSION_PARTS];
-        for (index, part) in text.split('.').enumerate() {
-            let digits_only =
-                !part.is_empty() && part.len() <= MAX_VERSION_DIGITS && part.bytes().all(|b| b.is_ascii_digit());
-            let slot = parts.get_mut(index).ok_or(TrustError::Version)?;
-            if !digits_only {
-                return Err(TrustError::Version);
-            }
-            // At most nine digits: always fits a `u32`.
-            *slot = part.parse().map_err(|_| TrustError::Version)?;
-        }
-        Ok(Self(parts))
-    }
-}
-
-impl fmt::Display for BundleVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let [major, minor, patch] = self.0;
-        write!(f, "{major}.{minor}.{patch}")
-    }
-}
-
-/// The authority the user trusted with `knsh authority trust` (FR-AUTH-10): its team, its signing identifier and the
-/// oldest version accepted. Stored by KNSH-068 as a Keychain item only `knshd` can read (FR-AUTH-11).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrustedAuthority {
-    /// The Apple developer team that signs it.
-    pub team_id: TeamId,
-    /// Its signing identifier.
-    pub identifier: SigningIdentifier,
-    /// The oldest `CFBundleVersion` accepted (FR-AUTH-14).
-    pub min_version: BundleVersion,
+    /// Any failure, including no item to replace: the previous record is then kept unchanged.
+    fn replace(&self, record: &TrustedAuthority, proof: Authenticated) -> Result<(), PlatformError>;
 }
 
 /// The XPC peer code-signing requirement for `trusted` (FR-AUTH-13): Apple-anchored, the trusted team and
@@ -451,63 +345,6 @@ mod tests {
             PeerGate::new(Some(trusted())).requirement(),
             Some(peer_requirement(&trusted()).as_str())
         );
-    }
-
-    // FR-AUTH-13: nothing that could end a quoted string or add a clause gets into the requirement.
-    #[test]
-    fn refuses_trust_parts_that_could_inject_requirement_clauses() {
-        for bad in [
-            "",
-            "ABCDE1234",
-            "ABCDE123456",
-            "abcde12345",
-            "ABCDE1234\"",
-            "ABCDE 1234",
-        ] {
-            assert_eq!(TeamId::new(bad), Err(TrustError::TeamId), "{bad:?}");
-        }
-        let long = "a".repeat(256);
-        for bad in [
-            "",
-            ".com.example",
-            "com.example.",
-            "com.example\" or anchor apple",
-            "com\\example",
-            "com example",
-            "com.exämple",
-            long.as_str(),
-        ] {
-            assert_eq!(SigningIdentifier::new(bad), Err(TrustError::Identifier), "{bad:?}");
-        }
-        assert!(SigningIdentifier::new(&"a".repeat(255)).is_ok());
-        assert!(SigningIdentifier::new("com.example-app.Authority2").is_ok());
-    }
-
-    // FR-AUTH-14: versions compare numerically, a missing part counts as 0, and only the strict grammar parses.
-    #[test]
-    fn compares_bundle_versions_numerically() {
-        let v = |text| BundleVersion::parse(text).unwrap();
-        assert!(v("1.10") > v("1.9"));
-        assert_eq!(v("2"), v("2.0.0"));
-        assert!(v("0.9") < v("1.0"));
-        assert!(v("10.0.3") > v("9.99.99"));
-        assert_eq!(v("1.4.2").to_string(), "1.4.2");
-        for bad in [
-            "",
-            "1.",
-            ".1",
-            "1..2",
-            "1.2.3.4",
-            "-1",
-            "+1",
-            "1.a",
-            " 1",
-            "1 ",
-            "1234567890",
-            "١",
-        ] {
-            assert_eq!(BundleVersion::parse(bad), Err(TrustError::Version), "{bad:?}");
-        }
     }
 
     #[test]

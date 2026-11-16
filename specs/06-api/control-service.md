@@ -4,7 +4,7 @@ An XPC Mach service (`knsh.control`, final name tied to the signing identity) re
 
 | Method | Purpose |
 | --- | --- |
-| `authority.register` | Become the authority (one at a time) |
+| `authority.register` | Become the authority (one at a time, [below](#authorityregister)) |
 | `decision.respond` | Answer a `decision.requested` |
 | `session.*` | Create, end, pause, resume, take and release control of any session |
 | `policy.set`, `policy.get`, `policy.grant`, `policy.grants`, `policy.revoke` | Push and read policy, manage grants |
@@ -27,6 +27,24 @@ Implemented in KNSH-067 (decision 13), FR-AUTH-12 – FR-AUTH-14:
 - Peers running as another user (or root) are refused.
 - With no trusted authority, every connection is refused before it is resumed.
 - An open, verified connection keeps `knshd` alive, like a socket connection.
+- The trust record is the one `knsh authority trust` stored ([`authority.trust`](user-socket.md#authoritytrust),
+  KNSH-068), read when `knshd` starts. A record that cannot be read means nothing is trusted. When the user trusts
+  another authority, the running service switches to it at once and closes every connection verified under the old
+  record.
+
+## `authority.register`
+
+Implemented in KNSH-068 (FR-AUTH-01, FR-AUTH-02). No params (`{}`). Result: `{"registered": true}`.
+
+- The first verified connection to call it becomes the authority, and `authority.connected` is published. Calling it
+  again on the same connection changes nothing and publishes nothing.
+- While one is registered, any other connection's call is `-32003` (decided with KNSH-068; the spec named no code).
+- When the authority's connection ends (it closed, failed a per-message check, or its trust was replaced),
+  `authority.disconnected` is published and another connection may register.
+- Both are engine events, with no session and no actor ([events](user-socket.md#events)), delivered to every
+  subscription to all sessions.
+- The authority sends `hello` and `authority.register` before it has checked `knshd`'s reply against its own peer
+  requirement (FR-AUTH-15), so neither carries anything sensitive.
 
 ## Decision protocol
 

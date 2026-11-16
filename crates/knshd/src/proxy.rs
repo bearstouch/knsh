@@ -793,7 +793,7 @@ pub(crate) mod tests {
                     )),
                     _ => None,
                 },
-                Delivery::Lost(_) => None,
+                Delivery::Lost(_) | Delivery::Engine(_) | Delivery::EngineLost(_) => None,
             })
             .collect()
     }

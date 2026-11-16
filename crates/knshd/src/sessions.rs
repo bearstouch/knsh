@@ -845,6 +845,7 @@ pub(crate) mod tests {
             binding,
             descriptors: crate::dispatch::tests::no_descriptors(),
             caller: &knsh_core::StillWaiting,
+            control: None,
         })
     }
 
@@ -872,7 +873,9 @@ pub(crate) mod tests {
             .into_iter()
             .filter_map(|(_, delivery)| match delivery {
                 knsh_core::Delivery::Event(event) => Some(event.name().to_owned()),
-                knsh_core::Delivery::Lost(_) => None,
+                knsh_core::Delivery::Lost(_) | knsh_core::Delivery::Engine(_) | knsh_core::Delivery::EngineLost(_) => {
+                    None
+                }
             })
             .collect()
     }

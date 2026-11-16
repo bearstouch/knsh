@@ -48,12 +48,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
-use knsh_core::{Caller, Delivery, Event, Lost, StillWaiting, SubscriptionId};
+use knsh_core::{Caller, Delivery, EngineLost, Event, Lost, StillWaiting, SubscriptionId};
 use knsh_json::{Frame, FrameReader, FrameWriter, JsonError, StreamId};
-use knsh_platform::AuditToken;
+use knsh_platform::{AuditToken, ConnectionId};
 use knsh_proto::{
     ByteTransport, ErrorCode, ErrorResponse, HelloParams, Message, OutputData, ProtoError, Rejection, Request,
-    RequestId, RpcError, SuccessResponse, decode, event_notification, event_notification_with_bytes, lost_notification,
+    RequestId, RpcError, SuccessResponse, decode, engine_event_notification, engine_lost_notification,
+    event_notification, event_notification_with_bytes, lost_notification,
 };
 
 use crate::dispatch::{Answer, Call, Dispatcher, Endpoint, HELLO, Passed, Reply};
@@ -166,6 +167,8 @@ struct Session<'a> {
     binding: &'a SessionBinding,
     /// Whether the client is still connected, for calls that wait on a decision (FR-LC-41).
     caller: &'a dyn Caller,
+    /// The control-service connection, for calls that need it (`authority.register`); `None` on the sockets.
+    control: Option<ConnectionId>,
     /// Whether `hello` has succeeded.
     greeted: bool,
     /// How raw bytes reach this client: binary frames until a `hello` opts out.
@@ -275,6 +278,7 @@ impl Session<'_> {
             binding: self.binding,
             descriptors,
             caller: self.caller,
+            control: self.control,
         })
     }
 
@@ -369,6 +373,7 @@ pub(crate) fn serve_with_descriptors<R: Read, W: Write + Send>(
         subscriber: &subscriber,
         binding: &binding,
         caller,
+        control: None,
         greeted: false,
         bytes: ByteTransport::BinaryFrames,
         pump_bytes: &pump_bytes,
@@ -503,31 +508,74 @@ fn write_delivery<W: Write>(
     let lost = match delivery {
         Delivery::Event(event) => {
             let (notification, stream) = event_message(subscription, event, bytes);
-            if let Some(value) = notification_value(notification) {
-                match writer.write_json(&value) {
-                    // Nothing was written; the writer is still usable for the replacement.
-                    Err(JsonError::TooDeep | JsonError::FrameTooLarge { .. }) => {}
-                    Ok(()) => {
-                        // The notification declared exactly these bytes on the stream; the end frame closes it.
-                        if let Some(raw) = stream {
-                            writer.write_chunk(FIRST_STREAM, raw)?;
-                            writer.write_end(FIRST_STREAM)?;
-                        }
-                        return Ok(());
-                    }
-                    Err(error) => return Err(error),
+            if let Some(value) = notification_value(notification)
+                && write_if_it_fits(writer, &value)?
+            {
+                // The notification declared exactly these bytes on the stream; the end frame closes it.
+                if let Some(raw) = stream {
+                    writer.write_chunk(FIRST_STREAM, raw)?;
+                    writer.write_end(FIRST_STREAM)?;
                 }
+                return Ok(());
             }
-            Lost {
-                session_id: event.session_id,
-                from_seq: event.seq,
-                to_seq: event.seq,
-            }
+            Gone::session_event(event)
         }
-        Delivery::Lost(lost) => *lost,
+        Delivery::Lost(lost) => Gone::Session(*lost),
+        Delivery::Engine(event) => {
+            if let Some(value) = notification_value(engine_event_notification(subscription, event))
+                && write_if_it_fits(writer, &value)?
+            {
+                return Ok(());
+            }
+            Gone::engine_event(event.seq)
+        }
+        Delivery::EngineLost(lost) => Gone::Engine(*lost),
     };
-    let value = notification_value(lost_notification(subscription, &lost)).ok_or(JsonError::TooDeep)?;
+    let value = notification_value(lost.notification(subscription)).ok_or(JsonError::TooDeep)?;
     writer.write_json(&value)
+}
+
+/// Writes `value` as one frame. `Ok(false)` when it is too deep or too large for one: nothing was written, and the
+/// writer is still usable for the lost-range notification that replaces it.
+fn write_if_it_fits<W: Write>(writer: &mut FrameWriter<W>, value: &knsh_json::Value) -> Result<bool, JsonError> {
+    match writer.write_json(value) {
+        Ok(()) => Ok(true),
+        Err(JsonError::TooDeep | JsonError::FrameTooLarge { .. }) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Events that will never reach a subscription, from a session's sequence or the engine's (KNSH-068).
+enum Gone {
+    Session(Lost),
+    Engine(EngineLost),
+}
+
+impl Gone {
+    /// Exactly the session event `event`: one that could not be sent.
+    const fn session_event(event: &Event) -> Self {
+        Self::Session(Lost {
+            session_id: event.session_id,
+            from_seq: event.seq,
+            to_seq: event.seq,
+        })
+    }
+
+    /// Exactly the engine event `seq`: one that could not be sent.
+    const fn engine_event(seq: u64) -> Self {
+        Self::Engine(EngineLost {
+            from_seq: seq,
+            to_seq: seq,
+        })
+    }
+
+    /// The `events.lost` notification announcing the range.
+    fn notification(&self, subscription: SubscriptionId) -> Result<knsh_proto::Notification, ProtoError> {
+        match self {
+            Self::Session(lost) => lost_notification(subscription, lost),
+            Self::Engine(lost) => engine_lost_notification(subscription, lost),
+        }
+    }
 }
 
 /// The notification for one event, and its raw bytes when they go beside it (in a binary stream on [`FIRST_STREAM`],
@@ -615,6 +663,8 @@ pub(crate) struct Outgoing {
 /// callbacks.
 pub(crate) struct MessageConnection {
     endpoint: Endpoint,
+    /// Which control connection this is, for the calls that need it (`authority.register`, KNSH-068).
+    connection: ConnectionId,
     dispatcher: Arc<Dispatcher>,
     /// Shared with the connection's event pump.
     subscriber: Arc<Subscriber>,
@@ -628,10 +678,11 @@ pub(crate) struct MessageConnection {
 }
 
 impl MessageConnection {
-    /// A new connection on `endpoint`, before its `hello`.
-    pub(crate) fn new(endpoint: Endpoint, dispatcher: Arc<Dispatcher>) -> Self {
+    /// A new connection on `endpoint`, identified as `connection`, before its `hello`.
+    pub(crate) fn new(endpoint: Endpoint, connection: ConnectionId, dispatcher: Arc<Dispatcher>) -> Self {
         Self {
             endpoint,
+            connection,
             dispatcher,
             subscriber: Arc::new(Subscriber::new()),
             // No audit token: the control service identifies its peer by code signature, per message, and no
@@ -666,6 +717,7 @@ impl MessageConnection {
             subscriber: &self.subscriber,
             binding: &self.binding,
             caller: &StillWaiting,
+            control: Some(self.connection),
             greeted: self.greeted,
             bytes: self.bytes,
             pump_bytes: &self.pump_bytes,
@@ -730,15 +782,24 @@ pub(crate) fn delivery_message(
                     close: false,
                 });
             }
-            Lost {
-                session_id: event.session_id,
-                from_seq: event.seq,
-                to_seq: event.seq,
-            }
+            Gone::session_event(event)
         }
-        Delivery::Lost(lost) => *lost,
+        Delivery::Lost(lost) => Gone::Session(*lost),
+        Delivery::Engine(event) => {
+            if let Some(json) = notification_value(engine_event_notification(subscription, event))
+                .as_ref()
+                .and_then(encode_value)
+            {
+                return Some(Outgoing {
+                    json: Some(json),
+                    ..Outgoing::default()
+                });
+            }
+            Gone::engine_event(event.seq)
+        }
+        Delivery::EngineLost(lost) => Gone::Engine(*lost),
     };
-    let value = notification_value(lost_notification(subscription, &lost))?;
+    let value = notification_value(lost.notification(subscription))?;
     Some(Outgoing {
         json: Some(encode_value(&value)?),
         ..Outgoing::default()

@@ -26,6 +26,9 @@
 //! - [`MemKeyStore`]: the policy signing key in memory, with read and create failures injected as `OSStatus`
 //!   values, every call counted (KNSH-065).
 //!
+//! - [`MemTrustStore`]: the authority trust record in memory, with read and write failures injected, every call
+//!   counted (KNSH-068).
+//!
 //! - [`FakeCodeSigning`]: the code-signing facts of a control-service peer, scripted and changeable mid-test (a
 //!   peer that exec'd), every inspection counted (KNSH-067).
 //!
@@ -50,7 +53,7 @@ pub use clock::FakeClock;
 pub use control::FakeCodeSigning;
 pub use denials::{ScriptedDenialLog, kernel_entry};
 pub use fs::{DEFAULT_UID, MemFs};
-pub use keychain::MemKeyStore;
+pub use keychain::{MemKeyStore, MemTrustStore};
 pub use launchd::{FakeSocketActivation, FixedPeerCredentials, RecordingServiceManager, ServiceCall};
 pub use log::{Entry, RecordingLog};
 pub use presence::{Prompt, ScriptedPresence};

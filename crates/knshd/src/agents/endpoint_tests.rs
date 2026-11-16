@@ -39,6 +39,7 @@ pub(crate) fn dispatcher(fixture: &Fixture) -> Dispatcher {
     );
     handlers.extend(crate::policy_edit::tests::idle_handlers());
     handlers.extend(crate::approvals::tests::idle_handlers());
+    handlers.extend(crate::authority::tests::idle_handlers());
     handlers.extend(crate::exec::unserved_handlers());
     handlers.extend(crate::start_agent::unserved_handlers());
     crate::hello::dispatcher_with_violations(

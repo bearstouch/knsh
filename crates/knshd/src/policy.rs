@@ -350,6 +350,7 @@ pub(crate) mod tests {
             binding,
             descriptors: crate::dispatch::tests::no_descriptors(),
             caller: &knsh_core::StillWaiting,
+            control: None,
         })
     }
 

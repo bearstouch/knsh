@@ -356,31 +356,19 @@ impl XpcControlService {
         handler: Arc<dyn ControlHandler>,
         create: impl FnOnce(Queue) -> Xpc,
     ) -> Result<Self, PlatformError> {
-        let signing = match gate.requirement() {
-            Some(text) => Some(Arc::new(SecCodeSigning::new(text)?) as Arc<dyn CodeSigning<XpcMessage>>),
-            None => None,
-        };
-        let requirement = gate.requirement().map(str::to_owned);
-        Self::start_with(gate, requirement.as_deref(), signing, handler, create)
+        Self::start_with(Trust::compile(gate)?, handler, create)
     }
 
-    /// [`XpcControlService::start`] with the XPC peer requirement text and the per-message code-signing service
-    /// given separately. Production passes the gate's own requirement and its compiled [`SecCodeSigning`]; tests pass
-    /// a requirement an ad-hoc test binary meets and a fake, to drive the per-message gate over real XPC.
+    /// [`XpcControlService::start`] with the trust already compiled. Production compiles the gate's own requirement
+    /// ([`Trust::compile`]); tests pass a requirement an ad-hoc test binary meets and a fake, to drive the per-message
+    /// gate over real XPC.
     fn start_with(
-        gate: PeerGate,
-        requirement: Option<&str>,
-        signing: Option<Arc<dyn CodeSigning<XpcMessage>>>,
+        trust: Trust,
         handler: Arc<dyn ControlHandler>,
         create: impl FnOnce(Queue) -> Xpc,
     ) -> Result<Self, PlatformError> {
-        let requirement = requirement
-            .map(|text| CString::new(text).map_err(|_| PlatformError::Xpc))
-            .transpose()?;
         let service = Arc::new(Service {
-            gate,
-            signing,
-            requirement,
+            trust: Mutex::new(Arc::new(trust)),
             handler,
             next_id: AtomicU64::new(1),
             open: AtomicUsize::new(0),
@@ -427,6 +415,21 @@ impl XpcControlService {
     pub fn open_connections(&self) -> usize {
         self.service.open.load(Ordering::SeqCst)
     }
+
+    /// Serves `gate` from now on: the user trusted another authority, or a first one (KNSH-068, FR-AUTH-10).
+    ///
+    /// New connections get the new requirement. Every connection accepted under the previous gate is cancelled,
+    /// because XPC checked it against the previous requirement: its peer may connect again and is then checked
+    /// against this one. A message such a connection sends after the swap, before its cancellation lands, is refused
+    /// unread.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Security`] if the gate's requirement does not compile: the previous gate stays in force.
+    pub fn set_gate(&self, gate: PeerGate) -> Result<(), PlatformError> {
+        self.service.replace_trust(Trust::compile(gate)?);
+        Ok(())
+    }
 }
 
 impl Drop for XpcControlService {
@@ -447,13 +450,53 @@ impl Drop for XpcControlService {
     }
 }
 
-/// What the listener and its peers share.
-struct Service {
+/// The gate in force, with what it needs compiled. Replaced as a whole ([`XpcControlService::set_gate`]); each peer
+/// keeps the one it was accepted under.
+struct Trust {
     gate: PeerGate,
     /// The compiled requirement's checker ([`SecCodeSigning`]); `None` when nothing is trusted.
     signing: Option<Arc<dyn CodeSigning<XpcMessage>>>,
     /// The requirement text for XPC; `None` when nothing is trusted.
     requirement: Option<CString>,
+}
+
+impl Trust {
+    /// `gate` with its own requirement compiled for XPC and for the per-message check.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Security`] if the requirement does not compile; [`PlatformError::Xpc`] if it holds a NUL
+    /// (impossible for a requirement built from a valid trust record).
+    fn compile(gate: PeerGate) -> Result<Self, PlatformError> {
+        let signing = match gate.requirement() {
+            Some(text) => Some(Arc::new(SecCodeSigning::new(text)?) as Arc<dyn CodeSigning<XpcMessage>>),
+            None => None,
+        };
+        let requirement = gate.requirement().map(str::to_owned);
+        Self::with(gate, requirement.as_deref(), signing)
+    }
+
+    /// `gate` with the XPC requirement text and the per-message checker given separately (tests).
+    fn with(
+        gate: PeerGate,
+        requirement: Option<&str>,
+        signing: Option<Arc<dyn CodeSigning<XpcMessage>>>,
+    ) -> Result<Self, PlatformError> {
+        let requirement = requirement
+            .map(|text| CString::new(text).map_err(|_| PlatformError::Xpc))
+            .transpose()?;
+        Ok(Self {
+            gate,
+            signing,
+            requirement,
+        })
+    }
+}
+
+/// What the listener and its peers share.
+struct Service {
+    /// The gate in force. Lock order: this, then `peers`; never held while calling the handler.
+    trust: Mutex<Arc<Trust>>,
     handler: Arc<dyn ControlHandler>,
     next_id: AtomicU64,
     /// Connections opened and not yet ended.
@@ -465,6 +508,31 @@ struct Service {
 }
 
 impl Service {
+    /// The gate in force now.
+    fn current_trust(&self) -> Arc<Trust> {
+        Arc::clone(&self.trust.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Puts `trust` in force and cancels every peer accepted before (XPC checked them against the old requirement).
+    /// Their queues then deliver the cancellation, which ends each one and tells the handler, as for any peer that
+    /// leaves.
+    fn replace_trust(&self, trust: Trust) {
+        let mut current = self.trust.lock().unwrap_or_else(PoisonError::into_inner);
+        *current = Arc::new(trust);
+        let peers: Vec<Arc<Peer>> = self
+            .peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        drop(current);
+        for peer in peers {
+            // SAFETY: the peer holds its connection retained; cancelling an ended connection does nothing.
+            unsafe { xpc_connection_cancel(peer.connection) };
+        }
+    }
+
     /// A new peer connection (listener queue): refused before it is resumed, or verified by XPC from now on.
     ///
     /// # Safety
@@ -477,7 +545,8 @@ impl Service {
             // no event, and in particular no message, is ever delivered for it.
             unsafe { xpc_connection_cancel(connection) };
         };
-        let (Some(requirement), Some(_)) = (self.requirement.as_ref(), self.signing.as_ref()) else {
+        let trust = self.current_trust();
+        let (Some(requirement), Some(_)) = (trust.requirement.as_ref(), trust.signing.as_ref()) else {
             return refuse(PeerRejection::NoTrustedAuthority);
         };
         if self.stopped.load(Ordering::SeqCst) {
@@ -504,6 +573,7 @@ impl Service {
             connection: unsafe { xpc_retain(connection) },
             queue,
             service: Arc::clone(self),
+            trust: Arc::clone(&trust),
             phase: Mutex::new(Phase::New),
         });
         {
@@ -547,6 +617,9 @@ struct Peer {
     /// The peer's own serial queue (+1), released on drop.
     queue: Queue,
     service: Arc<Service>,
+    /// The gate this peer was accepted under. Its messages are checked against it only while it is still the one
+    /// in force: a peer from before [`XpcControlService::set_gate`] is refused.
+    trust: Arc<Trust>,
     /// Changed on the peer's queue, and by [`ControlPeer::send`] readers on other threads.
     phase: Mutex<Phase>,
 }
@@ -604,10 +677,15 @@ impl Peer {
         if *self.phase() == Phase::Ended || self.service.stopped.load(Ordering::SeqCst) {
             return self.end();
         }
-        let Some(signing) = self.service.signing.as_ref() else {
+        // Accepted under a gate no longer in force (the user trusted another authority): never read, as with any
+        // peer the current gate would not have accepted. Its cancellation is already on the way.
+        if !Arc::ptr_eq(&self.trust, &self.service.current_trust()) {
+            return self.end();
+        }
+        let Some(signing) = self.trust.signing.as_ref() else {
             return self.end();
         };
-        if let Err(reason) = self.service.gate.admit(signing.as_ref(), &XpcMessage(message)) {
+        if let Err(reason) = self.trust.gate.admit(signing.as_ref(), &XpcMessage(message)) {
             // Dropped before the message is read: no answer, and nothing it said reaches the handler.
             self.service.handler.refused(reason);
             return self.end();
@@ -995,8 +1073,9 @@ mod tests {
     fn connect_checked(signing: Arc<FakeCodeSigning>, handler: Arc<dyn ControlHandler>) -> (XpcControlService, Xpc) {
         let signing: Arc<dyn CodeSigning<XpcMessage>> = signing;
         let gate = PeerGate::new(Some(trusted()));
+        let trust = Trust::with(gate, Some("always"), Some(signing)).unwrap();
         // SAFETY: a null name makes an anonymous listener on `queue`.
-        let service = XpcControlService::start_with(gate, Some("always"), Some(signing), handler, |queue| unsafe {
+        let service = XpcControlService::start_with(trust, handler, |queue| unsafe {
             xpc_connection_create(std::ptr::null(), queue)
         })
         .unwrap();
@@ -1140,6 +1219,49 @@ mod tests {
         assert_eq!(service.open_connections(), 0);
         // SAFETY: the client this test created.
         unsafe { xpc_release(client) };
+    }
+
+    // KNSH-068: trusting another authority ends every connection verified under the previous trust record, and its
+    // later messages are never read; new connections are checked against the new record.
+    #[test]
+    fn a_new_trust_record_ends_connections_verified_under_the_old_one() {
+        let (handler, seen) = Recording::new();
+        let signing = Arc::new(FakeCodeSigning::answering(Ok(good_facts())));
+        let (service, client) = connect_checked(Arc::clone(&signing), handler);
+        assert_eq!(reply_json(request(client)).as_deref(), Some(&b"{}"[..]));
+        assert_eq!(drain(&seen), [Seen::Opened, Seen::Message]);
+
+        let replacement: Arc<dyn CodeSigning<XpcMessage>> = Arc::new(FakeCodeSigning::answering(Ok(good_facts())));
+        let trust = Trust::with(PeerGate::new(Some(trusted())), Some("always"), Some(replacement)).unwrap();
+        service.service.replace_trust(trust);
+        assert_eq!(drain(&seen), [Seen::Closed]);
+        assert_eq!(service.open_connections(), 0);
+        // The client's next message reaches the service as a new peer connection (XPC reconnects an interrupted
+        // client), opened and checked under the new record only.
+        assert_eq!(reply_json(request(client)).as_deref(), Some(&b"{}"[..]));
+        assert_eq!(drain(&seen), [Seen::Opened, Seen::Message]);
+        assert_eq!(signing.calls(), 1, "nothing more was checked under the old record");
+        // SAFETY: the client this test created.
+        unsafe { xpc_release(client) };
+    }
+
+    // FR-AUTH-12, KNSH-068: trusting a first authority opens the service; until then every connection was refused.
+    #[test]
+    fn set_gate_compiles_and_rejects_nothing_new_without_trust() {
+        let (handler, seen) = Recording::new();
+        let (service, client) = connect(PeerGate::new(None), handler);
+        assert!(is_connection_error(request(client)));
+        assert_eq!(drain(&seen), [Seen::Refused(PeerRejection::NoTrustedAuthority)]);
+        service.set_gate(PeerGate::new(Some(trusted()))).unwrap();
+        // This ad-hoc test binary does not meet the real requirement: XPC now refuses it on that ground instead.
+        let again = client_of(&service);
+        assert!(is_connection_error(request(again)));
+        assert_eq!(drain(&seen), [Seen::Refused(PeerRejection::RequirementNotMet)]);
+        // SAFETY: the clients this test created.
+        unsafe {
+            xpc_release(client);
+            xpc_release(again);
+        }
     }
 
     // FR-AUTH-13: the built requirement is valid requirement language.

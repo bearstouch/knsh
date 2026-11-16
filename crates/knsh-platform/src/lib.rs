@@ -100,6 +100,7 @@
 //! | Trait | Effect | macOS backend | Fake ([`testing`]) |
 //! | --- | --- | --- | --- |
 //! | [`CodeSigning`] | Signature facts of a message's sender | `SecCodeSigning` (`SecCodeCreateWithXPCMessage`) | `FakeCodeSigning` |
+//! | [`TrustStore`] | Read, create or replace the trust record (KNSH-068) | `KeychainTrustStore` (legacy login keychain) | `MemTrustStore` |
 //!
 //! Later stories add `FSEvents` and APFS clones to the same interface.
 //!
@@ -184,7 +185,7 @@ pub use ancestry::{AuditToken, ProcessIdentity, ProcessKey, ProcessTree};
 pub use clock::{Clock, Monotonic};
 pub use control::{
     AfterMessage, BYTES_KEY, BundleVersion, CodeSigning, ConnectionId, ControlHandler, ControlPeer, JSON_KEY,
-    MAX_CONTROL_PAYLOAD, PeerGate, PeerRejection, SignatureFacts, SigningIdentifier, TeamId, TrustError,
+    MAX_CONTROL_PAYLOAD, PeerGate, PeerRejection, SignatureFacts, SigningIdentifier, TeamId, TrustError, TrustStore,
     TrustedAuthority, peer_requirement,
 };
 pub use engine_dirs::{EnginePaths, ensure_engine_dirs};

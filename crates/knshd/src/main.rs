@@ -37,6 +37,7 @@
 //!   `approval.deny`, KNSH-066)
 //! - FR-AUTH-12 – FR-AUTH-14, NFR-SEC-01, `specs/06-api/control-service.md` (the XPC control service with peer
 //!   verification, KNSH-067)
+//! - FR-AUTH-01, FR-AUTH-02, FR-AUTH-10, FR-AUTH-11 (`authority.trust` and `authority.register`, KNSH-068)
 //!
 //! On start it prepares the engine directories (KNSH-011) and takes its sockets from launchd ([`endpoints`],
 //! KNSH-012). It then serves them ([`server`], KNSH-013): a kqueue accept loop hands each connection to its own
@@ -68,7 +69,10 @@
 //! agent declares: every peer must meet the trusted authority's code-signing requirement, and every message's sender
 //! is checked again (hardened runtime, not debuggable, minimum version) before the message is read; with no trusted
 //! authority every connection is refused. Verified messages are served like socket messages, through the same
-//! dispatcher on the control endpoint.
+//! dispatcher on the control endpoint. The user trusts an authority with `knsh authority trust` (`authority.trust`,
+//! after Touch ID or the password; [`authority`], KNSH-068): the record is a Keychain item only `knshd` reads, and the
+//! running control service switches to it at once. One verified connection at a time may register as the authority,
+//! publishing `authority.connected` and, when it ends, `authority.disconnected`.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
@@ -81,6 +85,9 @@ mod agents;
 // Standalone approvals (KNSH-066): pending asks answered with `knsh approve` after the LocalAuthentication prompt.
 #[cfg(target_os = "macos")]
 mod approvals;
+// The authority (KNSH-068): `authority.trust` after Touch ID or the password, and the single `authority.register`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod authority;
 // Reading a line's output (KNSH-053): platform-neutral, used by the macOS spawner.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod capture;
@@ -281,14 +288,14 @@ fn start() -> Result<(), StartError> {
         );
         let profiles = profile_loader(&paths, random.clone(), &log);
         let policy = PolicyCheck::new(Arc::clone(&sessions), profiles.clone());
-        let editor = policy_editor(&profiles, &log);
         let approvals = local_approvals(&clock, &random, &log);
         let mut handlers = records.handlers();
         handlers.extend(events.handlers());
         handlers.extend(sessions.handlers());
         handlers.extend(policy.handlers());
-        handlers.extend(editor.handlers());
+        handlers.extend(policy_editor(&profiles, &log).handlers());
         handlers.extend(approvals.handlers());
+        let (trust, registration) = authority_services(&events, &log, &mut handlers);
         // `exec.run` (KNSH-051), listed only when the sandbox probe passes; without `knsh-exec` nothing can run.
         let supervision = Supervision {
             paths: &paths,
@@ -308,7 +315,7 @@ fn start() -> Result<(), StartError> {
         let violation_status = reader.as_ref().map_or_else(ReaderStatus::stopped, Reader::status);
         let dispatcher = hello::dispatcher_with_violations(probed, handlers, violation_status, Arc::clone(&sessions));
         let dispatcher = Arc::new(dispatcher.map_err(StartError::Dispatch)?);
-        let (control, control_service) = serve_control(&dispatcher, &log);
+        let (control, control_service) = serve_control(&dispatcher, &log, &trust, registration);
         let services = Services {
             dispatcher,
             credentials: Arc::new(SystemPeerCredentials::new()),
@@ -349,15 +356,21 @@ fn start() -> Result<(), StartError> {
 /// trust record every connection is refused, but the name is still served: launchd would otherwise keep queueing (and
 /// relaunching `knshd` for) messages nobody reads.
 ///
+/// The gate starts from the record in the Keychain (KNSH-068). When the user trusts another authority, `trust`
+/// switches the running service to it, closing every connection verified under the old record. A record that cannot
+/// be read means nothing is trusted (decision 11).
+///
 /// Returns the endpoint (its open connections keep `knshd` alive) and the listener, `None`, logged, if it cannot be
 /// created: the engine works fully without an authority.
 #[cfg(target_os = "macos")]
 fn serve_control(
     dispatcher: &std::sync::Arc<dispatch::Dispatcher>,
     log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+    trust: &std::sync::Arc<authority::AuthorityTrust>,
+    registration: std::sync::Arc<authority::Registration>,
 ) -> (
     std::sync::Arc<control::ControlEndpoint>,
-    Option<knsh_platform::macos::XpcControlService>,
+    Option<std::sync::Arc<knsh_platform::macos::XpcControlService>>,
 ) {
     use std::sync::Arc;
 
@@ -365,21 +378,64 @@ fn serve_control(
     use knsh_platform::macos::XpcControlService;
     use knsh_platform::{Level, PeerGate};
 
-    let control = control::ControlEndpoint::new(Arc::clone(dispatcher), Arc::clone(log));
-    let gate = PeerGate::new(trusted_authority());
+    let control = control::ControlEndpoint::new(Arc::clone(dispatcher), Arc::clone(log), registration);
+    let gate = PeerGate::new(trust.current());
     let handler: Arc<dyn knsh_platform::ControlHandler> = control.clone();
-    let service = XpcControlService::listen(CONTROL_SERVICE, gate, handler).ok();
-    if service.is_none() {
-        log.log(Level::Error, "control service unavailable", &[]);
+    let service = XpcControlService::listen(CONTROL_SERVICE, gate, handler)
+        .ok()
+        .map(Arc::new);
+    match &service {
+        Some(service) => {
+            // Weak: the callback must not keep the listener alive after `start` returns and drops it.
+            let service = Arc::downgrade(service);
+            let log = Arc::clone(log);
+            trust.when_trusted(Arc::new(move |record| {
+                let Some(service) = service.upgrade() else {
+                    return;
+                };
+                if service.set_gate(PeerGate::new(Some(record.clone()))).is_err() {
+                    // Fail closed: the user replaced the old record, so the old gate must not stay in force. A gate
+                    // with no trust compiles nothing and cannot fail; every connection is refused until a restart.
+                    let _ = service.set_gate(PeerGate::new(None));
+                    log.log(
+                        Level::Error,
+                        "new authority trust not applied until knshd restarts: no authority is trusted",
+                        &[],
+                    );
+                }
+            }));
+        }
+        None => log.log(Level::Error, "control service unavailable", &[]),
     }
     (control, service)
 }
 
-/// The authority the user trusted with `knsh authority trust` (FR-AUTH-10). The trust record and its Keychain item
-/// arrive with KNSH-068; until then nothing is trusted, so the control service refuses every connection (FR-AUTH-12).
+/// The trusted authority (KNSH-068), with its two methods added to `handlers`: `authority.trust` on `user.sock`
+/// stores the record as a Keychain item only knshd can read (FR-AUTH-11) after knshd's own Touch ID or password
+/// prompt (FR-AUTH-10); `authority.register` on the control service admits one authority at a time and publishes
+/// its arrival and departure on `events` (FR-AUTH-01, FR-AUTH-02).
 #[cfg(target_os = "macos")]
-fn trusted_authority() -> Option<knsh_platform::TrustedAuthority> {
-    None
+fn authority_services(
+    events: &std::sync::Arc<events::EventHub>,
+    log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+    handlers: &mut dispatch::Handlers,
+) -> (
+    std::sync::Arc<authority::AuthorityTrust>,
+    std::sync::Arc<authority::Registration>,
+) {
+    use std::sync::Arc;
+
+    use knsh_platform::macos::{KeychainTrustStore, LocalAuthentication};
+
+    let trust = authority::AuthorityTrust::new(
+        Arc::new(KeychainTrustStore::new()),
+        Arc::new(LocalAuthentication::new()),
+        Arc::clone(log),
+    );
+    let registration = authority::Registration::new(Arc::clone(events), Arc::clone(log));
+    handlers.extend(trust.handlers());
+    handlers.extend(registration.handlers());
+    (trust, registration)
 }
 
 /// Runs the capability probe on this machine (KNSH-014). The sandbox check runs the `knsh-exec` installed next to

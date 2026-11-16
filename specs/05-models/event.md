@@ -15,8 +15,8 @@ Delivery rules are in [../03-functional-requirements/events.md](../03-functional
 | `id` | ULID | Unique event ID |
 | `seq` | int | Starts at 1 (`session.started`) and increases by one per event of the session, with no gaps; used with `events.subscribe {since_seq}` |
 | `ts` | timestamp | UTC, microseconds |
-| `session_id` | ULID | |
-| `actor` | object | `kind`, `agent_id` |
+| `session_id` | ULID or `null` | `null` for an engine event |
+| `actor` | object or `null` | `kind`, `agent_id`; `null` for an engine event |
 | `data` | object | Event-specific payload |
 
 Every text in `data` is redacted before the event is published (FR-EVT-07): the engine's event types accept only
@@ -48,6 +48,7 @@ A `cwd` that is not valid UTF-8 is shown with U+FFFD replacements, as in records
 | `command.output` | `record_id`, `stream` (`stdout` or `stderr`), `offset` (where the chunk starts in the stream as captured, decimal string), `size` (decimal string), and the bytes: `data` (`stream_id`, `size`, `content_type`) naming the binary stream that follows the notification, or `data_base64` for a client that opted out of binary frames ([wire format](../06-api/wire-format.md)). Published only when the session's profile records output (`recording.output`), in order per stream, each chunk at most 8 KiB and already through redaction (FR-EVT-07), and only for the first 1 MB of each stream: beyond it the record keeps head and tail but no more chunks are published, so one line cannot flood the bus. Nothing is published for a line after its `command.finished` (KNSH-053) |
 | `proxy.denied` | `record_id` (the line whose credentials made the request, or `null` for the envelope's own connection, attributed to the session alone), `protocol` (`http`, `socks5`, or `null`), `host` (the host the request named, or `null` if it named no valid one), `port` (int or `null`), `reason` (the proxy's fixed reason, as in the record's [`network`](execution-record.md#network)). Published for every refusal of a request whose credentials were live; refusals before that have no session and are only logged (FR-NET-09, KNSH-060) |
 | `policy.invalid` | `profile`: the profile whose file has a missing or bad signature (the session's own, or a parent it `extends`). Published on the session whose line needed the file; the line is denied and nothing falls back to another profile. Without a session (starting a session, `policy.check`) the failure is in the system log and the call fails (FR-POL-42, KNSH-065) |
+| `authority.connected`, `authority.disconnected` | `{}`. Engine events: `session_id` and `actor` are `null`, `seq` counts the engine's own events from 1 per `knshd` run, and only subscriptions to every session receive them; not buffered, so not resumable. Published when an authority registers (`authority.register`) and when its connection ends (FR-AUTH-02, KNSH-068) |
 | `sandbox.violation` | A [sandbox violation](execution-record.md#sandbox_violations): `session_id`, `record_id` (ULID, or `null` for a denial inside an envelope), `rule`, `operation`, `argument` (string or `null`), `process`, `pid`, `count`, `at`. Published only for a live session named by the denial's tag; repeats within 3 s are one event with their `count` (KNSH-047) |
 
 ## Catalog

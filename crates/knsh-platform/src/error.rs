@@ -91,10 +91,12 @@ pub enum Operation {
     ProcessInfo,
     /// Resolving a host name to addresses (`getaddrinfo`; the network proxy, KNSH-060).
     Resolve,
-    /// Reading a Keychain item (`SecItemCopyMatching`; the policy signing key, KNSH-065).
+    /// Reading a Keychain item (`SecItemCopyMatching`; the policy signing key, KNSH-065; the trust record, KNSH-068).
     KeychainRead,
-    /// Creating a Keychain item (`SecItemAdd`; the policy signing key, KNSH-065).
+    /// Creating a Keychain item (`SecItemAdd`; the policy signing key, KNSH-065; the trust record, KNSH-068).
     KeychainAdd,
+    /// Replacing a Keychain item's value (`SecItemUpdate`; the trust record, KNSH-068).
+    KeychainUpdate,
     /// Reading the code signature of a control-service peer (`SecCodeCreateWithXPCMessage`,
     /// `SecCodeCopySigningInformation`; KNSH-067).
     CodeSigning,
@@ -145,6 +147,7 @@ impl Operation {
             Self::Resolve => "resolve host name",
             Self::KeychainRead => "read keychain item",
             Self::KeychainAdd => "add keychain item",
+            Self::KeychainUpdate => "update keychain item",
             Self::CodeSigning => "read code signature",
             Self::CodeRequirement => "compile code requirement",
         }

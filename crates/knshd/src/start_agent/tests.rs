@@ -212,6 +212,7 @@ fn call(harness: &Harness, endpoint: Endpoint, binding: &SessionBinding, params:
         binding,
         descriptors: &passed,
         caller,
+        control: None,
     })
 }
 
@@ -231,7 +232,7 @@ fn session_started_parents(watcher: &crate::events::Subscriber) -> Vec<Option<Se
                 knsh_core::EventData::SessionStarted { parent_session_id, .. } => Some(*parent_session_id),
                 _ => None,
             },
-            knsh_core::Delivery::Lost(_) => None,
+            knsh_core::Delivery::Lost(_) | knsh_core::Delivery::Engine(_) | knsh_core::Delivery::EngineLost(_) => None,
         })
         .collect()
 }
@@ -508,6 +509,7 @@ fn program_lookup_skips_shim_links() {
         binding: &binding,
         descriptors: &passed,
         caller: &StillWaiting,
+        control: None,
     })
     .unwrap();
     let launched = harness.launcher.launched.lock().unwrap()[0].clone();
@@ -556,6 +558,7 @@ fn refuses_what_cannot_start() {
         binding: &binding,
         descriptors: &one,
         caller: &StillWaiting,
+        control: None,
     })
     .unwrap_err();
     assert_eq!(error.code, ErrorCode::InvalidParams);
@@ -606,6 +609,7 @@ fn dispatch(dispatcher: &crate::dispatch::Dispatcher, endpoint: Endpoint) -> Rep
         binding: &binding,
         descriptors: &passed,
         caller: &StillWaiting,
+        control: None,
     })
 }
 
@@ -990,6 +994,7 @@ mod platform {
                 binding: &binding,
                 descriptors: &passed,
                 caller: &StillWaiting,
+                control: None,
             })
             .unwrap();
             drop(passed);

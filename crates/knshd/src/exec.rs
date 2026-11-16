@@ -610,6 +610,7 @@ mod tests {
             binding,
             descriptors: &passed,
             caller: &knsh_core::StillWaiting,
+            control: None,
         })
     }
 
