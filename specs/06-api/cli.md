@@ -152,6 +152,7 @@ Records and events carry text the engine did not author (commands, directories, 
 | --- | --- |
 | `knsh` interactive on a terminal, outside any envelope | Human session in integration mode |
 | `knsh -c '…'` inside an envelope | Agent client: forwards to the supervisor over `agent.sock` |
+| `knsh` interactive inside an envelope (session token set) | Agent client too: forwarded as an agent line reading the terminal, never a human session (FR-AGT-20) |
 | `knsh -c '…'` non-interactive outside any envelope | Supervised under the `unattended` profile |
 | `sh`, `bash`, `zsh` shims inside an envelope | Routed to `knsh -c` |
 

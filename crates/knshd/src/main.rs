@@ -99,6 +99,9 @@ mod probe;
 #[cfg(target_os = "macos")]
 mod profiles;
 // The lifecycle orchestrator (KNSH-050), served with `exec.run` (KNSH-051).
+// Envelope proxy credentials (KNSH-057), used by `start_agent`.
+#[cfg(target_os = "macos")]
+mod proxy;
 #[cfg(target_os = "macos")]
 mod supervisor;
 // The spawner behind the orchestrator (KNSH-051): lines through `knsh-exec`, process groups, timeouts.
@@ -544,6 +547,8 @@ impl Supervision<'_> {
             Arc::clone(self.sessions),
             self.profiles.clone(),
             Arc::new(launcher),
+            // No proxy runs before KNSH-059 (`network_filter: none`): envelopes reach only their loopback ports.
+            Arc::new(proxy::NoProxy),
             self.clock.clone(),
             self.paths.shim_dir(),
             knsh.into_path_buf(),

@@ -375,3 +375,23 @@ fn shims_forward_by_name_and_absolute_paths_are_not_intercepted() {
     assert_eq!(params.interpreter, Interpreter::Sh);
     assert_eq!(params.command, "sh 'script.sh' 'a b'");
 }
+
+// KNSH-057, FR-AGT-20: inside an envelope (its session token set) `knsh -i` hosts no human shell: it is forwarded to
+// the supervisor as an agent line reading the same stdin, so commands typed into the envelope's terminal are the
+// agent's and are decided like any other line.
+#[test]
+fn interactive_knsh_in_an_envelope_is_an_agent_line() {
+    let home = Home::new();
+    let supervisor = Supervisor::start(&home);
+    let output = home.run(
+        Path::new(env!("CARGO_BIN_EXE_knsh")),
+        &["-i"],
+        "/usr/bin:/bin",
+        &[(SESSION_TOKEN_VAR, "abc123")],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(supervisor.tokens(), [Some("abc123".to_owned())]);
+    let lines = supervisor.lines();
+    assert_eq!(lines.len(), 1, "forwarded, not run locally");
+    assert_eq!(lines[0].1, 3, "with the terminal's stdin, stdout and stderr");
+}
