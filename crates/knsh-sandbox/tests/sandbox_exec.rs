@@ -22,7 +22,7 @@ use knsh_core::{
     CanonicalPath, FixedDenies, LookupError, PathContext, PolicyFs, ProfileName, ProfileSource, RecordId, SessionId,
     Ulid, load_profile_text,
 };
-use knsh_sandbox::{CommandTag, ProfileInput, compile};
+use knsh_sandbox::{CommandTag, ProfileInput, SYSTEM_TOOL_FOLDERS, compile};
 
 /// The real filesystem, as the loader sees it.
 struct RealPaths;
@@ -416,18 +416,30 @@ fn executables_and_signals_limited_under_sandbox_exec() {
     let _ = sleeper.kill();
     let _ = sleeper.wait();
 
-    // Trusted and system tool folders: `/usr/bin/git` runs the developer directory's git.
+    // Trusted and system tool folders: `/usr/bin/git` runs the active developer directory's git. That directory is
+    // covered only if it is one of `SYSTEM_TOOL_FOLDERS`; any other (`Xcode-beta.app`, or `Xcode_16.4.app` on the CI
+    // runner, chosen through `DEVELOPER_DIR`) is documented as not covered, so there the stub's git must be refused.
+    let developer_dir = Command::new("/usr/bin/xcode-select").arg("-p").output().unwrap();
+    assert!(developer_dir.status.success(), "no developer directory");
+    let developer_dir = std::fs::canonicalize(String::from_utf8(developer_dir.stdout).unwrap().trim()).unwrap();
+    let covered = SYSTEM_TOOL_FOLDERS
+        .iter()
+        .any(|folder| developer_dir.starts_with(folder));
     let mut git = Command::new("/usr/bin/sandbox-exec")
         .arg("-f")
         .arg(&fixture.deny)
         .args(["/usr/bin/git", "--version"])
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .unwrap();
     let mut version = String::new();
     git.stdout.take().unwrap().read_to_string(&mut version).unwrap();
-    assert!(
-        git.wait().unwrap().success() && version.starts_with("git version"),
-        "{version}"
+    let ran = git.wait().unwrap().success() && version.starts_with("git version");
+    assert_eq!(
+        ran,
+        covered,
+        "developer directory {}: {version}",
+        developer_dir.display()
     );
 }
