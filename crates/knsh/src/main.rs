@@ -47,6 +47,9 @@ fn main() -> ExitCode {
         Ok(Invocation::Shell(shell)) => shell_mode(&shell, interpreter),
         Ok(Invocation::Command(parsed)) => match parsed.path.as_slice() {
             ["agent"] => agent(&parsed),
+            ["approvals"] => approvals(&parsed),
+            ["approve"] => answer_approval(&parsed, knsh::cli::approvals::Answer::Approve),
+            ["deny"] => answer_approval(&parsed, knsh::cli::approvals::Answer::Deny),
             ["daemon", action @ ("install" | "uninstall")] => daemon(action, parsed.json()),
             ["forget"] => forget(&parsed),
             ["history"] => history(&parsed),
@@ -130,6 +133,78 @@ fn forget(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Runs `knsh approvals` (KNSH-066, FR-AUTH-40): lists the pending asks through `approval.list` on `user.sock`. A
+/// failed call exits with 1 and the reason on stderr.
+#[cfg(unix)]
+fn approvals(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    use knsh::cli::{approvals, client};
+
+    let socket = match user_socket() {
+        Ok(socket) => socket,
+        Err(code) => return code,
+    };
+    let listed = client::connect_user(&socket)
+        .and_then(|mut client| approvals::list(&mut client))
+        .map_err(|error| approvals::failure_message("approvals", &error))
+        .and_then(|list| {
+            approvals::list_report(&list, parsed.json()).map_err(|error| format!("knsh: approvals failed: {error}\n"))
+        });
+    match listed {
+        Ok(text) => {
+            // A closed stdout (`knsh approvals | head`) is not an error worth reporting.
+            let _ = std::io::stdout().write_all(text.as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            report(&message);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs `knsh approve <request_id>` or `knsh deny <request_id>` (KNSH-066, FR-AUTH-41, FR-AUTH-42). A malformed ID is
+/// a usage error (exit 2) and sends nothing. An approval says on stderr that `knshd` shows the Touch ID or password
+/// prompt, then waits for it: the CLI never asks anything on the terminal (FR-AUTH-43). A refusal exits with 1.
+#[cfg(unix)]
+fn answer_approval(parsed: &knsh::cli::args::ParsedCommand, how: knsh::cli::approvals::Answer) -> ExitCode {
+    use knsh::cli::approvals::{self, Answer};
+    use knsh::cli::client;
+
+    let request_id = match approvals::request_id(parsed) {
+        Ok(request_id) => request_id,
+        Err(error) => return usage(&error, how.command()),
+    };
+    let socket = match user_socket() {
+        Ok(socket) => socket,
+        Err(code) => return code,
+    };
+    if how == Answer::Approve {
+        report(&approvals::confirm_notice(request_id));
+    }
+    match client::connect_user(&socket).and_then(|mut client| approvals::answer(&mut client, how, request_id)) {
+        Ok(result) => {
+            let _ = std::io::stdout().write_all(approvals::answer_report(&result, parsed.json()).as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            report(&approvals::failure_message(how.command(), &error));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `user.sock` is a Unix socket; no other platform has one.
+#[cfg(not(unix))]
+fn approvals(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    not_implemented("'knsh approvals' on this platform")
+}
+
+/// `user.sock` is a Unix socket; no other platform has one.
+#[cfg(not(unix))]
+fn answer_approval(_parsed: &knsh::cli::args::ParsedCommand, how: knsh::cli::approvals::Answer) -> ExitCode {
+    not_implemented(&format!("'knsh {}' on this platform", how.command()))
 }
 
 /// `user.sock` is a Unix socket; no other platform has one.

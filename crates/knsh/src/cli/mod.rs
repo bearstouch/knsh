@@ -14,6 +14,7 @@
 #[cfg(unix)]
 pub mod agent;
 pub mod agent_sandbox;
+pub mod approvals;
 pub mod args;
 pub mod client;
 pub mod commands;

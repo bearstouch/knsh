@@ -6,9 +6,12 @@
 
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 
-use knsh_core::{AgentId, DecisionVerdict, Delivery, EventScope, NoAuthority, NoHooks, SessionState, StillWaiting};
+use knsh_core::{
+    AgentId, AskAnswer, AskReply, AskRequest, DecisionVerdict, Delivery, EventScope, NoAuthority, NoHooks,
+    SessionState, StillWaiting,
+};
 use knsh_json::Value;
 use knsh_platform::testing::{FakeClock, Script, ScriptedProcesses, SeededRandom};
 use knsh_platform::{Signal, SpawnRequest};
@@ -122,9 +125,7 @@ impl Daemon {
             random: Arc::new(SeededRandom::new(5)),
             hooks: Arc::new(NoHooks),
             authority: authority(&fixture.sessions, session_id),
-            approvals: Arc::new(DenyAtTimeout {
-                timeout: Duration::from_millis(50),
-            }),
+            approvals: crate::approvals::tests::unanswered(Duration::from_millis(50)),
             spawner: Arc::new(GroupSpawner {
                 processes: processes.clone(),
                 running: Mutex::new(running_tx),

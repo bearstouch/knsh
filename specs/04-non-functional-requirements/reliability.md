@@ -20,7 +20,7 @@ The engine must stay safe when parts of it are missing: fail closed for agents, 
 
 | Situation | Human session | Agent session |
 | --- | --- | --- |
-| No authority connected | Unaffected | Local profiles apply; asks can be approved with `knsh approve` (Touch ID) or are denied at the timeout |
+| No authority connected | Unaffected | Local profiles apply; asks can be approved with `knsh approve` (Touch ID) or denied with `knsh deny`, and are denied at the timeout otherwise |
 | Pushed policy expired | Unaffected | Paused until the authority returns or the user picks a local profile with Touch ID |
 | `knshd` unreachable | Unaffected; telemetry is dropped | No line runs (no supervisor) and network is blocked (no proxy). The envelope keeps confining the agent, but changes it makes directly are not checkpointed until `knshd` returns, rescans and marks the gap |
 | Hook fails or times out | No hooks run | The line is denied |

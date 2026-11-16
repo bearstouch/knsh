@@ -273,8 +273,8 @@ pub struct Catalogue {
 /// Every method in the specification. Phase 1 implements `hello`, `records.query` and `records.output` (KNSH-016),
 /// `records.forget` (KNSH-017), `events.subscribe` and `events.unsubscribe` (KNSH-018), and the human session and
 /// telemetry methods with `session.info` (KNSH-021). Phase 2 adds `policy.check` (KNSH-043), `exec.*` (KNSH-051,
-/// KNSH-053), `session.start_agent` (KNSH-056), and `policy.read` and `policy.edit` (KNSH-065); the rest arrive with
-/// their stories.
+/// KNSH-053), `session.start_agent` (KNSH-056), `policy.read` and `policy.edit` (KNSH-065), and `approval.*` (KNSH-066);
+/// the rest arrive with their stories.
 const ENGINE_METHODS: &[MethodSpec] = &[
     // Handshake (specs/06-api/handshake.md).
     MethodSpec::planned("hello", Endpoints::ALL).available(),
@@ -322,9 +322,11 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("telemetry.command", Endpoints::USER).available(),
     MethodSpec::planned("telemetry.cwd", Endpoints::USER).available(),
     MethodSpec::planned("telemetry.idle", Endpoints::USER).available(),
-    MethodSpec::planned("approval.list", Endpoints::USER),
-    MethodSpec::planned("approval.approve", Endpoints::USER),
-    MethodSpec::planned("approval.deny", Endpoints::USER),
+    // Standalone approvals (KNSH-066): list, approve (after Touch ID or the password, shown by knshd) and deny
+    // pending asks. Never on agent.sock, so an agent can never answer its own ask (FR-AUTH-43).
+    MethodSpec::planned("approval.list", Endpoints::USER).available(),
+    MethodSpec::planned("approval.approve", Endpoints::USER).available(),
+    MethodSpec::planned("approval.deny", Endpoints::USER).available(),
     // `knsh policy edit` (KNSH-065): read a profile's text and signature state, then save it signed after Touch ID or
     // the password. Never on agent.sock: an agent cannot read for editing or write policy.
     MethodSpec::planned("policy.read", Endpoints::USER).available(),
@@ -569,6 +571,9 @@ mod tests {
                     "telemetry.command",
                     "telemetry.cwd",
                     "telemetry.idle",
+                    "approval.list",
+                    "approval.approve",
+                    "approval.deny",
                     "policy.read",
                     "policy.edit",
                     "records.forget",
@@ -611,8 +616,15 @@ mod tests {
             Lookup::NotOnEndpoint,
             "an agent can never erase records"
         );
-        // KNSH-065 (FR-POL-41): policy files are edited from user.sock only.
-        for method in ["policy.read", "policy.edit"] {
+        // KNSH-065 (FR-POL-41): policy files are edited from user.sock only. KNSH-066 (FR-AUTH-43): asks are
+        // answered from user.sock only, never by the agent that made them.
+        for method in [
+            "policy.read",
+            "policy.edit",
+            "approval.list",
+            "approval.approve",
+            "approval.deny",
+        ] {
             assert_eq!(
                 Catalogue::ENGINE.lookup(Endpoint::Agent, method, &caps),
                 Lookup::NotOnEndpoint,
