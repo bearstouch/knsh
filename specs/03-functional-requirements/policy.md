@@ -76,6 +76,26 @@ its members. Classes list everything a command may do, so a host rule must allow
 that is not normalised has no classes, so it reaches `approval_hosts` only with an approval. Dynamic code never has
 classes (FR-POL-20).
 
+**Class host rules (FR-NET-03, KNSH-058, proposed).** `network.class_hosts` names, per class that connects, the
+approval hosts a line reaches by its classes alone, without an approval:
+
+```toml
+[network]
+approval_hosts = ["github.com"]
+[network.class_hosts]
+fetch = ["github.com"]     # `git fetch` reaches github.com; `git push` still needs an approval
+```
+
+The keys are `fetch` and `publish` (`network:none` connects nowhere). A line reaches a host by class when it presents
+at least one class that connects and **every** class it presents that connects lists the host, so `git fetch && git
+push` needs github.com under both. A line with no classes (dynamic code, a program the table does not normalise)
+never reaches an approval host by class. Every host listed must be in the resolved profile's
+`network.approval_hosts`; the loader refuses one that is not (`InvalidValue` at `network.class_hosts.<class>[i]`), so
+a class rule never opens a host the profile does not name. An `extends` child replaces each class's list whole; a
+preset appends to it. Under profile strictness (FR-SES-03) a child's class host must be open to that class, or to every
+command, in the parent. The line decision carries the result as `capabilities.class_hosts`; the proxy enforces it
+(KNSH-060).
+
 **Line verdicts (FR-POL-18, FR-LC-09, KNSH-041).** `knsh-core`'s `evaluate_line` decides a whole classified line
 before any of it runs and returns `LineDecision { verdict, source, rule_id, reason, matched_rules, capabilities }`.
 
@@ -89,7 +109,7 @@ before any of it runs and returns `LineDecision { verdict, source, rule_id, reas
   `unattended` profile (below).
 - *Capabilities.* What the line may receive if it runs: the hosts open to it (`network.hosts`), the approval hosts it
   may reach once its classes or an approval allow (`network.approval_hosts`; the proxy decides each connection,
-  FR-NET-03), the loopback ports, the classes it presents, and the `secrets.env` variables whose `inject_for` patterns
+  FR-NET-03), the approval hosts its classes alone open (`class_hosts`, above), the loopback ports, the classes it presents, and the `secrets.env` variables whose `inject_for` patterns
   certainly match one of its commands (an upper bound: asking and injecting are FR-SEC-01 – FR-SEC-02's). Under
   `network.mode = "none"` there are no hosts. A denied line receives nothing.
 - *Line classes.* The proxy identifies a line, not a command within it, so a line presents classes only when every

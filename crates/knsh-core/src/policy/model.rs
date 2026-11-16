@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use knsh_bash::Interpreters;
+use knsh_bash::{Interpreters, NetworkClass};
 
 use crate::path::CanonicalPath;
 use crate::resolve::TrustedFolders;
@@ -152,8 +152,51 @@ pub struct NetworkPolicy {
     /// `network.approval_hosts`: only for commands whose class or approval includes them (FR-NET-03). Default
     /// none.
     pub approval_hosts: Vec<String>,
+    /// `network.class_hosts`: which approval hosts each network class reaches without an approval (FR-NET-03).
+    /// Default none.
+    pub class_hosts: ClassHosts,
     /// `network.loopback`: loopback ports allowed. Default none.
     pub loopback: Vec<u16>,
+}
+
+/// `[network.class_hosts]`: the approval hosts a line reaches by its network classes alone, without an approval
+/// (FR-NET-03, `specs/03-functional-requirements/policy.md`, "Class host rules").
+///
+/// A host is listed per class, and a line reaches it only when it presents a class that connects and **every** class
+/// that connects lists the host: classes list everything a command may do, so `git fetch` reaches a host listed under
+/// `fetch`, while a line presenting `network:fetch` and `network:publish` also needs it under `publish`.
+/// `network:none` connects nowhere and needs no host.
+///
+/// Invariant (checked by the loader): every host listed is one of the profile's `network.approval_hosts`. A class
+/// rule therefore never opens a host the profile does not already name for approval-gated use.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct ClassHosts {
+    /// `network.class_hosts.fetch`: hosts open to `network:fetch` lines.
+    pub fetch: Vec<String>,
+    /// `network.class_hosts.publish`: hosts open to `network:publish` lines.
+    pub publish: Vec<String>,
+}
+
+impl ClassHosts {
+    /// The hosts listed for `class`; none for [`NetworkClass::None`], which connects nowhere.
+    #[must_use]
+    pub fn for_class(&self, class: NetworkClass) -> &[String] {
+        match class {
+            NetworkClass::None => &[],
+            NetworkClass::Fetch => &self.fetch,
+            NetworkClass::Publish => &self.publish,
+        }
+    }
+
+    /// Whether a line presenting `classes` reaches `host` without an approval (type documentation). `false` when
+    /// `classes` holds no class that connects: a line with no classes (dynamic code, an unclassified program) or only
+    /// `network:none` never reaches an approval host by class.
+    #[must_use]
+    pub fn allows(&self, classes: &[NetworkClass], host: &str) -> bool {
+        let mut connecting = classes.iter().filter(|class| **class != NetworkClass::None).peekable();
+        connecting.peek().is_some()
+            && connecting.all(|class| self.for_class(*class).iter().any(|listed| listed == host))
+    }
 }
 
 /// `[approvals]`: how flagged lines are treated.

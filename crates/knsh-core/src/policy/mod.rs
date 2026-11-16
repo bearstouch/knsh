@@ -17,6 +17,7 @@
 //!    entry. A cycle is an error.
 //! 3. **`preset`.** The merged profile's preset, one of the [`PRESETS`] shipped as data, is read by the same parser
 //!    and its path and host lists are appended (FR-POL-02). A preset sets nothing else, so it never weakens a profile.
+//!    A preset that grants no model host (`generic`) requires the profile to name one (FR-AGT-32).
 //! 4. **Defaults** fill every unset key (documented on each field of the model; `fs.read` is `"all"`, FR-POL-12, and
 //!    `exec.default` is `ask`).
 //! 5. **Paths.** `~`, `${HOME}`, `${TMPDIR}` and `${PROJECT}` (the git root, or the session's start directory,
@@ -58,9 +59,9 @@ pub use line::{
     DecisionSource, LineCapabilities, LineDecision, LineReason, MatchedRule, evaluate_line, evaluate_line_with_grants,
 };
 pub use model::{
-    ApprovalsPolicy, CheckpointPolicy, DEFAULT_AGENT_BASH, DEFAULT_CHECKPOINT_EXCLUDES, DEFAULT_RETENTION_DAYS,
-    ExecPolicy, FsPolicy, NetworkMode, NetworkPolicy, OutputMode, OutputPolicy, Profile, RETENTION_DAYS_RANGE,
-    ReadScope, RecordingPolicy, RuleAction, SecretInjection,
+    ApprovalsPolicy, CheckpointPolicy, ClassHosts, DEFAULT_AGENT_BASH, DEFAULT_CHECKPOINT_EXCLUDES,
+    DEFAULT_RETENTION_DAYS, ExecPolicy, FsPolicy, NetworkMode, NetworkPolicy, OutputMode, OutputPolicy, Profile,
+    RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy, RuleAction, SecretInjection,
 };
 pub use paths::{LookupError, PathContext, PolicyFs, project_root};
 use paths::{PathTemplate, Variables};
@@ -164,6 +165,9 @@ where
     let (mut merged, extends) = merge_chain(root, &name, source)?;
     if let Some(preset) = merged.preset.clone() {
         apply_preset(&mut merged, &preset).map_err(|error| error.in_origin(&origin))?;
+        if presets::profile_names_model_host(&preset) {
+            require_model_host(&merged).map_err(|error| error.in_origin(&origin))?;
+        }
     }
     build(merged, name, extends, context, fs).map_err(|error| error.in_origin(&origin))
 }
@@ -228,6 +232,8 @@ fn override_layer(parent: Layer, child: Layer) -> Layer {
         network_mode: child.network_mode.or(parent.network_mode),
         network_hosts: child.network_hosts.or(parent.network_hosts),
         network_approval_hosts: child.network_approval_hosts.or(parent.network_approval_hosts),
+        network_class_hosts_fetch: child.network_class_hosts_fetch.or(parent.network_class_hosts_fetch),
+        network_class_hosts_publish: child.network_class_hosts_publish.or(parent.network_class_hosts_publish),
         network_loopback: child.network_loopback.or(parent.network_loopback),
         approvals_irreversible: child.approvals_irreversible.or(parent.approvals_irreversible),
         approvals_irreversible_commands: child
@@ -251,6 +257,12 @@ fn apply_preset(layer: &mut Layer, name: &str) -> Result<(), ProfileError> {
     };
     let preset = Layer::parse(text.as_bytes(), LayerKind::Preset)
         .map_err(|error| error.in_origin(&ProfileOrigin::Preset(name)))?;
+    merge_preset(layer, preset);
+    Ok(())
+}
+
+/// Appends the lists of `preset`, a layer read as [`LayerKind::Preset`], to `layer`'s.
+fn merge_preset(layer: &mut Layer, preset: Layer) {
     // `fs.read = "all"` already covers whatever the preset reads; only an explicit list grows.
     if let (Some(ReadTemplate::Paths(paths)), Some(ReadTemplate::Paths(added))) = (&mut layer.fs_read, preset.fs_read) {
         union(paths, added);
@@ -260,9 +272,53 @@ fn apply_preset(layer: &mut Layer, name: &str) -> Result<(), ProfileError> {
     append(&mut layer.exec_trusted_folders, preset.exec_trusted_folders);
     append(&mut layer.network_hosts, preset.network_hosts);
     append(&mut layer.network_approval_hosts, preset.network_approval_hosts);
+    append(&mut layer.network_class_hosts_fetch, preset.network_class_hosts_fetch);
+    append(
+        &mut layer.network_class_hosts_publish,
+        preset.network_class_hosts_publish,
+    );
     append(&mut layer.network_loopback, preset.network_loopback);
     append(&mut layer.checkpoints_roots, preset.checkpoints_roots);
-    Ok(())
+}
+
+/// A preset that grants no model host (`generic`, FR-AGT-32) leaves naming it to the profile: refuses a merged
+/// profile through which the agent CLI could reach no model at all. A remote model needs `network.mode =
+/// "allowlist"` and a host in `network.hosts` (open to the CLI itself, unlike `approval_hosts`); a local model needs
+/// its port in `network.loopback`. Without either, the CLI would start and fail on its first request, so the mistake
+/// is reported where the profile is loaded instead.
+fn require_model_host(layer: &Layer) -> Result<(), ProfileError> {
+    let remote = layer.network_mode == Some(NetworkMode::Allowlist)
+        && layer.network_hosts.as_ref().is_some_and(|hosts| !hosts.is_empty());
+    let local = layer.network_loopback.as_ref().is_some_and(|ports| !ports.is_empty());
+    if remote || local {
+        Ok(())
+    } else {
+        Err(ProfileError::new(ProfileErrorKind::MissingKey).at_key("network.hosts"))
+    }
+}
+
+/// `network.class_hosts`, checked against the profile's approval hosts (the [`ClassHosts`] invariant). A class rule
+/// for a host the profile does not list in `network.approval_hosts` would either do nothing or, worse, read as
+/// opening a host the profile never named; both are refused, naming the entry.
+fn class_hosts(
+    fetch: Option<Vec<String>>,
+    publish: Option<Vec<String>>,
+    approval_hosts: &[String],
+) -> Result<ClassHosts, ProfileError> {
+    let checked = |hosts: Option<Vec<String>>, key: &str| {
+        let hosts = hosts.unwrap_or_default();
+        match hosts.iter().position(|host| !approval_hosts.contains(host)) {
+            Some(index) => Err(ProfileError::new(ProfileErrorKind::InvalidValue {
+                expected: "a host listed in network.approval_hosts",
+            })
+            .at_key(&format!("network.class_hosts.{key}[{index}]"))),
+            None => Ok(hosts),
+        }
+    };
+    Ok(ClassHosts {
+        fetch: checked(fetch, "fetch")?,
+        publish: checked(publish, "publish")?,
+    })
 }
 
 /// Appends `added` to `list`, treating an unset list as its default (empty for every list a preset may set).
@@ -314,6 +370,12 @@ fn build<F: PolicyFs + ?Sized>(
         None => CanonicalPath::new(DEFAULT_AGENT_BASH)
             .map_err(|_| ProfileError::new(ProfileErrorKind::PathUnresolvable).at_key("exec.bash"))?,
     };
+    let approval_hosts = layer.network_approval_hosts.unwrap_or_default();
+    let class_hosts = class_hosts(
+        layer.network_class_hosts_fetch,
+        layer.network_class_hosts_publish,
+        &approval_hosts,
+    )?;
     let mut interpreters = knsh_bash::Interpreters::defaults();
     for (family, entry) in layer.exec_interpreters {
         interpreters.extend(entry).map_err(|_| {
@@ -347,7 +409,8 @@ fn build<F: PolicyFs + ?Sized>(
         network: NetworkPolicy {
             mode: layer.network_mode.unwrap_or(NetworkMode::None),
             hosts: layer.network_hosts.unwrap_or_default(),
-            approval_hosts: layer.network_approval_hosts.unwrap_or_default(),
+            class_hosts,
+            approval_hosts,
             loopback: layer.network_loopback.unwrap_or_default(),
         },
         approvals: ApprovalsPolicy {

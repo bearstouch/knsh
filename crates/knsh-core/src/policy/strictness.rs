@@ -23,6 +23,7 @@
 //! | `network.mode` | `none`, or both `allowlist` |
 //! | `network.hosts`, `network.loopback` | a subset of the parent's |
 //! | `network.approval_hosts` | a subset of the parent's hosts and approval hosts |
+//! | `network.class_hosts` | per class, a subset of the parent's hosts and of the parent's hosts for that class |
 //! | `approvals.irreversible_commands` | a superset of the parent's |
 //! | `checkpoints` | `required` kept, every parent root kept, excludes a subset of the parent's |
 //! | `recording` | commands and output recorded where the parent records them, kept at least as long |
@@ -33,6 +34,8 @@
 //! what it may do.
 
 use std::path::Path;
+
+use knsh_bash::NetworkClass;
 
 use crate::path::CanonicalPath;
 use crate::policy::model::{
@@ -129,6 +132,13 @@ fn network_no_looser(child: &NetworkPolicy, parent: &NetworkPolicy) -> bool {
             .iter()
             .all(|host| parent.hosts.contains(host) || parent.approval_hosts.contains(host))
         && child.loopback.iter().all(|port| parent.loopback.contains(port))
+        // A class rule opens an approval host without an approval (FR-NET-03): the parent must already open that
+        // host to the class, or to every command.
+        && [NetworkClass::Fetch, NetworkClass::Publish].into_iter().all(|class| {
+            child.class_hosts.for_class(class).iter().all(|host| {
+                parent.hosts.contains(host) || parent.class_hosts.for_class(class).contains(host)
+            })
+        })
 }
 
 /// `[approvals]`: irreversible lines treated at least as strictly, and every pattern the parent flags still flagged.
@@ -244,6 +254,35 @@ loopback = [3000]
         assert!(at_least_as_strict(&child, &parent));
         // …and the parent is looser than that child.
         assert!(!at_least_as_strict(&parent, &child));
+    }
+
+    // FR-SES-03, FR-NET-03: a class rule the parent does not have opens an approval host without an approval, so it
+    // is looser; one for a host the parent opens to every command, or the parent's own rule, is not.
+    #[test]
+    fn class_hosts_never_widen() {
+        let parent = parent();
+        let mut child = parent.clone();
+        child.network.class_hosts.fetch.push("registry.npmjs.org".to_owned());
+        assert!(!at_least_as_strict(&child, &parent));
+        assert!(at_least_as_strict(&parent, &child));
+        // github.com is open to every command in the parent.
+        let mut child = parent.clone();
+        child.network.class_hosts.publish.push("github.com".to_owned());
+        assert!(at_least_as_strict(&child, &parent));
+        // A rule for one class does not cover another.
+        let mut with_fetch = parent.clone();
+        with_fetch
+            .network
+            .class_hosts
+            .fetch
+            .push("registry.npmjs.org".to_owned());
+        let mut with_publish = parent;
+        with_publish
+            .network
+            .class_hosts
+            .publish
+            .push("registry.npmjs.org".to_owned());
+        assert!(!at_least_as_strict(&with_publish, &with_fetch));
     }
 
     // FR-SES-03: every way of allowing more than the parent is looser.

@@ -78,9 +78,8 @@ impl AgentId {
 }
 
 /// Agent CLIs whose actor is not their binary's name: `(binary, agent_id)` (FR-AGT-02,
-/// `specs/08-integrations/agent-clis.md#starting`). Only Claude Code is specified so far; the Codex CLI's entry
-/// arrives with its preset (KNSH-058).
-pub const DERIVED_AGENT_IDS: &[(&str, &str)] = &[("claude", "claude-code")];
+/// `specs/08-integrations/agent-clis.md#starting`). Each actor is named after the CLI's preset (KNSH-058).
+pub const DERIVED_AGENT_IDS: &[(&str, &str)] = &[("claude", "claude-code"), ("codex", "codex-cli")];
 
 impl fmt::Display for AgentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -469,6 +468,14 @@ mod tests {
     fn derives_claude_code_actor_from_claude() {
         for program in ["claude", "/opt/homebrew/bin/claude", "./claude"] {
             assert_eq!(AgentId::derive_from_program(program).unwrap().as_str(), "claude-code");
+        }
+    }
+
+    // FR-AGT-02, KNSH-058: `codex` is the `codex-cli` actor, named after its preset.
+    #[test]
+    fn derives_codex_cli_actor_from_codex() {
+        for program in ["codex", "/opt/homebrew/bin/codex"] {
+            assert_eq!(AgentId::derive_from_program(program).unwrap().as_str(), "codex-cli");
         }
     }
 

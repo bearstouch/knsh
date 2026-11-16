@@ -1,6 +1,7 @@
 //! The `knsh` command-line interface (`specs/06-api/cli.md`).
 //!
-//! [`agent`] implements `knsh agent` (KNSH-056): it starts an agent CLI through `session.start_agent`.
+//! [`agent`] implements `knsh agent` (KNSH-056): it starts an agent CLI through `session.start_agent`, after
+//! [`agent_sandbox`] checked that the CLI's own sandbox is off (KNSH-058).
 //! [`args`] is the in-house argument parser and help generator (KNSH-009); [`commands`] declares every command it
 //! parses. [`daemon`] implements `knsh daemon install` and `uninstall` (KNSH-012, macOS only). [`client`] is the
 //! JSON-RPC client the API commands use, and [`forget`] implements `knsh forget` (KNSH-017). [`history`] and
@@ -11,6 +12,7 @@
 
 #[cfg(unix)]
 pub mod agent;
+pub mod agent_sandbox;
 pub mod args;
 pub mod client;
 pub mod commands;

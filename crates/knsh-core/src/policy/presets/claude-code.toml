@@ -1,7 +1,16 @@
-# Preset `claude-code`: what Claude Code itself needs inside an envelope (FR-AGT-04).
-# Provisional: KNSH-058 verifies and completes it (proxy settings, classes).
+# Preset `claude-code`: what Claude Code itself needs inside an envelope (FR-AGT-04, KNSH-058).
+# Read from Claude Code 2.1.325 (native build); checked again per release (agent-clis.md, per-release checklist).
+#
+# Proxy: the native build reads HTTPS_PROXY and HTTP_PROXY itself, so the envelope's proxy settings (decision 14)
+# are enough; it needs no setting of its own. Its own sandbox (`sandbox.enabled` in its settings) must stay off.
 [fs]
-write = ["${PROJECT}", "~/.claude"]
+# Added to `fs.read` only when the profile lists its reads (the default, "all", already covers them): a write
+# root that cannot be read is of no use to the CLI.
+read = ["${PROJECT}", "~/.claude", "~/.claude.json"]
+# The project, the configuration and session folder, and the user-level state file Claude Code keeps beside it.
+write = ["${PROJECT}", "~/.claude", "~/.claude.json"]
 
 [network]
-hosts = ["api.anthropic.com"]
+# api.anthropic.com: the model API. platform.claude.com: OAuth token refresh for claude.ai sign-in
+# (https://platform.claude.com/v1/oauth/token); without it a subscription session stops when its token expires.
+hosts = ["api.anthropic.com", "platform.claude.com"]
