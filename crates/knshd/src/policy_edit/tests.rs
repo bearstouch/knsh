@@ -73,6 +73,7 @@ impl Harness {
             binding: &SessionBinding::new(),
             descriptors: crate::dispatch::tests::no_descriptors(),
             caller: &knsh_core::StillWaiting,
+            control: None,
         })
     }
 

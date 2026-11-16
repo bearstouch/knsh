@@ -273,8 +273,8 @@ pub struct Catalogue {
 /// Every method in the specification. Phase 1 implements `hello`, `records.query` and `records.output` (KNSH-016),
 /// `records.forget` (KNSH-017), `events.subscribe` and `events.unsubscribe` (KNSH-018), and the human session and
 /// telemetry methods with `session.info` (KNSH-021). Phase 2 adds `policy.check` (KNSH-043), `exec.*` (KNSH-051,
-/// KNSH-053), `session.start_agent` (KNSH-056), `policy.read` and `policy.edit` (KNSH-065), and `approval.*` (KNSH-066);
-/// the rest arrive with their stories.
+/// KNSH-053), `session.start_agent` (KNSH-056), `policy.read` and `policy.edit` (KNSH-065), `approval.*` (KNSH-066),
+/// and `authority.trust` and `authority.register` (KNSH-068); the rest arrive with their stories.
 const ENGINE_METHODS: &[MethodSpec] = &[
     // Handshake (specs/06-api/handshake.md).
     MethodSpec::planned("hello", Endpoints::ALL).available(),
@@ -335,8 +335,12 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("policy.grant", Endpoints::USER_CONTROL),
     // Deleting records is for the user only: an agent can never erase its own trail (KNSH-017).
     MethodSpec::planned("records.forget", Endpoints::USER).available(),
+    // Trusting an authority (KNSH-068, FR-AUTH-10): Touch ID or the password, shown by knshd. Never on agent.sock or
+    // the control service: only the user chooses who decides for their agents.
+    MethodSpec::planned("authority.trust", Endpoints::USER).available(),
     // Control service (specs/06-api/control-service.md).
-    MethodSpec::planned("authority.register", Endpoints::CONTROL),
+    // The single authority registers on the control service (KNSH-068, FR-AUTH-01).
+    MethodSpec::planned("authority.register", Endpoints::CONTROL).available(),
     MethodSpec::planned("decision.respond", Endpoints::CONTROL),
     MethodSpec::planned("policy.set", Endpoints::CONTROL),
     MethodSpec::planned("policy.get", Endpoints::CONTROL),
@@ -577,6 +581,7 @@ mod tests {
                     "policy.read",
                     "policy.edit",
                     "records.forget",
+                    "authority.trust",
                 ],
                 Endpoint::Agent => &[
                     "hello",
@@ -597,6 +602,7 @@ mod tests {
                     "records.output",
                     "events.subscribe",
                     "events.unsubscribe",
+                    "authority.register",
                 ],
             };
             assert_eq!(

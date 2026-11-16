@@ -86,6 +86,7 @@
 #![forbid(unsafe_code)]
 
 mod approval;
+mod authority;
 mod capability;
 mod catalogue;
 mod envelope;
@@ -105,6 +106,7 @@ pub use approval::{
     ApprovalAnswerParams, ApprovalAnswerResult, ApprovalListParams, ApprovalListResult, ApprovalVerdict, Irreversible,
     PendingApproval,
 };
+pub use authority::{AuthorityRegisterParams, AuthorityRegisterResult, AuthorityTrustParams, AuthorityTrustResult};
 pub use capability::{
     Backend, Capabilities, CheckpointBackend, FileEvents, NONE, NetworkFilter, Platform, Sandbox, SandboxViolations,
     Secrets,
@@ -125,8 +127,9 @@ pub use envelope::{
 pub use error::{EnvelopeFault, ProtoError};
 pub use error_code::ErrorCode;
 pub use events::{
-    EVENTS_LOST, EventsSubscribeParams, EventsSubscribeResult, EventsUnsubscribeParams, event_envelope,
-    event_notification, event_notification_with_bytes, hook_input, lost_notification,
+    EVENTS_LOST, EventsSubscribeParams, EventsSubscribeResult, EventsUnsubscribeParams, engine_event_notification,
+    engine_lost_notification, event_envelope, event_notification, event_notification_with_bytes, hook_input,
+    lost_notification,
 };
 pub use exec::{
     Denial, ExecHandleParams, ExecKillResult, ExecOutcome, ExecRunParams, ExecRunResult, ExecStartResult, ExecStdio,

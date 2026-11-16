@@ -16,7 +16,7 @@ The `knsh` binary wraps the API. Every command takes `--json` for machine-readab
 | `knsh policy check` | `user.sock` | Dry-run a line against policy |
 | `knsh policy edit <profile>` | `user.sock` | Edit a policy file; saving needs Touch ID or password ([below](#policy-edit)) |
 | `knsh profile use <profile>` | `user.sock` | Select a local profile; needs Touch ID |
-| `knsh authority trust --team-id <id> --identifier <bundle-id> --min-version <v>` | `user.sock` | Trust an authority; needs Touch ID or password |
+| `knsh authority trust --team-id <id> --identifier <bundle-id> --min-version <v>` | `user.sock` | Trust an authority; needs Touch ID or password ([below](#authority-trust)) |
 | `knsh forget [--session <id> \| --since <date>] [--with-checkpoints]` | `user.sock` | Delete records and optionally checkpoints |
 | `knsh shell install` | — (`/etc/shells`) | Add `knsh` to `/etc/shells` after asking, so `chsh` accepts it (see below) |
 | `knsh daemon install` | — (launchd) | Install and load the `knshd` launch agent (see below) |
@@ -80,6 +80,21 @@ signs and writes policy files ([integrity](../03-functional-requirements/policy.
 A profile name outside `[A-Za-z0-9._-]{1,64}` is a usage error (exit 2). A failed editor, a refused prompt
 (`-32001`), text that does not load (`-32602`, with the loader's reason) or any other failure exits with 1; the edited
 text is then kept in its temporary file and the path printed. `unattended` is built in and cannot be edited.
+
+## Authority trust
+
+`knsh authority trust --team-id <id> --identifier <bundle-id> --min-version <v>` (KNSH-068, FR-AUTH-10) calls
+[`authority.trust`](user-socket.md#authoritytrust) on `user.sock`.
+
+- All three options are required. A team ID, identifier or version that `knshd` would refuse is a usage error
+  (status 2) and nothing is sent, so no prompt appears.
+- It says on stderr that `knshd` may show its Touch ID or password prompt, naming the authority, then waits. It asks
+  nothing on the terminal and has no option to skip the prompt.
+- Success prints `Trusted <identifier> (team <team>, version <v> or later).`, with `, replacing the previous
+  authority` when another one was trusted, or `Already trusted: …` when nothing changed. `--json` prints the result
+  object.
+- A refusal exits with 1 and says why on stderr: not authenticated (`-32001`), or a trust record that cannot be read
+  or written (`-32603`, nothing changed).
 
 ## Version and the advisory label
 

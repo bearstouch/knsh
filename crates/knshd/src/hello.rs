@@ -160,6 +160,7 @@ pub(crate) mod tests {
         handlers.extend(crate::policy::tests::service(sessions, knsh_platform::testing::MemFs::new()).handlers());
         handlers.extend(crate::policy_edit::tests::idle_handlers());
         handlers.extend(crate::approvals::tests::idle_handlers());
+        handlers.extend(crate::authority::tests::idle_handlers());
         handlers.extend(crate::exec::unserved_handlers());
         handlers.extend(crate::start_agent::unserved_handlers());
         handlers
@@ -181,6 +182,7 @@ pub(crate) mod tests {
                 binding: &binding,
                 descriptors: crate::dispatch::tests::no_descriptors(),
                 caller: &knsh_core::StillWaiting,
+                control: None,
             })
             .map(|answer| answer.result.as_object().cloned().unwrap())
     }

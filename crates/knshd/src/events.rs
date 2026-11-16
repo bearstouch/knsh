@@ -33,8 +33,8 @@ use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use knsh_core::{
-    Actor, CoreError, Delivery, EventBus, EventData, EventId, EventScope, Session, SessionId, SessionState,
-    StateChanged, Subscribed, SubscriptionId, Ulid,
+    Actor, CoreError, Delivery, EngineEventData, EventBus, EventData, EventId, EventScope, Session, SessionId,
+    SessionState, StateChanged, Subscribed, SubscriptionId, Ulid,
 };
 use knsh_json::{Object, ToJson, Value};
 use knsh_platform::{Clock, PlatformError, Random};
@@ -125,6 +125,17 @@ struct HubState {
     signals: BTreeMap<SubscriptionId, Arc<Signal>>,
 }
 
+impl HubState {
+    /// Wakes the pump of every subscription in `delivered_to`.
+    fn wake(&self, delivered_to: &[SubscriptionId]) {
+        for subscription in delivered_to {
+            if let Some(signal) = self.signals.get(subscription) {
+                signal.notify();
+            }
+        }
+    }
+}
+
 /// The engine's event bus: one per `knshd`, shared by publishers and every connection.
 pub(crate) struct EventHub {
     state: Mutex<HubState>,
@@ -155,22 +166,38 @@ impl EventHub {
     pub(crate) fn publish(&self, session_id: SessionId, actor: &Actor, data: EventData) -> Result<u64, PublishError> {
         let mut state = lock(&self.state);
         // Stamped under the lock, so stamps follow `seq` order unless the wall clock itself steps back.
+        let (id, ts) = self.stamp()?;
+        let published = state
+            .bus
+            .publish(session_id, actor, data, id, ts)
+            .map_err(PublishError::Bus)?;
+        state.wake(&published.delivered_to);
+        Ok(published.event.seq)
+    }
+
+    /// Publishes one engine event (`authority.connected`, `authority.disconnected`, KNSH-068) to every subscription
+    /// to all sessions, and wakes them. Never waits for a subscriber (FR-EVT-04).
+    ///
+    /// # Errors
+    ///
+    /// [`PublishError::Platform`] if the event cannot be stamped; nothing is delivered then.
+    pub(crate) fn publish_engine(&self, data: EngineEventData) -> Result<u64, PublishError> {
+        let mut state = lock(&self.state);
+        let (id, ts) = self.stamp()?;
+        let published = state.bus.publish_engine(data, id, ts);
+        state.wake(&published.delivered_to);
+        Ok(published.event.seq)
+    }
+
+    /// A new event's ID and time, from the injected clock and random source.
+    fn stamp(&self) -> Result<(EventId, knsh_core::Timestamp), PublishError> {
         let ts = self.clock.now().map_err(PublishError::Platform)?;
         let mut random = [0; 10];
         self.random.fill(&mut random).map_err(PublishError::Platform)?;
         let id = Ulid::new(ts.as_unix_millis(), random)
             .map(EventId::from_ulid)
             .map_err(PublishError::Bus)?;
-        let published = state
-            .bus
-            .publish(session_id, actor, data, id, ts)
-            .map_err(PublishError::Bus)?;
-        for subscription in &published.delivered_to {
-            if let Some(signal) = state.signals.get(subscription) {
-                signal.notify();
-            }
-        }
-        Ok(published.event.seq)
+        Ok((id, ts))
     }
 
     /// Publishes `data` for `session_id` as its own actor, if the session is live. For publishers that know only
@@ -561,6 +588,7 @@ pub(crate) mod tests {
             binding: crate::dispatch::tests::binding(),
             descriptors: crate::dispatch::tests::no_descriptors(),
             caller: &knsh_core::StillWaiting,
+            control: None,
         })
     }
 
@@ -569,7 +597,7 @@ pub(crate) mod tests {
             .iter()
             .map(|(_, delivery)| match delivery {
                 Delivery::Event(event) => event.seq,
-                Delivery::Lost(lost) => panic!("unexpected loss {lost:?}"),
+                other => panic!("unexpected delivery {other:?}"),
             })
             .collect()
     }
@@ -741,7 +769,7 @@ pub(crate) mod tests {
             .into_iter()
             .map(|(_, delivery)| match delivery {
                 Delivery::Event(event) => (event.name(), event.seq),
-                Delivery::Lost(lost) => panic!("unexpected loss {lost:?}"),
+                other => panic!("unexpected delivery {other:?}"),
             })
             .collect();
         assert_eq!(

@@ -363,6 +363,7 @@ mod tests {
             binding: crate::dispatch::tests::binding(),
             descriptors: crate::dispatch::tests::no_descriptors(),
             caller: &knsh_core::StillWaiting,
+            control: None,
         }
     }
 

@@ -179,7 +179,7 @@ impl Running {
             .into_iter()
             .filter_map(|(_, delivery)| match delivery {
                 Delivery::Event(event) => Some(event),
-                Delivery::Lost(_) => None,
+                Delivery::Lost(_) | Delivery::Engine(_) | Delivery::EngineLost(_) => None,
             })
             .collect()
     }

@@ -50,6 +50,7 @@ fn main() -> ExitCode {
             ["approvals"] => approvals(&parsed),
             ["approve"] => answer_approval(&parsed, knsh::cli::approvals::Answer::Approve),
             ["deny"] => answer_approval(&parsed, knsh::cli::approvals::Answer::Deny),
+            ["authority", "trust"] => authority_trust(&parsed),
             ["daemon", action @ ("install" | "uninstall")] => daemon(action, parsed.json()),
             ["forget"] => forget(&parsed),
             ["history"] => history(&parsed),
@@ -193,6 +194,41 @@ fn answer_approval(parsed: &knsh::cli::args::ParsedCommand, how: knsh::cli::appr
             ExitCode::FAILURE
         }
     }
+}
+
+/// Runs `knsh authority trust` (KNSH-068, FR-AUTH-10): a malformed team ID, identifier or version is a usage error
+/// (exit 2) and sends nothing. Otherwise it says on stderr that `knshd` may show the Touch ID or password prompt, then
+/// waits for `authority.trust`: the CLI never asks anything on the terminal and cannot skip the prompt. A refusal exits
+/// with 1.
+#[cfg(unix)]
+fn authority_trust(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    use knsh::cli::{authority, client};
+
+    let params = match authority::params(parsed) {
+        Ok(params) => params,
+        Err(error) => return usage(&error, "authority trust"),
+    };
+    let socket = match user_socket() {
+        Ok(socket) => socket,
+        Err(code) => return code,
+    };
+    report(&authority::confirm_notice(&params));
+    match client::connect_user(&socket).and_then(|mut client| authority::trust(&mut client, &params)) {
+        Ok(result) => {
+            let _ = std::io::stdout().write_all(authority::report(&result, parsed.json()).as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            report(&authority::failure_message(&error));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `user.sock` is a Unix socket; no other platform has one.
+#[cfg(not(unix))]
+fn authority_trust(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    not_implemented("'knsh authority trust' on this platform")
 }
 
 /// `user.sock` is a Unix socket; no other platform has one.

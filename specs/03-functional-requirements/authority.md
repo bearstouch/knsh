@@ -30,6 +30,13 @@ requirement guards only what the client receives, so the authority's first messa
 it sends anything else only after a reply has passed its requirement. Peers are identified by the message's audit
 token, never by pid.
 
+Implemented in KNSH-068 (FR-AUTH-01, FR-AUTH-02, FR-AUTH-10, FR-AUTH-11): [`authority.trust`](../06-api/user-socket.md#authoritytrust)
+stores the record as the Keychain item `knsh.authority-trust` after `knshd`'s own prompt, for a first record and a
+replacement alike, and the running control service switches to it at once;
+[`authority.register`](../06-api/control-service.md#authorityregister) admits one authority at a time and refuses
+others with `-32003`; `authority.connected` and `authority.disconnected` are engine events (no session). Removing
+trust is not specified yet (proposed: `knsh authority untrust`, with Touch ID).
+
 ## Decisions
 
 | ID | Requirement |

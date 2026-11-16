@@ -23,6 +23,11 @@
 //!   remembers the lost range per session, which [`EventBus::take`] reports as a [`Lost`] delivery before any later
 //!   event of that session: the subscriber is told, and reads what it missed from the record store.
 //! - **Scope.** A [`EventScope::Session`] subscription receives only that session's events (FR-EVT-01).
+//! - **Engine events.** A few events belong to the engine, not to a session: `authority.connected` and
+//!   `authority.disconnected` (FR-AUTH-02, KNSH-068). An [`EngineEvent`] has no session and no actor; it is numbered
+//!   in one engine sequence of its own (from 1, gapless, per bus), is not buffered (there is nothing to resume: a
+//!   `since_seq` names a session), and is queued only for [`EventScope::All`] subscriptions, in publication order with
+//!   the session events. When a queue overflows, dropped engine events are reported as an [`EngineLost`] range.
 //! - **Resume.** A session subscription may start after a `since_seq`: the buffered events after it are queued in
 //!   the same step that registers the subscription, so nothing is delivered twice and nothing falls between the
 //!   replay and the live events (FR-EVT-03).
@@ -222,6 +227,50 @@ impl CancelReason {
     }
 }
 
+/// The payload of an engine event: one that belongs to no session (KNSH-068).
+///
+/// Closed, like [`EventData`]: a new engine event is a new variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineEventData {
+    /// `authority.connected`: an authority registered on the control service (FR-AUTH-01, FR-AUTH-02).
+    AuthorityConnected,
+    /// `authority.disconnected`: the registered authority's connection ended (FR-AUTH-02).
+    AuthorityDisconnected,
+}
+
+impl EngineEventData {
+    /// The event name, the envelope's `event` member.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::AuthorityConnected => "authority.connected",
+            Self::AuthorityDisconnected => "authority.disconnected",
+        }
+    }
+}
+
+/// One engine event, as delivered to subscribers: the envelope of `specs/05-models/event.md` with no session and no
+/// actor (`session_id` and `actor` are `null` on the wire), and `seq` in the engine's own sequence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineEvent {
+    /// Unique event ID.
+    pub id: EventId,
+    /// Position in the engine sequence: 1 for the bus's first engine event, then one more per engine event.
+    pub seq: u64,
+    /// When the event was published, UTC microseconds.
+    pub ts: Timestamp,
+    /// The name and payload.
+    pub data: EngineEventData,
+}
+
+impl EngineEvent {
+    /// The event name, the envelope's `event` member.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.data.name()
+    }
+}
+
 impl EventData {
     /// The raw bytes the event carries beside its JSON: a `command.output` chunk. `None` for every other event.
     #[must_use]
@@ -363,6 +412,16 @@ pub struct Lost {
     pub to_seq: u64,
 }
 
+/// Engine events that a subscription will never receive: its queue overflowed (FR-EVT-04). Like [`Lost`], with the
+/// engine sequence instead of a session's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EngineLost {
+    /// The first lost engine `seq`.
+    pub from_seq: u64,
+    /// The last lost engine `seq` (inclusive).
+    pub to_seq: u64,
+}
+
 /// What [`EventBus::take`] hands a subscriber, in delivery order.
 #[derive(Clone, Debug)]
 pub enum Delivery {
@@ -370,6 +429,10 @@ pub enum Delivery {
     Event(Arc<Event>),
     /// A range of events that will never be delivered. Always reported before any later event of its session.
     Lost(Lost),
+    /// The next engine event (KNSH-068). Only [`EventScope::All`] subscriptions receive these.
+    Engine(Arc<EngineEvent>),
+    /// A range of engine events that will never be delivered. Always reported before any later engine event.
+    EngineLost(EngineLost),
 }
 
 /// What [`EventBus::subscribe`] tells the new subscriber.
@@ -392,6 +455,15 @@ pub struct Subscribed {
 pub struct Published {
     /// The event, as numbered and buffered.
     pub event: Arc<Event>,
+    /// Every subscription that received it, so the caller can wake their readers.
+    pub delivered_to: Vec<SubscriptionId>,
+}
+
+/// What [`EventBus::publish_engine`] did.
+#[derive(Clone, Debug)]
+pub struct PublishedEngine {
+    /// The event, as numbered.
+    pub event: Arc<EngineEvent>,
     /// Every subscription that received it, so the caller can wake their readers.
     pub delivered_to: Vec<SubscriptionId>,
 }
@@ -440,34 +512,59 @@ impl Buffer {
     }
 }
 
+/// One waiting event of a subscription: a session's or the engine's.
+#[derive(Debug)]
+enum Queued {
+    Session(Arc<Event>),
+    Engine(Arc<EngineEvent>),
+}
+
 /// One subscription's undelivered events.
 #[derive(Debug)]
 struct Subscription {
     scope: EventScope,
-    /// Waiting events, oldest first. Per session their `seq`s are consecutive.
-    queue: VecDeque<Arc<Event>>,
+    /// Waiting events, oldest first. Per session, and for the engine, their `seq`s are consecutive.
+    queue: VecDeque<Queued>,
     /// Dropped ranges per session, not yet reported.
     lost: BTreeMap<SessionId, Lost>,
+    /// Dropped engine events, not yet reported.
+    engine_lost: Option<EngineLost>,
 }
 
 impl Subscription {
     /// Queues `event`, dropping the oldest waiting event if the queue is full (FR-EVT-04).
     fn push(&mut self, event: Arc<Event>, limit: usize) {
-        self.queue.push_back(event);
+        self.push_queued(Queued::Session(event), limit);
+    }
+
+    /// Queues `queued`, dropping the oldest waiting event if the queue is full (FR-EVT-04).
+    fn push_queued(&mut self, queued: Queued, limit: usize) {
+        self.queue.push_back(queued);
         while self.queue.len() > limit {
             let Some(dropped) = self.queue.pop_front() else {
                 break;
             };
-            // A session's queued events are consecutive and the oldest goes first, so each drop extends the range
-            // already recorded for the session, or starts one.
-            self.lost
-                .entry(dropped.session_id)
-                .and_modify(|lost| lost.to_seq = dropped.seq)
-                .or_insert(Lost {
-                    session_id: dropped.session_id,
-                    from_seq: dropped.seq,
-                    to_seq: dropped.seq,
-                });
+            // A stream's queued events are consecutive and the oldest goes first, so each drop extends the range
+            // already recorded for its session (or the engine), or starts one.
+            match dropped {
+                Queued::Session(dropped) => {
+                    self.lost
+                        .entry(dropped.session_id)
+                        .and_modify(|lost| lost.to_seq = dropped.seq)
+                        .or_insert(Lost {
+                            session_id: dropped.session_id,
+                            from_seq: dropped.seq,
+                            to_seq: dropped.seq,
+                        });
+                }
+                Queued::Engine(dropped) => {
+                    let lost = self.engine_lost.get_or_insert(EngineLost {
+                        from_seq: dropped.seq,
+                        to_seq: dropped.seq,
+                    });
+                    lost.to_seq = dropped.seq;
+                }
+            }
         }
     }
 }
@@ -488,6 +585,8 @@ pub struct EventBus {
     subscriptions: BTreeMap<SubscriptionId, Subscription>,
     /// The next subscription ID; starts at 1.
     next_subscription: u64,
+    /// The `seq` the next engine event gets; starts at 1.
+    next_engine_seq: u64,
 }
 
 impl Default for EventBus {
@@ -510,6 +609,7 @@ impl EventBus {
             ended: VecDeque::new(),
             subscriptions: BTreeMap::new(),
             next_subscription: 1,
+            next_engine_seq: 1,
         }
     }
 
@@ -593,6 +693,26 @@ impl EventBus {
         Ok(Published { event, delivered_to })
     }
 
+    /// Numbers `data` as the engine's next event and queues it for every [`EventScope::All`] subscription. Engine
+    /// events are not buffered. Never waits for a subscriber (FR-EVT-04). Never fails.
+    pub fn publish_engine(&mut self, data: EngineEventData, id: EventId, ts: Timestamp) -> PublishedEngine {
+        let event = Arc::new(EngineEvent {
+            id,
+            seq: self.next_engine_seq,
+            ts,
+            data,
+        });
+        self.next_engine_seq += 1;
+        let mut delivered_to = Vec::new();
+        for (&subscription_id, subscription) in &mut self.subscriptions {
+            if subscription.scope == EventScope::All {
+                subscription.push_queued(Queued::Engine(Arc::clone(&event)), self.limits.queue_len);
+                delivered_to.push(subscription_id);
+            }
+        }
+        PublishedEngine { event, delivered_to }
+    }
+
     /// Drops the buffers of the oldest ended sessions beyond the limit. Subscriptions keep whatever they had already
     /// queued from them.
     fn forget_old_ended(&mut self) {
@@ -623,6 +743,7 @@ impl EventBus {
             scope,
             queue: VecDeque::new(),
             lost: BTreeMap::new(),
+            engine_lost: None,
         };
         let (oldest_seq, latest_seq, gap) = match scope {
             EventScope::All => {
@@ -671,6 +792,11 @@ impl EventBus {
     pub fn take(&mut self, id: SubscriptionId, max: usize) -> Option<Vec<Delivery>> {
         let subscription = self.subscriptions.get_mut(&id)?;
         let mut taken = Vec::new();
+        if taken.len() < max
+            && let Some(lost) = subscription.engine_lost.take()
+        {
+            taken.push(Delivery::EngineLost(lost));
+        }
         while taken.len() < max {
             let Some((_, lost)) = subscription.lost.pop_first() else {
                 break;
@@ -678,10 +804,13 @@ impl EventBus {
             taken.push(Delivery::Lost(lost));
         }
         while taken.len() < max {
-            let Some(event) = subscription.queue.pop_front() else {
+            let Some(queued) = subscription.queue.pop_front() else {
                 break;
             };
-            taken.push(Delivery::Event(event));
+            taken.push(match queued {
+                Queued::Session(event) => Delivery::Event(event),
+                Queued::Engine(event) => Delivery::Engine(event),
+            });
         }
         Some(taken)
     }
@@ -689,9 +818,9 @@ impl EventBus {
     /// Whether the subscription has something waiting. `false` for an unknown subscription.
     #[must_use]
     pub fn has_pending(&self, id: SubscriptionId) -> bool {
-        self.subscriptions
-            .get(&id)
-            .is_some_and(|subscription| !subscription.queue.is_empty() || !subscription.lost.is_empty())
+        self.subscriptions.get(&id).is_some_and(|subscription| {
+            !subscription.queue.is_empty() || !subscription.lost.is_empty() || subscription.engine_lost.is_some()
+        })
     }
 
     /// The oldest buffered `seq` of a session, or `None` if it has no buffer.
@@ -766,9 +895,74 @@ mod tests {
             .iter()
             .map(|delivery| match delivery {
                 Delivery::Event(event) => event.seq,
-                Delivery::Lost(lost) => panic!("unexpected lost range {lost:?}"),
+                other => panic!("unexpected delivery {other:?}"),
             })
             .collect()
+    }
+
+    fn engine(bus: &mut EventBus, data: EngineEventData) -> PublishedEngine {
+        bus.publish_engine(
+            data,
+            EventId::from_ulid(Ulid::from_u128(1)),
+            Timestamp::from_unix_micros(0).unwrap(),
+        )
+    }
+
+    // FR-AUTH-02, KNSH-068: engine events are numbered in their own gapless sequence, reach only subscriptions to
+    // every session, and keep their place among the session events.
+    #[test]
+    fn engine_events_reach_all_scope_subscriptions_in_order() {
+        let mut bus = EventBus::default();
+        start(&mut bus, 1);
+        let all = bus.subscribe(EventScope::All, None).unwrap().id;
+        let one = bus.subscribe(EventScope::Session(sid(1)), None).unwrap().id;
+        let connected = engine(&mut bus, EngineEventData::AuthorityConnected);
+        assert_eq!(connected.event.seq, 1);
+        assert_eq!(connected.event.name(), "authority.connected");
+        assert_eq!(connected.delivered_to, [all]);
+        idle(&mut bus, 1);
+        let disconnected = engine(&mut bus, EngineEventData::AuthorityDisconnected);
+        assert_eq!(disconnected.event.seq, 2);
+        assert_eq!(disconnected.event.name(), "authority.disconnected");
+
+        let names: Vec<_> = drain(&mut bus, all)
+            .iter()
+            .map(|delivery| match delivery {
+                Delivery::Event(event) => event.name(),
+                Delivery::Engine(event) => event.name(),
+                other => panic!("unexpected delivery {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["authority.connected", "session.idle", "authority.disconnected"]);
+        assert_eq!(
+            seqs(&drain(&mut bus, one)),
+            [2],
+            "a session subscription never sees engine events"
+        );
+    }
+
+    // FR-EVT-04 for engine events: an overflowing queue reports the dropped engine events as one range.
+    #[test]
+    fn dropped_engine_events_are_reported_as_lost() {
+        let mut bus = small(4, 2);
+        let all = bus.subscribe(EventScope::All, None).unwrap().id;
+        for _ in 0..4 {
+            engine(&mut bus, EngineEventData::AuthorityConnected);
+        }
+        assert!(bus.has_pending(all));
+        let deliveries = drain(&mut bus, all);
+        assert!(
+            matches!(
+                deliveries.as_slice(),
+                [
+                    Delivery::EngineLost(EngineLost { from_seq: 1, to_seq: 2 }),
+                    Delivery::Engine(third),
+                    Delivery::Engine(fourth),
+                ] if third.seq == 3 && fourth.seq == 4
+            ),
+            "{deliveries:?}"
+        );
+        assert!(!bus.has_pending(all));
     }
 
     fn small(buffer_len: usize, queue_len: usize) -> EventBus {
