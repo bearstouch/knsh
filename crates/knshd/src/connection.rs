@@ -35,16 +35,20 @@
 //!
 //! The loop works on any blocking [`Read`] and [`Write`], so tests drive it over a socket pair. It never logs:
 //! [`Closed`] says why the connection ended, without any content.
+//!
+//! **Whole messages** (KNSH-067). The control service receives each JSON-RPC message whole, in an XPC message,
+//! instead of as frames on a byte stream. [`MessageConnection`] keeps the same protocol state and applies the same
+//! rules one message at a time (handshake first, strict JSON, `-32700` closes); [`Outgoing`] is what to send back:
+//! the JSON, the raw bytes of the stream it names (an XPC data value instead of binary chunks), and whether to close.
+//! [`delivery_message`] turns one event delivery into the same notification the pump writes on a socket.
 
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
-#[cfg(test)]
-use knsh_core::StillWaiting;
-use knsh_core::{Caller, Delivery, Lost, SubscriptionId};
+use knsh_core::{Caller, Delivery, Event, Lost, StillWaiting, SubscriptionId};
 use knsh_json::{Frame, FrameReader, FrameWriter, JsonError, StreamId};
 use knsh_platform::AuditToken;
 use knsh_proto::{
@@ -498,18 +502,7 @@ fn write_delivery<W: Write>(
 ) -> Result<(), JsonError> {
     let lost = match delivery {
         Delivery::Event(event) => {
-            // The raw bytes to send after the notification, when they go in a binary stream.
-            let (notification, stream) = match (event.data.bytes(), bytes) {
-                (None, _) => (event_notification(subscription, event), None),
-                (Some(raw), ByteTransport::BinaryFrames) => (
-                    event_notification_with_bytes(subscription, event, OutputData::Stream(FIRST_STREAM)),
-                    Some(raw.expose().as_slice()),
-                ),
-                (Some(raw), ByteTransport::Base64) => (
-                    event_notification_with_bytes(subscription, event, OutputData::Base64(raw.expose())),
-                    None,
-                ),
-            };
+            let (notification, stream) = event_message(subscription, event, bytes);
             if let Some(value) = notification_value(notification) {
                 match writer.write_json(&value) {
                     // Nothing was written; the writer is still usable for the replacement.
@@ -535,6 +528,26 @@ fn write_delivery<W: Write>(
     };
     let value = notification_value(lost_notification(subscription, &lost)).ok_or(JsonError::TooDeep)?;
     writer.write_json(&value)
+}
+
+/// The notification for one event, and its raw bytes when they go beside it (in a binary stream on [`FIRST_STREAM`],
+/// or a data value over XPC) rather than as base64 inside it.
+fn event_message(
+    subscription: SubscriptionId,
+    event: &Event,
+    bytes: ByteTransport,
+) -> (Result<knsh_proto::Notification, ProtoError>, Option<&[u8]>) {
+    match (event.data.bytes(), bytes) {
+        (None, _) => (event_notification(subscription, event), None),
+        (Some(raw), ByteTransport::BinaryFrames) => (
+            event_notification_with_bytes(subscription, event, OutputData::Stream(FIRST_STREAM)),
+            Some(raw.expose().as_slice()),
+        ),
+        (Some(raw), ByteTransport::Base64) => (
+            event_notification_with_bytes(subscription, event, OutputData::Base64(raw.expose())),
+            None,
+        ),
+    }
 }
 
 /// A built notification as a JSON value, or `None` if it could not be built.
@@ -583,6 +596,153 @@ fn internal_error(message: &Message) -> Message {
         Message::Request(_) | Message::Notification(_) => None,
     };
     failure(id, RpcError::new(ErrorCode::InternalError))
+}
+
+/// One encoded message for a transport that carries whole messages (the control service, KNSH-067): the JSON text,
+/// and the raw bytes of the stream it names, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct Outgoing {
+    /// The JSON message, strict profile, at most [`knsh_json::MAX_PAYLOAD`] bytes. `None`: nothing to send.
+    pub(crate) json: Option<Vec<u8>>,
+    /// Raw bytes for the stream the JSON names (`records.output`), sent beside it instead of in binary chunks.
+    pub(crate) bytes: Option<Vec<u8>>,
+    /// Whether the connection is closed after this.
+    pub(crate) close: bool,
+}
+
+/// The protocol state of one connection whose messages arrive whole (the control service, KNSH-067). Exactly the
+/// rules of a socket connection ([`Session`]), one message at a time; owned, so it lives across the transport's
+/// callbacks.
+pub(crate) struct MessageConnection {
+    endpoint: Endpoint,
+    dispatcher: Arc<Dispatcher>,
+    /// Shared with the connection's event pump.
+    subscriber: Arc<Subscriber>,
+    binding: SessionBinding,
+    /// Whether the client takes raw bytes as binary values (`true`) or base64 in JSON, for the event pump.
+    pump_bytes: Arc<AtomicBool>,
+    greeted: bool,
+    bytes: ByteTransport,
+    unbound: bool,
+    next_stream: StreamId,
+}
+
+impl MessageConnection {
+    /// A new connection on `endpoint`, before its `hello`.
+    pub(crate) fn new(endpoint: Endpoint, dispatcher: Arc<Dispatcher>) -> Self {
+        Self {
+            endpoint,
+            dispatcher,
+            subscriber: Arc::new(Subscriber::new()),
+            // No audit token: the control service identifies its peer by code signature, per message, and no
+            // control method looks for an envelope.
+            binding: SessionBinding::for_peer(None),
+            pump_bytes: Arc::new(AtomicBool::new(true)),
+            greeted: false,
+            bytes: ByteTransport::BinaryFrames,
+            unbound: false,
+            next_stream: FIRST_STREAM,
+        }
+    }
+
+    /// The connection's subscriptions, for its event pump.
+    pub(crate) fn subscriber(&self) -> &Arc<Subscriber> {
+        &self.subscriber
+    }
+
+    /// The byte transport the latest `hello` chose, as the event pump reads it.
+    pub(crate) fn pump_bytes(&self) -> &Arc<AtomicBool> {
+        &self.pump_bytes
+    }
+
+    /// Handles one whole JSON message and says what to send back.
+    ///
+    /// The caller is treated as still connected for the whole call ([`StillWaiting`]): the transport delivers a
+    /// disconnect only after the call returns, and no control method waits on a decision yet.
+    pub(crate) fn handle(&mut self, payload: &[u8]) -> Outgoing {
+        let mut session = Session {
+            endpoint: self.endpoint,
+            dispatcher: &self.dispatcher,
+            subscriber: &self.subscriber,
+            binding: &self.binding,
+            caller: &StillWaiting,
+            greeted: self.greeted,
+            bytes: self.bytes,
+            pump_bytes: &self.pump_bytes,
+            unbound: self.unbound,
+            next_stream: self.next_stream,
+        };
+        // No descriptors ever arrive over XPC; an empty set refuses nothing that could not be refused anyway.
+        let step = session.handle(payload, &Passed::default());
+        self.greeted = session.greeted;
+        self.bytes = session.bytes;
+        self.unbound = session.unbound;
+        self.next_stream = session.next_stream;
+        let (json, bytes) = match step.reply {
+            None => (None, None),
+            Some(reply) => match encode(&reply) {
+                Some(json) => (Some(json), step.stream.map(|(_, bytes)| bytes)),
+                // As on a socket: an answer that cannot be sent as strict JSON is replaced by `-32603` for the same
+                // request, and the stream it announced is not sent.
+                None => (encode(&internal_error(&reply)), None),
+            },
+        };
+        Outgoing {
+            json,
+            bytes,
+            close: step.close,
+        }
+    }
+
+    /// Ends the connection: every subscription ends, and so does a human session bound to it.
+    pub(crate) fn close(&self) {
+        self.subscriber.close();
+        self.binding.release();
+    }
+}
+
+/// `message` as strict JSON text, or `None` if it cannot be written or is larger than a frame may be.
+fn encode(message: &Message) -> Option<Vec<u8>> {
+    encode_value(&message.to_value().ok()?)
+}
+
+/// `value` as strict JSON text, or `None` if it cannot be written or is larger than a frame may be.
+fn encode_value(value: &knsh_json::Value) -> Option<Vec<u8>> {
+    let text = knsh_json::write(value).ok()?;
+    (text.len() <= knsh_json::MAX_PAYLOAD).then(|| text.into_bytes())
+}
+
+/// One event delivery as a whole message: the notification the pump writes on a socket, with an event's raw bytes
+/// beside it (or base64 in it, as `bytes` says). An event too large for one message is announced as a lost range of
+/// exactly that event instead (FR-EVT-04). `None` only if not even that could be written.
+pub(crate) fn delivery_message(
+    subscription: SubscriptionId,
+    delivery: &Delivery,
+    bytes: ByteTransport,
+) -> Option<Outgoing> {
+    let lost = match delivery {
+        Delivery::Event(event) => {
+            let (notification, raw) = event_message(subscription, event, bytes);
+            if let Some(json) = notification_value(notification).as_ref().and_then(encode_value) {
+                return Some(Outgoing {
+                    json: Some(json),
+                    bytes: raw.map(<[u8]>::to_vec),
+                    close: false,
+                });
+            }
+            Lost {
+                session_id: event.session_id,
+                from_seq: event.seq,
+                to_seq: event.seq,
+            }
+        }
+        Delivery::Lost(lost) => *lost,
+    };
+    let value = notification_value(lost_notification(subscription, &lost))?;
+    Some(Outgoing {
+        json: Some(encode_value(&value)?),
+        ..Outgoing::default()
+    })
 }
 
 #[cfg(test)]

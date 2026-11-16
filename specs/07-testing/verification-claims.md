@@ -384,6 +384,12 @@ the same user (out of scope); the authority's check of `knshd` is what catches a
 lightweight code requirements of macOS 14.4 and the `xpc_peer_requirement_t` API of macOS 26 were not tested and are
 not needed.
 
+**Implemented (KNSH-067).** `knsh-platform`'s `macos::XpcControlService` does exactly this. Observed in its tests on
+macOS 26.6.2, in-process on an anonymous listener: with no trusted authority a connection cancelled before it is
+resumed fails on the client side with no message delivered, and an ad-hoc-signed client is refused by
+`xpc_connection_set_peer_code_signing_requirement` (`XPC_ERROR_PEER_CODE_SIGNING_REQUIREMENT` on the service side)
+before any message reaches the handler. A Developer ID authority against an installed, signed `knshd` is pending.
+
 ## Proxy results (KNSH-027: C9, C10)
 
 Observed on 2026-11-14 on an Apple M1 Pro, macOS 26.6.2 (25G83), from a normal account; nothing ran as root. Tools:

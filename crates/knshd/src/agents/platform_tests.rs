@@ -49,7 +49,7 @@ impl Running {
         let fixture = fixture_on(Some(Arc::new(SystemProcessTree::new())));
         let dispatcher = super::endpoint_tests::dispatcher(&fixture);
         let services = Services {
-            dispatcher,
+            dispatcher: Arc::new(dispatcher),
             credentials: Arc::new(SystemPeerCredentials::new()),
             log: Arc::new(RecordingLog::new()),
             own_uid: effective_uid(),

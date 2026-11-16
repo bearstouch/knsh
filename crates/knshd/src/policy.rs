@@ -206,6 +206,8 @@ impl PolicyCheck {
             (Endpoint::User, PolicyCheckTarget::Caller) => Err(RpcError::new(ErrorCode::InvalidParams)),
             (Endpoint::User, PolicyCheckTarget::Session(session_id)) => self.sessions.profile_of(*session_id),
             (Endpoint::User, PolicyCheckTarget::Profile(name)) => Ok(name.clone()),
+            // Dry runs are for the sockets only (KNSH-043); the catalogue keeps them off the control service.
+            (Endpoint::Control, _) => Err(RpcError::new(ErrorCode::NotAllowed)),
         }
     }
 }

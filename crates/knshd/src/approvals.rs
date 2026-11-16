@@ -355,7 +355,8 @@ impl LocalApprovals for Approvals {
 fn user_only(call: &Call<'_>) -> Result<(), RpcError> {
     match call.endpoint {
         Endpoint::User => Ok(()),
-        Endpoint::Agent => Err(RpcError::new(ErrorCode::NotAllowed)),
+        // The authority answers asks with `decision.respond` (KNSH-069), never through the local approvals.
+        Endpoint::Agent | Endpoint::Control => Err(RpcError::new(ErrorCode::NotAllowed)),
     }
 }
 

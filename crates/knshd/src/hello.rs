@@ -48,8 +48,9 @@ impl Handshake {
         let params: HelloParams = call.request.params().map_err(|error| RpcError::from(&error))?;
         let protocol = negotiate(&params.protocols).ok_or_else(|| capability_unavailable(PROTOCOL_CAPABILITY))?;
         // agent.sock: every later call acts for exactly this session; without one the caller is refused (-32009).
+        // The control service acts across all sessions, like user.sock.
         let session_id = match call.endpoint {
-            Endpoint::User => None,
+            Endpoint::User | Endpoint::Control => None,
             Endpoint::Agent => Some(self.sessions.bind_agent(call.binding, params.session_token.as_ref())?),
         };
         // The probed backends, with the violation reader's state as it is now: the reader can stop and restart
@@ -257,6 +258,7 @@ pub(crate) mod tests {
                 let params = match endpoint {
                     Endpoint::User => PARAMS,
                     Endpoint::Agent => &agent_params,
+                    Endpoint::Control => unreachable!("Endpoint::ALL lists the sockets"),
                 };
                 let result = hello(&dispatcher, endpoint, params).unwrap();
                 let mut listed = methods(&result);
@@ -270,6 +272,18 @@ pub(crate) mod tests {
                 listed.sort_unstable();
                 assert_eq!(listed, dispatcher.methods(endpoint), "{}", endpoint.name());
             }
+            // KNSH-067: the control service is dispatched from the same catalogue; `hello` there names no session.
+            let result = hello(&dispatcher, Endpoint::Control, PARAMS).unwrap();
+            assert!(result.get("session_id").is_none());
+            let mut listed = methods(&result);
+            let from_catalogue: Vec<&str> = Catalogue::ENGINE
+                .available(knsh_proto::Endpoint::Control, &capabilities)
+                .map(|spec| spec.name)
+                .collect();
+            assert_eq!(listed, from_catalogue);
+            assert!(!listed.contains(&"policy.check"), "dry runs are for the sockets only");
+            listed.sort_unstable();
+            assert_eq!(listed, dispatcher.methods(Endpoint::Control));
         }
     }
 

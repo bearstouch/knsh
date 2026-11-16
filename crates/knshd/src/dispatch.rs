@@ -61,13 +61,16 @@ impl Passed {
     }
 }
 
-/// A Unix-socket endpoint (`specs/02-architecture/endpoints.md`). The control service (XPC) is not served here.
+/// An endpoint (`specs/02-architecture/endpoints.md`): the two Unix sockets, and the XPC control service (KNSH-067),
+/// whose messages carry the same JSON-RPC payloads and are dispatched through the same tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Endpoint {
     /// `user.sock`: user processes outside envelopes.
     User,
     /// `agent.sock`: processes inside envelopes.
     Agent,
+    /// The control service: only the trusted, code-signed authority, verified on every message (KNSH-067).
+    Control,
 }
 
 impl Endpoint {
@@ -80,6 +83,7 @@ impl Endpoint {
         match self {
             Self::User => "user",
             Self::Agent => "agent",
+            Self::Control => "control",
         }
     }
 
@@ -88,6 +92,7 @@ impl Endpoint {
         match self {
             Self::User => knsh_proto::Endpoint::User,
             Self::Agent => knsh_proto::Endpoint::Agent,
+            Self::Control => knsh_proto::Endpoint::Control,
         }
     }
 }
@@ -207,13 +212,14 @@ pub(crate) enum Route<'a> {
     Unknown,
 }
 
-/// The dispatch tables of both endpoints, with the catalogue and capabilities they were generated from.
+/// The dispatch tables of every endpoint, with the catalogue and capabilities they were generated from.
 #[derive(Clone)]
 pub(crate) struct Dispatcher {
     catalogue: Catalogue,
     capabilities: Arc<Capabilities>,
     user: Table,
     agent: Table,
+    control: Table,
 }
 
 impl Dispatcher {
@@ -246,16 +252,18 @@ impl Dispatcher {
         };
         let user = table(Endpoint::User)?;
         let agent = table(Endpoint::Agent)?;
+        let control = table(Endpoint::Control)?;
         Ok(Self {
             catalogue,
             capabilities,
             user,
             agent,
+            control,
         })
     }
 
-    /// Tables given directly, for tests of the connection loop and server. Calls outside them are still answered
-    /// from the engine catalogue, with every backend `none`.
+    /// Tables given directly, for tests of the connection loop and server; the control service serves nothing.
+    /// Calls outside them are still answered from the engine catalogue, with every backend `none`.
     #[cfg(test)]
     pub(crate) fn from_tables(user: Table, agent: Table) -> Self {
         Self {
@@ -263,6 +271,7 @@ impl Dispatcher {
             capabilities: Arc::new(tests::no_backends()),
             user,
             agent,
+            control: Table::new(),
         }
     }
 
@@ -274,6 +283,7 @@ impl Dispatcher {
         match endpoint {
             Endpoint::User => self.user = self.user.with(name, handler),
             Endpoint::Agent => self.agent = self.agent.with(name, handler),
+            Endpoint::Control => self.control = self.control.with(name, handler),
         }
         self
     }
@@ -282,6 +292,7 @@ impl Dispatcher {
         match endpoint {
             Endpoint::User => &self.user,
             Endpoint::Agent => &self.agent,
+            Endpoint::Control => &self.control,
         }
     }
 

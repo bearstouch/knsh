@@ -12,6 +12,22 @@ An XPC Mach service (`knsh.control`, final name tied to the signing identity) re
 | `recording.set` | Turn command or output recording on or off for a session |
 | Every `user.sock` read and checkpoint method | Across all sessions |
 
+## Verification
+
+Implemented in KNSH-067 (decision 13), FR-AUTH-12 – FR-AUTH-14:
+
+- `knshd` serves the Mach name its launch agent declares, and sets the trusted authority's peer code-signing
+  requirement on every connection before resuming it: Apple-anchored, the trusted team and identifier, a Developer ID
+  or Mac App Store certificate, and no `get-task-allow` entitlement. XPC refuses a peer that does not meet it before
+  any message is delivered.
+- For **every message**, before it is read, `knshd` identifies the sender by the message's audit token (never by pid)
+  and checks hardened runtime, a valid live signature, that it is neither debuggable nor being debugged, and that its
+  `CFBundleVersion` is at least the trusted minimum. Any failure, or any doubt, closes the connection without an
+  answer.
+- Peers running as another user (or root) are refused.
+- With no trusted authority, every connection is refused before it is resumed.
+- An open, verified connection keeps `knshd` alive, like a socket connection.
+
 ## Decision protocol
 
 ```json

@@ -90,7 +90,18 @@
 //!
 //! `macos::hmac_sha256` is `CommonCrypto`'s HMAC, the MAC the signer uses.
 //!
-//! Later stories add XPC, `FSEvents` and APFS clones to the same interface.
+//! The `control` module (KNSH-067) decides who may use the XPC control service: the trust record's parts
+//! ([`TrustedAuthority`]), the peer code-signing requirement built from them ([`peer_requirement`]), and
+//! [`PeerGate::admit`], which checks every message's sender by audit token (hardened runtime, not debuggable, minimum
+//! version) and refuses everything when no authority is trusted. `macos::XpcControlService` is the transport: it
+//! sets the requirement on every peer, admits each message before reading it, and hands the JSON to a
+//! [`ControlHandler`].
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`CodeSigning`] | Signature facts of a message's sender | `SecCodeSigning` (`SecCodeCreateWithXPCMessage`) | `FakeCodeSigning` |
+//!
+//! Later stories add `FSEvents` and APFS clones to the same interface.
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
 //! in a fake. All failures use the single crate error, [`PlatformError`], whose messages never echo paths or other
@@ -130,6 +141,8 @@
 //!   KNSH-049)
 //! - NFR-SEC-04, FR-AUTH-41, FR-AUTH-42, decision 12 (user presence through `LocalAuthentication`, KNSH-064)
 //! - FR-POL-40, FR-POL-41, FR-POL-42, decision 11 (policy file signatures, Keychain signing key, KNSH-065)
+//! - FR-AUTH-12 – FR-AUTH-14, NFR-SEC-01, decision 13, `specs/06-api/control-service.md`,
+//!   `specs/06-api/wire-format.md#control-service-xpc` (XPC control service with peer verification, KNSH-067)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
@@ -138,6 +151,7 @@
 
 mod ancestry;
 mod clock;
+mod control;
 pub mod engine_dirs;
 mod error;
 mod fs;
@@ -168,6 +182,11 @@ pub mod testing;
 
 pub use ancestry::{AuditToken, ProcessIdentity, ProcessKey, ProcessTree};
 pub use clock::{Clock, Monotonic};
+pub use control::{
+    AfterMessage, BYTES_KEY, BundleVersion, CodeSigning, ConnectionId, ControlHandler, ControlPeer, JSON_KEY,
+    MAX_CONTROL_PAYLOAD, PeerGate, PeerRejection, SignatureFacts, SigningIdentifier, TeamId, TrustError,
+    TrustedAuthority, peer_requirement,
+};
 pub use engine_dirs::{EnginePaths, ensure_engine_dirs};
 pub use error::{Operation, PlatformError, SqliteCode};
 pub use fs::{FileKind, Fs, Metadata};
