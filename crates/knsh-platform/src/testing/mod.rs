@@ -18,6 +18,9 @@
 //! - [`ScriptedDenialLog`]: sandbox denial entries written by the test, canaries echoed back, failing opens and
 //!   ended streams (KNSH-047); [`kernel_entry`] writes one entry as the kernel logs it.
 //!
+//! - [`ScriptedPresence`]: the authentication prompt answered as the test scripts, refusing when nothing is
+//!   scripted; records every prompt's reason and timeout (KNSH-064).
+//!
 //! - [`FakeResolver`]: host names resolved to the addresses the test sets, every question counted (KNSH-060).
 //!
 //! Locks in the fakes are independent (one per fake) and never held across calls into another fake.
@@ -28,6 +31,7 @@ mod denials;
 mod fs;
 mod launchd;
 mod log;
+mod presence;
 mod probe;
 mod process;
 mod random;
@@ -39,6 +43,7 @@ pub use denials::{ScriptedDenialLog, kernel_entry};
 pub use fs::{DEFAULT_UID, MemFs};
 pub use launchd::{FakeSocketActivation, FixedPeerCredentials, RecordingServiceManager, ServiceCall};
 pub use log::{Entry, RecordingLog};
+pub use presence::{Prompt, ScriptedPresence};
 pub use probe::FakeSystemProbe;
 pub use process::{Script, ScriptedProcesses};
 pub use random::SeededRandom;

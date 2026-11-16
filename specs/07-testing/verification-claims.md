@@ -318,6 +318,11 @@ fail closed. `knshd` cannot rely on a "no GUI" error: the prompt went to the con
 graphics access. Every outcome other than success (cancel, error, no answer by `timeout_at`) denies with a reason
 naming the cause, and the context is invalidated at the timeout.
 
+**Implementation (KNSH-064):** `knsh-platform` `macos::LocalAuthentication` follows this. Its reply block was checked
+against the real block runtime, and real `NSError` values were mapped to refusals, by unit tests on macOS 26.6.2. A
+prompt shown by `knshd` itself, and the Touch ID, cancel, timeout and SSH cases, are still **pending** (manual:
+`cargo test -p knsh-platform -- --ignored shows_the_system_prompt`).
+
 ### C7: XPC peer code-signing requirements
 
 The service is a launchd agent declaring the Mach service in its plist (Developer ID, hardened runtime, version 1.0).

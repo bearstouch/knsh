@@ -71,7 +71,16 @@
 //! arrives, bounded and close-on-exec. Concrete, like the kqueue: tested over real socket pairs.
 //! [`EnginePaths::shim_dir`] names the shim directory, the one engine-managed path outside the fixed denies.
 //!
-//! Later stories add Keychain, `LocalAuthentication`, XPC, `FSEvents` and APFS clones to the same interface.
+//! The `presence` module (KNSH-064) asks the person at the Mac for Touch ID or their password before a
+//! security-changing action. `knshd` shows the prompt itself, with the exact command or change in it
+//! ([`PromptReason`]); success is an [`Authenticated`] proof only this crate can make, and every other outcome is a
+//! [`NotAuthenticated`] refusal.
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`UserPresence`] | Authenticate the user with a reason text | `LocalAuthentication` (`LAContext`) | `ScriptedPresence` |
+//!
+//! Later stories add Keychain, XPC, `FSEvents` and APFS clones to the same interface.
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
 //! in a fake. All failures use the single crate error, [`PlatformError`], whose messages never echo paths or other
@@ -109,6 +118,7 @@
 //! - FR-AGT-23, `specs/02-architecture/endpoints.md` (audit tokens and process ancestry for `agent.sock`, KNSH-048)
 //! - FR-AGT-10, FR-OUT-04, `specs/06-api/wire-format.md#descriptors` (descriptor passing and the shim directory,
 //!   KNSH-049)
+//! - NFR-SEC-04, FR-AUTH-41, FR-AUTH-42, decision 12 (user presence through `LocalAuthentication`, KNSH-064)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
@@ -124,6 +134,7 @@ pub mod launchd;
 mod log;
 mod lookup;
 mod policy_source;
+mod presence;
 pub mod probe;
 mod process;
 mod random;
@@ -151,6 +162,7 @@ pub use fs::{FileKind, Fs, Metadata};
 pub use launchd::{LaunchAgent, PeerCredentials, ServiceManager, SocketActivation, install_agent, uninstall_agent};
 pub use log::{Field, Level, SystemLog, Value, render};
 pub use policy_source::PolicyDirectory;
+pub use presence::{Authenticated, NotAuthenticated, PromptReason, UserPresence};
 pub use probe::{ProbeFailure, SystemProbe};
 pub use process::{ExitStatus, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest, Stdio};
 pub use random::Random;

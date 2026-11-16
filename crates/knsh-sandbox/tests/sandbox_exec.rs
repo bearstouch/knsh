@@ -10,7 +10,7 @@
 // Test helpers outside `#[test]` functions: a failed step should stop the test.
 #![allow(clippy::unwrap_used, clippy::panic)]
 
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::num::NonZeroU16;
 use std::os::unix::net::UnixListener;
@@ -22,7 +22,7 @@ use knsh_core::{
     CanonicalPath, FixedDenies, LookupError, PathContext, PolicyFs, ProfileName, ProfileSource, RecordId, SessionId,
     Ulid, load_profile_text,
 };
-use knsh_sandbox::{CommandTag, ProfileInput, compile};
+use knsh_sandbox::{CommandTag, ProfileInput, SYSTEM_TOOL_FOLDERS, compile};
 
 /// The real filesystem, as the loader sees it.
 struct RealPaths;
@@ -370,16 +370,27 @@ fn unix_sockets_limited_under_sandbox_exec() {
 #[test]
 fn executables_and_signals_limited_under_sandbox_exec() {
     let fixture = Fixture::new("045-exec");
-    // A copy of a platform binary is killed by the system unless re-signed, so it is signed ad hoc.
+    // A project binary: a native program built here, which the linker signs ad hoc. Not a copy of `/bin/echo`: its
+    // only Apple silicon slice is arm64e, which macOS 15 refuses to run once the binary is no longer a platform
+    // binary (observed on the macOS 15.8.2 CI runner; macOS 26.6 runs it), so it failed even under `allow`.
     let copied = fixture.project().join("bin/echo");
-    std::fs::copy("/bin/echo", &copied).unwrap();
-    let signed = Command::new("/usr/bin/codesign")
-        .args(["-s", "-", "-f"])
+    let mut cc = Command::new("/usr/bin/cc")
+        .args(["-x", "c", "-", "-o"])
         .arg(&copied)
-        .stderr(Stdio::null())
-        .status()
+        .stdin(Stdio::piped())
+        .spawn()
         .unwrap();
-    assert!(signed.success());
+    cc.stdin
+        .take()
+        .unwrap()
+        .write_all(b"int main(void) { return 0; }\n")
+        .unwrap();
+    assert!(cc.wait().unwrap().success(), "cc failed");
+    // A precondition, so a binary the system will not run cannot pass for a sandbox failure.
+    assert!(
+        Command::new(&copied).status().unwrap().success(),
+        "the project binary does not run unsandboxed"
+    );
     let script = fixture.project().join("bin/build.sh");
     std::fs::write(&script, "#!/bin/sh\necho built\n").unwrap();
     std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
@@ -405,18 +416,30 @@ fn executables_and_signals_limited_under_sandbox_exec() {
     let _ = sleeper.kill();
     let _ = sleeper.wait();
 
-    // Trusted and system tool folders: `/usr/bin/git` runs the developer directory's git.
+    // Trusted and system tool folders: `/usr/bin/git` runs the active developer directory's git. That directory is
+    // covered only if it is one of `SYSTEM_TOOL_FOLDERS`; any other (`Xcode-beta.app`, or `Xcode_16.4.app` on the CI
+    // runner, chosen through `DEVELOPER_DIR`) is documented as not covered, so there the stub's git must be refused.
+    let developer_dir = Command::new("/usr/bin/xcode-select").arg("-p").output().unwrap();
+    assert!(developer_dir.status.success(), "no developer directory");
+    let developer_dir = std::fs::canonicalize(String::from_utf8(developer_dir.stdout).unwrap().trim()).unwrap();
+    let covered = SYSTEM_TOOL_FOLDERS
+        .iter()
+        .any(|folder| developer_dir.starts_with(folder));
     let mut git = Command::new("/usr/bin/sandbox-exec")
         .arg("-f")
         .arg(&fixture.deny)
         .args(["/usr/bin/git", "--version"])
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .unwrap();
     let mut version = String::new();
     git.stdout.take().unwrap().read_to_string(&mut version).unwrap();
-    assert!(
-        git.wait().unwrap().success() && version.starts_with("git version"),
-        "{version}"
+    let ran = git.wait().unwrap().success() && version.starts_with("git version");
+    assert_eq!(
+        ran,
+        covered,
+        "developer directory {}: {version}",
+        developer_dir.display()
     );
 }
