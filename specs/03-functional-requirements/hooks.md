@@ -33,6 +33,28 @@ A hook is an executable registered in the user's configuration for `command.prop
 | FR-HOOK-12 | The final verdict must be the most restrictive of all: deny, then ask, then allow. |
 | FR-HOOK-13 | A rewrite must apply only when the final verdict is not deny. |
 
+How these combine, pass by pass (KNSH-063; one evaluation pass per line, see
+[the decision pipeline](command-lifecycle.md#the-decision-pipeline-knsh-050)):
+
+- **The chain.** Hooks run in declared order. The first `deny`, or a hook failure (FR-HOOK-04), ends the chain and
+  denies the line with source `hook`; policy is not evaluated. `allow` and `annotate` decide nothing. An `ask` is
+  remembered and the chain goes on; the first asking hook is the one named.
+- **A rewrite** ends the chain of its pass: the hooks after the rewriting one do not run on the old line, and policy
+  never judges it (FR-HOOK-11). The new line gets a pass of its own, with its own `command.proposed`, in which every
+  hook runs again on the new line, the rewriting hook included, then policy. A hook that rewrites must therefore
+  answer `allow` (or anything but `rewrite`) for its own output: a second rewrite denies the line (FR-AUTH-31).
+- **Asks of a rewritten pass are not carried over.** They judged a line that will not run; every hook judges the new
+  line in its own pass.
+- **Most restrictive.** On a pass whose hooks neither denied nor rewrote, the final verdict is the strictest of the
+  hooks' and policy's (deny, then ask, then allow). A hook's `ask` on a line the rules allow is asked about with no
+  `rule_id`; when both ask, the rule and the hook are named.
+- **A denied rewrite is not applied.** When the rewritten line's pass ends in a deny (a hook, a failing hook,
+  policy, the authority or the user), nothing runs and the record's verdict is `deny`, never `rewrite`. The record's
+  `command` is the rewritten line, the one the denial applies to, and `rewritten_from` the received line, so the
+  denial can be explained. Only a line that runs carries the `rewrite` verdict.
+- **Annotations** from every hook that ran, in both passes, are kept in the record's `decision.hooks`, whatever the
+  verdict.
+
 ## Rate limiting
 
 | ID | Requirement |

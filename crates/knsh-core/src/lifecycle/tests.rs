@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::hook::{Ended, Execution, HookConfig, HookExecutor, HookExit, HookSpec, parse_hooks, run_hooks};
 use crate::policy::paths::testing::FakeFs;
 use crate::policy::{LookupError, PathContext, ProfileSource, load_profile_text, load_unattended};
 use crate::record::HookResult;
@@ -145,8 +146,10 @@ struct ScriptedAsker<'a> {
 
 impl ScriptedAsker<'_> {
     fn answer(&self, request: &AskRequest<'_>) -> AskAnswer {
+        // The asking hook is journalled only when one is named, so the asks of hook-less tests read as before.
+        let hook = request.hook.map(|hook| format!(" hook={hook}")).unwrap_or_default();
         self.journal.push(format!(
-            "ask {} {} rule={}",
+            "ask {} {} rule={}{hook}",
             self.name,
             request.proposal.command.expose(),
             request.rule_id.unwrap_or("-")
@@ -263,6 +266,16 @@ impl Harness {
     }
 
     fn decide(&self, line: &str) -> Outcome {
+        let hooks = ScriptedHooks {
+            journal: &self.journal,
+            script: RefCell::new(self.hooks.clone()),
+            report_runs: self.report_runs,
+        };
+        self.decide_with(line, &hooks)
+    }
+
+    /// Decides `line` with `hooks` in place of the scripted ones.
+    fn decide_with(&self, line: &str, hooks: &dyn Hooks) -> Outcome {
         let actor = Actor::Agent(AgentId::new("claude-code").unwrap());
         let cwd = CanonicalPath::new("/Users/u/app").unwrap();
         let input = LineInput {
@@ -273,11 +286,6 @@ impl Harness {
             command: line,
             cwd: &cwd,
             env_path: "/usr/bin:/bin",
-        };
-        let hooks = ScriptedHooks {
-            journal: &self.journal,
-            script: RefCell::new(self.hooks.clone()),
-            report_runs: self.report_runs,
         };
         let authority = ScriptedAsker {
             name: "authority",
@@ -297,7 +305,7 @@ impl Harness {
         let effects = Effects {
             lookup: &binaries(),
             observer: &Events(&self.journal),
-            hooks: &hooks,
+            hooks,
             authority: &authority,
             approvals: &approvals,
             caller: &caller,
@@ -737,4 +745,286 @@ fn refusals_carry_the_normalised_line_key() {
     let refusal = refused(harness.decide("  git push "));
     assert_eq!(refusal.decision.source, DecisionSource::Authority);
     assert_eq!(refusal.line_key, Some(LineKey::of("/usr/bin/git push")));
+}
+
+// ---- Combining verdicts and the rewrite chain (KNSH-063) ----
+
+/// Hook processes that answer from a function of their file name and the line they are given, recording both.
+struct LineExecutor {
+    /// `(hook file name, line)` for every run, in order.
+    seen: RefCell<Vec<(String, String)>>,
+    answer: fn(&str, &str) -> &'static str,
+}
+
+impl HookExecutor for LineExecutor {
+    fn execute(&self, hook: &HookSpec, input: &[u8]) -> Execution {
+        let name = hook.program.file_name().unwrap().to_str().unwrap().to_owned();
+        let line = String::from_utf8(input.to_vec()).unwrap();
+        let stdout = (self.answer)(&name, &line).as_bytes().to_vec();
+        self.seen.borrow_mut().push((name, line));
+        Execution {
+            ended: Ended::Finished {
+                stdout,
+                exit: HookExit::Exited(0),
+            },
+            duration: std::time::Duration::from_millis(1),
+        }
+    }
+}
+
+/// The real chain ([`run_hooks`]) over `config`, each hook given the pass's line as its input.
+struct Chain<'a> {
+    config: HookConfig,
+    executor: &'a LineExecutor,
+}
+
+impl Hooks for Chain<'_> {
+    fn run(&self, proposal: &Proposal<'_>) -> HookOutcome {
+        let input = proposal.command.expose().as_bytes();
+        run_hooks(&self.config, proposal, Some(input), self.executor)
+    }
+}
+
+/// Hooks `first`, `rewriter` and `last`, declared in that order.
+fn three_hooks() -> HookConfig {
+    let text = ["first", "rewriter", "last"]
+        .iter()
+        .map(|name| {
+            format!(
+                "[[hooks]]\nevent = \"command.proposed\"\nrun = \"~/.config/knsh/hooks/{name}\"\ntimeout_ms = 100\n"
+            )
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    parse_hooks(&knsh_toml::parse(text.as_bytes()).unwrap(), Path::new("/Users/u"))
+}
+
+// FR-HOOK-10: a rewrite replaces the line for the hooks after the rewriting one: they never see the old line, and in
+// the new line's pass every hook judges the new line.
+#[test]
+fn later_hooks_see_rewritten_line() {
+    let executor = LineExecutor {
+        seen: RefCell::new(Vec::new()),
+        answer: |hook, line| match (hook, line) {
+            ("rewriter", "rm -rf build") => r#"{"verdict":"rewrite","command":"ls build"}"#,
+            _ => r#"{"verdict":"allow"}"#,
+        },
+    };
+    let chain = Chain {
+        config: three_hooks(),
+        executor: &executor,
+    };
+    let harness = Harness::new();
+    let run = allowed(harness.decide_with("rm -rf build", &chain));
+
+    let seen: Vec<_> = executor
+        .seen
+        .borrow()
+        .iter()
+        .map(|(hook, line)| format!("{hook}: {line}"))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            "first: rm -rf build",
+            "rewriter: rm -rf build",
+            // The rewrite ended the first pass: `last` never saw the old line.
+            "first: ls build",
+            "rewriter: ls build",
+            "last: ls build",
+        ]
+    );
+    assert_eq!(run.command, "ls build");
+    assert_eq!(run.rewritten_from.as_deref(), Some("rm -rf build"));
+    assert_eq!(run.executed, "/bin/ls build");
+    assert_eq!(run.decision.verdict, DecisionVerdict::Rewrite);
+    let results: Vec<_> = run.decision.hooks.iter().map(|run| run.result).collect();
+    assert_eq!(
+        results,
+        [
+            HookResult::Allow,
+            HookResult::Rewrite,
+            HookResult::Allow,
+            HookResult::Allow,
+            HookResult::Allow
+        ]
+    );
+}
+
+// FR-HOOK-11: policy judges the rewritten line, never the received one: a denied line rewritten to an allowed one
+// runs, and an allowed line rewritten to one that asks is asked about as rewritten.
+#[test]
+fn policy_evaluates_rewritten_line() {
+    let rewrite = |command: &str| {
+        Some(HookVerdict::Rewrite {
+            command: command.to_owned(),
+        })
+    };
+
+    // `rm` is denied by the rules, but only `ls` is evaluated.
+    let harness = Harness::new().hooks(vec![rewrite("ls")]);
+    let run = allowed(harness.decide("rm -rf build"));
+    assert_eq!(
+        run.decision,
+        decision(
+            DecisionVerdict::Rewrite,
+            DecisionSource::Rule,
+            Some("exec.allow[1]"),
+            None
+        )
+    );
+    assert_eq!(run.executed, "/bin/ls");
+
+    // `ls` is allowed, but its rewrite asks, and the ask is about the rewritten line.
+    let harness = Harness::new()
+        .hooks(vec![rewrite("git push")])
+        .authority(vec![Some(AskReply::Allow)]);
+    let run = allowed(harness.decide("ls"));
+    assert_eq!(
+        harness.journal.entries(),
+        [
+            "proposed ls",
+            "hooks ls",
+            "proposed git push from ls",
+            "hooks git push",
+            "ask authority git push rule=exec.ask[0]",
+        ]
+    );
+    assert_eq!(run.decision.rule_id.as_deref(), Some("exec.ask[0]"));
+    assert_eq!(run.decision.verdict, DecisionVerdict::Rewrite);
+
+    // `ls` is allowed, but its rewrite is denied by the rules.
+    let refusal = refused(Harness::new().hooks(vec![rewrite("rm x")]).decide("ls"));
+    assert_eq!(refusal.decision.rule_id.as_deref(), Some("exec.deny[0]"));
+}
+
+// FR-HOOK-12: the final verdict is the most restrictive of the hooks' and policy's: deny, then ask, then allow.
+#[test]
+fn final_verdict_is_most_restrictive() {
+    assert_eq!(most_restrictive([]), Strictness::Allow);
+    for (verdicts, expected) in [
+        (vec![Strictness::Allow, Strictness::Allow], Strictness::Allow),
+        (vec![Strictness::Allow, Strictness::Ask], Strictness::Ask),
+        (vec![Strictness::Ask, Strictness::Allow], Strictness::Ask),
+        (vec![Strictness::Ask, Strictness::Deny], Strictness::Deny),
+        (
+            vec![Strictness::Deny, Strictness::Allow, Strictness::Ask],
+            Strictness::Deny,
+        ),
+    ] {
+        assert_eq!(most_restrictive(verdicts.clone()), expected, "{verdicts:?}");
+    }
+
+    // Every hook verdict against every policy verdict, through the pipeline. An ask is answered `allow` by the
+    // authority, so an asked line runs with source `authority` and an unasked one with source `rule`.
+    let hook_verdicts = [
+        (HookVerdict::Allow, Strictness::Allow),
+        (HookVerdict::Ask, Strictness::Ask),
+        (HookVerdict::Deny { reason: None }, Strictness::Deny),
+    ];
+    let lines = [
+        ("ls", Strictness::Allow),
+        ("git push", Strictness::Ask),
+        ("rm x", Strictness::Deny),
+    ];
+    for (hook, hook_strictness) in &hook_verdicts {
+        for (line, policy_strictness) in lines {
+            let harness = Harness::new()
+                .hooks(vec![Some(hook.clone())])
+                .authority(vec![Some(AskReply::Allow)]);
+            let outcome = harness.decide(line);
+            let case = format!("hook {hook:?}, line {line}");
+            let asks: Vec<_> = harness
+                .journal
+                .entries()
+                .into_iter()
+                .filter(|entry| entry.starts_with("ask"))
+                .collect();
+            match (*hook_strictness).max(policy_strictness) {
+                Strictness::Deny => {
+                    let refusal = refused(outcome);
+                    assert!(asks.is_empty(), "{case}: a deny asks no one");
+                    // The hook's deny comes first: policy never ran (FR-HOOK-11).
+                    let source = if *hook_strictness == Strictness::Deny {
+                        DecisionSource::Hook
+                    } else {
+                        DecisionSource::Rule
+                    };
+                    assert_eq!(refusal.decision.source, source, "{case}");
+                }
+                Strictness::Ask => {
+                    let run = allowed(outcome);
+                    assert_eq!(run.decision.source, DecisionSource::Authority, "{case}");
+                    // The ask names the rule only when the rule asked, and the hook only when the hook asked.
+                    let rule = if policy_strictness == Strictness::Ask {
+                        "exec.ask[0]"
+                    } else {
+                        "-"
+                    };
+                    let hook = if *hook_strictness == Strictness::Ask {
+                        " hook=guard"
+                    } else {
+                        ""
+                    };
+                    assert_eq!(asks, [format!("ask authority {line} rule={rule}{hook}")], "{case}");
+                }
+                Strictness::Allow => {
+                    let run = allowed(outcome);
+                    assert_eq!(run.decision.source, DecisionSource::Rule, "{case}");
+                    assert!(asks.is_empty(), "{case}");
+                }
+            }
+        }
+    }
+}
+
+// FR-HOOK-13: a rewrite applies only when the final verdict is not deny. A rewritten line its own pass denies (by a
+// hook, a failing hook, policy or the authority) never runs and is recorded as a deny, not a rewrite.
+#[test]
+fn rewrite_discarded_when_final_verdict_deny() {
+    let rewrite = || {
+        Some(HookVerdict::Rewrite {
+            command: "echo hi".to_owned(),
+        })
+    };
+    let deny = || AskReply::Deny { reason: None };
+
+    for (case, harness, line) in [
+        (
+            "hook denies",
+            Harness::new().hooks(vec![rewrite(), Some(HookVerdict::Deny { reason: None })]),
+            "echo hi",
+        ),
+        (
+            "hook fails",
+            Harness::new().hooks(vec![rewrite(), Some(HookVerdict::Failed)]),
+            "echo hi",
+        ),
+        (
+            "policy denies",
+            Harness::new().hooks(vec![Some(HookVerdict::Rewrite {
+                command: "rm -rf build".to_owned(),
+            })]),
+            "rm -rf build",
+        ),
+        (
+            "authority denies",
+            Harness::new()
+                .hooks(vec![rewrite(), Some(HookVerdict::Ask)])
+                .authority(vec![Some(deny())]),
+            "echo hi",
+        ),
+    ] {
+        let refusal = refused(harness.decide("ls"));
+        assert_eq!(refusal.decision.verdict, DecisionVerdict::Deny, "{case}");
+        // The record explains the denial by the line it applied to, and keeps the received one.
+        assert_eq!(refusal.command, line, "{case}");
+        assert_eq!(refusal.rewritten_from.as_deref(), Some("ls"), "{case}");
+    }
+
+    // The same rewrite on a line its pass allows is applied.
+    let run = allowed(Harness::new().hooks(vec![rewrite()]).decide("ls"));
+    assert_eq!(run.decision.verdict, DecisionVerdict::Rewrite);
+    assert_eq!(run.command, "echo hi");
+    assert_eq!(run.rewritten_from.as_deref(), Some("ls"));
 }

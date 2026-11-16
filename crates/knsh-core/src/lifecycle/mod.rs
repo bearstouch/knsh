@@ -19,7 +19,7 @@
 //!    (FR-HOOK-04, NFR-REL-07); a hook `deny` denies with source `hook`.
 //! 5. **Policy** (FR-LC-09, FR-HOOK-11): the profile's rules (and live grants) on the whole line of this pass. Deny if
 //!    any part is denied, ask if any part asks (FR-POL-18); the hooks' `ask` joins in, the strictest wins
-//!    (FR-HOOK-12).
+//!    (FR-HOOK-12). How verdicts combine, rewrites included (FR-HOOK-10 to FR-HOOK-13), is in `combine`.
 //! 6. **Ask** (FR-LC-10): through the [`Authority`] when one is connected, otherwise through [`LocalApprovals`]
 //!    (standalone mode: `knsh approve` with Touch ID, or deny at the timeout). Under the `unattended` profile no one
 //!    can answer, so an ask is a deny with source `standalone` (FR-AGT-21).
@@ -47,6 +47,7 @@
 //! Hooks, the authority and events see one redacted text of the line ([`redact`], FR-REC-05). The spawned line is
 //! the real one.
 
+mod combine;
 #[cfg(test)]
 mod tests;
 
@@ -58,8 +59,8 @@ use knsh_bash::{Classification, ParseOutcome, classify, parse_line, reserialise}
 use crate::id::{RequestId, SessionId};
 use crate::path::CanonicalPath;
 use crate::policy::{
-    DecisionSource, GrantSet, LineCapabilities, LineDecision, LineResolver, Profile, RuleAction, UNATTENDED_PROFILE,
-    evaluate_line, evaluate_line_with_grants,
+    DecisionSource, GrantSet, LineCapabilities, LineDecision, LineResolver, Profile, UNATTENDED_PROFILE, evaluate_line,
+    evaluate_line_with_grants,
 };
 use crate::ratelimit::LineKey;
 use crate::record::{DecisionVerdict, HookRun, RecordDecision};
@@ -67,6 +68,8 @@ use crate::redacted::{REDACTED_MARKER, Redacted};
 use crate::resolve::BinaryLookup;
 use crate::session::{Actor, ProfileName};
 use crate::time::Timestamp;
+
+use combine::{Strictness, most_restrictive};
 
 /// Most rewrites one line may receive (FR-LC-11): one more evaluation pass, never two (FR-AUTH-31).
 pub const MAX_REWRITES: usize = 1;
@@ -585,9 +588,9 @@ impl<'i, 'e> Pipeline<'i, 'e> {
         if self.effects.caller.gone() {
             return Step::Done(self.cancelled(&pass, None));
         }
-        let hook_asks = match hooks.verdict {
-            HookVerdict::Allow => false,
-            HookVerdict::Ask => true,
+        let hook_strictness = match hooks.verdict {
+            HookVerdict::Allow => Strictness::Allow,
+            HookVerdict::Ask => Strictness::Ask,
             HookVerdict::Deny { reason } => {
                 return Step::Done(self.refuse(&pass, DecisionSource::Hook, None, hooks.hook, reason));
             }
@@ -612,20 +615,34 @@ impl<'i, 'e> Pipeline<'i, 'e> {
             }
         };
 
-        // Step 5: the whole line (FR-LC-09, FR-POL-18).
+        // Step 5: the whole line (FR-LC-09, FR-POL-18), the line of this pass: the rewritten one on a second pass
+        // (FR-HOOK-11).
         let policy = self.evaluate(&pass.classification);
         let rule_id = policy.rule_id.map(|rule| rule.to_string());
-        // The ask names the hook only when a hook asked; a hook that allowed has no part in it.
-        let asking_hook = if hook_asks { hooks.hook } else { None };
-        match policy.verdict {
-            RuleAction::Deny => {
+        let policy_strictness = Strictness::of_rule(policy.verdict);
+        // FR-HOOK-12: the strictest of the hooks' verdict and policy's wins.
+        match most_restrictive([hook_strictness, policy_strictness]) {
+            // Only policy can deny here: a hook's deny ended the pass at step 4.
+            Strictness::Deny => {
                 let reason = policy.reason.as_ref().map(ToString::to_string);
                 Step::Done(self.refuse(&pass, policy.source, rule_id, None, reason))
             }
-            RuleAction::Ask => self.ask(&pass, &proposal, rule_id, asking_hook, policy.capabilities),
-            // The rules allow, but a hook asked: the strictest wins (FR-HOOK-12). No rule asked, so none is named.
-            RuleAction::Allow if hook_asks => self.ask(&pass, &proposal, None, asking_hook, policy.capabilities),
-            RuleAction::Allow => {
+            Strictness::Ask => {
+                // The ask names the hook only when a hook asked, and the rule only when policy asked: a hook or rule
+                // that allowed has no part in it.
+                let asking_hook = if hook_strictness == Strictness::Ask {
+                    hooks.hook
+                } else {
+                    None
+                };
+                let asking_rule = if policy_strictness == Strictness::Ask {
+                    rule_id
+                } else {
+                    None
+                };
+                self.ask(&pass, &proposal, asking_rule, asking_hook, policy.capabilities)
+            }
+            Strictness::Allow => {
                 let decision = Decision {
                     verdict: self.allowed_verdict(),
                     source: policy.source,

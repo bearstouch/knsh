@@ -31,6 +31,9 @@ timeout_ms = 2000
   not have the hook run files from agent-writable places either.
 - Keep hooks fast: their run time is added to every matching command and reported per record (the performance target for decisions excludes hooks).
 - A rewrite cannot contain a redaction marker's real value; lines with markers cannot be rewritten.
+- A rewritten line is evaluated again from the start, and your hook runs on it too. Answer `allow` for a line you
+  already rewrote: a second rewrite denies the line
+  ([combining verdicts](../03-functional-requirements/hooks.md#combining-verdicts)).
 - A malicious hook installed by the user is outside the threat model; review hooks as you would any code running with your privileges.
 
 Envelopes cannot read or write the hook configuration, so an agent cannot register or edit a hook.

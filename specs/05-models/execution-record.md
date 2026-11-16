@@ -8,8 +8,8 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 | `session_id` | ULID | Owning session |
 | `actor` | object | `kind` and `agent_id` |
 | `attribution` | `command` \| `agent_edit` \| `external` \| `concurrent` | How the record's file changes were attributed ([checkpoints](../03-functional-requirements/checkpoints.md)) |
-| `command` | string | The line actually executed, after any rewrite, with secrets redacted |
-| `rewritten_from` | string or null | The original line when a rewrite was applied |
+| `command` | string | The line actually executed, after any rewrite, with secrets redacted. For a denied line, the line the denial applies to: a rewritten line denied in its own pass is recorded as rewritten ([combining verdicts](../03-functional-requirements/hooks.md#combining-verdicts)) |
+| `rewritten_from` | string or null | The original line when a rewrite was accepted, whether the rewritten line then ran (verdict `rewrite`) or was denied (verdict `deny`) |
 | `argv` | array | Each simple command with resolved absolute path and class (`static`, `wrapper`, `dynamic`, `project_executable`). A wrapper and the command it runs are separate entries, the inner one linked to its wrapper; a dynamic entry carries its reason code |
 | `cwd` | path | Working directory at start |
 | `decision` | object | See below |
