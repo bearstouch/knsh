@@ -263,8 +263,8 @@ pub fn lost_notification(subscription: SubscriptionId, lost: &Lost) -> Result<No
     })
 }
 
-/// `{kind, agent_id?}`, as in records.
-fn actor(actor: &Actor) -> Result<Object, JsonError> {
+/// `{kind, agent_id?}`, as in records. Shared with `approval.list` (KNSH-066).
+pub(crate) fn actor(actor: &Actor) -> Result<Object, JsonError> {
     let object = Object::new().with("kind", actor.kind().as_str())?;
     match actor.agent_id() {
         Some(agent_id) => object.with("agent_id", agent_id.as_str()),

@@ -33,6 +33,8 @@
 //!   registry and the audit-token fallback, KNSH-048)
 //! - FR-LC-01, FR-LC-14, FR-LC-16, FR-OUT-04, `specs/06-api/agent-socket.md#execrun`, `specs/06-api/wire-format.md`
 //!   (receiving `exec.run` from `knsh -c` with its stdio passed as descriptors, KNSH-049)
+//! - FR-AUTH-40 to FR-AUTH-43, `specs/06-api/user-socket.md#approvals` (`approval.list`, `approval.approve` and
+//!   `approval.deny`, KNSH-066)
 //!
 //! On start it prepares the engine directories (KNSH-011) and takes its sockets from launchd ([`endpoints`],
 //! KNSH-012). It then serves them ([`server`], KNSH-013): a kqueue accept loop hands each connection to its own
@@ -58,8 +60,9 @@
 //! in-flight requests and committing pending writes first. A session can be paused or taken over by a human
 //! ([`holds`], KNSH-054): its new lines are held with `-32007`, and a pause stops its envelope's and running lines'
 //! process groups. Policy files are accepted only with `knshd`'s signature, made with a Keychain key after Touch ID or
-//! the password ([`policy_edit`], KNSH-065).
-//! The supervisor arrives in later stories.
+//! the password ([`policy_edit`], KNSH-065). Without an authority, an ask waits for `knsh approve` (after Touch ID or
+//! the password, shown by `knshd`) or `knsh deny` from another terminal, and is denied at the timeout otherwise
+//! ([`approvals`], KNSH-066).
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
@@ -69,6 +72,9 @@
 // Owned by the session registry, so built where it is.
 #[cfg(target_os = "macos")]
 mod agents;
+// Standalone approvals (KNSH-066): pending asks answered with `knsh approve` after the LocalAuthentication prompt.
+#[cfg(target_os = "macos")]
+mod approvals;
 // Reading a line's output (KNSH-053): platform-neutral, used by the macOS spawner.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod capture;
@@ -267,11 +273,13 @@ fn start() -> Result<(), StartError> {
         let profiles = profile_loader(&paths, random.clone(), &log);
         let policy = PolicyCheck::new(Arc::clone(&sessions), profiles.clone());
         let editor = policy_editor(&profiles, &log);
+        let approvals = local_approvals(&clock, &random, &log);
         let mut handlers = records.handlers();
         handlers.extend(events.handlers());
         handlers.extend(sessions.handlers());
         handlers.extend(policy.handlers());
         handlers.extend(editor.handlers());
+        handlers.extend(approvals.handlers());
         // `exec.run` (KNSH-051), listed only when the sandbox probe passes; without `knsh-exec` nothing can run.
         let supervision = Supervision {
             paths: &paths,
@@ -283,6 +291,7 @@ fn start() -> Result<(), StartError> {
             store,
             clock: clock.clone(),
             random,
+            approvals,
         };
         handlers.extend(supervision.handlers());
         // Probed once, before serving: every hello of this process reports the same result, and a restarted knshd
@@ -442,6 +451,24 @@ fn policy_editor(
     )
 }
 
+/// Standalone approvals (KNSH-066): asks wait here when no authority is connected, and `knsh approve` answers them
+/// after knshd's own Touch ID or password prompt (FR-AUTH-41).
+#[cfg(target_os = "macos")]
+fn local_approvals(
+    clock: &std::sync::Arc<knsh_platform::macos::SystemClock>,
+    random: &std::sync::Arc<knsh_platform::macos::SystemRandom>,
+    log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+) -> std::sync::Arc<crate::approvals::Approvals> {
+    use std::sync::Arc;
+
+    crate::approvals::Approvals::with_default_timeout(
+        clock.clone(),
+        random.clone(),
+        Arc::new(knsh_platform::macos::LocalAuthentication::new()),
+        Arc::clone(log),
+    )
+}
+
 /// The record store. One that cannot be opened (newer schema, foreign or unsafe file) is reported and left
 /// untouched; knshd still serves, so a human session is never blocked by it, and the record methods answer -32603.
 /// Retention uses the defaults (30 days or 2 GB); per-profile periods arrive with profile loading.
@@ -487,6 +514,8 @@ struct Supervision<'a> {
     store: Option<knsh_store::RecordStore>,
     clock: std::sync::Arc<knsh_platform::macos::SystemClock>,
     random: std::sync::Arc<knsh_platform::macos::SystemRandom>,
+    /// Standalone approvals (KNSH-066), shared with the `approval.*` handlers.
+    approvals: std::sync::Arc<approvals::Approvals>,
 }
 
 /// Starts the network proxy (KNSH-059) on a loopback port with the host rules, the system resolver and address
@@ -533,10 +562,10 @@ fn start_proxy(
 #[cfg(target_os = "macos")]
 impl Supervision<'_> {
     /// The `exec.run` handler: the orchestrator over the real spawner, the `knsh-exec` installed next to this binary
-    /// (the one the sandbox probe checked), with the user's hooks ([`hooks::HookRunner`], KNSH-062). No authority or
-    /// local approvals are wired yet (KNSH-069, KNSH-066): every line policy asks about waits and is denied at the
-    /// timeout. When `knsh-exec` or a
-    /// canonical home cannot be found it is logged, and every call is `-32005` ([`exec::unserved_handlers`]).
+    /// (the one the sandbox probe checked), with the user's hooks ([`hooks::HookRunner`], KNSH-062). No authority is
+    /// wired yet (KNSH-069): every line policy asks about waits for `knsh approve` or `knsh deny`
+    /// ([`approvals::Approvals`], KNSH-066) and is denied at the timeout. When `knsh-exec` or a canonical home cannot
+    /// be found it is logged, and every call is `-32005` ([`exec::unserved_handlers`]).
     fn exec_run_handlers(self, proxy: std::sync::Arc<dyn proxy::ProxyIssuer>) -> dispatch::Handlers {
         use std::sync::Arc;
 
@@ -545,7 +574,7 @@ impl Supervision<'_> {
 
         use crate::probe::SandboxProbe;
         use crate::spawn::{Limits, TrampolineSpawner};
-        use crate::supervisor::{DenyAtTimeout, Lifecycle, Parts};
+        use crate::supervisor::{Lifecycle, Parts};
 
         let trampoline = std::env::current_exe()
             .ok()
@@ -589,7 +618,7 @@ impl Supervision<'_> {
             random: self.random,
             hooks: Arc::new(hook_runner),
             authority: Arc::new(NoAuthority),
-            approvals: Arc::new(DenyAtTimeout::default()),
+            approvals: self.approvals,
             spawner: Arc::new(spawner),
             // Secret redaction arrives with KNSH-091; the hook is already on the capture path.
             redaction: Arc::new(knsh_core::NoOutputRedaction),

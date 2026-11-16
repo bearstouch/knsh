@@ -94,6 +94,13 @@ pub static KNSH: Command = group(
             }],
             ..leaf("approve", "Approve an ask; knshd shows a Touch ID or password prompt")
         },
+        Command {
+            positionals: &[Positional {
+                name: "request_id",
+                help: "The ask to deny (from 'knsh approvals')",
+            }],
+            ..leaf("deny", "Deny an ask")
+        },
         group(
             "policy",
             "Check or edit policy",

@@ -55,15 +55,13 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use knsh_core::{
-    Actor, Allowed, AskAnswer, AskReply, AskRequest, Authority, BinaryLookup, Caller, CancelReason, CanonicalPath,
-    Counted, Decision, DecisionSource, DenialLimiter, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR,
-    LineInput, LineKey, LocalApprovals, NetworkEntry, Observer, Outcome, OutputRedaction, OutputStream, Profile,
-    Proposal, RateLimits, RecordDetails, RecordId, Redacted, Refusal, RefusalKind, RequestId, SessionId, Timestamp,
-    Ulid, argv_of, decide, redact,
+    Actor, Allowed, Authority, BinaryLookup, Caller, CancelReason, CanonicalPath, Counted, Decision, DecisionSource,
+    DenialLimiter, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR, LineInput, LineKey, LocalApprovals,
+    NetworkEntry, Observer, Outcome, OutputRedaction, OutputStream, Profile, Proposal, RateLimits, RecordDetails,
+    RecordId, Redacted, Refusal, RefusalKind, RequestId, SessionId, Timestamp, Ulid, argv_of, decide, redact,
 };
 use knsh_json::{Object, ToJson, Value};
 use knsh_platform::{Clock, ProcessGroupId, Processes, Random};
@@ -80,9 +78,6 @@ use crate::sessions::Sessions;
 
 /// How long an ask waits for an answer by default (FR-AUTH-23).
 pub(crate) const DEFAULT_ASK_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// How often a waiting ask checks whether its caller is still there.
-const CALLER_POLL: Duration = Duration::from_millis(100);
 
 /// Reasons for denials the driver makes itself, before the pipeline decides. Fixed texts.
 const NO_STORE: &str = "the record store is unavailable, so the line cannot be recorded and was denied (fail closed)";
@@ -186,45 +181,6 @@ impl SpawnFailure {
     }
 }
 
-/// Standalone handling when no authority is connected and local approvals are not available yet (KNSH-066 adds
-/// `knsh approve`): the request waits, so the caller can still go away, and is denied at the timeout
-/// (`specs/04-non-functional-requirements/reliability.md#standalone-mode`).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DenyAtTimeout {
-    /// How long a request waits.
-    pub(crate) timeout: Duration,
-}
-
-impl Default for DenyAtTimeout {
-    fn default() -> Self {
-        Self {
-            timeout: DEFAULT_ASK_TIMEOUT,
-        }
-    }
-}
-
-impl LocalApprovals for DenyAtTimeout {
-    fn ask(&self, _request: &AskRequest<'_>, caller: &dyn Caller) -> AskAnswer {
-        // Monotonic: a wall clock stepping back must not hold a request longer than its timeout.
-        let deadline = Instant::now() + self.timeout;
-        let reply = loop {
-            if caller.gone() {
-                break AskReply::CallerGone;
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break AskReply::TimedOut;
-            }
-            thread::sleep(left.min(CALLER_POLL));
-        };
-        AskAnswer {
-            request_id: None,
-            reply,
-            decided_by: None,
-        }
-    }
-}
-
 /// The effects the orchestrator needs, shared by every connection.
 pub(crate) struct Parts {
     /// The live sessions: the bound session's actor and profile.
@@ -243,7 +199,7 @@ pub(crate) struct Parts {
     pub(crate) hooks: Arc<dyn Hooks + Send + Sync>,
     /// The authority, when one is connected (KNSH-069).
     pub(crate) authority: Arc<dyn Authority + Send + Sync>,
-    /// Standalone approvals (KNSH-066).
+    /// Standalone approvals: `knsh approve` and `knsh deny` ([`crate::approvals::Approvals`], KNSH-066).
     pub(crate) approvals: Arc<dyn LocalApprovals + Send + Sync>,
     /// Starts allowed lines (KNSH-051).
     pub(crate) spawner: Arc<dyn Spawner>,

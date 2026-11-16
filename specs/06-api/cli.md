@@ -12,6 +12,7 @@ The `knsh` binary wraps the API. Every command takes `--json` for machine-readab
 | `knsh events` | `user.sock` | Stream events |
 | `knsh approvals` | `user.sock` | List pending asks |
 | `knsh approve <request_id>` | `user.sock` | Approve an ask; `knshd` shows Touch ID or password prompt |
+| `knsh deny <request_id>` | `user.sock` | Deny an ask ([below](#approvals)) |
 | `knsh policy check` | `user.sock` | Dry-run a line against policy |
 | `knsh policy edit <profile>` | `user.sock` | Edit a policy file; saving needs Touch ID or password ([below](#policy-edit)) |
 | `knsh profile use <profile>` | `user.sock` | Select a local profile; needs Touch ID |
@@ -43,6 +44,23 @@ the CLI in an envelope on those streams; `knsh agent` runs nothing itself.
 - **Limit (KNSH-057):** the CLI runs in a process group of `knshd`, not in the terminal's foreground group.
   Terminal-generated signals (Ctrl-C with `ISIG` on, `SIGWINCH`) reach `knsh agent`, not the CLI; agent CLIs run the
   terminal in raw mode and read Ctrl-C as input.
+
+## Approvals
+
+`knsh approvals`, `knsh approve <request_id>` and `knsh deny <request_id>` (KNSH-066, FR-AUTH-40 to FR-AUTH-43) call
+[`approval.list`, `approval.approve` and `approval.deny`](user-socket.md#approvals) on `user.sock`.
+
+- `knsh approvals` prints each pending ask as a line with its request ID, session, agent, matched rule (or hook) and
+  `timeout_at`, then the command and its directory, escaped ([terminal safety](#terminal-safety)); `No pending
+  asks.` when there are none. `--json` prints each request object as the API returns it, one per line.
+- `knsh approve` says on stderr that the prompt is on the Mac's screen, then waits for `knshd`'s Touch ID or
+  password prompt. It asks nothing on the terminal itself and has no option to skip the prompt (FR-AUTH-42).
+- `knsh deny` answers at once; no prompt.
+- On success they print `Approved request <id>.` or `Denied request <id>.`; `--json` prints `{"request_id",
+  "verdict"}`.
+- A request ID that is not 26 ULID characters is a usage error (status 2) and nothing is sent. A refusal exits with 1
+  and says why on stderr: not authenticated (`-32001`), already timed out (`-32002`), cancelled (`-32011`), already
+  answered or unknown (`-32602`).
 
 ## Policy edit
 

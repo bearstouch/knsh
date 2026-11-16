@@ -6,9 +6,12 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
-use knsh_core::{AgentId, DecisionVerdict, Delivery, EventScope, HookVerdict, Redacted};
+use knsh_core::{
+    AgentId, AskAnswer, AskReply, AskRequest, DecisionVerdict, Delivery, EventScope, HookVerdict, Redacted,
+};
 use knsh_json::{Frame, FrameReader, FrameWriter};
 use knsh_platform::macos::{SystemPeerCredentials, effective_uid};
 use knsh_platform::testing::{FakeClock, RecordingLog, SeededRandom};
@@ -107,7 +110,7 @@ impl Running {
                 seen: None,
             }),
             authority: authority.clone(),
-            approvals: Arc::new(DenyAtTimeout { timeout: ask_timeout }),
+            approvals: crate::approvals::tests::unanswered(ask_timeout),
             spawner: Arc::new(FakeSpawner::new(Arc::clone(&journal))),
             redaction: Arc::new(knsh_core::NoOutputRedaction),
         });

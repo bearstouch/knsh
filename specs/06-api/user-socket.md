@@ -9,7 +9,7 @@ Reachable by the user's processes outside envelopes. Every envelope and command 
 | `session.info` | The caller's own session: actor, profile, state, recording settings |
 | `records.query`, `records.output`, `events.subscribe`, `events.unsubscribe` | Read-only access to all sessions, for observers and the CLI |
 | `checkpoint.*` | All checkpoint operations, including `restore` and `force` |
-| `approval.list`, `approval.approve`, `approval.deny` | Pending asks; approving needs Touch ID or password, checked by `knshd` |
+| `approval.list`, `approval.approve`, `approval.deny` | Pending asks; approving needs Touch ID or password, checked by `knshd` ([below](#approvals)) |
 | `policy.check` | Dry run of a line against a named session's or profile's policy ([parameters](agent-socket.md#policycheck)); no authentication |
 | `policy.read`, `policy.edit` | Read a policy file for editing, and save it signed after Touch ID or password ([below](#policy-files)) |
 | `profile.use`, `policy.grant` | Profile selection and grants need Touch ID or password |
@@ -259,3 +259,54 @@ and gets a final newline if it lacks one. In order:
    that cannot be read or created, or a failed write, is `-32603` and the old file is kept.
 
 Saves are serialised in `knshd`. `unattended` is `-32602`.
+
+## Approvals
+
+With no authority connected, an ask (lifecycle step 6) becomes a pending request that the user answers from another
+terminal with `knsh approvals`, `knsh approve` and `knsh deny` (KNSH-066, FR-AUTH-40 to FR-AUTH-43,
+[standalone mode](../04-non-functional-requirements/reliability.md#standalone-mode)). The agent's call waits on it.
+All three methods are on `user.sock` only: `agent.sock` never lists them, and a call dispatched there is `-32003`.
+Nothing in an agent session's terminal asks anything (FR-AUTH-43).
+
+A request ends exactly once: answered, timed out after 90 s (FR-AUTH-23, denied with source `standalone`), or
+cancelled because its caller left (FR-AUTH-22). Its `request_id` is then the one in `-32002`, `-32011` and
+`decision.cancelled`. Answers recorded through these methods have `decision.source` `user` (FR-REC-03); a denial
+gives the agent the reason `denied by the user (knsh deny)`.
+
+### `approval.list`
+
+No params. Result: `{"requests": [...]}`, pending requests in `request_id` (creation) order, each as the authority
+would see it in `decision.requested`:
+
+```json
+{"request_id": "01J…", "session_id": "01J…", "actor": {"kind": "agent", "agent_id": "claude-code"},
+ "command": "git push origin main", "rewritten_from": null, "cwd": "/Users/me/code/app",
+ "matched_rule": "exec.ask[0]", "hook": null, "irreversible": null, "timeout_at": "2026-11-16T10:01:30.000000Z"}
+```
+
+`command` and `rewritten_from` are redacted. `matched_rule` is `null` when only a hook asked; `hook` names it.
+`irreversible` is `{"value", "reasons"}`, or `null` until lines are classified for irreversibility (KNSH-093). A
+request past its `timeout_at` is not listed. No authentication: listing changes nothing.
+
+### `approval.approve`
+
+`{"request_id": "01J…"}` → `{"request_id", "verdict": "allow"}`. In order:
+
+1. The request must be pending, or the call is refused without a prompt (below).
+2. `knshd` shows the Touch ID or password prompt itself: `approve the agent command: <command> (cwd <dir>, session
+   <id>)`, with control and invisible characters escaped ([decision 12](../09-reference/decisions.md)). It waits at
+   most until the request's `timeout_at`. Any outcome but success is `-32001` with `source: "user"`, `rule_id: null`
+   and `reason: "not authenticated: …"`; the request stays pending. No parameter skips the prompt (FR-AUTH-42).
+3. The request must still be pending after the prompt; the line then runs as approved.
+
+### `approval.deny`
+
+`{"request_id": "01J…"}` → `{"request_id", "verdict": "deny"}`. No authentication: a denial is never less safe than
+waiting (decided with KNSH-066).
+
+### Errors
+
+An answer to a request that is not pending is refused: `-32002` with `data.request_id` when it timed out (even if
+its waiting call has not noticed yet), `-32011` with `data.request_id` when it was cancelled, and `-32602` with
+`data.reason` when it was already answered or no such request exists. The last 256 ended requests are remembered to
+tell these apart; older ones are reported as unknown. A malformed `request_id` is `-32602`.

@@ -85,6 +85,7 @@
 #![warn(clippy::pedantic)]
 #![forbid(unsafe_code)]
 
+mod approval;
 mod capability;
 mod catalogue;
 mod envelope;
@@ -100,6 +101,10 @@ mod records;
 mod session;
 mod start_agent;
 
+pub use approval::{
+    ApprovalAnswerParams, ApprovalAnswerResult, ApprovalListParams, ApprovalListResult, ApprovalVerdict, Irreversible,
+    PendingApproval,
+};
 pub use capability::{
     Backend, Capabilities, CheckpointBackend, FileEvents, NONE, NetworkFilter, Platform, Sandbox, SandboxViolations,
     Secrets,

@@ -3,9 +3,11 @@
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use knsh_core::{
-    DecisionVerdict, Delivery, EventScope, HookOutcome, HookVerdict, NoAuthority, NoHooks, RecordDecision, StillWaiting,
+    AskAnswer, AskReply, AskRequest, DecisionVerdict, Delivery, EventScope, HookOutcome, HookVerdict, NoAuthority,
+    NoHooks, RecordDecision, StillWaiting,
 };
 use knsh_json::Value;
 use knsh_platform::testing::{FakeClock, MemFs, SeededRandom};
@@ -234,6 +236,8 @@ struct Setup {
     hooks: Vec<HookVerdict>,
     authority: Option<Vec<AskReply>>,
     approvals_timeout: Option<Duration>,
+    /// Standalone approvals; by default, ones nobody answers within `approvals_timeout` (KNSH-066).
+    approvals: Option<Arc<crate::approvals::Approvals>>,
     no_store: bool,
     profiles: Option<Vec<(&'static str, &'static str)>>,
     /// Profile files written as given, after the signed `profiles`: unsigned or tampered files (KNSH-065).
@@ -301,8 +305,8 @@ impl Daemon {
             random: self.random.clone(),
             hooks,
             authority,
-            approvals: Arc::new(DenyAtTimeout {
-                timeout: setup.approvals_timeout.unwrap_or(Duration::from_millis(50)),
+            approvals: setup.approvals.unwrap_or_else(|| {
+                crate::approvals::tests::unanswered(setup.approvals_timeout.unwrap_or(Duration::from_millis(50)))
             }),
             spawner: Arc::new(
                 setup
@@ -600,23 +604,74 @@ fn ask_without_authority_is_denied_at_the_timeout() {
         .run(daemon.line("git push"), &StillWaiting)
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::DecisionTimeout);
-    assert_eq!(data_field(&error, "request_id"), Some(Value::Null));
+    // KNSH-066: the ask was a pending request, listed for `knsh approve`, so it has an ID.
+    let Some(Value::String(request_id)) = data_field(&error, "request_id") else {
+        panic!("{error:?}");
+    };
     let events = daemon.events();
     assert_eq!(
         names(&events),
         ["command.proposed", "decision.cancelled", "command.denied"]
     );
-    assert!(matches!(
-        events[1].data,
+    match &events[1].data {
         EventData::DecisionCancelled {
             reason: CancelReason::TimedOut,
-            ..
-        }
-    ));
+            request_id: Some(cancelled),
+        } => assert_eq!(cancelled.to_string(), request_id),
+        other => panic!("{other:?}"),
+    }
     let decision = daemon.records().pop().unwrap().details.decision.unwrap();
     assert_eq!(decision.source, DecisionSource::Standalone);
     assert_eq!(decision.rule_id.as_deref(), Some("exec.ask[0]"));
     assert_eq!(daemon.spawns(), Vec::<String>::new());
+}
+
+// FR-REC-03, FR-AUTH-41 (KNSH-066): without an authority, an ask answered with `knsh approve` (after the prompt)
+// runs and is recorded with `decision.source = user`; one answered with `knsh deny` is refused with -32001 and
+// recorded the same way, with the user's reason.
+#[test]
+fn records_user_as_decision_source() {
+    let daemon = Daemon::new();
+    let presence = Arc::new(knsh_platform::testing::ScriptedPresence::new());
+    presence.approve_next();
+    let approvals = crate::approvals::tests::prompting(presence.clone(), Duration::from_secs(30));
+    let lifecycle = daemon.lifecycle(Setup {
+        approvals: Some(Arc::clone(&approvals)),
+        ..Setup::default()
+    });
+
+    let approving = crate::approvals::tests::approve_when_pending(&approvals);
+    lifecycle.run(daemon.line("git push"), &StillWaiting).unwrap();
+    approving.join().unwrap().unwrap();
+    assert_eq!(daemon.spawns().len(), 1, "approved, so spawned");
+    assert_eq!(presence.prompts().len(), 1);
+
+    let denying = crate::approvals::tests::deny_when_pending(&approvals);
+    let error = lifecycle.run(daemon.line("git push"), &StillWaiting).unwrap_err();
+    denying.join().unwrap().unwrap();
+    assert_eq!(error.code, ErrorCode::Denied);
+    let denial = Denial::from_error(&error).unwrap();
+    assert_eq!(denial.source.as_deref(), Some("user"));
+    assert_eq!(denial.reason.as_deref(), Some(crate::approvals::DENIED_BY_USER));
+    assert_eq!(daemon.spawns().len(), 1, "denied, so not spawned");
+    assert_eq!(presence.prompts().len(), 1, "a denial needs no prompt");
+
+    // Record IDs from the frozen clock differ only by their random part, so the two are found by verdict.
+    let mut decisions: Vec<_> = daemon
+        .records()
+        .into_iter()
+        .map(|record| record.details.decision.unwrap())
+        .map(|decision| (decision.verdict, decision.source, decision.rule_id))
+        .collect();
+    decisions.sort_by_key(|(verdict, ..)| *verdict == DecisionVerdict::Deny);
+    let rule = Some("exec.ask[0]".to_owned());
+    assert_eq!(
+        decisions,
+        [
+            (DecisionVerdict::Allow, DecisionSource::User, rule.clone()),
+            (DecisionVerdict::Deny, DecisionSource::User, rule),
+        ]
+    );
 }
 
 // FR-LC-41: a caller that disconnects while the decision is pending cancels it (-32011, `decision.cancelled`), and
@@ -645,7 +700,8 @@ fn cancels_and_skips_spawn_when_caller_disconnects() {
         events[1].data,
         EventData::DecisionCancelled {
             reason: CancelReason::CallerGone,
-            request_id: None
+            // KNSH-066: the pending request had an ID.
+            request_id: Some(_)
         }
     ));
     // Allowed by the rules, but the caller is gone by the driver's last look before the spawn.
@@ -778,14 +834,13 @@ fn runs_with_no_hooks_and_no_authority() {
         random: daemon.random.clone(),
         hooks: Arc::new(NoHooks),
         authority: Arc::new(NoAuthority),
-        approvals: Arc::new(DenyAtTimeout::default()),
+        approvals: crate::approvals::tests::unanswered(DEFAULT_ASK_TIMEOUT),
         spawner: Arc::new(FakeSpawner::new(Arc::clone(&daemon.journal))),
         redaction: Arc::new(knsh_core::NoOutputRedaction),
     });
     // `echo` is a builtin and stays as written; `ls` runs by its absolute path.
     lifecycle.run(daemon.line("echo hi; ls"), &StillWaiting).unwrap();
     assert_eq!(daemon.spawns(), ["spawn echo hi; /bin/ls as bash"]);
-    assert_eq!(DenyAtTimeout::default().timeout, DEFAULT_ASK_TIMEOUT);
 }
 
 /// A daemon whose spawner ends every line with `outcome`, reporting a long run when `long_running`.

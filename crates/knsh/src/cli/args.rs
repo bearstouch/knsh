@@ -835,10 +835,11 @@ mod tests {
     #[test]
     fn json_flag_accepted_by_every_subcommand() {
         let leaves = leaves();
-        // The 17 leaf commands of specs/06-api/cli.md; a mismatch means the table and the page have drifted.
+        // The 18 leaf commands of specs/06-api/cli.md (`knsh deny` added by KNSH-066); a mismatch means the table and
+        // the page have drifted.
         assert_eq!(
             leaves.len(),
-            17,
+            18,
             "{:?}",
             leaves.iter().map(|(p, _)| p).collect::<Vec<_>>()
         );
