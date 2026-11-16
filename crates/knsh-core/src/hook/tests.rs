@@ -488,3 +488,73 @@ fn no_hooks_run_for_human_sessions() {
     );
     assert_eq!(outcome.verdict, HookVerdict::Allow);
 }
+
+// ---- Combining verdicts (KNSH-063) ----
+
+// FR-HOOK-10: the first deny stops the chain: no later hook runs, an earlier ask cannot soften it, and the denying
+// hook is named.
+#[test]
+fn first_deny_stops_chain() {
+    let three = [hook("/h/0", ""), hook("/h/1", ""), hook("/h/2", "")].concat();
+    let loaded = config(&three);
+
+    let executor = Scripted::new(vec![exited(0), exited(2)]);
+    let outcome = run(&loaded, "ls", &executor);
+    assert_eq!(outcome.verdict, HookVerdict::Deny { reason: None });
+    assert_eq!(outcome.hook.as_deref(), Some("hooks[1]"));
+    assert_eq!(
+        executor.ran(),
+        [PathBuf::from("/h/0"), PathBuf::from("/h/1")],
+        "hooks[2] never ran"
+    );
+    assert_eq!(outcome.runs.len(), 2);
+
+    // An ask before the deny is outranked by it.
+    let executor = Scripted::new(vec![
+        printed(r#"{"verdict":"ask"}"#),
+        printed(r#"{"verdict":"deny","reason":"no"}"#),
+    ]);
+    let outcome = run(&loaded, "ls", &executor);
+    assert_eq!(
+        outcome.verdict,
+        HookVerdict::Deny {
+            reason: Some("no".to_owned())
+        }
+    );
+    assert_eq!(outcome.hook.as_deref(), Some("hooks[1]"));
+    assert_eq!(executor.ran().len(), 2);
+
+    // The first hook denying runs nothing after it.
+    let executor = Scripted::new(vec![exited(2)]);
+    assert_eq!(run(&loaded, "ls", &executor).runs.len(), 1);
+    assert_eq!(executor.ran().len(), 1);
+}
+
+// Hook model (`annotate`): labels go to the record and the chain's verdict is whatever the other hooks say.
+#[test]
+fn annotate_does_not_change_verdict() {
+    let two = [hook("/h/0", ""), hook("/h/1", "")].concat();
+    let loaded = config(&two);
+    let annotate = || printed(r#"{"verdict":"annotate","labels":["build","ci:1"]}"#);
+
+    for (second, verdict, decider) in [
+        (exited(0), HookVerdict::Allow, None),
+        (printed(r#"{"verdict":"ask"}"#), HookVerdict::Ask, Some("hooks[1]")),
+        (exited(2), HookVerdict::Deny { reason: None }, Some("hooks[1]")),
+    ] {
+        let executor = Scripted::new(vec![annotate(), second]);
+        let outcome = run(&loaded, "ls", &executor);
+        assert_eq!(outcome.verdict, verdict);
+        assert_eq!(outcome.hook.as_deref(), decider, "an annotating hook never decides");
+        assert_eq!(outcome.runs[0].result, HookResult::Annotate);
+        assert_eq!(outcome.runs[0].labels, ["build", "ci:1"]);
+        assert_eq!(outcome.runs[1].labels, Vec::<String>::new());
+    }
+
+    // Annotations alone are an allow, and every hook still runs.
+    let executor = Scripted::new(vec![annotate(), annotate()]);
+    let outcome = run(&loaded, "ls", &executor);
+    assert_eq!(outcome.verdict, HookVerdict::Allow);
+    assert_eq!(outcome.hook, None);
+    assert_eq!(executor.ran().len(), 2);
+}
