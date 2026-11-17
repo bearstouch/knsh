@@ -18,10 +18,16 @@
 //! - **One writer.** Only this module writes the file, under its own lock: the grant store and the pushed policies
 //!   each hand it their whole half after a change, while holding their own lock, so the file always follows the
 //!   latest change of each half (lock order: the half's lock, then this one's; this one is a leaf).
-//! - **Never overwritten when unreadable.** A file that exists but cannot be read, is not a `0600` regular file of
-//!   this user, does not parse, or has a newer `version` is left exactly as it is: the store is *frozen*, every save
-//!   fails, and the callers refuse the change (`-32603`) rather than lose what the file holds. Recovering such a file
-//!   is KNSH-074's.
+//! - **Never overwritten when unusable: set aside instead (KNSH-074).** A file that is not a `0600` regular file of
+//!   this user, is too large, does not parse, or has a newer `version` is never written over. At start `knshd`
+//!   renames it, without replacing anything ([`Fs::rename_new`]), to `state.json.corrupt-<µs>` (or
+//!   `state.json.newer-<µs>` for a newer version; `.<n>` is appended if that name is taken), logs that it did, and
+//!   starts with no grants and no pushed policy. The set-aside file keeps its bytes for the user or a newer `knshd`
+//!   to inspect; this one never reads it again. Starting empty fails closed: a lost grant only removes a permission,
+//!   and a lost snapshot leaves its sessions on local profiles or paused (KNSH-072), never on a weaker policy.
+//! - **Frozen when it cannot be set aside.** A file that cannot even be examined (an I/O or permission error, which
+//!   may pass) or whose rename fails is left exactly as it is: the store is *frozen*, every save fails, and the
+//!   callers refuse the change (`-32603`) rather than lose what the file holds. The next start tries again.
 //! - **What is restored.** [`StateStore::open`] returns what a readable file holds; `knshd` gives the snapshots back
 //!   to the pushed policies and the unexpired grants back to the grant store. Expired grants are dropped then and
 //!   are never written again. Secrets the authority supplies are memory-only and never reach this file.
@@ -42,6 +48,10 @@ use crate::pushed::{MAX_SNAPSHOTS, Snapshot};
 
 /// The file format this build writes and reads.
 const VERSION: u64 = 1;
+
+/// How many set-aside names [`set_aside`] tries for one start: `-<µs>`, then `-<µs>.1` and so on. Another file of
+/// the same microsecond needs a clock that went back, so more than one attempt is already rare.
+const ASIDE_ATTEMPTS: u32 = 8;
 
 /// Largest state file read, in bytes: every snapshot at the profile size limit, each character escaped, plus the
 /// grants. Anything larger was not written by `knshd`.
@@ -95,20 +105,22 @@ impl StateStore {
     }
 
     /// Opens the state file at `path`, owned by `uid`, and returns the store with what the file holds (module
-    /// documentation, "What is restored"). A missing file is an empty state. A file that cannot be read is left as
-    /// it is, reported to `log`, and the store is frozen.
-    pub(crate) fn open(fs: Arc<dyn Fs>, path: PathBuf, uid: u32, log: Arc<dyn SystemLog>) -> (Arc<Self>, State) {
-        let read = read_state(fs.as_ref(), &path, uid);
-        let (state, frozen) = match read {
+    /// documentation, "What is restored"). A missing file is an empty state. An unusable file is set aside, named
+    /// after `now` (the start time, or the Unix epoch when the clock failed), and the state starts empty; a file that
+    /// cannot be examined or set aside is left as it is and the store is frozen. Either is reported to `log`.
+    pub(crate) fn open(
+        fs: Arc<dyn Fs>,
+        path: PathBuf,
+        uid: u32,
+        now: Option<Timestamp>,
+        log: Arc<dyn SystemLog>,
+    ) -> (Arc<Self>, State) {
+        let (state, frozen) = match read_state(fs.as_ref(), &path, uid) {
             Ok(state) => (state, false),
-            Err(reason) => {
-                log.log(
-                    Level::Error,
-                    "state file unreadable; kept as it is, and grants and pushed policy cannot be saved",
-                    &[Field::new("reason", knsh_platform::Value::Static(reason))],
-                );
-                (State::default(), true)
-            }
+            Err(unusable) => (
+                State::default(),
+                !recover(fs.as_ref(), &path, unusable, now, log.as_ref()),
+            ),
         };
         let store = Arc::new(Self {
             file: Some(StateFile { fs, path }),
@@ -179,19 +191,127 @@ impl StateStore {
     }
 }
 
-/// Reads the state file, or why it cannot be used: a fixed reason for the log.
-fn read_state(fs: &dyn Fs, path: &std::path::Path, uid: u32) -> Result<State, &'static str> {
+/// Sets the `unusable` file at `path` aside, named after `now`, and reports what happened to `log`. Returns whether
+/// the path is now free to write; `false` leaves the file exactly where and as it is, and the store must be frozen.
+fn recover(
+    fs: &dyn Fs,
+    path: &std::path::Path,
+    unusable: Unusable,
+    now: Option<Timestamp>,
+    log: &dyn SystemLog,
+) -> bool {
+    // Not examinable (an I/O or permission error that may pass): leave it alone and try again at the next start.
+    let Some(kind) = unusable.aside_kind() else {
+        log_frozen(
+            log,
+            "state file unreadable; kept as it is, and grants and pushed policy cannot be saved",
+            unusable.reason(),
+        );
+        return false;
+    };
+    // The rename failed: the file stays where it is, so nothing may write over it.
+    let Some(stamp) = set_aside(fs, path, kind, now) else {
+        log_frozen(
+            log,
+            "state file unusable and could not be set aside; kept as it is, and grants and pushed policy cannot be saved",
+            unusable.reason(),
+        );
+        return false;
+    };
+    log.log(
+        Level::Error,
+        "state file unusable; set aside, and grants and pushed policy start empty",
+        &[
+            Field::new("reason", knsh_platform::Value::Static(unusable.reason())),
+            Field::new("kept_as", knsh_platform::Value::Static(kind)),
+            Field::new("stamp", knsh_platform::Value::U64(stamp)),
+        ],
+    );
+    true
+}
+
+/// Logs that the file was left in place and the store is frozen.
+fn log_frozen(log: &dyn SystemLog, message: &'static str, reason: &'static str) {
+    log.log(
+        Level::Error,
+        message,
+        &[Field::new("reason", knsh_platform::Value::Static(reason))],
+    );
+}
+
+/// Why the state file at start cannot be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unusable {
+    /// It could not be examined or read: an I/O or permission error, which may pass.
+    Unreadable,
+    /// Not a `0600` regular file of this user (a symlink, a directory, another owner, other modes).
+    NotPrivate,
+    /// Larger than any file `knshd` writes.
+    TooLarge,
+    /// Not the format: bad JSON, an unknown member, a value out of range, an older version.
+    Corrupt,
+    /// Written by a newer `knshd`.
+    NewerVersion,
+}
+
+impl Unusable {
+    /// The fixed reason for the log.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Unreadable => "unreadable",
+            Self::NotPrivate => "not_private",
+            Self::TooLarge => "too_large",
+            Self::Corrupt => "corrupt",
+            Self::NewerVersion => "newer_version",
+        }
+    }
+
+    /// The set-aside name's kind, or `None` when the file is left in place (module documentation). Only a file this
+    /// build read and judged is moved: an error reading it says nothing about its contents.
+    fn aside_kind(self) -> Option<&'static str> {
+        match self {
+            Self::Unreadable => None,
+            Self::NotPrivate | Self::TooLarge | Self::Corrupt => Some("corrupt"),
+            Self::NewerVersion => Some("newer"),
+        }
+    }
+}
+
+/// Renames the file at `path` to `<name>.<kind>-<µs>` (or `…-<µs>.<n>` when taken) next to it, never replacing an
+/// entry, and returns the microseconds used, or `None` when nothing moved. A symlink is moved itself, never its
+/// target.
+fn set_aside(fs: &dyn Fs, path: &std::path::Path, kind: &str, now: Option<Timestamp>) -> Option<u64> {
+    let stamp = now.map_or(0, Timestamp::as_unix_micros);
+    let name = path.file_name()?.to_string_lossy();
+    for attempt in 0..ASIDE_ATTEMPTS {
+        let aside = if attempt == 0 {
+            format!("{name}.{kind}-{stamp}")
+        } else {
+            format!("{name}.{kind}-{stamp}.{attempt}")
+        };
+        match fs.rename_new(path, &path.with_file_name(aside)) {
+            Ok(()) => return Some(stamp),
+            // Taken (a clock that went back, or a set-aside of the same microsecond): try the next name.
+            Err(error) if error.is_already_exists() => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Reads the state file, or why it cannot be used.
+fn read_state(fs: &dyn Fs, path: &std::path::Path, uid: u32) -> Result<State, Unusable> {
     match fs.metadata(path) {
         Ok(meta) if meta.kind == FileKind::File && meta.uid == uid && meta.mode == FILE_MODE => {}
-        Ok(_) => return Err("not_private"),
+        Ok(_) => return Err(Unusable::NotPrivate),
         Err(error) if error.is_not_found() => return Ok(State::default()),
-        Err(_) => return Err("unreadable"),
+        Err(_) => return Err(Unusable::Unreadable),
     }
     let bytes = fs.read(path, MAX_STATE_LEN as u64).map_err(|error| match error {
-        PlatformError::TooLarge { .. } => "too_large",
-        _ => "unreadable",
+        PlatformError::TooLarge { .. } => Unusable::TooLarge,
+        _ => Unusable::Unreadable,
     })?;
-    let value = knsh_json::parse(&bytes, MAX_STATE_LEN).map_err(|_| "corrupt")?;
+    let value = knsh_json::parse(&bytes, MAX_STATE_LEN).map_err(|_| Unusable::Corrupt)?;
     decode(&value)
 }
 
@@ -236,33 +356,30 @@ fn encode(state: &State) -> Result<Value, JsonError> {
 
 /// Reads the file's JSON. Closed objects throughout: a member this build does not know means a format it does not
 /// understand, and guessing would rewrite the file without it.
-fn decode(value: &Value) -> Result<State, &'static str> {
-    let mut fields = Fields::new(value).map_err(|_| "corrupt")?;
-    let version: u64 = fields.required("version").map_err(|_| "corrupt")?;
+fn decode(value: &Value) -> Result<State, Unusable> {
+    let corrupt = |_| Unusable::Corrupt;
+    let mut fields = Fields::new(value).map_err(corrupt)?;
+    let version: u64 = fields.required("version").map_err(corrupt)?;
     if version > VERSION {
-        // A newer knshd wrote it: kept for that version, never downgraded by this one.
-        return Err("newer_version");
+        // A newer knshd wrote it: set aside for that version, never downgraded by this one.
+        return Err(Unusable::NewerVersion);
     }
     if version != VERSION {
-        return Err("corrupt");
+        return Err(Unusable::Corrupt);
     }
-    let snapshots: Vec<Value> = fields.required("snapshots").map_err(|_| "corrupt")?;
-    let grants: Vec<Value> = fields.required("grants").map_err(|_| "corrupt")?;
-    fields.finish_closed().map_err(|_| "corrupt")?;
+    let snapshots: Vec<Value> = fields.required("snapshots").map_err(corrupt)?;
+    let grants: Vec<Value> = fields.required("grants").map_err(corrupt)?;
+    fields.finish_closed().map_err(corrupt)?;
     if snapshots.len() > MAX_SNAPSHOTS || grants.len() > MAX_GRANTS {
-        return Err("corrupt");
+        return Err(Unusable::Corrupt);
     }
     let snapshots = snapshots
         .iter()
-        .map(|value| Snapshot::from_json(value).map_err(|_| "corrupt"))
+        .map(|value| Snapshot::from_json(value).map_err(corrupt))
         .collect::<Result<Vec<_>, _>>()?;
     let grants = grants
         .iter()
-        .map(|value| {
-            StoredGrant::from_json(value)
-                .map(|stored| stored.0)
-                .map_err(|_| "corrupt")
-        })
+        .map(|value| StoredGrant::from_json(value).map(|stored| stored.0).map_err(corrupt))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(State { snapshots, grants })
 }
@@ -377,10 +494,18 @@ pub(crate) mod tests {
         ]
     }
 
+    /// The start time the tests open the store at, which names a set-aside file.
+    const STARTED: u64 = 1_000;
+
     fn open(fs: &Arc<MemFs>) -> (Arc<StateStore>, State, Arc<RecordingLog>) {
         let log = Arc::new(RecordingLog::new());
-        let (store, state) = StateStore::open(fs.clone(), path(), DEFAULT_UID, log.clone());
+        let (store, state) = StateStore::open(fs.clone(), path(), DEFAULT_UID, Some(at(STARTED)), log.clone());
         (store, state, log)
+    }
+
+    /// `state.json.<kind>-<STARTED in µs><suffix>`, next to the state file.
+    fn aside(kind: &str, suffix: &str) -> PathBuf {
+        path().with_file_name(format!("state.json.{kind}-{}{suffix}", STARTED * 1_000_000))
     }
 
     // FR-POL-60 (KNSH-071): pushed policy and grants are written owner-only, and read back as they were.
@@ -418,24 +543,92 @@ pub(crate) mod tests {
         assert_eq!(store.saved().grants.len(), 0);
     }
 
-    // Persistence rules: a corrupt, newer or foreign file is never overwritten; the store refuses every save.
+    // Persistence rules (KNSH-074): a corrupt, newer, foreign or oversized file is never overwritten. It is set aside
+    // with its bytes intact, the state starts empty, and saves work again, writing a fresh file in its place; the
+    // set-aside file is never touched again.
     #[test]
-    fn never_overwrites_an_unreadable_file() {
-        for (bytes, mode) in [
-            (b"{not json".to_vec(), FILE_MODE),
-            (br#"{"version":2,"snapshots":[],"grants":[]}"#.to_vec(), FILE_MODE),
+    fn corrupt_state_file_is_not_overwritten() {
+        let too_large = vec![b' '; MAX_STATE_LEN + 1];
+        for (bytes, mode, kind) in [
+            (b"{not json".to_vec(), FILE_MODE, "corrupt"),
+            (
+                br#"{"version":2,"snapshots":[],"grants":[]}"#.to_vec(),
+                FILE_MODE,
+                "newer",
+            ),
+            (
+                br#"{"version":0,"snapshots":[],"grants":[]}"#.to_vec(),
+                FILE_MODE,
+                "corrupt",
+            ),
             (
                 br#"{"version":1,"snapshots":[],"grants":[],"secrets":[]}"#.to_vec(),
                 FILE_MODE,
+                "corrupt",
             ),
-            (br#"{"version":1,"snapshots":[],"grants":[]}"#.to_vec(), 0o644),
+            (
+                br#"{"version":1,"snapshots":[],"grants":[]}"#.to_vec(),
+                0o644,
+                "corrupt",
+            ),
+            (too_large, FILE_MODE, "corrupt"),
         ] {
             let fs = fs();
             fs.write(&path(), &bytes, mode).unwrap();
             let (store, state, log) = open(&fs);
             assert_eq!(state, State::default());
-            assert_eq!(store.save_grants(grants()), Err(SaveError::Frozen));
-            assert_eq!(fs.contents(&path()).unwrap(), bytes, "left as it was");
+            assert_eq!(fs.contents(&aside(kind, "")).unwrap(), bytes, "kept, byte for byte");
+            assert_eq!(log.entries().len(), 1, "the recovery is reported");
+
+            store.save_grants(grants()).unwrap();
+            assert_eq!(
+                fs.contents(&aside(kind, "")).unwrap(),
+                bytes,
+                "still untouched after a save"
+            );
+            let (_, restored, _) = open(&fs);
+            assert_eq!(restored.grants, grants(), "the fresh file is read at the next start");
+        }
+    }
+
+    // KNSH-074: a symlink in place of the file is set aside itself; its target is never read, followed or written.
+    #[test]
+    fn sets_aside_a_symlink_without_touching_its_target() {
+        let fs = fs();
+        let target = path().with_file_name("elsewhere");
+        fs.write(&target, b"theirs", FILE_MODE).unwrap();
+        fs.add_symlink(&path(), &target).unwrap();
+        let (store, _, _) = open(&fs);
+        assert_eq!(fs.metadata(&aside("corrupt", "")).unwrap().kind, FileKind::Symlink);
+        store.save_grants(grants()).unwrap();
+        assert_eq!(fs.contents(&target).unwrap(), b"theirs");
+        assert_eq!(fs.metadata(&path()).unwrap().kind, FileKind::File);
+    }
+
+    // KNSH-074: an earlier set-aside file of the same name is never replaced: the next free name is used.
+    #[test]
+    fn set_aside_never_replaces_an_earlier_one() {
+        let fs = fs();
+        fs.write(&aside("corrupt", ""), b"earlier", FILE_MODE).unwrap();
+        fs.write(&path(), b"{", FILE_MODE).unwrap();
+        let _ = open(&fs);
+        assert_eq!(fs.contents(&aside("corrupt", "")).unwrap(), b"earlier");
+        assert_eq!(fs.contents(&aside("corrupt", ".1")).unwrap(), b"{");
+    }
+
+    // Persistence rules: a file that cannot be set aside, or cannot even be examined, stays exactly where and as it
+    // is; the store is frozen and refuses every save rather than write over it.
+    #[test]
+    fn freezes_when_the_file_cannot_be_set_aside_or_examined() {
+        for fault in [Operation::Rename, Operation::Metadata] {
+            let fs = fs();
+            fs.write(&path(), b"{not json", FILE_MODE).unwrap();
+            fs.inject_fault(fault, 5);
+            let (store, state, log) = open(&fs);
+            assert_eq!(state, State::default());
+            assert_eq!(store.save_grants(grants()), Err(SaveError::Frozen), "{fault:?}");
+            assert_eq!(fs.contents(&path()).unwrap(), b"{not json", "{fault:?}: left as it was");
+            assert!(fs.contents(&aside("corrupt", "")).is_none());
             assert_eq!(log.entries().len(), 1);
         }
     }

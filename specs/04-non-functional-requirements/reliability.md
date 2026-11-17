@@ -26,5 +26,15 @@ The engine must stay safe when parts of it are missing: fail closed for agents, 
 | Hook fails or times out | No hooks run | The line is denied |
 | Shadow not ready | Not applicable | Lines touching that root wait, or fail with `-32010` |
 | No working sandbox backend | Unaffected | Agent sessions refuse to start (`sandbox: none`) |
+| State file corrupt or newer | Unaffected | Set aside at start, never overwritten; the engine starts with no grants and no pushed policy ([state store](../06-api/control-service.md#state-store), KNSH-074) |
+
+## What survives a restart
+
+A restarted `knshd` restores grants that are still live and pushed snapshots from its state store (NFR-REL-06).
+Everything else is memory-only and is lost: secrets the authority supplied, pending asks (the waiting `knsh -c` sees
+its connection close and exits 126), the authority's connection (it reconnects), and **sessions**. An envelope started
+before the crash is not known to the new `knshd`, so its lines are refused (`-32009`, exit 126) until the agent is
+started again: fail closed. Adopting surviving envelopes after a restart is not specified yet (pending, see
+[KNSH-074](../00-stories/KNSH-074-fail-closed-operation-and-state-across-restarts.md)).
 
 An agent session never gets a yes/no prompt in its own terminal, because the agent driving that terminal could answer it.

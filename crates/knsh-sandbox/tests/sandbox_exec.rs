@@ -346,6 +346,33 @@ fn network_limited_to_proxy_port_under_sandbox_exec() {
     );
 }
 
+// KNSH-074, NFR-REL-01: envelope network goes only through the proxy, so once the proxy is gone (with `knshd`) it
+// fails: the proxy's port is reachable while it listens and refused after, and nothing else ever was.
+#[test]
+fn envelope_network_fails_once_the_proxy_is_gone() {
+    let Fixture {
+        dir: _dir,
+        envelope,
+        proxy_port,
+        _proxy: proxy,
+        ..
+    } = Fixture::new("074-net");
+    let port = proxy_port.to_string();
+    assert!(
+        succeeds(&envelope, "/usr/bin/nc", &["-z", "127.0.0.1", &port]),
+        "the envelope cannot reach the proxy"
+    );
+    drop(proxy);
+    assert!(
+        !succeeds(&envelope, "/usr/bin/nc", &["-z", "127.0.0.1", &port]),
+        "reached the proxy port with no proxy"
+    );
+    assert!(
+        !succeeds(&envelope, "/usr/bin/nc", &["-z", "-G", "3", "1.1.1.1", "443"]),
+        "reached the network directly"
+    );
+}
+
 // KNSH-045, FR-SBX-05: a command connects to no Unix socket, `user.sock` included; an envelope reaches `agent.sock`
 // but never `user.sock`.
 #[test]

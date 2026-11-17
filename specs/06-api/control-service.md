@@ -219,10 +219,19 @@ saved it is logged, and the grant would apply again only after a restart, until 
 Grants and pushed snapshots are kept in `state.json` in the engine data directory
 ([file locations](../09-reference/file-locations.md)): a versioned JSON file, rewritten whole on every change with an
 atomic replace (temporary file, flush, rename), owner-only `0600`, written only by `knshd`. At start `knshd` restores
-the snapshots and the grants still live. A file that is not a `0600` regular file of the user, does not parse, or has a
-newer version is never overwritten: it is logged and left as it is, and every change that would save (`policy.set`,
-`policy.grant`, an answer's grant) is refused until it is recovered
-([KNSH-074](../00-stories/KNSH-074-fail-closed-operation-and-state-across-restarts.md)).
+the snapshots and the grants still live. A file is never overwritten when it cannot be used
+([KNSH-074](../00-stories/KNSH-074-fail-closed-operation-and-state-across-restarts.md)):
+
+- **Recovery.** A file that is not a `0600` regular file of the user (a symlink, a directory, another owner or mode),
+  is larger than any file `knshd` writes, does not parse, or has an older or newer version is renamed at start,
+  without replacing anything, to `state.json.corrupt-<µs>` (`state.json.newer-<µs>` for a newer version, `<µs>` the
+  start time in Unix microseconds, `.<n>` appended if the name is taken). The rename moves a symlink itself, never its
+  target. `knshd` logs it and starts with no grants and no pushed policy, which fails closed: grants only add
+  permissions, and a profile whose snapshot is lost falls back to its signed local file or is paused (KNSH-072). The
+  set-aside file is never read or written again; a newer `knshd` or the user may inspect it.
+- **Frozen.** A file that cannot be examined (an I/O or permission error, which may pass) or whose rename fails is
+  left as it is, and every change that would save (`policy.set`, `policy.grant`, an answer's grant) is refused
+  (`-32603`) until a later start can read or set it aside.
 
 ## `recording.set`
 

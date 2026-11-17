@@ -79,8 +79,13 @@ impl Admin {
         let fixture = fixture();
         let clock = Arc::new(FakeClock::new(Timestamp::from_unix_micros(NOW * 1_000_000).unwrap()));
         let log = Arc::new(RecordingLog::new());
-        let (state, restored) =
-            StateStore::open(state_fs.clone(), crate::state::tests::path(), DEFAULT_UID, log.clone());
+        let (state, restored) = StateStore::open(
+            state_fs.clone(),
+            crate::state::tests::path(),
+            DEFAULT_UID,
+            clock.now().ok(),
+            log.clone(),
+        );
         let pushed = PushedPolicies::new(Arc::clone(&state), clock.clone(), restored.snapshots);
         let grants = GrantStore::persisted(state, log.clone(), restored.grants, clock.now().ok());
         let profiles = loader(fs(&[("web", WEB)])).with_pushed(Arc::clone(&pushed));

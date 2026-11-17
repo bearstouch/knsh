@@ -252,6 +252,8 @@ struct Setup {
     grants: Option<Arc<crate::grants::GrantStore>>,
     /// A real authority in place of the scripted `authority` (KNSH-069).
     authority_service: Option<Arc<dyn Authority + Send + Sync>>,
+    /// Pushed policy, read before the profile files (KNSH-071).
+    pushed: Option<Arc<crate::pushed::PushedPolicies>>,
 }
 
 impl Daemon {
@@ -301,9 +303,13 @@ impl Daemon {
         for (name, bytes) in &setup.raw_files {
             fs.write(&policies.join(format!("{name}.toml")), bytes, 0o600).unwrap();
         }
+        let profiles = match setup.pushed {
+            Some(pushed) => crate::policy::tests::loader(fs).with_pushed(pushed),
+            None => crate::policy::tests::loader(fs),
+        };
         Lifecycle::new(Parts {
             sessions: Arc::clone(&self.fixture.sessions),
-            profiles: crate::policy::tests::loader(fs),
+            profiles,
             events: Arc::clone(&self.fixture.hub),
             store: (!setup.no_store).then(|| self.fixture.store.clone()),
             clock: self.clock.clone(),
@@ -599,10 +605,10 @@ fn reevaluates_rewritten_line_once() {
     assert_eq!(daemon.spawns().len(), 1, "the second line was never spawned");
 }
 
-// FR-LC-10, FR-AUTH-23, standalone mode: an ask with no authority waits, then is denied at the timeout with -32002;
-// `decision.cancelled` says so, and the denial is recorded as standalone.
+// FR-LC-10, FR-AUTH-23, NFR-REL-09 (KNSH-074), standalone mode: an ask with no authority waits, then is denied at
+// the timeout with -32002; `decision.cancelled` says so, and the denial is recorded as standalone.
 #[test]
-fn ask_without_authority_is_denied_at_the_timeout() {
+fn asks_denied_at_timeout_without_authority() {
     let daemon = Daemon::new();
     daemon.events();
     let error = daemon
@@ -1846,4 +1852,110 @@ fn authority_grant_allows_the_line_again() {
     );
     assert_eq!(wire.wait_for(1).len(), 1, "the granted line was not asked about");
     assert_eq!(daemon.spawns().len(), 2);
+}
+
+/// The state store a `knshd` start opens from `fs` at the daemon's time, with what it restored (as `main` does).
+fn started(daemon: &Daemon, fs: &Arc<MemFs>) -> (Arc<crate::state::StateStore>, crate::state::State) {
+    use knsh_platform::Clock;
+    crate::state::StateStore::open(
+        fs.clone(),
+        crate::state::tests::path(),
+        knsh_platform::testing::DEFAULT_UID,
+        daemon.clock.now().ok(),
+        Arc::new(knsh_platform::testing::RecordingLog::new()),
+    )
+}
+
+// NFR-REL-06 (KNSH-074): grants live when `knshd` stopped come back with the next start and decide lines again, so a
+// granted `git push` runs without asking, decided by the grant; one that expired while `knshd` was down is not
+// restored.
+#[test]
+fn restores_grants_after_restart() {
+    use knsh_core::{Grant, GrantId, GrantScope, Ulid};
+    use knsh_platform::Clock;
+
+    let daemon = Daemon::new();
+    let now = daemon.clock.now().unwrap();
+    let fs = crate::state::tests::fs();
+    let id = |n| GrantId::from_ulid(Ulid::from_u128(n));
+    let later = |seconds: u64| Timestamp::from_unix_micros(now.as_unix_micros() + seconds * 1_000_000).unwrap();
+    {
+        // The first run: the grants are made, then `knshd` stops.
+        let (state, restored) = started(&daemon, &fs);
+        let log = Arc::new(knsh_platform::testing::RecordingLog::new());
+        let grants = crate::grants::GrantStore::persisted(state, log, restored.grants, Some(now));
+        let push = Grant::new(id(1), GrantScope::Session(daemon.session_id), "git push", later(3600)).unwrap();
+        grants.insert(push, now).unwrap();
+        let short = Grant::new(
+            id(2),
+            GrantScope::Profile(ProfileName::new("web").unwrap()),
+            "git commit",
+            later(5),
+        )
+        .unwrap();
+        grants.insert(short, now).unwrap();
+    }
+    daemon.clock.advance(Duration::from_secs(60));
+
+    let (state, restored) = started(&daemon, &fs);
+    let restarted_at = daemon.clock.now().unwrap();
+    let log = Arc::new(knsh_platform::testing::RecordingLog::new());
+    let grants = crate::grants::GrantStore::persisted(state, log, restored.grants, Some(restarted_at));
+    assert_eq!(
+        grants
+            .list(restarted_at)
+            .iter()
+            .map(|grant| grant.rule().to_owned())
+            .collect::<Vec<_>>(),
+        ["git push"],
+        "the expired grant is not restored"
+    );
+    let lifecycle = daemon.lifecycle(Setup {
+        grants: Some(grants),
+        ..Setup::default()
+    });
+    lifecycle.run(daemon.line("git push"), &StillWaiting).unwrap();
+    let decision = daemon.records().pop().unwrap().details.decision.unwrap();
+    assert_eq!(decision.source, DecisionSource::Grant);
+    assert_eq!(daemon.spawns().len(), 1);
+}
+
+// NFR-REL-06 (KNSH-074): pushed policy comes back with the next start and is what lines are evaluated against, in
+// place of the profile file: the snapshot allows `echo` and denies `ls`, which the file allows.
+#[test]
+fn restores_pushed_policy_after_restart() {
+    use knsh_platform::Clock;
+
+    const PUSHED: &str = "name = \"web\"\n[exec]\nallow = [\"echo\"]\ndeny = [\"ls\"]\n";
+    let daemon = Daemon::new();
+    let now = daemon.clock.now().unwrap();
+    let expires_at = Timestamp::from_unix_micros(now.as_unix_micros() + 3_600_000_000).unwrap();
+    let fs = crate::state::tests::fs();
+    {
+        let (state, restored) = started(&daemon, &fs);
+        let pushed = crate::pushed::PushedPolicies::new(state, daemon.clock.clone(), restored.snapshots);
+        let snapshot = crate::pushed::Snapshot {
+            profile: ProfileName::new("web").unwrap(),
+            policy: PUSHED.to_owned(),
+            expires_at,
+        };
+        pushed.set(snapshot).unwrap();
+    }
+    daemon.clock.advance(Duration::from_secs(60));
+
+    let (state, restored) = started(&daemon, &fs);
+    assert_eq!(restored.snapshots.len(), 1);
+    let pushed = crate::pushed::PushedPolicies::new(state, daemon.clock.clone(), restored.snapshots);
+    let lifecycle = daemon.lifecycle(Setup {
+        pushed: Some(pushed),
+        ..Setup::default()
+    });
+    lifecycle.run(daemon.line("echo hi"), &StillWaiting).unwrap();
+    let error = lifecycle.run(daemon.line("ls"), &StillWaiting).unwrap_err();
+    assert_eq!(
+        error.code,
+        ErrorCode::Denied,
+        "the pushed policy, not the file, decides"
+    );
+    assert_eq!(daemon.spawns(), ["spawn echo hi as bash"]);
 }

@@ -242,7 +242,8 @@ mod tests {
         assert!(pushed.expired().is_empty(), "a new snapshot applies again");
     }
 
-    // A snapshot that cannot be saved is not stored.
+    // A snapshot that cannot be saved is not stored: here the state file is corrupt and cannot be set aside, so the
+    // store is frozen (KNSH-074).
     #[test]
     fn refuses_snapshots_that_cannot_be_saved() {
         let fs = crate::state::tests::fs();
@@ -252,10 +253,12 @@ mod tests {
             knsh_platform::engine_dirs::FILE_MODE,
         )
         .unwrap();
+        fs.inject_fault(knsh_platform::Operation::Rename, 5);
         let (state, _) = StateStore::open(
             fs,
             crate::state::tests::path(),
             knsh_platform::testing::DEFAULT_UID,
+            Some(at(10)),
             Arc::new(RecordingLog::new()),
         );
         let pushed = PushedPolicies::new(state, Arc::new(FakeClock::new(at(10))), Vec::new());
