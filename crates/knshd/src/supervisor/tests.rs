@@ -1490,6 +1490,40 @@ fn returns_executed_command_after_rewrite() {
     assert_eq!(finished.default_mode, knsh_core::OutputMode::Full);
 }
 
+// FR-AUTH-33, FR-REC-04 (KNSH-070): after the authority's rewrite, the line spawned and returned by `exec.run` as
+// `executed_command` is the rewritten one with its absolute paths; the record's `command` is the rewritten line and
+// its `rewritten_from` the received one. The received line never runs.
+#[test]
+fn executed_command_reflects_rewrite() {
+    let daemon = Daemon::new();
+    let finished = daemon
+        .next(
+            Setup {
+                authority: Some(vec![AskReply::Rewrite {
+                    command: "ls -a".to_owned(),
+                }]),
+                ..Setup::default()
+            },
+            "git push --force",
+        )
+        .unwrap();
+    assert_eq!(finished.executed_command.expose(), "/bin/ls -a");
+    assert_eq!(daemon.spawns(), ["spawn /bin/ls -a as bash"]);
+    assert_eq!(finished.decision.verdict, DecisionVerdict::Rewrite);
+
+    let record = daemon.records().pop().unwrap();
+    assert_eq!(record.command.expose(), "ls -a");
+    assert_eq!(
+        record
+            .details
+            .rewritten_from
+            .as_ref()
+            .map(|text| text.expose().as_str()),
+        Some("git push --force")
+    );
+    assert_eq!(record.details.decision.unwrap().verdict, DecisionVerdict::Rewrite);
+}
+
 // FR-HOOK-20, FR-HOOK-21, FR-REC-03 (KNSH-055): five denials of one line within 60 s limit it. The sixth attempt is
 // denied with source `rate_limit` without hooks or an ask (the authority's script is empty: an ask would panic), it
 // is still recorded and reported, and `command.denied_repeatedly` follows only the denial that started the limit.

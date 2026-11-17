@@ -9,6 +9,7 @@ use crate::hook::{Ended, Execution, HookConfig, HookExecutor, HookExit, HookSpec
 use crate::policy::paths::testing::FakeFs;
 use crate::policy::{LookupError, PathContext, ProfileSource, load_profile_text, load_unattended};
 use crate::record::HookResult;
+use crate::redacted::REDACTED_MARKER;
 use crate::resolve::BinaryLookup;
 use crate::session::AgentId;
 use crate::ulid::Ulid;
@@ -148,8 +149,14 @@ impl ScriptedAsker<'_> {
     fn answer(&self, request: &AskRequest<'_>) -> AskAnswer {
         // The asking hook is journalled only when one is named, so the asks of hook-less tests read as before.
         let hook = request.hook.map(|hook| format!(" hook={hook}")).unwrap_or_default();
+        // The line a rewritten line replaced, as the asker sees it (FR-AUTH-30); only after a rewrite.
+        let from = request
+            .proposal
+            .rewritten_from
+            .map(|from| format!(" from {}", from.expose()))
+            .unwrap_or_default();
         self.journal.push(format!(
-            "ask {} {} rule={}{hook}",
+            "ask {} {} rule={}{hook}{from}",
             self.name,
             request.proposal.command.expose(),
             request.rule_id.unwrap_or("-")
@@ -602,6 +609,195 @@ fn refuses_rewrites_it_cannot_trust() {
     }
 }
 
+// FR-AUTH-30 (KNSH-070): the authority's rewrite is parsed and evaluated once more (steps 2 to 5) on the new line,
+// which is what runs; the authority is not asked again about a line the rules allow.
+#[test]
+fn reevaluates_authority_rewrite_once() {
+    let harness = Harness::new().authority(vec![Some(AskReply::Rewrite {
+        command: "ls -a".to_owned(),
+    })]);
+    let run = allowed(harness.decide("git push"));
+    assert_eq!(
+        harness.journal.entries(),
+        [
+            "proposed git push",
+            "hooks git push",
+            "ask authority git push rule=exec.ask[0]",
+            "proposed ls -a from git push",
+            "hooks ls -a",
+        ],
+        "one more pass, and one only"
+    );
+    assert_eq!(run.command, "ls -a");
+    assert_eq!(run.rewritten_from.as_deref(), Some("git push"));
+    assert_eq!(run.executed, "/bin/ls -a");
+    assert_eq!(run.decision.verdict, DecisionVerdict::Rewrite);
+    assert_eq!(run.decision.rule_id.as_deref(), Some("exec.allow[1]"));
+    // The rewritten line was allowed by a rule, not approved: it gets no approval hosts (KNSH-060).
+    assert!(!run.profile.approved);
+
+    // Policy decides the new line on its own: a rewrite into a denied line is denied by its rule, not run.
+    let harness = Harness::new().authority(vec![Some(AskReply::Rewrite {
+        command: "rm -rf build".to_owned(),
+    })]);
+    let refusal = refused(harness.decide("git push"));
+    assert_eq!(refusal.decision.source, DecisionSource::Rule);
+    assert_eq!(refusal.decision.rule_id.as_deref(), Some("exec.deny[0]"));
+    assert_eq!(refusal.command, "rm -rf build");
+    assert_eq!(refusal.rewritten_from.as_deref(), Some("git push"));
+}
+
+// FR-AUTH-30 (KNSH-070): a rewritten line that asks again reaches the authority with `rewritten_from`, the line it
+// replaced, and the authority's answer to that second ask decides it.
+#[test]
+fn second_ask_carries_rewritten_from() {
+    let harness = Harness::new().authority(vec![
+        Some(AskReply::Rewrite {
+            command: "git push --dry-run".to_owned(),
+        }),
+        Some(AskReply::Allow),
+    ]);
+    let run = allowed(harness.decide("git push --force"));
+    let asks: Vec<_> = harness
+        .journal
+        .entries()
+        .into_iter()
+        .filter(|entry| entry.starts_with("ask"))
+        .collect();
+    assert_eq!(
+        asks,
+        [
+            "ask authority git push --force rule=exec.ask[0]",
+            "ask authority git push --dry-run rule=exec.ask[0] from git push --force",
+        ]
+    );
+    assert_eq!(run.command, "git push --dry-run");
+    assert_eq!(run.rewritten_from.as_deref(), Some("git push --force"));
+    assert_eq!(
+        run.decision,
+        decision(
+            DecisionVerdict::Rewrite,
+            DecisionSource::Authority,
+            Some("exec.ask[0]"),
+            Some("authority")
+        )
+    );
+    assert!(run.profile.approved, "the second ask approved the rewritten line");
+
+    // Without an authority, local approvals see the same `rewritten_from` (a hook's rewrite, then a rule's ask).
+    let harness = Harness::new()
+        .hooks(vec![Some(HookVerdict::Rewrite {
+            command: "git push".to_owned(),
+        })])
+        .approvals(vec![Some(AskReply::Deny { reason: None })]);
+    refused(harness.decide("git push --force"));
+    assert!(
+        harness
+            .journal
+            .entries()
+            .contains(&"ask user git push rule=exec.ask[0] from git push --force".to_owned())
+    );
+}
+
+// FR-AUTH-31 (KNSH-070): a second rewrite is refused and the line denied, whoever sends it, in either order. Nothing
+// runs, and the refused line is the first rewrite's, recorded with the received line as `rewritten_from`.
+#[test]
+fn refuses_second_rewrite() {
+    let rewrite_reply = |command: &str| {
+        Some(AskReply::Rewrite {
+            command: command.to_owned(),
+        })
+    };
+    let rewrite_hook = |command: &str| {
+        Some(HookVerdict::Rewrite {
+            command: command.to_owned(),
+        })
+    };
+    let cases = [
+        // The authority rewrites, then rewrites its own rewrite again.
+        (
+            Harness::new().authority(vec![rewrite_reply("git push origin"), rewrite_reply("ls")]),
+            DecisionSource::Authority,
+            "git push origin",
+        ),
+        // A hook rewrites, then the authority rewrites the hook's line.
+        (
+            Harness::new()
+                .hooks(vec![rewrite_hook("git push origin")])
+                .authority(vec![rewrite_reply("ls")]),
+            DecisionSource::Authority,
+            "git push origin",
+        ),
+        // The authority rewrites, then a hook rewrites the authority's line.
+        (
+            Harness::new()
+                .hooks(vec![Some(HookVerdict::Allow), rewrite_hook("ls")])
+                .authority(vec![rewrite_reply("echo hi")]),
+            DecisionSource::Hook,
+            "echo hi",
+        ),
+    ];
+    for (harness, source, refused_line) in cases {
+        let refusal = refused(harness.decide("git push --force"));
+        assert_eq!(refusal.decision.verdict, DecisionVerdict::Deny);
+        assert_eq!(refusal.decision.source, source);
+        assert_eq!(refusal.kind, RefusalKind::Denied);
+        assert_eq!(refusal.reason.as_deref(), Some(SECOND_REWRITE));
+        assert_eq!(refusal.command, refused_line);
+        assert_eq!(refusal.rewritten_from.as_deref(), Some("git push --force"));
+        // The second rewrite's line is never proposed, evaluated or asked about.
+        assert!(
+            !harness.journal.entries().iter().any(|entry| entry.contains(" ls")),
+            "{:?}",
+            harness.journal.entries()
+        );
+    }
+}
+
+// FR-AUTH-32 (KNSH-070): a line holding a redaction marker, plain or named (`«redacted:<name>»`, FR-SEC-10), cannot
+// be rewritten, and a rewrite carrying one is refused: the marker stands for a value the rewriter never saw.
+#[test]
+fn refuses_rewrite_of_line_with_redaction_marker() {
+    let named = "«redacted:npm-token»";
+    // The received line holds the marker: the authority's (or a hook's) rewrite of it is refused.
+    for (harness, source) in [
+        (
+            Harness::new().authority(vec![Some(AskReply::Rewrite {
+                command: "git push origin".to_owned(),
+            })]),
+            DecisionSource::Authority,
+        ),
+        (
+            Harness::new().hooks(vec![Some(HookVerdict::Rewrite {
+                command: "git push origin".to_owned(),
+            })]),
+            DecisionSource::Hook,
+        ),
+    ] {
+        for marker in [named, REDACTED_MARKER] {
+            let line = format!("git push https://{marker}@example.com");
+            let refusal = refused(harness.decide(&line));
+            assert_eq!(refusal.decision.verdict, DecisionVerdict::Deny);
+            assert_eq!(refusal.decision.source, source);
+            assert_eq!(refusal.reason.as_deref(), Some(REWRITE_OF_REDACTED));
+            assert_eq!(refusal.command, line, "refused as received");
+            assert_eq!(refusal.rewritten_from, None, "no rewrite was applied");
+        }
+    }
+    // The rewrite itself carries a named marker.
+    let harness = Harness::new().authority(vec![Some(AskReply::Rewrite {
+        command: format!("npm publish --token {named}"),
+    })]);
+    let refusal = refused(harness.decide("git push"));
+    assert_eq!(refusal.reason.as_deref(), Some(REWRITE_OF_REDACTED));
+    assert_eq!(refusal.command, "git push");
+    assert!(!harness.journal.entries().iter().any(|entry| entry.contains("npm")));
+
+    // Without a rewrite, a line holding a marker is decided like any other.
+    let harness = Harness::new().authority(vec![Some(AskReply::Allow)]);
+    allowed(harness.decide(&format!("git push https://{named}@example.com")));
+}
+
 // NFR-REL-07, FR-HOOK-04: every failure in any step is a deny, never a run, panics included.
 #[test]
 fn denies_on_internal_error_in_any_step() {
@@ -887,7 +1083,7 @@ fn policy_evaluates_rewritten_line() {
             "hooks ls",
             "proposed git push from ls",
             "hooks git push",
-            "ask authority git push rule=exec.ask[0]",
+            "ask authority git push rule=exec.ask[0] from ls",
         ]
     );
     assert_eq!(run.decision.rule_id.as_deref(), Some("exec.ask[0]"));

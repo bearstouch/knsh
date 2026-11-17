@@ -45,7 +45,7 @@ use super::rules::{matches_certainly, matches_exactly};
 use crate::error::CoreError;
 use crate::id::{GrantId, SessionId};
 use crate::lifecycle::redact;
-use crate::redacted::REDACTED_MARKER;
+use crate::redacted::holds_redaction_marker;
 use crate::session::ProfileName;
 use crate::time::Timestamp;
 
@@ -299,7 +299,7 @@ pub fn line_grant_rule(classification: &Classification) -> Option<String> {
     let rule = words.join(" ");
     // Grants are listed and stored, so a rule redaction would change (or one already holding the marker, which could
     // not be told apart from a redacted secret) gets no grant rather than a secret written down.
-    let holds_secret = redact(&rule).expose() != &rule || rule.contains(REDACTED_MARKER);
+    let holds_secret = redact(&rule).expose() != &rule || holds_redaction_marker(&rule);
     (!holds_secret && is_pattern(&rule)).then_some(rule)
 }
 

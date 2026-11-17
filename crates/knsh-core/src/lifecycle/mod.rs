@@ -64,7 +64,7 @@ use crate::policy::{
 };
 use crate::ratelimit::LineKey;
 use crate::record::{DecisionVerdict, HookRun, RecordDecision};
-use crate::redacted::{REDACTED_MARKER, Redacted};
+use crate::redacted::{Redacted, holds_redaction_marker};
 use crate::resolve::BinaryLookup;
 use crate::session::{Actor, ProfileName};
 use crate::time::Timestamp;
@@ -776,8 +776,10 @@ impl<'i, 'e> Pipeline<'i, 'e> {
     ) -> Result<String, Outcome> {
         let refused = if self.rewritten_from.is_some() {
             Some(SECOND_REWRITE)
-        } else if redact(&from).expose().contains(REDACTED_MARKER) || to.contains(REDACTED_MARKER) {
-            // The rewriter saw a marker in place of a value, so its line cannot hold the real one.
+        } else if holds_redaction_marker(redact(&from).expose()) || holds_redaction_marker(&to) {
+            // FR-AUTH-32: the rewriter saw a marker (`«redacted»` or `«redacted:<name>»`) in place of a value, so its
+            // line cannot hold the real one; running it would pass the marker text on as the value. A line that held
+            // a marker as received is refused the same way: what was redacted cannot be told from what was typed.
             Some(REWRITE_OF_REDACTED)
         } else if to.len() > MAX_LINE_LEN || to.contains('\0') {
             Some(REWRITE_INVALID)
