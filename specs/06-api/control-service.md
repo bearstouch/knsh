@@ -198,14 +198,15 @@ Makes a [grant](../05-models/grant.md) (FR-POL-62): `scope` `session` with `sess
 like an `exec.allow` entry (1 to 4096 bytes); `duration_s`, 1 to 2,592,000 (30 days). Result:
 `{"grant_id", "expires_at"}`. A rule that is not a command pattern (blank, naming a path) or a full grant store
 (1024 grants) is `-32602`. The grant is saved to the state store before it applies; one that cannot be saved is
-`-32603` and no grant exists. The user's `policy.grant` on `user.sock`, with Touch ID, is
-[KNSH-073](../00-stories/KNSH-073-policy-grant-on-user-sock-with-touch-id.md)'s.
+`-32603` and no grant exists. The user makes the same grants on `user.sock` after Touch ID or the password
+([KNSH-073](user-socket.md#grants)).
 
 ### `policy.grants`
 
 No params. `{"grants": [...]}`: every live grant, the authority's and those its answers created, oldest first, each
 `{"grant_id", "scope", "session_id", "profile", "rule", "exact", "expires_at"}` (`session_id` or `profile` is
-`null` according to the scope; `exact` is true for a grant made from an answer, KNSH-069).
+`null` according to the scope; `exact` is true for a grant made from an answer, KNSH-069). The user's grants
+(KNSH-073) are listed too, and `policy.grants` and `policy.revoke` are also on [`user.sock`](user-socket.md#grants).
 
 ### `policy.revoke`
 

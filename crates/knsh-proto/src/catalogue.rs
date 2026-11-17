@@ -373,8 +373,13 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     // `knsh profile use` (KNSH-072): run the sessions paused by expired pushed policy under a signed local profile,
     // after Touch ID or the password.
     MethodSpec::planned("profile.use", Endpoints::USER).available(),
-    // The authority's grants (KNSH-071); the user's, after Touch ID on user.sock, are KNSH-073's.
-    MethodSpec::planned("policy.grant", Endpoints::USER_CONTROL).available_on(Endpoints::CONTROL),
+    // Grants (FR-POL-62): the authority's on the control service (KNSH-071); the user's on user.sock after Touch ID
+    // or the password, shown by knshd (KNSH-073). Never on agent.sock: an agent can never widen its own policy.
+    MethodSpec::planned("policy.grant", Endpoints::USER_CONTROL).available(),
+    // Listing and revoking (FR-POL-61) on both, so a user without an authority app can see and remove what they
+    // granted. Neither needs authentication: listing changes nothing and revoking only removes a permission.
+    MethodSpec::planned("policy.grants", Endpoints::USER_CONTROL).available(),
+    MethodSpec::planned("policy.revoke", Endpoints::USER_CONTROL).available(),
     // Deleting records is for the user only: an agent can never erase its own trail (KNSH-017).
     MethodSpec::planned("records.forget", Endpoints::USER).available(),
     // Trusting an authority (KNSH-068, FR-AUTH-10): Touch ID or the password, shown by knshd. Never on agent.sock or
@@ -395,8 +400,6 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("session.release_control", Endpoints::CONTROL).available(),
     MethodSpec::planned("policy.set", Endpoints::CONTROL).available(),
     MethodSpec::planned("policy.get", Endpoints::CONTROL).available(),
-    MethodSpec::planned("policy.grants", Endpoints::CONTROL).available(),
-    MethodSpec::planned("policy.revoke", Endpoints::CONTROL).available(),
     MethodSpec::planned("secrets.provide", Endpoints::CONTROL).requires(Backend::Secrets),
     MethodSpec::planned("secrets.revoke", Endpoints::CONTROL).requires(Backend::Secrets),
     MethodSpec::planned("recording.set", Endpoints::CONTROL).available(),
@@ -641,6 +644,9 @@ mod tests {
                     "policy.read",
                     "policy.edit",
                     "profile.use",
+                    "policy.grant",
+                    "policy.grants",
+                    "policy.revoke",
                     "records.forget",
                     "authority.trust",
                 ],
@@ -666,6 +672,8 @@ mod tests {
                     "session.list",
                     "session.end",
                     "policy.grant",
+                    "policy.grants",
+                    "policy.revoke",
                     "authority.register",
                     "decision.respond",
                     "session.create",
@@ -675,8 +683,6 @@ mod tests {
                     "session.release_control",
                     "policy.set",
                     "policy.get",
-                    "policy.grants",
-                    "policy.revoke",
                     "recording.set",
                 ],
             };
@@ -687,9 +693,9 @@ mod tests {
                 endpoint.name()
             );
         }
-        // KNSH-073: the user's `policy.grant` (Touch ID) is not implemented yet, so user.sock neither lists nor serves
-        // it, while the control service does (KNSH-071). Likewise `session.list` and `session.end`.
-        for method in ["policy.grant", "session.list", "session.end"] {
+        // `session.list` and `session.end` for `knsh agent` are not implemented on user.sock yet, so it neither lists
+        // nor serves them, while the control service does (KNSH-071).
+        for method in ["session.list", "session.end"] {
             assert_eq!(
                 Catalogue::ENGINE.lookup(Endpoint::User, method, &caps),
                 Lookup::Planned,
@@ -719,8 +725,12 @@ mod tests {
         );
         // KNSH-065 (FR-POL-41): policy files are edited from user.sock only. KNSH-066 (FR-AUTH-43): asks are
         // answered from user.sock only, never by the agent that made them. KNSH-072 (FR-POL-51): only the user
-        // selects a local profile.
+        // selects a local profile. KNSH-073 (FR-POL-62): an agent can never grant itself anything, nor list or revoke
+        // grants.
         for method in [
+            "policy.grant",
+            "policy.grants",
+            "policy.revoke",
             "policy.read",
             "policy.edit",
             "profile.use",

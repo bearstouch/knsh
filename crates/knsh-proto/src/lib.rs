@@ -122,7 +122,7 @@ pub use control::{
     GrantEntry, GrantTargetParam, MAX_GRANT_RULE_LEN, NoParams, PolicyGetParams, PolicyGetResult, PolicyGrantParams,
     PolicyGrantResult, PolicyGrantsResult, PolicyRevokeParams, PolicyRevokeResult, PolicySetParams, PolicySetResult,
     PolicySource, RecordingSetParams, SessionCreateParams, SessionCreateResult, SessionListResult, SessionStateResult,
-    SessionTargetParams,
+    SessionTargetParams, grant_duration_text,
 };
 pub use decision::{
     DECISION_CANCELLED, DECISION_REQUESTED, DecisionAnswer, DecisionCancelledParams, DecisionRequestedParams,

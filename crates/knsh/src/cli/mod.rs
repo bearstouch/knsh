@@ -12,7 +12,8 @@
 //! the password. [`approvals`] implements `knsh approvals`, `knsh approve` and `knsh deny` (KNSH-066), and
 //! [`authority`] implements `knsh authority trust` (KNSH-068): `knshd` stores the trust record after Touch ID or the
 //! password. [`profile`] implements `knsh profile use` (KNSH-072): `knshd` moves the sessions paused by expired pushed
-//! policy to a signed local profile after Touch ID or the password.
+//! policy to a signed local profile after Touch ID or the password. [`grants`] implements `knsh policy grant`,
+//! `knsh policy grants` and `knsh policy revoke` (KNSH-073): `knshd` makes a grant after Touch ID or the password.
 
 #[cfg(unix)]
 pub mod agent;
@@ -26,6 +27,7 @@ pub mod commands;
 pub mod daemon;
 pub mod events;
 pub mod forget;
+pub mod grants;
 pub mod history;
 pub mod policy;
 pub mod profile;

@@ -63,6 +63,7 @@ pub(crate) fn idle_handlers() -> Handlers {
             expiry,
             clock,
             random: Arc::new(knsh_platform::testing::SeededRandom::new(1)),
+            presence: Arc::new(knsh_platform::testing::ScriptedPresence::new()),
             log,
         })
         .handlers(),

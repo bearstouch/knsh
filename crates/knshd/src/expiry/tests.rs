@@ -66,6 +66,7 @@ fn harness() -> Harness {
         expiry: Arc::clone(&expiry),
         clock: clock.clone(),
         random: Arc::new(SeededRandom::new(5)),
+        presence: Arc::new(knsh_platform::testing::ScriptedPresence::new()),
         log,
     })
     .handlers();
