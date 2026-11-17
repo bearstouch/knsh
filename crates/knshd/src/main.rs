@@ -38,6 +38,8 @@
 //! - FR-AUTH-12 – FR-AUTH-14, NFR-SEC-01, `specs/06-api/control-service.md` (the XPC control service with peer
 //!   verification, KNSH-067)
 //! - FR-AUTH-01, FR-AUTH-02, FR-AUTH-10, FR-AUTH-11 (`authority.trust` and `authority.register`, KNSH-068)
+//! - FR-AUTH-20 – FR-AUTH-24, FR-EVT-06, FR-LC-41, FR-POL-62, `specs/06-api/control-service.md#decision-protocol`
+//!   (the decision protocol with the authority, KNSH-069)
 //!
 //! On start it prepares the engine directories (KNSH-011) and takes its sockets from launchd ([`endpoints`],
 //! KNSH-012). It then serves them ([`server`], KNSH-013): a kqueue accept loop hands each connection to its own
@@ -72,7 +74,10 @@
 //! dispatcher on the control endpoint. The user trusts an authority with `knsh authority trust` (`authority.trust`,
 //! after Touch ID or the password; [`authority`], KNSH-068): the record is a Keychain item only `knshd` reads, and the
 //! running control service switches to it at once. One verified connection at a time may register as the authority,
-//! publishing `authority.connected` and, when it ends, `authority.disconnected`.
+//! publishing `authority.connected` and, when it ends, `authority.disconnected`. While one is registered, every ask
+//! is sent to it as `decision.requested` and waits for its `decision.respond`, the 90 s timeout or the caller leaving
+//! ([`decisions`], KNSH-069); requests still pending when it reconnects are sent again, and a `grant` in an answer
+//! becomes a live grant ([`grants`]) that later lines are evaluated with.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
@@ -96,12 +101,19 @@ mod connection;
 // The XPC control service's JSON-RPC side (KNSH-067): verified messages served through the shared dispatcher.
 #[cfg(target_os = "macos")]
 mod control;
+// The decision protocol with the authority (KNSH-069): `decision.requested`, `decision.respond`, cancellation and
+// re-sending on reconnection.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod decisions;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod dispatch;
 #[cfg(target_os = "macos")]
 mod endpoints;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod events;
+// The live grants (KNSH-042 model), created by the authority's answers (KNSH-069) and consulted for every agent line.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod grants;
 // Reads the session binding, so built where the session registry is. Served with the supervisor (KNSH-051).
 #[cfg(target_os = "macos")]
 mod exec;
@@ -288,14 +300,13 @@ fn start() -> Result<(), StartError> {
         );
         let profiles = profile_loader(&paths, random.clone(), &log);
         let policy = PolicyCheck::new(Arc::clone(&sessions), profiles.clone());
-        let approvals = local_approvals(&clock, &random, &log);
         let mut handlers = records.handlers();
         handlers.extend(events.handlers());
         handlers.extend(sessions.handlers());
         handlers.extend(policy.handlers());
         handlers.extend(policy_editor(&profiles, &log).handlers());
-        handlers.extend(approvals.handlers());
-        let (trust, registration) = authority_services(&events, &log, &mut handlers);
+        let (approvals, decisions) = ask_services(&clock, &random, &log, &mut handlers);
+        let (trust, registration) = authority_services(&events, &log, &decisions, &mut handlers);
         // `exec.run` (KNSH-051), listed only when the sandbox probe passes; without `knsh-exec` nothing can run.
         let supervision = Supervision {
             paths: &paths,
@@ -308,6 +319,7 @@ fn start() -> Result<(), StartError> {
             clock: clock.clone(),
             random,
             approvals,
+            decisions: Arc::clone(&decisions),
         };
         handlers.extend(supervision.handlers());
         // Probed once before serving: every hello reports the same result; a restarted knshd probes again (KNSH-014).
@@ -315,7 +327,7 @@ fn start() -> Result<(), StartError> {
         let violation_status = reader.as_ref().map_or_else(ReaderStatus::stopped, Reader::status);
         let dispatcher = hello::dispatcher_with_violations(probed, handlers, violation_status, Arc::clone(&sessions));
         let dispatcher = Arc::new(dispatcher.map_err(StartError::Dispatch)?);
-        let (control, control_service) = serve_control(&dispatcher, &log, &trust, registration);
+        let (control, control_service) = serve_control(&dispatcher, &log, &trust, registration, &decisions);
         let services = Services {
             dispatcher,
             credentials: Arc::new(SystemPeerCredentials::new()),
@@ -368,6 +380,7 @@ fn serve_control(
     log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
     trust: &std::sync::Arc<authority::AuthorityTrust>,
     registration: std::sync::Arc<authority::Registration>,
+    decisions: &std::sync::Arc<decisions::Decisions>,
 ) -> (
     std::sync::Arc<control::ControlEndpoint>,
     Option<std::sync::Arc<knsh_platform::macos::XpcControlService>>,
@@ -379,6 +392,10 @@ fn serve_control(
     use knsh_platform::{Level, PeerGate};
 
     let control = control::ControlEndpoint::new(Arc::clone(dispatcher), Arc::clone(log), registration);
+    // `decision.requested` and `decision.cancelled` reach the authority through the control service (KNSH-069). A
+    // courier that cannot start is logged; requests then time out and are denied (fail closed).
+    let link: Arc<dyn decisions::AuthorityLink> = control.clone();
+    let _ = decisions.attach(Arc::downgrade(&link));
     let gate = PeerGate::new(trust.current());
     let handler: Arc<dyn knsh_platform::ControlHandler> = control.clone();
     let service = XpcControlService::listen(CONTROL_SERVICE, gate, handler)
@@ -410,14 +427,16 @@ fn serve_control(
     (control, service)
 }
 
-/// The trusted authority (KNSH-068), with its two methods added to `handlers`: `authority.trust` on `user.sock`
+/// The trusted authority (KNSH-068), with its methods added to `handlers`: `authority.trust` on `user.sock`
 /// stores the record as a Keychain item only knshd can read (FR-AUTH-11) after knshd's own Touch ID or password
 /// prompt (FR-AUTH-10); `authority.register` on the control service admits one authority at a time and publishes
-/// its arrival and departure on `events` (FR-AUTH-01, FR-AUTH-02).
+/// its arrival and departure on `events` (FR-AUTH-01, FR-AUTH-02); `decision.respond` answers the requests
+/// `decisions` sends it (KNSH-069), which is told of every registration so it can re-send them (FR-AUTH-24).
 #[cfg(target_os = "macos")]
 fn authority_services(
     events: &std::sync::Arc<events::EventHub>,
     log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+    decisions: &std::sync::Arc<decisions::Decisions>,
     handlers: &mut dispatch::Handlers,
 ) -> (
     std::sync::Arc<authority::AuthorityTrust>,
@@ -433,8 +452,10 @@ fn authority_services(
         Arc::clone(log),
     );
     let registration = authority::Registration::new(Arc::clone(events), Arc::clone(log));
+    registration.watch(decisions.clone());
     handlers.extend(trust.handlers());
     handlers.extend(registration.handlers());
+    handlers.extend(decisions.handlers());
     (trust, registration)
 }
 
@@ -554,22 +575,36 @@ fn policy_editor(
     )
 }
 
-/// Standalone approvals (KNSH-066): asks wait here when no authority is connected, and `knsh approve` answers them
-/// after knshd's own Touch ID or password prompt (FR-AUTH-41).
+/// Where asks go. Standalone approvals (KNSH-066): asks wait there when no authority is connected, and
+/// `knsh approve` answers them after knshd's own Touch ID or password prompt (FR-AUTH-41). The decision protocol
+/// (KNSH-069): asks go to the registered authority, and a grant in its answer joins the live grants. The approval
+/// methods are added to `handlers`; `decision.respond` is added with the authority's ([`authority_services`]).
 #[cfg(target_os = "macos")]
-fn local_approvals(
+fn ask_services(
     clock: &std::sync::Arc<knsh_platform::macos::SystemClock>,
     random: &std::sync::Arc<knsh_platform::macos::SystemRandom>,
     log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
-) -> std::sync::Arc<crate::approvals::Approvals> {
+    handlers: &mut dispatch::Handlers,
+) -> (
+    std::sync::Arc<crate::approvals::Approvals>,
+    std::sync::Arc<crate::decisions::Decisions>,
+) {
     use std::sync::Arc;
 
-    crate::approvals::Approvals::with_default_timeout(
+    let approvals = crate::approvals::Approvals::with_default_timeout(
         clock.clone(),
         random.clone(),
         Arc::new(knsh_platform::macos::LocalAuthentication::new()),
         Arc::clone(log),
-    )
+    );
+    let decisions = crate::decisions::Decisions::with_default_timeout(
+        clock.clone(),
+        random.clone(),
+        Arc::clone(log),
+        crate::grants::GrantStore::new(),
+    );
+    handlers.extend(approvals.handlers());
+    (approvals, decisions)
 }
 
 /// The record store. One that cannot be opened (newer schema, foreign or unsafe file) is reported and left
@@ -619,6 +654,9 @@ struct Supervision<'a> {
     random: std::sync::Arc<knsh_platform::macos::SystemRandom>,
     /// Standalone approvals (KNSH-066), shared with the `approval.*` handlers.
     approvals: std::sync::Arc<approvals::Approvals>,
+    /// The authority, asked whenever one is registered (KNSH-069), shared with `decision.respond`; also holds the
+    /// live grants every line is evaluated with.
+    decisions: std::sync::Arc<decisions::Decisions>,
 }
 
 /// Starts the network proxy (KNSH-059) on a loopback port with the host rules, the system resolver and address
@@ -665,14 +703,15 @@ fn start_proxy(
 #[cfg(target_os = "macos")]
 impl Supervision<'_> {
     /// The `exec.run` handler: the orchestrator over the real spawner, the `knsh-exec` installed next to this binary
-    /// (the one the sandbox probe checked), with the user's hooks ([`hooks::HookRunner`], KNSH-062). No authority is
-    /// wired yet (KNSH-069): every line policy asks about waits for `knsh approve` or `knsh deny`
-    /// ([`approvals::Approvals`], KNSH-066) and is denied at the timeout. When `knsh-exec` or a canonical home cannot
-    /// be found it is logged, and every call is `-32005` ([`exec::unserved_handlers`]).
+    /// (the one the sandbox probe checked), with the user's hooks ([`hooks::HookRunner`], KNSH-062). A line policy
+    /// asks about goes to the registered authority ([`decisions::Decisions`], KNSH-069), or, with none registered,
+    /// waits for `knsh approve` or `knsh deny` ([`approvals::Approvals`], KNSH-066); either way it is denied at the
+    /// timeout. When `knsh-exec` or a canonical home cannot be found it is logged, and every call is `-32005`
+    /// ([`exec::unserved_handlers`]).
     fn exec_run_handlers(self, proxy: std::sync::Arc<dyn proxy::ProxyIssuer>) -> dispatch::Handlers {
         use std::sync::Arc;
 
-        use knsh_core::{CanonicalPath, NoAuthority};
+        use knsh_core::CanonicalPath;
         use knsh_platform::macos::{RealFs, SystemProcesses, sha256};
 
         use crate::probe::SandboxProbe;
@@ -720,7 +759,8 @@ impl Supervision<'_> {
             clock: self.clock,
             random: self.random,
             hooks: Arc::new(hook_runner),
-            authority: Arc::new(NoAuthority),
+            grants: self.decisions.grants(),
+            authority: self.decisions,
             approvals: self.approvals,
             spawner: Arc::new(spawner),
             // Secret redaction arrives with KNSH-091; the hook is already on the capture path.

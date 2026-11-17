@@ -47,10 +47,10 @@
 //! ([`Decision::to_record`]), so the two always match. `latency_ms` is the time from receiving the line to the final
 //! decision, on the injected clock.
 //!
-//! # Not yet consulted
+//! # Grants
 //!
-//! Grants are not consulted until the grant store exists (KNSH-073): every line is evaluated without them, which only
-//! ever asks more.
+//! Every line is evaluated with a copy of the live grants ([`GrantStore`]) at the injected clock's time (FR-POL-60,
+//! KNSH-042): a grant only ever turns an ask into an allow. If the clock cannot be read, no grant applies.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
@@ -71,6 +71,7 @@ use knsh_store::{RecordStore, RecordedOutput};
 use crate::capture::{CapturePlan, LineOutput, OutputSink};
 use crate::events::EventHub;
 use crate::exec::{Finished, ForwardedLine, Supervisor};
+use crate::grants::GrantStore;
 use crate::holds::{GroupKind, Kept};
 use crate::jobs::LineControl;
 use crate::policy::ProfileLoader;
@@ -201,6 +202,8 @@ pub(crate) struct Parts {
     pub(crate) authority: Arc<dyn Authority + Send + Sync>,
     /// Standalone approvals: `knsh approve` and `knsh deny` ([`crate::approvals::Approvals`], KNSH-066).
     pub(crate) approvals: Arc<dyn LocalApprovals + Send + Sync>,
+    /// The live grants, a copy of which every line is evaluated with (KNSH-042, KNSH-069).
+    pub(crate) grants: Arc<GrantStore>,
     /// Starts allowed lines (KNSH-051).
     pub(crate) spawner: Arc<dyn Spawner>,
     /// The hook every output chunk passes before it is stored, emitted or returned (FR-EVT-07): a pass-through
@@ -357,11 +360,14 @@ impl Lifecycle {
                 received_at,
             },
         };
+        // A copy, so no lock is held while the decision waits on an ask. Without a clock no grant applies (fail
+        // closed: an ask stays an ask).
+        let grants = parts.grants.snapshot();
         let input = LineInput {
             session_id,
             actor: &actor,
             profile: &profile,
-            grants: None,
+            grants: parts.clock.now().ok().map(|now| (&grants, now)),
             command: &line.proposal.command,
             cwd: &line.proposal.cwd,
             env_path: &line.proposal.path,

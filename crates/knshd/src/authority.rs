@@ -47,6 +47,7 @@ use knsh_proto::{
     RpcError,
 };
 
+use crate::decisions::AuthorityWatch;
 use crate::dispatch::{Call, Endpoint, Handler, Handlers, Reply, answer, params};
 use crate::events::EventHub;
 
@@ -215,8 +216,12 @@ fn not_authenticated(refusal: NotAuthenticated) -> RpcError {
 
 /// The single registered authority (FR-AUTH-01). One per `knshd`.
 pub(crate) struct Registration {
-    /// The authority's connection, if one registered. Lock order: this, then the event hub.
+    /// The authority's connection, if one registered. Lock order: this, then the watcher's lock
+    /// ([`crate::decisions`]), then the event hub.
     current: Mutex<Option<ConnectionId>>,
+    /// Told of every registration and departure, under `current`, so it always sees them in order: the decision
+    /// protocol, which sends its requests to the authority (KNSH-069).
+    watch: Mutex<Option<Arc<dyn AuthorityWatch>>>,
     events: Arc<EventHub>,
     log: Arc<dyn SystemLog>,
 }
@@ -226,9 +231,20 @@ impl Registration {
     pub(crate) fn new(events: Arc<EventHub>, log: Arc<dyn SystemLog>) -> Arc<Self> {
         Arc::new(Self {
             current: Mutex::new(None),
+            watch: Mutex::new(None),
             events,
             log,
         })
+    }
+
+    /// Tells `watch` of every registration and departure from now on.
+    pub(crate) fn watch(&self, watch: Arc<dyn AuthorityWatch>) {
+        *lock(&self.watch) = Some(watch);
+    }
+
+    /// The watcher, if one is set. Its lock is released before the watcher is called.
+    fn watcher(&self) -> Option<Arc<dyn AuthorityWatch>> {
+        lock(&self.watch).clone()
     }
 
     /// The handler.
@@ -264,6 +280,10 @@ impl Registration {
             None => {
                 *current = Some(connection);
                 self.log.log(Level::Notice, "authority registered", &[]);
+                // FR-AUTH-24: pending requests are sent again to the new authority, after this call's answer.
+                if let Some(watch) = self.watcher() {
+                    watch.registered(connection);
+                }
                 // Published under the lock, so connected and disconnected events always alternate.
                 self.publish(EngineEventData::AuthorityConnected);
             }
@@ -278,6 +298,9 @@ impl Registration {
         if *current == Some(connection) {
             *current = None;
             self.log.log(Level::Notice, "authority disconnected", &[]);
+            if let Some(watch) = self.watcher() {
+                watch.unregistered(connection);
+            }
             self.publish(EngineEventData::AuthorityDisconnected);
         }
     }

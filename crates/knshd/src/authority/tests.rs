@@ -11,7 +11,7 @@ use crate::events::Subscriber;
 use crate::events::tests::hub;
 use crate::sessions::SessionBinding;
 
-/// `authority.trust` and `authority.register` with a store holding nothing and a prompt nobody answers: for
+/// `authority.trust`, `authority.register` and `decision.respond` with a store holding nothing and a prompt nobody answers: for
 /// dispatcher tests that need every catalogued handler.
 pub(crate) fn idle_handlers() -> Handlers {
     let log: Arc<dyn SystemLog> = Arc::new(RecordingLog::new());
@@ -21,7 +21,17 @@ pub(crate) fn idle_handlers() -> Handlers {
         Arc::clone(&log),
     )
     .handlers();
-    handlers.extend(Registration::new(hub(), log).handlers());
+    handlers.extend(Registration::new(hub(), Arc::clone(&log)).handlers());
+    // `decision.respond` (KNSH-069) is served with the authority's methods.
+    let decisions = crate::decisions::Decisions::with_default_timeout(
+        Arc::new(knsh_platform::testing::FakeClock::new(
+            knsh_core::Timestamp::from_unix_micros(1_800_000_000_000_000).unwrap(),
+        )),
+        Arc::new(knsh_platform::testing::SeededRandom::new(1)),
+        log,
+        crate::grants::GrantStore::new(),
+    );
+    handlers.extend(decisions.handlers());
     handlers
 }
 

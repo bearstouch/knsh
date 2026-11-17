@@ -386,3 +386,67 @@ fn insert_refuses_duplicates_expired_and_overflow() {
     assert_eq!(grants.insert(later, at(100)), Ok(()));
     assert_eq!(grants.list(at(100)).count(), 1);
 }
+
+/// The rule a grant from an answer to `line` would get.
+fn answer_rule(line: &str) -> Option<String> {
+    let p = profile(RULES);
+    line_grant_rule(&classify(&parse_line(line), line, &Session, &p.exec.interpreters))
+}
+
+// KNSH-069, FR-POL-62: a grant in `decision.respond` covers the asked line itself: one simple command whose every
+// word is known becomes the rule, and the rule then turns the same line's ask into an allow.
+#[test]
+fn answer_grant_rule_is_the_asked_command() {
+    assert_eq!(
+        answer_rule("git push origin main").as_deref(),
+        Some("git push origin main")
+    );
+    assert_eq!(
+        answer_rule("'git'  push   \"origin\"").as_deref(),
+        Some("git push origin")
+    );
+    let p = profile(RULES);
+    let rule = answer_rule("npm publish --tag next").unwrap();
+    let exact = Grant::exact(grant_id(1), GrantScope::Session(session_id(1)), &rule, at(100)).unwrap();
+    assert!(exact.is_exact());
+    let grants = set_of([exact]);
+    let decision = decide(&p, &grants, session_id(1), 10, "npm publish --tag next");
+    assert_eq!(decision.verdict, RuleAction::Allow);
+    assert_eq!(decision.source, DecisionSource::Grant);
+    // It covers that command, not its siblings, nor the same command with more arguments the authority never saw.
+    for other in [
+        "npm publish --tag latest",
+        "npm publish --tag next --access public",
+        "npm publish --tag next $X",
+    ] {
+        assert_eq!(
+            decide(&p, &grants, session_id(1), 10, other).verdict,
+            RuleAction::Ask,
+            "{other}"
+        );
+    }
+    // A grant made with `Grant::new` keeps the FR-POL-16 extension.
+    assert!(!session_grant(2, "npm publish").is_exact());
+}
+
+// A line that cannot be written as a rule gets no grant, never a broader one: several commands, a wrapper, an
+// expansion, a substitution, a word with a space or a `*`, a path as the name, or a line the parser cannot read.
+#[test]
+fn answer_grant_rule_refuses_lines_it_cannot_express() {
+    for line in [
+        "git push origin main && npm publish",
+        "git push | cat",
+        "env git push",
+        "git push $REMOTE",
+        "git push $(cat remote)",
+        "git commit -m 'two words'",
+        "rm *.txt",
+        "rm '*'",
+        "./deploy.sh",
+        "/usr/bin/git push",
+        "git push origin main )",
+        "",
+    ] {
+        assert_eq!(answer_rule(line), None, "{line:?}");
+    }
+}

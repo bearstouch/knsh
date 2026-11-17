@@ -248,6 +248,10 @@ struct Setup {
     spawner: Option<FakeSpawner>,
     /// The output redaction hook; a pass-through by default.
     redaction: Option<Arc<dyn knsh_core::OutputRedaction>>,
+    /// The live grants; none by default.
+    grants: Option<Arc<crate::grants::GrantStore>>,
+    /// A real authority in place of the scripted `authority` (KNSH-069).
+    authority_service: Option<Arc<dyn Authority + Send + Sync>>,
 }
 
 impl Daemon {
@@ -279,6 +283,7 @@ impl Daemon {
     fn lifecycle(&self, setup: Setup) -> Arc<Lifecycle> {
         let profiles = setup.profiles.unwrap_or_else(|| vec![("web", WEB)]);
         let authority: Arc<dyn Authority + Send + Sync> = match setup.authority {
+            _ if setup.authority_service.is_some() => setup.authority_service.clone().unwrap(),
             Some(script) => Arc::new(FakeAuthority {
                 journal: Arc::clone(&self.journal),
                 clock: Arc::clone(&self.clock),
@@ -308,6 +313,7 @@ impl Daemon {
             approvals: setup.approvals.unwrap_or_else(|| {
                 crate::approvals::tests::unanswered(setup.approvals_timeout.unwrap_or(Duration::from_millis(50)))
             }),
+            grants: setup.grants.unwrap_or_default(),
             spawner: Arc::new(
                 setup
                     .spawner
@@ -835,6 +841,7 @@ fn runs_with_no_hooks_and_no_authority() {
         hooks: Arc::new(NoHooks),
         authority: Arc::new(NoAuthority),
         approvals: crate::approvals::tests::unanswered(DEFAULT_ASK_TIMEOUT),
+        grants: crate::grants::GrantStore::new(),
         spawner: Arc::new(FakeSpawner::new(Arc::clone(&daemon.journal))),
         redaction: Arc::new(knsh_core::NoOutputRedaction),
     });
@@ -1694,4 +1701,86 @@ fn record_carries_the_lines_network() {
         hosts,
         [("registry.npmjs.org", None), ("github.com", Some("approval_required"))]
     );
+}
+
+// FR-AUTH-20, FR-AUTH-23 (KNSH-069): with an authority registered, an ask is sent to it as `decision.requested`;
+// with no answer, the line is denied at 90 s on the clock with -32002 naming the request, recorded with source
+// `authority`, and the authority is told with `decision.cancelled`.
+#[test]
+fn authority_timeout_is_32002() {
+    let daemon = Daemon::new();
+    daemon.events();
+    let (decisions, wire) = crate::decisions::tests::on_wire(daemon.clock.clone(), crate::grants::GrantStore::new());
+    let lifecycle = daemon.lifecycle(Setup {
+        authority_service: Some(decisions),
+        ..Setup::default()
+    });
+    let line = daemon.line("git push origin main");
+    let running = std::thread::spawn(move || lifecycle.run(line, &StillWaiting));
+    let request_id = crate::decisions::tests::requested_id(&wire.wait_for(1)[0].1);
+    daemon.clock.advance(DEFAULT_ASK_TIMEOUT);
+    let error = running.join().unwrap().unwrap_err();
+    assert_eq!(error.code, ErrorCode::DecisionTimeout);
+    assert_eq!(
+        data_field(&error, "request_id"),
+        Some(Value::String(request_id.to_string()))
+    );
+    assert_eq!(wire.wait_for(2).len(), 2, "decision.cancelled sent to the authority");
+    assert_eq!(
+        names(&daemon.events()),
+        ["command.proposed", "decision.cancelled", "command.denied"],
+        "decision.requested is never an event (FR-EVT-06)"
+    );
+    let decision = daemon.records().pop().unwrap().details.decision.unwrap();
+    assert_eq!(decision.source, DecisionSource::Authority);
+    assert_eq!(daemon.spawns(), Vec::<String>::new());
+}
+
+// FR-AUTH-21, FR-POL-60, FR-POL-62 (KNSH-069): an `allow` with a session grant runs the line, and the same line
+// then runs again without asking, decided by the grant.
+#[test]
+fn authority_grant_allows_the_line_again() {
+    let daemon = Daemon::new();
+    let grants = crate::grants::GrantStore::new();
+    let (decisions, wire) = crate::decisions::tests::on_wire(daemon.clock.clone(), Arc::clone(&grants));
+    let lifecycle = daemon.lifecycle(Setup {
+        authority_service: Some(decisions.clone()),
+        grants: Some(grants),
+        ..Setup::default()
+    });
+    let line = daemon.line("git push origin main");
+    let asking = Arc::clone(&lifecycle);
+    let running = std::thread::spawn(move || asking.run(line, &StillWaiting).map(drop));
+    let request_id = crate::decisions::tests::requested_id(&wire.wait_for(1)[0].1);
+    let answer =
+        format!(r#"{{"request_id":"{request_id}","verdict":"allow","grant":{{"scope":"session","duration_s":3600}}}}"#);
+    crate::decisions::tests::respond_on(
+        &decisions,
+        crate::dispatch::Endpoint::Control,
+        Some(crate::decisions::tests::AUTHORITY),
+        &answer,
+    )
+    .unwrap();
+    running.join().unwrap().unwrap();
+
+    lifecycle
+        .run(daemon.line("git push origin main"), &StillWaiting)
+        .unwrap();
+    // Record IDs from the frozen clock order by their random part, so the records are compared as a set.
+    let mut decisions: Vec<_> = daemon
+        .records()
+        .into_iter()
+        .map(|record| {
+            let decision = record.details.decision.unwrap();
+            (format!("{:?}", decision.source), decision.rule_id)
+        })
+        .collect();
+    decisions.sort();
+    let asked = Some("exec.ask[0]".to_owned());
+    assert_eq!(
+        decisions,
+        [("Authority".to_owned(), asked.clone()), ("Grant".to_owned(), asked)]
+    );
+    assert_eq!(wire.wait_for(1).len(), 1, "the granted line was not asked about");
+    assert_eq!(daemon.spawns().len(), 2);
 }

@@ -125,10 +125,12 @@ impl Harness {
                 rewritten_from: None,
                 classification: &classification,
             };
+            let profile = knsh_core::ProfileName::new("web").unwrap();
             let request = AskRequest {
                 proposal: &proposal,
                 rule_id: Some("exec.ask[0]"),
                 hook: None,
+                profile: &profile,
             };
             approvals.ask(&request, caller.as_ref())
         });

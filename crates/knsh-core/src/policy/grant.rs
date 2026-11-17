@@ -27,15 +27,25 @@
 //!
 //! Creation is authorised elsewhere: only the authority, or the user with Touch ID, may create grants (FR-POL-62,
 //! KNSH-071, KNSH-073). Persistence in `knshd`'s state store is KNSH-074's.
+//!
+//! # A grant from an answer
+//!
+//! A `grant` in `decision.respond` (KNSH-069) names only a scope and a duration: its rule is the asked line itself,
+//! read by [`line_grant_rule`]. Only a line that is one simple command whose every word is known can be written as a
+//! rule; anything else gets no grant rather than one that covers more than was asked about. Such a grant is
+//! [exact](Grant::exact): it covers the command with exactly the asked arguments, not the same command with more
+//! (no FR-POL-16 extension), so a grant for `rm -r build` never covers `rm -r build /`.
 
 use std::collections::BTreeMap;
 
-use knsh_bash::ClassifiedCommand;
+use knsh_bash::{Classification, ClassifiedCommand};
 
 use super::layer::is_pattern;
-use super::rules::matches_certainly;
+use super::rules::{matches_certainly, matches_exactly};
 use crate::error::CoreError;
 use crate::id::{GrantId, SessionId};
+use crate::lifecycle::redact;
+use crate::redacted::REDACTED_MARKER;
 use crate::session::ProfileName;
 use crate::time::Timestamp;
 
@@ -83,6 +93,8 @@ pub struct Grant {
     id: GrantId,
     scope: GrantScope,
     rule: String,
+    /// Whether the rule matches only the command with exactly its arguments ([`Grant::exact`]).
+    exact: bool,
     expires_at: Timestamp,
 }
 
@@ -94,6 +106,27 @@ impl Grant {
     /// [`CoreError::InvalidGrantRule`] if `rule` is not a command pattern (see the type's invariants). A blank rule or
     /// a path would never match anything, and a grant that silently does nothing hides the mistake.
     pub fn new(id: GrantId, scope: GrantScope, rule: &str, expires_at: Timestamp) -> Result<Self, CoreError> {
+        Self::build(id, scope, rule, false, expires_at)
+    }
+
+    /// Builds an exact grant: its rule matches the command with exactly the rule's arguments, never with more (no
+    /// FR-POL-16 extension). Made from one asked line ([`line_grant_rule`], KNSH-069), so it covers that line and
+    /// not a longer one the authority was never shown.
+    ///
+    /// # Errors
+    ///
+    /// As [`Grant::new`].
+    pub fn exact(id: GrantId, scope: GrantScope, rule: &str, expires_at: Timestamp) -> Result<Self, CoreError> {
+        Self::build(id, scope, rule, true, expires_at)
+    }
+
+    fn build(
+        id: GrantId,
+        scope: GrantScope,
+        rule: &str,
+        exact: bool,
+        expires_at: Timestamp,
+    ) -> Result<Self, CoreError> {
         if !is_pattern(rule) {
             return Err(CoreError::InvalidGrantRule);
         }
@@ -101,6 +134,7 @@ impl Grant {
             id,
             scope,
             rule: rule.to_owned(),
+            exact,
             expires_at,
         })
     }
@@ -123,6 +157,12 @@ impl Grant {
         &self.rule
     }
 
+    /// Whether the rule matches only the command with exactly its arguments ([`Grant::exact`]).
+    #[must_use]
+    pub const fn is_exact(&self) -> bool {
+        self.exact
+    }
+
     /// The first instant at which the grant no longer applies.
     #[must_use]
     pub const fn expires_at(&self) -> Timestamp {
@@ -138,7 +178,12 @@ impl Grant {
     /// Whether the grant covers `command` in `session`, running under `profile`, at `now`: unexpired, in scope, and
     /// with a rule that certainly matches the command.
     fn covers(&self, session: SessionId, profile: &ProfileName, command: &ClassifiedCommand, now: Timestamp) -> bool {
-        !self.is_expired(now) && self.scope.covers(session, profile) && matches_certainly(&self.rule, command)
+        let matches = if self.exact {
+            matches_exactly(&self.rule, command)
+        } else {
+            matches_certainly(&self.rule, command)
+        };
+        !self.is_expired(now) && self.scope.covers(session, profile) && matches
     }
 }
 
@@ -216,6 +261,46 @@ impl GrantSet {
             .values()
             .find(|grant| grant.covers(session, profile, command, now))
     }
+}
+
+/// The rule a grant made from an answer to `classification`'s line gets (module documentation, "A grant from an
+/// answer"), or `None` when the line cannot be written as one.
+///
+/// The rule is the command's name and arguments as written, joined by single spaces. `None` unless:
+///
+/// - the line was parsed and is exactly one simple command, with no wrapper, substitution or other dynamic part, so
+///   the rule names everything the line runs;
+/// - every word is known (no expansion), non-empty, and holds no whitespace or `*`: a pattern splits on spaces and
+///   reads `*` as a wildcard, so such a word would make the rule match other commands;
+/// - the text holds no secret: redaction leaves it unchanged, since grants are listed and stored;
+/// - it is a valid command pattern (a name without `/`, no control characters, bounded length).
+///
+/// Use it with [`Grant::exact`], so the grant covers the same command with more arguments only if asked again.
+#[must_use]
+pub fn line_grant_rule(classification: &Classification) -> Option<String> {
+    if classification.is_whole_line() || !classification.dynamic_parts().is_empty() {
+        return None;
+    }
+    let [command] = classification.commands() else {
+        return None;
+    };
+    if !command.arguments_complete {
+        return None;
+    }
+    let mut words = Vec::with_capacity(command.arguments.len() + 1);
+    words.push(command.name.as_deref()?);
+    for argument in &command.arguments {
+        words.push(argument.text.as_deref()?);
+    }
+    let literal = |word: &&str| !word.is_empty() && !word.contains('*') && !word.chars().any(char::is_whitespace);
+    if !words.iter().all(literal) {
+        return None;
+    }
+    let rule = words.join(" ");
+    // Grants are listed and stored, so a rule redaction would change (or one already holding the marker, which could
+    // not be told apart from a redacted secret) gets no grant rather than a secret written down.
+    let holds_secret = redact(&rule).expose() != &rule || rule.contains(REDACTED_MARKER);
+    (!holds_secret && is_pattern(&rule)).then_some(rule)
 }
 
 #[cfg(test)]

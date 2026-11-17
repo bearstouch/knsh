@@ -54,7 +54,7 @@ pub use check::{LineCheck, LineResolver, check_line};
 pub use fixed::{
     AGENT_SOCKET, CONTROL_SERVICE, ENGINE_CONFIG_DIR, ENGINE_DATA_DIR, ENGINE_RUN_DIR, FixedDenies, USER_SOCKET,
 };
-pub use grant::{Grant, GrantScope, GrantSet, MAX_GRANTS};
+pub use grant::{Grant, GrantScope, GrantSet, MAX_GRANTS, line_grant_rule};
 use layer::{Layer, LayerKind, ReadTemplate};
 pub use line::{
     DecisionSource, LineCapabilities, LineDecision, LineReason, MatchedRule, evaluate_line, evaluate_line_with_grants,

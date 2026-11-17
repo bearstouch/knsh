@@ -341,7 +341,8 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     // Control service (specs/06-api/control-service.md).
     // The single authority registers on the control service (KNSH-068, FR-AUTH-01).
     MethodSpec::planned("authority.register", Endpoints::CONTROL).available(),
-    MethodSpec::planned("decision.respond", Endpoints::CONTROL),
+    // The authority answers `decision.requested` (KNSH-069, FR-AUTH-21). Only the registered authority's answers count.
+    MethodSpec::planned("decision.respond", Endpoints::CONTROL).available(),
     MethodSpec::planned("policy.set", Endpoints::CONTROL),
     MethodSpec::planned("policy.get", Endpoints::CONTROL),
     MethodSpec::planned("policy.grants", Endpoints::CONTROL),
@@ -603,6 +604,7 @@ mod tests {
                     "events.subscribe",
                     "events.unsubscribe",
                     "authority.register",
+                    "decision.respond",
                 ],
             };
             assert_eq!(
