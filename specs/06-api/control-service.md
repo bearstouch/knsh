@@ -6,11 +6,11 @@ An XPC Mach service (`knsh.control`, final name tied to the signing identity) re
 | --- | --- |
 | `authority.register` | Become the authority (one at a time, [below](#authorityregister)) |
 | `decision.respond` | Answer a `decision.requested` |
-| `session.*` | Create, end, pause, resume, take and release control of any session |
-| `policy.set`, `policy.get`, `policy.grant`, `policy.grants`, `policy.revoke` | Push and read policy, manage grants |
+| `session.create`, `session.end`, `session.pause`, `session.resume`, `session.take_control`, `session.release_control`, `session.list` | Create, end, pause, resume, take and release control of any agent session; list every session ([below](#sessions)) |
+| `policy.set`, `policy.get`, `policy.grant`, `policy.grants`, `policy.revoke` | Push and read policy, manage grants ([below](#policy)) |
 | `secrets.provide`, `secrets.revoke` | Time-limited secrets held in memory |
-| `recording.set` | Turn command or output recording on or off for a session |
-| Every `user.sock` read and checkpoint method | Across all sessions |
+| `recording.set` | Turn command or output recording on or off for a session ([below](#recordingset)) |
+| `records.query`, `records.output`, `events.subscribe`, `events.unsubscribe`, `checkpoint.*` | Every `user.sock` read and checkpoint method, across all sessions |
 
 ## Verification
 
@@ -123,9 +123,108 @@ withdraw its prompt. The `decision.cancelled` [event](../05-models/event.md) is 
 - Notifications are sent in order. One that cannot be delivered is dropped; the request still ends by its answer, its
   timeout or its caller.
 
-## `policy.set`
+## Sessions
 
-Pushes a policy snapshot. A snapshot must carry `expires_at`; on expiry, sessions using it are paused ([policy](../03-functional-requirements/policy.md#lifetime-of-pushed-policy)).
+Implemented in KNSH-071 (FR-SES-02, FR-SES-10, FR-SES-12, FR-SES-14). The authority supervises **agent** sessions:
+every method that acts on one session refuses a human session with `-32003`, since nothing in a human session may be
+blocked (FR-SES-22), a human session ends only with its own connection, and a human's recording is theirs to choose.
+A session that is not live is `-32006` naming it, as is a move the [state diagram](../03-functional-requirements/sessions.md#states)
+does not have (pausing a paused session); nothing changes then. Each move is the session registry's own (KNSH-054):
+signals to the session's kept process groups, `-32007` for new lines while held, and `session.state_changed`.
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `session.create` | `agent` (an `agent_id`), `profile` | `{"session_id", "session_token"}` |
+| `session.end` | `session_id` | `{"session_id", "state": "ended"}` |
+| `session.pause` | `session_id` | `{"session_id", "state": "paused"}` |
+| `session.resume` | `session_id` | `{"session_id", "state": "active"}` |
+| `session.take_control` | `session_id` | `{"session_id", "state": "human_control"}` |
+| `session.release_control` | `session_id` | `{"session_id", "state": "active"}` |
+| `session.list` | none | `{"sessions": [...]}`: every live session (human ones too), each as [`session.info`](user-socket.md#sessioninfo) shows one, in start order |
+
+- **`session.create`** makes an agent session with no envelope (`envelope: false`, recording on), for an agent the
+  authority starts itself (FR-SES-02). The agent binds to it on `agent.sock` by passing `session_token` in `hello`
+  (or as `KNSH_SESSION_TOKEN`), like a line inside an envelope; the token is sent only to the authority. The profile
+  must load now: one that does not exist is `-32602`, one that does not load (invalid, a bad signature, an expired
+  snapshot) is `-32603`, and nothing is created. `session.started` is published.
+- **`session.end`** sends `SIGTERM` to the session's envelope process groups (through kept handles; the agent CLI of
+  `knsh agent` exits and its call returns), revokes its token and envelopes, and ends it (`session.state_changed` to
+  `ended`, then `session.ended`). A line already running is not stopped; nothing new can start.
+- On `user.sock`, `session.list` and `session.end` (for `knsh agent`) are not implemented yet: not listed in `hello`
+  and answered `-32601` there.
+
+## Policy
+
+Implemented in KNSH-071 (FR-POL-01, FR-POL-50 – FR-POL-53, FR-POL-60 – FR-POL-62).
+
+### `policy.set`
+
+Pushes a policy snapshot: `profile` (the name it defines), `policy` (its text, a profile in the
+[policy profile](../05-models/policy-profile.md) format, at most 1 MiB) and `expires_at`. Result: `{"replaced": bool}`,
+whether a snapshot of that profile was replaced.
+
+- A snapshot without `expires_at`, or one already expired, is `-32602` (FR-POL-50). So is one naming the built-in
+  `unattended` profile, which is never replaced.
+- It is checked with the loader policy files go through (FR-POL-01), as it would load once stored: its `extends`
+  chain is read from the other snapshots and the signed files. One that does not load is `-32602`; nothing changes.
+- It is saved to `knshd`'s [state store](#state-store) first; one that cannot be saved is `-32603`. Up to 64
+  profiles may have a snapshot; another profile's is then `-32602`.
+- From then on it takes the place of the policy file of the same name for every load (a session's lines,
+  `session.create`, `policy.check`, and profiles that `extends` it), and `policy.updated` is published (FR-POL-53), an
+  engine event with `{profile, expires_at}`. An envelope already running keeps the sandbox profile it started with.
+- From `expires_at` on (or while the clock cannot be read), the profile loads from nothing: not from the snapshot,
+  and never from the file of its name (FR-POL-52), so lines of sessions using it are denied until a new snapshot is
+  pushed. Pausing those sessions is [KNSH-072](../00-stories/KNSH-072-pushed-policy-expiry-and-knsh-profile-use.md)'s.
+  A snapshot is replaced only by another `policy.set`.
+
+### `policy.get`
+
+`{"profile"}`. Where that name loads from now, and its text:
+`{"profile", "source", "policy", "expires_at", "expired"}`. `source` is `pushed` (with the snapshot's text,
+`expires_at`, and whether it has `expired`), `file` (the signed file's body; `expires_at` `null`) or `builtin`
+(`unattended`; `policy` `null`). A name with neither a snapshot nor a file is `-32602`; a file that cannot be read or
+whose signature does not verify is `-32603`.
+
+### `policy.grant`
+
+Makes a [grant](../05-models/grant.md) (FR-POL-62): `scope` `session` with `session_id` (a live agent session;
+`-32006` if not live, `-32003` for a human one), or `scope` `profile` with `profile`; `rule`, a command pattern read
+like an `exec.allow` entry (1 to 4096 bytes); `duration_s`, 1 to 2,592,000 (30 days). Result:
+`{"grant_id", "expires_at"}`. A rule that is not a command pattern (blank, naming a path) or a full grant store
+(1024 grants) is `-32602`. The grant is saved to the state store before it applies; one that cannot be saved is
+`-32603` and no grant exists. The user's `policy.grant` on `user.sock`, with Touch ID, is
+[KNSH-073](../00-stories/KNSH-073-policy-grant-on-user-sock-with-touch-id.md)'s.
+
+### `policy.grants`
+
+No params. `{"grants": [...]}`: every live grant, the authority's and those its answers created, oldest first, each
+`{"grant_id", "scope", "session_id", "profile", "rule", "exact", "expires_at"}` (`session_id` or `profile` is
+`null` according to the scope; `exact` is true for a grant made from an answer, KNSH-069).
+
+### `policy.revoke`
+
+`{"grant_id"}`. Removes the grant at once: the next line no longer sees it (FR-POL-61). Result: `{"revoked": bool}`;
+`false` for an unknown, already revoked or expired grant. A revocation always takes effect in memory; if it cannot be
+saved it is logged, and the grant would apply again only after a restart, until it expires.
+
+### State store
+
+Grants and pushed snapshots are kept in `state.json` in the engine data directory
+([file locations](../09-reference/file-locations.md)): a versioned JSON file, rewritten whole on every change with an
+atomic replace (temporary file, flush, rename), owner-only `0600`, written only by `knshd`. At start `knshd` restores
+the snapshots and the grants still live. A file that is not a `0600` regular file of the user, does not parse, or has a
+newer version is never overwritten: it is logged and left as it is, and every change that would save (`policy.set`,
+`policy.grant`, an answer's grant) is refused until it is recovered
+([KNSH-074](../00-stories/KNSH-074-fail-closed-operation-and-state-across-restarts.md)).
+
+## `recording.set`
+
+Implemented in KNSH-071 (FR-SES-25). `session_id` and at least one of `commands` and `output` (booleans). `commands`
+sets the session's `recording`; `output` sets output recording for the session in place of its profile's
+`recording.output`, for its next lines. Result: the session as [`session.info`](user-socket.md#sessioninfo) shows it,
+which the session's own `session.info` then reports too, and its stored row follows. Turning `commands` off never
+suppresses an agent's records: every line is still recorded (FR-REC-01, FR-REC-03); what the settings withhold is
+output (FR-REC-06). A human session is `-32003`; neither params is `-32602`.
 
 ## `secrets.provide`
 

@@ -230,21 +230,30 @@ impl CancelReason {
 /// The payload of an engine event: one that belongs to no session (KNSH-068).
 ///
 /// Closed, like [`EventData`]: a new engine event is a new variant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineEventData {
     /// `authority.connected`: an authority registered on the control service (FR-AUTH-01, FR-AUTH-02).
     AuthorityConnected,
     /// `authority.disconnected`: the registered authority's connection ended (FR-AUTH-02).
     AuthorityDisconnected,
+    /// `policy.updated`: the authority pushed a policy snapshot, which was loaded (FR-POL-53, KNSH-071). A pushed
+    /// profile can be used by sessions of any agent, so the event belongs to the engine rather than one session.
+    PolicyUpdated {
+        /// The profile the snapshot defines.
+        profile: ProfileName,
+        /// When the snapshot expires (FR-POL-50).
+        expires_at: Timestamp,
+    },
 }
 
 impl EngineEventData {
     /// The event name, the envelope's `event` member.
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub const fn name(&self) -> &'static str {
         match self {
             Self::AuthorityConnected => "authority.connected",
             Self::AuthorityDisconnected => "authority.disconnected",
+            Self::PolicyUpdated { .. } => "policy.updated",
         }
     }
 }

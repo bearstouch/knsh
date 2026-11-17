@@ -62,6 +62,9 @@ const CONFIG_DIR: [&str; 2] = knsh_core::ENGINE_CONFIG_DIR;
 const RUN_DIR: &str = knsh_core::ENGINE_RUN_DIR;
 /// Compiled sandbox profiles, inside the data directory (FR-SBX-07, KNSH-045).
 const PROFILES_DIR: &str = "profiles";
+
+/// Name of the state file in the data directory: grants and pushed policy (KNSH-071).
+const STATE_FILE: &str = "state.json";
 /// Checkpoints for the home volume, inside the data directory.
 const CHECKPOINTS_DIR: &str = "checkpoints";
 /// The user settings file in the configuration directory (KNSH-021).
@@ -144,6 +147,13 @@ impl EnginePaths {
     #[must_use]
     pub fn profiles_dir(&self) -> PathBuf {
         self.data.join(PROFILES_DIR)
+    }
+
+    /// `~/Library/Application Support/knsh/state.json`: `knshd`'s state store, the live grants and the policy the
+    /// authority pushed (FR-POL-60, KNSH-071). Owner-only `0600`, written atomically by `knshd` alone.
+    #[must_use]
+    pub fn state_file(&self) -> PathBuf {
+        self.data.join(STATE_FILE)
     }
 
     /// `~/Library/Application Support/knsh/run/agent.sock`.

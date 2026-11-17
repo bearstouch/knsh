@@ -326,8 +326,10 @@ pub struct SessionSpec {
 ///
 /// # Invariants
 ///
-/// - The actor, profile, envelope flag, recording flag and parent link never change after creation: there are no
-///   setters, and the fields are private (FR-SES-01).
+/// - The actor, profile, envelope flag and parent link never change after creation: there are no setters, and the
+///   fields are private (FR-SES-01).
+/// - The recording settings of an agent session change only through [`set_recording`](Self::set_recording)
+///   (`recording.set`, KNSH-071); a human session's never change once it exists, and it never records output.
 /// - `envelope` is `true` only for agent sessions.
 /// - The state only moves along the edges of the diagram, through [`apply`](Self::apply).
 // Field names follow the wire names in `specs/05-models/session.md`, including `session_id`.
@@ -339,6 +341,8 @@ pub struct Session {
     profile: ProfileName,
     envelope: bool,
     recording: bool,
+    /// Output recording set for this session by `recording.set`; `None` follows its profile's `recording.output`.
+    output_recording: Option<bool>,
     parent_session_id: Option<SessionId>,
     state: SessionState,
 }
@@ -372,6 +376,7 @@ impl Session {
             profile,
             envelope,
             recording,
+            output_recording: None,
             parent_session_id,
             state: SessionState::Active,
         })
@@ -405,6 +410,36 @@ impl Session {
     #[must_use]
     pub const fn recording(&self) -> bool {
         self.recording
+    }
+
+    /// Output recording as set for this session by `recording.set` (KNSH-071), or `None` when it follows the
+    /// profile's `recording.output`.
+    #[must_use]
+    pub const fn output_recording(&self) -> Option<bool> {
+        self.output_recording
+    }
+
+    /// Changes what an agent session records (`recording.set`, KNSH-071): `commands` sets `recording`, `output` sets
+    /// output recording for the session in place of its profile's; `None` leaves that setting as it is.
+    ///
+    /// Turning command recording off never suppresses an agent's records: every line is recorded whatever the
+    /// setting (FR-REC-01, FR-REC-03). What it withholds is the line's output, with `output` (FR-REC-06).
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::HumanRecording`] for a human session, which is left unchanged: a human's recording is theirs to
+    /// choose, never an authority's (FR-SES-04), and a human session never records output (FR-REC-09).
+    pub fn set_recording(&mut self, commands: Option<bool>, output: Option<bool>) -> Result<(), CoreError> {
+        if self.actor.kind() == ActorKind::Human {
+            return Err(CoreError::HumanRecording);
+        }
+        if let Some(commands) = commands {
+            self.recording = commands;
+        }
+        if output.is_some() {
+            self.output_recording = output;
+        }
+        Ok(())
     }
 
     /// `parent_session_id`.
@@ -582,6 +617,23 @@ mod tests {
         );
         assert_eq!(ProfileName::new("web/app"), Err(CoreError::InvalidProfileName));
         assert_eq!(ProfileName::new("web-app_1.2").unwrap().as_str(), "web-app_1.2");
+    }
+
+    // KNSH-071: `recording.set` changes an agent session's recording settings, one at a time or both; a human
+    // session's are refused and stay as they were.
+    #[test]
+    fn sets_recording_of_agent_sessions_only() {
+        let mut session = Session::new(spec(agent())).unwrap();
+        assert_eq!((session.recording(), session.output_recording()), (true, None));
+        session.set_recording(None, Some(true)).unwrap();
+        assert_eq!((session.recording(), session.output_recording()), (true, Some(true)));
+        session.set_recording(Some(false), None).unwrap();
+        assert_eq!((session.recording(), session.output_recording()), (false, Some(true)));
+
+        let mut human = Session::new(spec(Actor::Human)).unwrap();
+        assert_eq!(human.set_recording(Some(true), None), Err(CoreError::HumanRecording));
+        assert_eq!(human.set_recording(None, Some(true)), Err(CoreError::HumanRecording));
+        assert_eq!((human.recording(), human.output_recording()), (false, None));
     }
 
     // FR-SES-04: recording defaults to off for humans and on for agents; an explicit choice wins.

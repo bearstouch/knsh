@@ -89,6 +89,7 @@ mod approval;
 mod authority;
 mod capability;
 mod catalogue;
+mod control;
 mod decision;
 mod envelope;
 mod error;
@@ -115,6 +116,12 @@ pub use capability::{
 pub use catalogue::{
     Availability, Catalogue, CatalogueError, DEPRECATION_WINDOW, Deprecation, Endpoint, Endpoints, Lookup, MethodSpec,
     Release, SESSION_CREATING_METHODS, creates_session,
+};
+pub use control::{
+    GrantEntry, GrantTargetParam, MAX_GRANT_RULE_LEN, NoParams, PolicyGetParams, PolicyGetResult, PolicyGrantParams,
+    PolicyGrantResult, PolicyGrantsResult, PolicyRevokeParams, PolicyRevokeResult, PolicySetParams, PolicySetResult,
+    PolicySource, RecordingSetParams, SessionCreateParams, SessionCreateResult, SessionListResult, SessionStateResult,
+    SessionTargetParams,
 };
 pub use decision::{
     DECISION_CANCELLED, DECISION_REQUESTED, DecisionAnswer, DecisionCancelledParams, DecisionRequestedParams,

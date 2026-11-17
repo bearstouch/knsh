@@ -25,7 +25,8 @@
 //! # Output (KNSH-053)
 //!
 //! A line's output is captured when the caller did not pass its stdio (`exec.run` and `exec.start` from an agent
-//! that integrates natively) or when the session's profile records output (`recording.output`, FR-REC-06). Only in
+//! that integrates natively) or when the session records output: its profile's `recording.output` (FR-REC-06), or
+//! what the authority set for the session with `recording.set` (KNSH-071), which takes its place. Only in
 //! the second case is it stored with the record and published as `command.output` (FR-LC-18): with
 //! `recording.output = false` (the default) nothing is stored and nothing is emitted, and a captured line's output
 //! goes only to its caller. Every chunk passes the [`OutputRedaction`] hook first (FR-EVT-07).
@@ -645,16 +646,15 @@ impl Lifecycle {
         (written, ended_at)
     }
 
-    /// How `profile`'s line is captured (module documentation, "Output"): `None` when its output goes straight to
-    /// passed descriptors in a session that does not record output.
+    /// How `line` is captured (module documentation, "Output"), given whether its session records output: `None` when
+    /// its output goes straight to passed descriptors in a session that does not record output.
     fn capture_plan(
         &self,
         line: &ForwardedLine,
-        profile: &Profile,
+        record_output: bool,
         actor: &Actor,
         record_id: RecordId,
     ) -> Option<CapturePlan> {
-        let record_output = profile.recording.output;
         if line.stdio.is_some() && !record_output {
             return None;
         }
@@ -694,9 +694,15 @@ impl Supervisor for Lifecycle {
         let session_id = line.session_id;
         let cwd = line.proposal.cwd.clone();
         let control = Arc::clone(&line.control);
-        let record_output = profile.recording.output;
+        // KNSH-071: `recording.set` may have set output recording for the session in place of its profile's. Read
+        // once, so the capture and the record agree for the whole line.
+        let record_output = self
+            .parts
+            .sessions
+            .output_recording_of(session_id)
+            .unwrap_or(profile.recording.output);
         let default_mode = profile.output.mode;
-        let capture = self.capture_plan(&line, &profile, &actor, record_id);
+        let capture = self.capture_plan(&line, record_output, &actor, record_id);
         // Never a 1970 start, which retention would expire at once.
         let started_at = self.parts.clock.now().unwrap_or(received_at);
         let events = RunningEvents {

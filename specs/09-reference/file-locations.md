@@ -4,7 +4,7 @@
 | --- | --- |
 | Configuration, hooks and policy files | `~/.config/knsh/` (policies in `~/.config/knsh/policies/`; integrity-protected) |
 | User settings | `~/.config/knsh/config.toml` (`[recording] human`, `[shell] hosted`; written by the user, read by `knsh`; `[[hooks]]`, read by `knshd` for every agent line, [hook](../05-models/hook.md)) |
-| Records, grants, pushed policy | `~/Library/Application Support/knsh/` (records in `records.db`, owner-only `0600`) |
+| Records, grants, pushed policy | `~/Library/Application Support/knsh/` (records in `records.db`; grants and pushed policy in `state.json`, written atomically by `knshd`, KNSH-071; both owner-only `0600`) |
 | Checkpoints, home volume | `~/Library/Application Support/knsh/checkpoints/` |
 | Compiled sandbox profiles | `~/Library/Application Support/knsh/profiles/<sha256>.sb` (directory `0700`, files `0600`, written atomically; removed when no running envelope or line uses them, and swept at `knshd` start; FR-SBX-07) |
 | Checkpoints, other APFS volumes | `.knsh-checkpoints/` on that volume, when writable; otherwise plain copies in the home store |

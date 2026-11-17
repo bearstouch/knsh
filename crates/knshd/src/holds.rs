@@ -178,6 +178,16 @@ impl Holds {
         }
     }
 
+    /// Sends `SIGTERM` to every kept envelope group of `session_id` (`session.end` from the authority, KNSH-071), so
+    /// the agent CLI exits as its own `knsh agent` would make it. Through kept handles only, never a bare pid. A
+    /// stopped group is continued by the end that follows, and the signal is delivered then.
+    pub(crate) fn terminate_envelopes(&self, session_id: SessionId) {
+        let run = lock(&self.runs).get(&session_id).cloned();
+        if let Some(run) = run {
+            lock(&run.inner).signal_all(GroupKind::Envelope, Signal::Terminate);
+        }
+    }
+
     /// Keeps `group` of `session_id`, whose registry state is `state`, until the returned handle is dropped. If the
     /// session is paused the group is stopped at once (module documentation).
     pub(crate) fn keep(
@@ -270,6 +280,34 @@ mod tests {
                 (ids[1], Signal::Continue),
             ]
         );
+    }
+
+    // KNSH-071: ending a session for the authority terminates its envelope groups, not its lines' or another
+    // session's.
+    #[test]
+    fn terminates_only_the_sessions_envelopes() {
+        let processes = Arc::new(ScriptedProcesses::new());
+        let ids = groups(&processes, 3);
+        let holds = Holds::new();
+        let shared: Arc<dyn Processes> = processes.clone();
+        let _envelope = holds.keep(
+            sid(1),
+            SessionState::Active,
+            ids[0],
+            Arc::clone(&shared),
+            GroupKind::Envelope,
+        );
+        let _line = holds.keep(
+            sid(1),
+            SessionState::Active,
+            ids[1],
+            Arc::clone(&shared),
+            GroupKind::Line,
+        );
+        let _other = holds.keep(sid(2), SessionState::Active, ids[2], shared, GroupKind::Envelope);
+        holds.terminate_envelopes(sid(1));
+        holds.terminate_envelopes(sid(3));
+        assert_eq!(processes.signals(), [(ids[0], Signal::Terminate)]);
     }
 
     // A dropped handle is never signalled again, and another session's groups are never touched.

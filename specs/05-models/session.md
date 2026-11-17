@@ -9,7 +9,7 @@ A session has exactly one actor, fixed at start. Behaviour is specified in [../0
 | `actor.agent_id` | string | Required for agents, absent for humans, e.g. `claude-code`. 1–64 characters from `[A-Za-z0-9._-]` |
 | `profile` | string | Policy profile name. 1–64 characters from `[A-Za-z0-9._-]` |
 | `envelope` | bool | True for agent sessions started with `knsh agent`; always false for humans |
-| `recording` | bool | Off by default for humans, on by default for agents |
+| `recording` | bool | Off by default for humans, on by default for agents. The authority may change an agent session's with [`recording.set`](../06-api/control-service.md#recordingset) (KNSH-071), which may also set its output recording in place of the profile's; a human session's never changes |
 | `parent_session_id` | ULID or null | Set for sessions started from inside another session |
 | `state` | `active` \| `paused` \| `human_control` \| `ended` | |
 

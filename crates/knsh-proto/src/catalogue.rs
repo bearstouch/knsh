@@ -8,7 +8,7 @@
 //!
 //! The entries follow the method tables of `specs/06-api/agent-socket.md`, `user-socket.md` and
 //! `control-service.md`. Engine notifications (`decision.requested`, `command.output`, ...) are sent, never called,
-//! so they are not here. The control service's `session.*` verbs are not named by the spec yet and are added with it.
+//! so they are not here. The control service's `session.*` verbs are named in `control-service.md#sessions` (KNSH-071).
 
 use std::fmt;
 
@@ -91,6 +91,31 @@ pub enum Availability {
     Available,
     /// Specified but not implemented in this build: never listed or served, answered `-32601`.
     Planned,
+    /// Implemented on these of its endpoints only, and planned on the others: a method whose forms differ per
+    /// endpoint and arrive in different stories (`policy.grant` on the control service, KNSH-071, before its
+    /// Touch ID form on `user.sock`, KNSH-073). Each endpoint must be one of the method's own.
+    AvailableOn(Endpoints),
+}
+
+impl Availability {
+    /// Whether the method is implemented on `endpoint` (assumed to be one of its own).
+    #[must_use]
+    pub const fn on(self, endpoint: Endpoint) -> bool {
+        match self {
+            Self::Available => true,
+            Self::Planned => false,
+            Self::AvailableOn(served) => served.contains(endpoint),
+        }
+    }
+
+    /// Whether the method is implemented on any endpoint: `knshd` must then have a handler for it.
+    #[must_use]
+    pub const fn anywhere(self) -> bool {
+        match self {
+            Self::Available | Self::AvailableOn(_) => true,
+            Self::Planned => false,
+        }
+    }
 }
 
 /// An engine release, `major.minor`. Patch releases do not count for deprecation windows.
@@ -195,6 +220,14 @@ impl MethodSpec {
         }
     }
 
+    /// The same method, implemented on `served` only (a subset of its endpoints) and planned on the others.
+    const fn available_on(self, served: Endpoints) -> Self {
+        Self {
+            availability: Availability::AvailableOn(served),
+            ..self
+        }
+    }
+
     /// The same method, needing `backend`.
     const fn requires(self, backend: Backend) -> Self {
         Self {
@@ -235,6 +268,8 @@ pub enum CatalogueError {
     DeprecationWindow(&'static str),
     /// A method that creates sessions is declared on `agent.sock` (FR-SES-02).
     SessionCreationOnAgent(&'static str),
+    /// A method is implemented on no endpoint, or on one that is not its own ([`Availability::AvailableOn`]).
+    ServedOffEndpoint(&'static str),
 }
 
 impl fmt::Display for CatalogueError {
@@ -246,6 +281,7 @@ impl fmt::Display for CatalogueError {
             Self::Hello => f.write_str("hello must be available on every endpoint with no backend requirement"),
             Self::DeprecationWindow(name) => write!(f, "deprecated method {name:?} must still be served"),
             Self::SessionCreationOnAgent(name) => write!(f, "session-creating method {name:?} is on agent.sock"),
+            Self::ServedOffEndpoint(name) => write!(f, "method {name:?} is served off its endpoints"),
         }
     }
 }
@@ -256,7 +292,7 @@ impl std::error::Error for CatalogueError {}
 /// session (FR-SES-02, KNSH-048). [`Catalogue::validate`] refuses a catalogue that puts one there, and
 /// [`Catalogue::lookup`] answers them on `agent.sock` as [`Lookup::Unknown`] (`-32601`), not as another endpoint's
 /// method: an agent is not even told they exist.
-pub const SESSION_CREATING_METHODS: &[&str] = &["session.start_agent", "session.start_human"];
+pub const SESSION_CREATING_METHODS: &[&str] = &["session.start_agent", "session.start_human", "session.create"];
 
 /// Whether `name` creates a session ([`SESSION_CREATING_METHODS`]).
 #[must_use]
@@ -274,7 +310,8 @@ pub struct Catalogue {
 /// `records.forget` (KNSH-017), `events.subscribe` and `events.unsubscribe` (KNSH-018), and the human session and
 /// telemetry methods with `session.info` (KNSH-021). Phase 2 adds `policy.check` (KNSH-043), `exec.*` (KNSH-051,
 /// KNSH-053), `session.start_agent` (KNSH-056), `policy.read` and `policy.edit` (KNSH-065), `approval.*` (KNSH-066),
-/// and `authority.trust` and `authority.register` (KNSH-068); the rest arrive with their stories.
+/// `authority.trust` and `authority.register` (KNSH-068), `decision.respond` (KNSH-069), and the control service's
+/// `session.*`, `policy.*` and `recording.set` methods (KNSH-071); the rest arrive with their stories.
 const ENGINE_METHODS: &[MethodSpec] = &[
     // Handshake (specs/06-api/handshake.md).
     MethodSpec::planned("hello", Endpoints::ALL).available(),
@@ -313,8 +350,9 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("session.start_agent", Endpoints::USER)
         .requires(Backend::Sandbox)
         .available(),
-    MethodSpec::planned("session.list", Endpoints::USER),
-    MethodSpec::planned("session.end", Endpoints::USER),
+    // Every session, live (KNSH-071): served on the control service; `knsh agent` management on user.sock is planned.
+    MethodSpec::planned("session.list", Endpoints::USER_CONTROL).available_on(Endpoints::CONTROL),
+    MethodSpec::planned("session.end", Endpoints::USER_CONTROL).available_on(Endpoints::CONTROL),
     // Human telemetry (KNSH-021): `knsh` starts a recorded human session bound to its connection and reports each
     // command line. Only ever on user.sock: nothing inside an envelope may create a session (FR-SES-02) or write
     // records as a human.
@@ -332,7 +370,8 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("policy.read", Endpoints::USER).available(),
     MethodSpec::planned("policy.edit", Endpoints::USER).available(),
     MethodSpec::planned("profile.use", Endpoints::USER),
-    MethodSpec::planned("policy.grant", Endpoints::USER_CONTROL),
+    // The authority's grants (KNSH-071); the user's, after Touch ID on user.sock, are KNSH-073's.
+    MethodSpec::planned("policy.grant", Endpoints::USER_CONTROL).available_on(Endpoints::CONTROL),
     // Deleting records is for the user only: an agent can never erase its own trail (KNSH-017).
     MethodSpec::planned("records.forget", Endpoints::USER).available(),
     // Trusting an authority (KNSH-068, FR-AUTH-10): Touch ID or the password, shown by knshd. Never on agent.sock or
@@ -343,13 +382,21 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("authority.register", Endpoints::CONTROL).available(),
     // The authority answers `decision.requested` (KNSH-069, FR-AUTH-21). Only the registered authority's answers count.
     MethodSpec::planned("decision.respond", Endpoints::CONTROL).available(),
-    MethodSpec::planned("policy.set", Endpoints::CONTROL),
-    MethodSpec::planned("policy.get", Endpoints::CONTROL),
-    MethodSpec::planned("policy.grants", Endpoints::CONTROL),
-    MethodSpec::planned("policy.revoke", Endpoints::CONTROL),
+    // Supervising agents (KNSH-071): the authority creates agent sessions (never on agent.sock, FR-SES-02), moves any
+    // agent session through the state diagram (FR-SES-10, FR-SES-12), pushes and reads policy (FR-POL-01,
+    // FR-POL-50, FR-POL-53), manages grants (FR-POL-60 to FR-POL-62) and recording.
+    MethodSpec::planned("session.create", Endpoints::CONTROL).available(),
+    MethodSpec::planned("session.pause", Endpoints::CONTROL).available(),
+    MethodSpec::planned("session.resume", Endpoints::CONTROL).available(),
+    MethodSpec::planned("session.take_control", Endpoints::CONTROL).available(),
+    MethodSpec::planned("session.release_control", Endpoints::CONTROL).available(),
+    MethodSpec::planned("policy.set", Endpoints::CONTROL).available(),
+    MethodSpec::planned("policy.get", Endpoints::CONTROL).available(),
+    MethodSpec::planned("policy.grants", Endpoints::CONTROL).available(),
+    MethodSpec::planned("policy.revoke", Endpoints::CONTROL).available(),
     MethodSpec::planned("secrets.provide", Endpoints::CONTROL).requires(Backend::Secrets),
     MethodSpec::planned("secrets.revoke", Endpoints::CONTROL).requires(Backend::Secrets),
-    MethodSpec::planned("recording.set", Endpoints::CONTROL),
+    MethodSpec::planned("recording.set", Endpoints::CONTROL).available(),
 ];
 
 impl Catalogue {
@@ -390,10 +437,10 @@ impl Catalogue {
         if !spec.endpoints.contains(endpoint) {
             return Lookup::NotOnEndpoint;
         }
-        match (spec.availability, spec.requires) {
-            (Availability::Planned, _) => Lookup::Planned,
-            (Availability::Available, Some(backend)) if !capabilities.has(backend) => Lookup::Unavailable(backend),
-            (Availability::Available, _) => Lookup::Available(spec),
+        match (spec.availability.on(endpoint), spec.requires) {
+            (false, _) => Lookup::Planned,
+            (true, Some(backend)) if !capabilities.has(backend) => Lookup::Unavailable(backend),
+            (true, _) => Lookup::Available(spec),
         }
     }
 
@@ -434,8 +481,17 @@ impl Catalogue {
             if creates_session(spec.name) && spec.endpoints.contains(Endpoint::Agent) {
                 return Err(CatalogueError::SessionCreationOnAgent(spec.name));
             }
+            if let Availability::AvailableOn(served) = spec.availability
+                && (served.is_empty()
+                    || Endpoint::ALL
+                        .iter()
+                        .any(|&e| served.contains(e) && !spec.endpoints.contains(e)))
+            {
+                return Err(CatalogueError::ServedOffEndpoint(spec.name));
+            }
             if let Some(deprecation) = spec.deprecated {
                 let deprecated_later = deprecation.since > release;
+                // A deprecated method must still be served on every one of its endpoints.
                 let dropped_early = deprecation.must_serve_in(release) && spec.availability != Availability::Available;
                 if deprecated_later || dropped_early {
                     return Err(CatalogueError::DeprecationWindow(spec.name));
@@ -603,8 +659,21 @@ mod tests {
                     "records.output",
                     "events.subscribe",
                     "events.unsubscribe",
+                    "session.list",
+                    "session.end",
+                    "policy.grant",
                     "authority.register",
                     "decision.respond",
+                    "session.create",
+                    "session.pause",
+                    "session.resume",
+                    "session.take_control",
+                    "session.release_control",
+                    "policy.set",
+                    "policy.get",
+                    "policy.grants",
+                    "policy.revoke",
+                    "recording.set",
                 ],
             };
             assert_eq!(
@@ -614,6 +683,20 @@ mod tests {
                 endpoint.name()
             );
         }
+        // KNSH-073: the user's `policy.grant` (Touch ID) is not implemented yet, so user.sock neither lists nor serves
+        // it, while the control service does (KNSH-071). Likewise `session.list` and `session.end`.
+        for method in ["policy.grant", "session.list", "session.end"] {
+            assert_eq!(
+                Catalogue::ENGINE.lookup(Endpoint::User, method, &caps),
+                Lookup::Planned,
+                "{method}"
+            );
+        }
+        // FR-SES-02: an agent cannot create a session through the authority's method either.
+        assert_eq!(
+            Catalogue::ENGINE.lookup(Endpoint::Agent, "session.create", &caps),
+            Lookup::Unknown
+        );
         // KNSH-043: dry runs are on both sockets, never on the control service.
         assert_eq!(
             Catalogue::ENGINE.lookup(Endpoint::Control, "policy.check", &caps),
@@ -791,8 +874,25 @@ mod tests {
             MethodSpec::planned("hello", Endpoints::ALL).available(),
             MethodSpec::planned("session.start_agent", Endpoints::SOCKETS),
         ];
+        // KNSH-071: a method served on an endpoint that is not its own, or on none, is refused.
+        const SERVED_OFF: &[MethodSpec] = &[
+            MethodSpec::planned("hello", Endpoints::ALL).available(),
+            MethodSpec::planned("policy.grant", Endpoints::CONTROL).available_on(Endpoints::USER),
+        ];
+        const SERVED_NOWHERE: &[MethodSpec] = &[
+            MethodSpec::planned("hello", Endpoints::ALL).available(),
+            MethodSpec::planned("policy.grant", Endpoints::CONTROL).available_on(Endpoints::new(false, false, false)),
+        ];
         let release = Release::current();
         let check = |methods| Catalogue::new(methods).validate(release);
+        assert_eq!(
+            check(SERVED_OFF),
+            Err(CatalogueError::ServedOffEndpoint("policy.grant"))
+        );
+        assert_eq!(
+            check(SERVED_NOWHERE),
+            Err(CatalogueError::ServedOffEndpoint("policy.grant"))
+        );
         assert_eq!(check(BAD_NAME), Err(CatalogueError::InvalidName("Exec.run")));
         assert_eq!(check(DUPLICATE), Err(CatalogueError::Duplicate("exec.run")));
         assert_eq!(check(NOWHERE), Err(CatalogueError::NoEndpoint("exec.run")));

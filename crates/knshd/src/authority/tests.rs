@@ -11,8 +11,8 @@ use crate::events::Subscriber;
 use crate::events::tests::hub;
 use crate::sessions::SessionBinding;
 
-/// `authority.trust`, `authority.register` and `decision.respond` with a store holding nothing and a prompt nobody answers: for
-/// dispatcher tests that need every catalogued handler.
+/// `authority.trust`, `authority.register`, `decision.respond` and the supervision methods (KNSH-071) with a store
+/// holding nothing and a prompt nobody answers: for dispatcher tests that need every catalogued handler.
 pub(crate) fn idle_handlers() -> Handlers {
     let log: Arc<dyn SystemLog> = Arc::new(RecordingLog::new());
     let mut handlers = AuthorityTrust::new(
@@ -28,10 +28,33 @@ pub(crate) fn idle_handlers() -> Handlers {
             knsh_core::Timestamp::from_unix_micros(1_800_000_000_000_000).unwrap(),
         )),
         Arc::new(knsh_platform::testing::SeededRandom::new(1)),
-        log,
+        Arc::clone(&log),
         crate::grants::GrantStore::new(),
     );
     handlers.extend(decisions.handlers());
+    // The supervision methods (KNSH-071) over sessions that cannot record, an empty filesystem and a state store
+    // in memory.
+    let sessions = crate::hello::tests::sessions();
+    let profiles = crate::policy::tests::loader(knsh_platform::testing::MemFs::new());
+    handlers.extend(crate::supervise::Supervise::new(Arc::clone(&sessions), profiles.clone()).handlers());
+    let clock = Arc::new(knsh_platform::testing::FakeClock::new(
+        knsh_core::Timestamp::from_unix_micros(1_800_000_000_000_000).unwrap(),
+    ));
+    let state = crate::state::StateStore::in_memory(Arc::clone(&log));
+    let pushed = crate::pushed::PushedPolicies::new(Arc::clone(&state), clock.clone(), Vec::new());
+    handlers.extend(
+        crate::policy_admin::PolicyAdmin::new(crate::policy_admin::PolicyAdminParts {
+            profiles: profiles.with_pushed(Arc::clone(&pushed)),
+            pushed,
+            grants: crate::grants::GrantStore::new(),
+            sessions,
+            events: hub(),
+            clock,
+            random: Arc::new(knsh_platform::testing::SeededRandom::new(1)),
+            log,
+        })
+        .handlers(),
+    );
     handlers
 }
 

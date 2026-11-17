@@ -152,6 +152,24 @@ impl<P: ProfileOrder> SessionRegistry<P> {
         Ok(event)
     }
 
+    /// Changes the recording settings of the live agent session `id` (`recording.set`, KNSH-071;
+    /// [`Session::set_recording`]) and returns the session as it now is.
+    ///
+    /// # Errors
+    ///
+    /// - [`CoreError::SessionNotFoundOrEnded`] if the session is unknown or has ended.
+    /// - [`CoreError::HumanRecording`] for a human session; nothing changes.
+    pub fn set_recording(
+        &mut self,
+        id: SessionId,
+        commands: Option<bool>,
+        output: Option<bool>,
+    ) -> Result<&Session, CoreError> {
+        let session = self.sessions.get_mut(&id).ok_or(CoreError::SessionNotFoundOrEnded)?;
+        session.set_recording(commands, output)?;
+        Ok(session)
+    }
+
     /// Whether any envelope or recording session is live: what keeps `knshd` running between connections
     /// (`specs/02-architecture/process-model.md`).
     #[must_use]

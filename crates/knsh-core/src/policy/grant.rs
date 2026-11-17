@@ -26,7 +26,7 @@
 //! not apply grants, so an ask stays an ask (fail closed).
 //!
 //! Creation is authorised elsewhere: only the authority, or the user with Touch ID, may create grants (FR-POL-62,
-//! KNSH-071, KNSH-073). Persistence in `knshd`'s state store is KNSH-074's.
+//! KNSH-071, KNSH-073). `knshd` keeps them in its state store (KNSH-071).
 //!
 //! # A grant from an answer
 //!
