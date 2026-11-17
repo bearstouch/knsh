@@ -450,3 +450,12 @@ fn answer_grant_rule_refuses_lines_it_cannot_express() {
         assert_eq!(answer_rule(line), None, "{line:?}");
     }
 }
+
+// FR-SEC-10 (KNSH-070): a line holding a redaction marker, plain or named, gets no grant: the marker stands for a value
+// that was taken out, and a grant would write it down as if it were the real line.
+#[test]
+fn answer_grant_rule_refuses_lines_with_redaction_markers() {
+    for line in ["npm publish «redacted»", "npm publish --token=«redacted:npm-token»"] {
+        assert_eq!(answer_rule(line), None, "{line:?}");
+    }
+}

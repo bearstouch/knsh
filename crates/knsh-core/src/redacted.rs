@@ -10,6 +10,22 @@ use std::fmt;
 /// Text printed in place of the inner value by both `Debug` and `Display`.
 pub const REDACTED_MARKER: &str = "«redacted»";
 
+/// How every redaction marker starts: [`REDACTED_MARKER`] and the redaction engine's named markers,
+/// `«redacted:<name>»` (FR-SEC-10, `specs/05-models/secret.md`).
+const MARKER_OPENING: &str = "«redacted";
+
+/// Whether `text` holds a redaction marker: [`REDACTED_MARKER`] or a named one, `«redacted:<name>»` (FR-SEC-10).
+///
+/// A marker stands for a value that was taken out. Text holding one cannot be told apart from redacted text, so it
+/// must never be turned back into something that runs or is kept as if it were real: a rewrite (FR-AUTH-32) or a
+/// grant. Matching is deliberately loose: `«redacted` followed by `»` or `:` is a marker, whether or not a named one
+/// is well formed, so a malformed marker is never mistaken for plain text.
+#[must_use]
+pub(crate) fn holds_redaction_marker(text: &str) -> bool {
+    text.match_indices(MARKER_OPENING)
+        .any(|(at, opening)| matches!(text[at + opening.len()..].chars().next(), Some('»' | ':')))
+}
+
 /// Holds a value that must not be printed.
 ///
 /// # Invariants
@@ -102,6 +118,30 @@ mod tests {
         // Explicit access still works.
         assert_eq!(secret.expose(), SECRET);
         assert_eq!(secret.into_inner(), SECRET);
+    }
+
+    // FR-SEC-10, FR-AUTH-32: both the plain and the named markers are found, wherever they are; text that merely
+    // mentions the word is not a marker.
+    #[test]
+    fn finds_plain_and_named_redaction_markers() {
+        for text in [
+            "«redacted»",
+            "npm publish --token «redacted:npm-token»",
+            "curl -H 'auth: «redacted:»'",
+            "«redacted «redacted:x»",
+        ] {
+            assert!(holds_redaction_marker(text), "{text}");
+        }
+        for text in [
+            "",
+            "echo redacted",
+            "«redacted",
+            "«redacted »",
+            "echo «redactedx»",
+            "redacted:npm-token",
+        ] {
+            assert!(!holds_redaction_marker(text), "{text}");
+        }
     }
 }
 

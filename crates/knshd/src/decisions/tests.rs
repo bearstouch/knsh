@@ -148,9 +148,20 @@ pub(crate) fn respond_on(
 /// Asks `decisions` about `line` on its own thread, as the orchestrator does, with `caller` waiting; returns once the
 /// request is pending.
 pub(crate) fn ask(asked: &Arc<Decisions>, line: &str, caller: Arc<dyn Caller + Send + Sync>) -> JoinHandle<AskAnswer> {
+    ask_rewritten(asked, line, None, caller)
+}
+
+/// [`ask`], for a line that replaced `rewritten_from` (FR-AUTH-30) when one is given.
+fn ask_rewritten(
+    asked: &Arc<Decisions>,
+    line: &str,
+    rewritten_from: Option<&str>,
+    caller: Arc<dyn Caller + Send + Sync>,
+) -> JoinHandle<AskAnswer> {
     let before = asked.state().pending.len();
     let decisions = Arc::clone(asked);
     let line = line.to_owned();
+    let rewritten_from = rewritten_from.map(|from| Redacted::new(from.to_owned()));
     let asking = thread::spawn(move || {
         let classification = classify(&parse_line(&line), &line, &Resolver, &Interpreters::defaults());
         let actor = Actor::Agent(AgentId::new("claude-code").unwrap());
@@ -161,7 +172,7 @@ pub(crate) fn ask(asked: &Arc<Decisions>, line: &str, caller: Arc<dyn Caller + S
             actor: &actor,
             command: &command,
             cwd: &cwd,
-            rewritten_from: None,
+            rewritten_from: rewritten_from.as_ref(),
             classification: &classification,
         };
         let profile = profile();
@@ -266,6 +277,33 @@ impl Harness {
 
 /// The registered authority's connection.
 pub(crate) const AUTHORITY: ConnectionId = ConnectionId(1);
+
+// FR-AUTH-30 (KNSH-070): a rewritten line that asks again reaches the authority as `decision.requested` with
+// `rewritten_from`, the line it replaced, beside the rewritten `command`.
+#[test]
+fn sends_rewritten_from_with_second_ask() {
+    let harness = Harness::new();
+    harness.decisions.registered(AUTHORITY);
+    let asking = ask_rewritten(
+        &harness.decisions,
+        "git push --dry-run",
+        Some(LINE),
+        Arc::new(StillWaiting),
+    );
+    let sent = harness.wire.wait_for(1);
+    let request = requested(&sent[0].1);
+    assert_eq!(request.command, "git push --dry-run");
+    assert_eq!(request.rewritten_from.as_deref(), Some(LINE));
+    let (_, params) = parts(&sent[0].1);
+    assert_eq!(
+        params.as_object().unwrap().get("rewritten_from").and_then(Json::as_str),
+        Some(LINE)
+    );
+
+    let id = request.request_id;
+    harness.respond(AUTHORITY, &format!(r#"{{"request_id":"{id}","verdict":"allow"}}"#));
+    assert_eq!(asking.join().unwrap().reply, AskReply::Allow);
+}
 
 // FR-AUTH-20, FR-EVT-06: `decision.requested` carries the request ID, session, actor, redacted command, working
 // directory, matched rule, irreversibility and `timeout_at`, and goes only to the registered authority's connection.

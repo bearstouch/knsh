@@ -119,8 +119,9 @@ whole lifecycle is tested with fakes. How the steps combine:
   `command.proposed` carries `rewritten_from`.
 - **Rewrites.** A rewrite from a hook or from the authority starts the second pass; it is the line's one rewrite.
   Policy is never evaluated on the line a hook rewrote, only on the new one (FR-HOOK-11). A second rewrite, from
-  either, denies the line (FR-AUTH-31), as does a rewrite of a line holding a redaction marker, or one carrying the
-  marker (FR-AUTH-32), or one longer than 65536 bytes or holding NUL.
+  either, denies the line (FR-AUTH-31), as does a rewrite of a line holding a redaction marker (`«redacted»` or a
+  named `«redacted:<name>»`), or one carrying a marker (FR-AUTH-32), or one longer than 65536 bytes or holding NUL. A
+  rewritten line that asks is asked about with `rewritten_from` (FR-AUTH-30).
 - **Combining.** A hook `deny` or failure denies with source `hook` before policy runs. Otherwise the strictest of the
   hooks' verdict and policy's wins (FR-HOOK-12): a hook `ask` on a line the rules allow is asked about with no
   `rule_id`. Under the `unattended` profile any ask, a hook's included, is a deny with source `standalone`.
