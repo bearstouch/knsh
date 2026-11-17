@@ -27,8 +27,8 @@ can allow a repeated action for a limited time.
 - `user_grant_absent_on_agent_socket` — FR-POL-62.
 
 Also: `user_grant_checks_before_prompting`, `user_grant_rechecks_after_the_prompt`,
-`user_grants_are_listed_and_revocable_like_authority_grants` and `writes_durations_exactly` (`knshd`,
-`policy_admin`); `reads_grant_results_back` (`knsh-proto`, `control`); `checks_grant_command_lines_before_sending`,
+and `user_grants_are_listed_and_revocable_like_authority_grants` (`knshd`, `policy_admin`);
+`reads_grant_results_back` and `writes_grant_durations_exactly` (`knsh-proto`, `control`); `checks_grant_command_lines_before_sending`,
 `reads_durations_strictly`, `sends_the_grant_and_reports_it`, `lists_and_revokes` and
 `failure_messages_name_the_refusal` (`knsh`, `cli::grants`).
 
