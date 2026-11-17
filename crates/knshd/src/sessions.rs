@@ -36,8 +36,10 @@
 //! session's row is rewritten and `session.state_changed` is published (FR-SES-14). A transition the state diagram
 //! does not have, or one on a session that is not live, is `-32006` and changes nothing. While a session is paused or
 //! under human control, [`Sessions::runnable`] answers `-32007` with `data.state` for each new line (FR-SES-10,
-//! FR-SES-12); the client retries (`specs/03-functional-requirements/sessions.md`, "Holding a line"). The control
-//! methods that call these arrive with KNSH-071.
+//! FR-SES-12); the client retries (`specs/03-functional-requirements/sessions.md`, "Holding a line"). The authority
+//! calls these through the control service's `session.*` methods (`crate::supervise`, KNSH-071), which also end agent
+//! sessions ([`Sessions::end_for_authority`]), create ones with no envelope ([`Sessions::create_agent`]) and change
+//! their recording ([`Sessions::set_recording`]).
 //!
 //! # Errors
 //!
@@ -81,6 +83,18 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// `session` as `session.info` shows it. Its output recording is what `recording.set` set, otherwise `false`.
+///
+/// Human sessions never record output (FR-REC-09). Without a setting, an agent session records its lines' output
+/// when its profile sets `recording.output` (KNSH-053); reporting that here needs the profile, which the registry does
+/// not load, so it reads false (pending: wire the profile loader into `session.info`).
+fn session_info(session: knsh_core::Session) -> SessionInfoResult {
+    SessionInfoResult {
+        output_recording: session.output_recording().unwrap_or(false),
+        session,
+    }
+}
+
 /// The engine's live sessions and the human telemetry handlers. One per `knshd`, shared by every connection.
 pub(crate) struct Sessions {
     registry: Mutex<SessionRegistry>,
@@ -97,8 +111,6 @@ pub(crate) struct Sessions {
 
 /// A state change asked of a live session (KNSH-054): the edges of the state diagram other than ending, which has its
 /// own path ([`Sessions::end_agent`]) because it also revokes the session's token and envelopes.
-// Called by the control methods (KNSH-071); until then only tests change states.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StateChange {
     /// `active → paused` (FR-SES-10).
@@ -181,7 +193,7 @@ impl SessionBinding {
     }
 
     /// The bound human session, for a telemetry call.
-    fn session_id(&self) -> Result<SessionId, RpcError> {
+    pub(crate) fn session_id(&self) -> Result<SessionId, RpcError> {
         match lock(&self.bound).as_ref() {
             Some(Bound::Human { session_id, .. }) => Ok(*session_id),
             Some(Bound::Agent(_)) | None => Err(RpcError::new(ErrorCode::NotAllowed)),
@@ -415,13 +427,7 @@ impl Sessions {
                 // An agent session ended between the binding check and this read: the binding is expired.
                 Endpoint::Agent => invalid_session_token(),
             })?;
-        answer(&SessionInfoResult {
-            session,
-            // Human sessions never record output (FR-REC-09). An agent session records its lines' output when its
-            // profile sets `recording.output` (KNSH-053); reporting that here needs the profile, which the registry
-            // does not load yet, so it still reads false (pending: wire the profile loader into session.info).
-            output_recording: false,
-        })
+        answer(&session_info(session))
     }
 
     /// Opens a top-level agent session running `profile` for `actor` ([`Sessions::open_agent_in`] with no parent).
@@ -457,13 +463,35 @@ impl Sessions {
         parent: Option<SessionId>,
         order: &dyn ProfileOrder,
     ) -> Result<OpenedAgent, RpcError> {
+        self.open_agent_session(actor, profile, parent, order, true)
+    }
+
+    /// Opens an agent session with no envelope for an agent the authority starts itself (`session.create`, KNSH-071,
+    /// FR-SES-02): the agent binds to it on `agent.sock` with the returned token. Top level, so no parent.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sessions::open_agent_in`].
+    pub(crate) fn create_agent(&self, actor: Actor, profile: ProfileName) -> Result<OpenedAgent, RpcError> {
+        self.open_agent_session(actor, profile, None, &knsh_core::EqualProfileOnly, false)
+    }
+
+    /// [`Sessions::open_agent_in`], with or without an envelope.
+    fn open_agent_session(
+        &self,
+        actor: Actor,
+        profile: ProfileName,
+        parent: Option<SessionId>,
+        order: &dyn ProfileOrder,
+        envelope: bool,
+    ) -> Result<OpenedAgent, RpcError> {
         let now = self.clock.now().map_err(|_| internal_error())?;
         let session_id = SessionId::from_ulid(self.ulid(now)?);
         let spec = SessionSpec {
             session_id,
             actor,
             profile,
-            envelope: true,
+            envelope,
             recording: None,
             parent_session_id: parent,
         };
@@ -616,7 +644,6 @@ impl Sessions {
     /// `-32006` naming the session if it is not live, or if the state diagram has no such edge from its state
     /// (pausing a paused session, resuming an active one, taking control of a paused one…): the state is unchanged
     /// and no event is published.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn change_state(&self, session_id: SessionId, change: StateChange) -> Result<SessionState, RpcError> {
         let (session, change) = {
             let mut registry = lock(&self.registry);
@@ -655,6 +682,92 @@ impl Sessions {
             Ok(session) => self.holds.keep(session_id, session.state(), group, processes, kind),
             Err(_) => Holds::detached(),
         }
+    }
+
+    /// Every live session, in ID (start) order, each as `session.info` shows it (`session.list`, KNSH-071).
+    pub(crate) fn list(&self) -> Vec<SessionInfoResult> {
+        lock(&self.registry)
+            .iter()
+            .map(|session| session_info(session.clone()))
+            .collect()
+    }
+
+    /// The live session `session_id` as `session.info` shows it.
+    ///
+    /// # Errors
+    ///
+    /// `-32006` naming the session if it is not live.
+    #[cfg(test)]
+    pub(crate) fn info_of(&self, session_id: SessionId) -> Result<SessionInfoResult, RpcError> {
+        let registry = lock(&self.registry);
+        let session = registry.get(session_id).map_err(|_| session_gone(session_id))?;
+        Ok(session_info(session.clone()))
+    }
+
+    /// The live agent session `session_id`, refusing a human one: the authority supervises agents, and nothing in a
+    /// human session may be blocked or ended for the human (FR-SES-22).
+    ///
+    /// # Errors
+    ///
+    /// `-32006` naming the session if it is not live; `-32003` if it is a human session.
+    pub(crate) fn agent_session(&self, session_id: SessionId) -> Result<(), RpcError> {
+        let registry = lock(&self.registry);
+        let session = registry.get(session_id).map_err(|_| session_gone(session_id))?;
+        match session.actor() {
+            Actor::Agent(_) => Ok(()),
+            Actor::Human => Err(RpcError::new(ErrorCode::NotAllowed)),
+        }
+    }
+
+    /// Changes what the live agent session `session_id` records (`recording.set`, KNSH-071) and rewrites its row;
+    /// returns it as `session.info` now shows it. Output recording set here takes the place of the profile's
+    /// `recording.output` for the session's next lines ([`Sessions::output_recording_of`]).
+    ///
+    /// # Errors
+    ///
+    /// `-32006` naming the session if it is not live; `-32003` for a human session, which is left unchanged.
+    pub(crate) fn set_recording(
+        &self,
+        session_id: SessionId,
+        commands: Option<bool>,
+        output: Option<bool>,
+    ) -> Result<SessionInfoResult, RpcError> {
+        let session = lock(&self.registry)
+            .set_recording(session_id, commands, output)
+            .cloned()
+            .map_err(|error| match error {
+                CoreError::HumanRecording => RpcError::new(ErrorCode::NotAllowed),
+                _ => session_gone(session_id),
+            })?;
+        // Best effort, like a state change: the setting applies from now whatever the store says.
+        if let (Some(store), Ok(now)) = (&self.store, self.clock.now()) {
+            let _ = store.write_session(&session, now);
+        }
+        Ok(session_info(session))
+    }
+
+    /// Output recording as `recording.set` set it for the live session `session_id`, or `None` when its profile
+    /// decides (or the session is not live).
+    pub(crate) fn output_recording_of(&self, session_id: SessionId) -> Option<bool> {
+        lock(&self.registry)
+            .get(session_id)
+            .ok()
+            .and_then(knsh_core::Session::output_recording)
+    }
+
+    /// Ends the live agent session `session_id` for the authority (`session.end`, KNSH-071): its envelopes' process
+    /// groups get `SIGTERM`, so the agent CLI started by `knsh agent` exits, then the session ends as every session
+    /// does (its token and envelopes are revoked first, so no line can start for it).
+    ///
+    /// # Errors
+    ///
+    /// `-32006` naming the session if it is not live; `-32003` for a human session, which ends only with its own
+    /// connection.
+    pub(crate) fn end_for_authority(&self, session_id: SessionId) -> Result<(), RpcError> {
+        self.agent_session(session_id)?;
+        self.holds.terminate_envelopes(session_id);
+        self.end(session_id);
+        Ok(())
     }
 
     /// Ends `session_id`: its connection closed. Writes the ended state and publishes `session.state_changed` to

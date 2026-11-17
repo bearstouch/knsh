@@ -421,3 +421,83 @@ fn holds_line_paused_during_its_decision() {
     let decision = records[0].details.decision.clone().unwrap();
     assert_eq!(decision.verdict, DecisionVerdict::Deny);
 }
+
+// FR-SES-10, FR-SES-14 (KNSH-071): `session.pause` and `session.resume` on the control service do exactly what the
+// registry's own pause and resume do (KNSH-054): the same signals to the same groups in the same order, the same
+// `-32007` for a new line while paused, and the same `session.state_changed` events.
+#[test]
+fn pause_via_control_matches_user_pause() {
+    /// What one pause and resume did: the signals by group role, the hold a new line met, and the state changes.
+    type Observed = (Vec<(&'static str, Signal)>, String, Vec<(SessionState, SessionState)>);
+
+    fn observe(change: impl Fn(&Daemon, StateChange)) -> Observed {
+        let daemon = Daemon::new();
+        let (envelope, _kept) = daemon.envelope();
+        let (line, line_group) = daemon.start("ls");
+        daemon.state_changes();
+        change(&daemon, StateChange::Pause);
+        let held = daemon
+            .lifecycle
+            .run(forwarded(daemon.session_id, "echo hi"), &StillWaiting)
+            .unwrap_err();
+        assert_held(&held, "paused");
+        change(&daemon, StateChange::Resume);
+        let roles = daemon
+            .processes
+            .signals()
+            .into_iter()
+            .map(|(group, signal)| {
+                (
+                    if group == envelope {
+                        "envelope"
+                    } else if group == line_group {
+                        "line"
+                    } else {
+                        "other"
+                    },
+                    signal,
+                )
+            })
+            .collect();
+        let changes = daemon.state_changes();
+        daemon.release.send(()).unwrap();
+        line.join().unwrap().unwrap();
+        (roles, format!("{:?}", held.code), changes)
+    }
+
+    let direct = observe(|daemon, change| {
+        daemon.change(change).unwrap();
+    });
+    let via_control = observe(|daemon, change| {
+        let handlers = crate::supervise::Supervise::new(
+            Arc::clone(&daemon.fixture.sessions),
+            crate::policy::tests::loader(filesystem(&[("web", WEB)])),
+        )
+        .handlers();
+        let method = match change {
+            StateChange::Pause => "session.pause",
+            StateChange::Resume => "session.resume",
+            StateChange::TakeControl => "session.take_control",
+            StateChange::HandBack => "session.release_control",
+        };
+        let params = format!(r#"{{"session_id":"{}"}}"#, daemon.session_id);
+        crate::supervise::tests::control(&handlers, method, &params).unwrap();
+    });
+    assert_eq!(via_control, direct);
+    assert_eq!(
+        direct.0,
+        [
+            ("envelope", Signal::Stop),
+            ("line", Signal::Stop),
+            ("line", Signal::Continue),
+            ("envelope", Signal::Continue),
+        ]
+    );
+    assert_eq!(
+        direct.2,
+        [
+            (SessionState::Active, SessionState::Paused),
+            (SessionState::Paused, SessionState::Active)
+        ]
+    );
+}

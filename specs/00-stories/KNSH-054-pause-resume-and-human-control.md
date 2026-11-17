@@ -37,5 +37,5 @@ the agent mid-task and inspect or intervene safely.
   `setsid` process keeping running while paused, so it stays unchecked.
 - The pause criterion is met by the mechanism (`Sessions::keep_group` with `GroupKind::Envelope`, tested with fake
   and real process groups); end to end it also needs the envelope wiring below.
-- Pending: the envelope's group is kept by `session.start_agent` (KNSH-056) and the `session.*` control methods
-  that pause and take control arrive with KNSH-071; until then only tests reach `Sessions::change_state`.
+- The envelope's group is kept by `session.start_agent` (KNSH-056); the control service's `session.pause`,
+  `session.resume`, `session.take_control` and `session.release_control` (KNSH-071) reach `Sessions::change_state`.

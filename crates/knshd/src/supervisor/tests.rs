@@ -313,7 +313,7 @@ impl Daemon {
             approvals: setup.approvals.unwrap_or_else(|| {
                 crate::approvals::tests::unanswered(setup.approvals_timeout.unwrap_or(Duration::from_millis(50)))
             }),
-            grants: setup.grants.unwrap_or_default(),
+            grants: setup.grants.unwrap_or_else(crate::grants::GrantStore::new),
             spawner: Arc::new(
                 setup
                     .spawner
@@ -1422,6 +1422,35 @@ fn emits_output_events_only_when_recording() {
             .any(|entry| entry.starts_with("capture"))
     );
     assert!(!names(&daemon.events()).contains(&"command.output"));
+}
+
+// KNSH-071: output recording set for the session with `recording.set` takes the place of its profile's: turned on, a
+// line's output is stored and published although the profile does not record output; turned off, nothing is, although
+// the profile does.
+#[test]
+fn recording_set_output_overrides_the_profile() {
+    for (profile, set_to) in [(WEB, true), (WEB_RECORDING_OUTPUT, false)] {
+        let daemon = Daemon::new();
+        daemon
+            .fixture
+            .sessions
+            .set_recording(daemon.session_id, None, Some(set_to))
+            .unwrap();
+        daemon.events();
+        daemon
+            .next(
+                Setup {
+                    spawner: Some(writing(&daemon, b"built\n", b"")),
+                    profiles: Some(vec![("web", profile)]),
+                    ..Setup::default()
+                },
+                "ls",
+            )
+            .unwrap();
+        let stored = last_stored(&daemon);
+        assert_eq!(stored.stdout.is_some(), set_to, "{set_to}");
+        assert_eq!(names(&daemon.events()).contains(&"command.output"), set_to, "{set_to}");
+    }
 }
 
 // FR-EVT-07: what is stored and published is what the redaction hook returned, never the raw chunk.

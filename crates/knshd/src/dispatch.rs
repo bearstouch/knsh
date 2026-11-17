@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use knsh_json::{FromJson, Object, StreamId, ToJson, Value};
 use knsh_proto::{
-    Availability, Backend, ByteTransport, Capabilities, Catalogue, CatalogueError, ErrorCode, Lookup, MethodName,
-    Release, Request, RpcError,
+    Backend, ByteTransport, Capabilities, Catalogue, CatalogueError, ErrorCode, Lookup, MethodName, Release, Request,
+    RpcError,
 };
 
 use crate::events::Subscriber;
@@ -241,7 +241,7 @@ impl Dispatcher {
         // Checked against the catalogue, not the tables: a handler whose backend is missing here is still listed.
         for &name in handlers.keys() {
             match catalogue.find(name) {
-                Some(spec) if spec.availability == Availability::Available => {}
+                Some(spec) if spec.availability.anywhere() => {}
                 Some(_) | None => return Err(BuildError::UnlistedHandler(name)),
             }
         }
@@ -361,7 +361,7 @@ pub(crate) fn answer(result: &impl ToJson) -> Reply {
 pub(crate) mod tests {
     use std::collections::BTreeMap;
 
-    use knsh_proto::{Endpoints, FileEvents, MethodSpec, NetworkFilter, RequestId, Sandbox, Secrets};
+    use knsh_proto::{Availability, Endpoints, FileEvents, MethodSpec, NetworkFilter, RequestId, Sandbox, Secrets};
 
     use super::*;
 

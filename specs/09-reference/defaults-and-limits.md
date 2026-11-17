@@ -65,6 +65,8 @@
 | Rewrites per line | 1, by a hook or the authority alike; a second is a deny | — | [authority](../03-functional-requirements/authority.md) |
 | Caller check while an ask waits | Every 100 ms, so a disconnected caller cancels its line at once (FR-LC-41) | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md#the-decision-pipeline-knsh-050) |
 | Grant from a `decision.respond` answer | 1 s to 30 days (`duration_s`); longer is `-32602` | — | [control service](../06-api/control-service.md#decision-protocol) (KNSH-069) |
+| Grant from `policy.grant` | 1 s to 30 days (`duration_s`); rule 1 to 4096 bytes | — | [control service](../06-api/control-service.md#policygrant) (KNSH-071) |
+| Pushed policy snapshots | 64 profiles; each at most 1 MiB of text | — | [control service](../06-api/control-service.md#policyset) (KNSH-071) |
 | `reason` in a `decision.respond` answer | 1024 bytes, as a hook's reason; longer is `-32602` | — | [control service](../06-api/control-service.md#decision-protocol) (KNSH-069) |
 | Deprecated method lifetime | 2 engine minor releases | — | [API](../06-api/README.md) |
 | Human recording | Off | Per session | [privacy](../04-non-functional-requirements/privacy.md) |

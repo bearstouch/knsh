@@ -119,6 +119,18 @@ mod grants;
 mod exec;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod hello;
+// Policy the authority pushes (KNSH-071), read by the profile loader in place of files.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod pushed;
+// The authority's policy and grant methods on the control service (KNSH-071).
+#[cfg(target_os = "macos")]
+mod policy_admin;
+// The state store (KNSH-071): grants and pushed policy, saved atomically and owner-only.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod state;
+// The authority's session and recording methods on the control service (KNSH-071).
+#[cfg(target_os = "macos")]
+mod supervise;
 // Pause, resume and human control (KNSH-054): owned by the session registry.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod holds;
@@ -285,9 +297,8 @@ fn start() -> Result<(), StartError> {
         // The event bus with the specified limits (10,000 events per session).
         let random = Arc::new(SystemRandom::new());
         let events = EventHub::new(knsh_core::EventBus::default(), clock.clone(), random.clone());
-        // The live sessions: recorded human sessions (KNSH-021); agent sessions arrive with `knsh agent` (KNSH-056).
-        // Sandbox denials the system reports, attributed by tag to sessions and records (KNSH-047). Best effort:
-        // a reader that cannot start is reported as `sandbox_violations: none` and never blocks anything.
+        // Sandbox denials the system reports, attributed by tag to sessions and records (KNSH-047). Best effort: a
+        // reader that cannot start is reported as `sandbox_violations: none` and never blocks anything.
         let reader = start_violation_reader(&paths, clock.clone(), random.clone(), &log, store.clone(), &events);
         // `agent.sock` callers without a token are matched to their envelope through the process table (KNSH-048).
         let processes = Arc::new(SystemProcessTree::new());
@@ -298,14 +309,14 @@ fn start() -> Result<(), StartError> {
             random.clone(),
             processes,
         );
-        let profiles = profile_loader(&paths, random.clone(), &log);
-        let policy = PolicyCheck::new(Arc::clone(&sessions), profiles.clone());
+        let authority = authority_supervision(&paths, uid, &log, &clock, &random, &sessions, &events);
         let mut handlers = records.handlers();
         handlers.extend(events.handlers());
         handlers.extend(sessions.handlers());
-        handlers.extend(policy.handlers());
-        handlers.extend(policy_editor(&profiles, &log).handlers());
-        let (approvals, decisions) = ask_services(&clock, &random, &log, &mut handlers);
+        handlers.extend(PolicyCheck::new(Arc::clone(&sessions), authority.profiles.clone()).handlers());
+        handlers.extend(policy_editor(&authority.profiles, &log).handlers());
+        handlers.extend(authority.handlers);
+        let (approvals, decisions) = ask_services(&clock, &random, &log, authority.grants, &mut handlers);
         let (trust, registration) = authority_services(&events, &log, &decisions, &mut handlers);
         // `exec.run` (KNSH-051), listed only when the sandbox probe passes; without `knsh-exec` nothing can run.
         let supervision = Supervision {
@@ -313,7 +324,7 @@ fn start() -> Result<(), StartError> {
             uid,
             log: &log,
             sessions: &sessions,
-            profiles,
+            profiles: authority.profiles,
             events: &events,
             store,
             clock: clock.clone(),
@@ -556,6 +567,60 @@ fn profile_loader(
     )
 }
 
+/// What [`authority_supervision`] builds.
+#[cfg(target_os = "macos")]
+struct AuthoritySupervision {
+    /// The profile loader, reading pushed snapshots in place of files.
+    profiles: crate::policy::ProfileLoader,
+    /// The live grants, saved in the state store; every line is evaluated with them.
+    grants: std::sync::Arc<grants::GrantStore>,
+    /// The control service's `session.*`, `recording.set` and `policy.*` handlers.
+    handlers: dispatch::Handlers,
+}
+
+/// The state store and what the authority supervises agents with (KNSH-071): the store's grants and pushed policy,
+/// restored from the last run and saved on every change (FR-POL-60); the profile loader, reading pushed snapshots
+/// before files; and the control service's session, recording, policy and grant methods.
+#[cfg(target_os = "macos")]
+fn authority_supervision(
+    paths: &knsh_platform::EnginePaths,
+    uid: u32,
+    log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+    clock: &std::sync::Arc<knsh_platform::macos::SystemClock>,
+    random: &std::sync::Arc<knsh_platform::macos::SystemRandom>,
+    sessions: &std::sync::Arc<sessions::Sessions>,
+    events: &std::sync::Arc<events::EventHub>,
+) -> AuthoritySupervision {
+    use std::sync::Arc;
+
+    use knsh_platform::Clock;
+    use knsh_platform::macos::RealFs;
+
+    let (state, restored) = state::StateStore::open(Arc::new(RealFs::new()), paths.state_file(), uid, Arc::clone(log));
+    let pushed = pushed::PushedPolicies::new(Arc::clone(&state), clock.clone(), restored.snapshots);
+    let grants = grants::GrantStore::persisted(state, Arc::clone(log), restored.grants, clock.now().ok());
+    let profiles = profile_loader(paths, random.clone(), log).with_pushed(Arc::clone(&pushed));
+    let mut handlers = supervise::Supervise::new(Arc::clone(sessions), profiles.clone()).handlers();
+    handlers.extend(
+        policy_admin::PolicyAdmin::new(policy_admin::PolicyAdminParts {
+            profiles: profiles.clone(),
+            pushed,
+            grants: Arc::clone(&grants),
+            sessions: Arc::clone(sessions),
+            events: Arc::clone(events),
+            clock: clock.clone(),
+            random: random.clone(),
+            log: Arc::clone(log),
+        })
+        .handlers(),
+    );
+    AuthoritySupervision {
+        profiles,
+        grants,
+        handlers,
+    }
+}
+
 /// `policy.read` and `policy.edit` for `knsh policy edit`: knshd shows the Touch ID or password prompt itself before
 /// signing (FR-POL-41).
 #[cfg(target_os = "macos")]
@@ -577,13 +642,15 @@ fn policy_editor(
 
 /// Where asks go. Standalone approvals (KNSH-066): asks wait there when no authority is connected, and
 /// `knsh approve` answers them after knshd's own Touch ID or password prompt (FR-AUTH-41). The decision protocol
-/// (KNSH-069): asks go to the registered authority, and a grant in its answer joins the live grants. The approval
+/// (KNSH-069): asks go to the registered authority, and a grant in its answer joins `grants`, the live grants saved in
+/// the state store (KNSH-071). The approval
 /// methods are added to `handlers`; `decision.respond` is added with the authority's ([`authority_services`]).
 #[cfg(target_os = "macos")]
 fn ask_services(
     clock: &std::sync::Arc<knsh_platform::macos::SystemClock>,
     random: &std::sync::Arc<knsh_platform::macos::SystemRandom>,
     log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+    grants: std::sync::Arc<grants::GrantStore>,
     handlers: &mut dispatch::Handlers,
 ) -> (
     std::sync::Arc<crate::approvals::Approvals>,
@@ -597,12 +664,8 @@ fn ask_services(
         Arc::new(knsh_platform::macos::LocalAuthentication::new()),
         Arc::clone(log),
     );
-    let decisions = crate::decisions::Decisions::with_default_timeout(
-        clock.clone(),
-        random.clone(),
-        Arc::clone(log),
-        crate::grants::GrantStore::new(),
-    );
+    let decisions =
+        crate::decisions::Decisions::with_default_timeout(clock.clone(), random.clone(), Arc::clone(log), grants);
     handlers.extend(approvals.handlers());
     (approvals, decisions)
 }

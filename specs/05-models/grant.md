@@ -1,6 +1,6 @@
 # Grant
 
-A grant is a time-limited rule added on top of a profile, usually after an approval: "allow `git push` in this session for one hour". Kept in `knshd`'s state store, so it survives restarts (KNSH-074; until then grants are held in memory only and lost when `knshd` exits, which only ever asks more).
+A grant is a time-limited rule added on top of a profile, usually after an approval: "allow `git push` in this session for one hour". Kept in `knshd`'s [state store](../06-api/control-service.md#state-store), saved before it applies, so it survives restarts (KNSH-071; restoring is checked end to end by KNSH-074).
 
 | Field | Type | Notes |
 | --- | --- | --- |
@@ -9,7 +9,7 @@ A grant is a time-limited rule added on top of a profile, usually after an appro
 | `rule` | pattern | The command it allows: a command pattern read like an `exec.allow` entry. Confirmed (KNSH-042): the original spec implies this field without naming it |
 | `expires_at` | timestamp | From this instant on the grant no longer applies |
 
-- Created by the authority (`policy.grant`, or a `grant` in `decision.respond` with `scope` and `duration_s`) or by the user with Touch ID (`policy.grant` on `user.sock`).
+- Created by the authority (`policy.grant` on the control service, KNSH-071, or a `grant` in `decision.respond` with `scope` and `duration_s`) or by the user with Touch ID (`policy.grant` on `user.sock`, KNSH-073).
 - Listed with `policy.grants`; revoked with `policy.revoke`.
 - A grant can cover lines that would receive secrets and lines that need `approval_hosts`.
 

@@ -29,8 +29,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use knsh_core::{
-    PathContext, Profile, ProfileError, ProfileErrorKind, ProfileName, ProfileOrigin, UNATTENDED_PROFILE, check_line,
-    load_profile, load_unattended,
+    LookupError, PathContext, Profile, ProfileError, ProfileErrorKind, ProfileName, ProfileOrigin, ProfileSource,
+    UNATTENDED_PROFILE, check_line, load_profile, load_unattended,
 };
 use knsh_platform::{Field, Fs, Level, PolicyDirectory, PolicySigner, SystemLog, Value};
 use knsh_proto::{
@@ -38,6 +38,7 @@ use knsh_proto::{
 };
 
 use crate::dispatch::{Call, Endpoint, Handler, Handlers, Reply, answer, params};
+use crate::pushed::{PushedPolicies, Snapshot};
 use crate::sessions::Sessions;
 
 /// The method name.
@@ -59,6 +60,8 @@ pub(crate) struct ProfileLoader {
     signer: Arc<PolicySigner>,
     /// Where an ignored file is reported when no session is there to receive `policy.invalid`.
     log: Arc<dyn SystemLog>,
+    /// Policy the authority pushed (KNSH-071), read in place of the files of the same names; `None` reads files only.
+    pushed: Option<Arc<PushedPolicies>>,
 }
 
 impl ProfileLoader {
@@ -79,6 +82,37 @@ impl ProfileLoader {
             tmpdir,
             signer,
             log,
+            pushed: None,
+        }
+    }
+
+    /// The same loader reading `pushed` snapshots in place of the files of their names (`crate::pushed`).
+    #[must_use]
+    pub(crate) fn with_pushed(mut self, pushed: Arc<PushedPolicies>) -> Self {
+        self.pushed = Some(pushed);
+        self
+    }
+
+    /// Loads `candidate`, a snapshot `policy.set` was given, as its profile would load once stored: through the same
+    /// loader as files (FR-POL-01), with its `extends` chain read from the pushed snapshots and the files, from the
+    /// home directory.
+    ///
+    /// # Errors
+    ///
+    /// [`ProfileError`] for a snapshot that is not a valid profile, or whose parents do not load.
+    pub(crate) fn check_snapshot(&self, candidate: Snapshot) -> Result<Profile, ProfileError> {
+        let name = candidate.profile.clone();
+        let context = self.context(&self.home);
+        let directory = self.directory();
+        let fs: &dyn Fs = &*self.fs;
+        match &self.pushed {
+            Some(pushed) => load_profile(
+                &name,
+                &pushed.source(&directory).with_candidate(candidate),
+                &context,
+                fs,
+            ),
+            None => load_profile(&name, &OnlyCandidate(candidate, &directory), &context, fs),
         }
     }
 
@@ -118,7 +152,12 @@ impl ProfileLoader {
         if name.as_str() == UNATTENDED_PROFILE {
             return load_unattended(&context, fs);
         }
-        let loaded = load_profile(name, &self.directory(), &context, fs);
+        let directory = self.directory();
+        // KNSH-071: a pushed snapshot takes the place of the file of its name, and an expired one loads nothing.
+        let loaded = match &self.pushed {
+            Some(pushed) => load_profile(name, &pushed.source(&directory), &context, fs),
+            None => load_profile(name, &directory, &context, fs),
+        };
         if let Err(error) = &loaded
             && *error.kind() == ProfileErrorKind::SignatureInvalid
         {
@@ -131,6 +170,19 @@ impl ProfileLoader {
             );
         }
         loaded
+    }
+}
+
+/// A candidate snapshot in front of the files, for a loader without pushed policies (tests).
+struct OnlyCandidate<'a>(Snapshot, &'a dyn ProfileSource);
+
+impl ProfileSource for OnlyCandidate<'_> {
+    fn read_profile(&self, name: &ProfileName) -> Result<Vec<u8>, LookupError> {
+        if *name == self.0.profile {
+            Ok(self.0.policy.clone().into_bytes())
+        } else {
+            self.1.read_profile(name)
+        }
     }
 }
 
@@ -303,7 +355,7 @@ pub(crate) mod tests {
     }
 
     /// A Mac-like filesystem: trusted binaries, a project, the policies directory and the profiles given.
-    fn fs(profiles: &[(&str, &str)]) -> MemFs {
+    pub(crate) fn fs(profiles: &[(&str, &str)]) -> MemFs {
         let fs = MemFs::new();
         for dir in ["/usr/bin", "/bin", "/tmp", PROJECT] {
             fs.add_dir_all(Path::new(dir)).unwrap();
@@ -320,7 +372,8 @@ pub(crate) mod tests {
     }
 
     /// A profile asking for `git push`, allowing `git status`, and allowing `bash` (whose `-c` code is dynamic).
-    const WEB: &str = "name = \"web\"\n[exec]\nallow = [\"git status\", \"bash\", \"ls\"]\nask = [\"git push\"]\n";
+    pub(crate) const WEB: &str =
+        "name = \"web\"\n[exec]\nallow = [\"git status\", \"bash\", \"ls\"]\nask = [\"git push\"]\n";
 
     fn request(method: &'static str, params: &str) -> Request {
         Request {
@@ -333,7 +386,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn call_with(
+    pub(crate) fn call_with(
         handlers: &Handlers,
         endpoint: Endpoint,
         binding: &SessionBinding,

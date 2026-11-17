@@ -14,7 +14,8 @@
 //! ([`engine_lost_notification`]).
 
 use knsh_core::{
-    Actor, EngineEvent, EngineLost, Event, EventData, Lost, Proposal, SessionId, Subscribed, SubscriptionId,
+    Actor, EngineEvent, EngineEventData, EngineLost, Event, EventData, Lost, Proposal, SessionId, Subscribed,
+    SubscriptionId,
 };
 use knsh_json::{Fields, FromJson, JsonError, Object, ToJson, Value};
 
@@ -288,7 +289,7 @@ pub fn engine_event_notification(
             .with("ts", event.ts.to_string())?
             .with("session_id", Value::Null)?
             .with("actor", Value::Null)?
-            .with("data", Object::new())?
+            .with("data", engine_data(&event.data)?)?
             .with("subscription_id", subscription.get().to_json()?)
     })()
     .map_err(ProtoError::Encode)?;
@@ -296,6 +297,17 @@ pub fn engine_event_notification(
         method: MethodName::new(event.name())?,
         params: Some(params),
     })
+}
+
+/// The `data` member of an engine event: `{}` for the authority's arrival and departure, `{profile, expires_at}` for
+/// `policy.updated` (KNSH-071).
+fn engine_data(data: &EngineEventData) -> Result<Object, JsonError> {
+    match data {
+        EngineEventData::AuthorityConnected | EngineEventData::AuthorityDisconnected => Ok(Object::new()),
+        EngineEventData::PolicyUpdated { profile, expires_at } => Object::new()
+            .with("profile", profile.as_str())?
+            .with("expires_at", expires_at.to_string()),
+    }
 }
 
 /// The [`EVENTS_LOST`] notification for engine events: `{subscription_id, session_id: null, from_seq, to_seq}`.
@@ -891,7 +903,7 @@ mod tests {
     // FR-AUTH-02, KNSH-068: engine events have no session and no actor, and their lost ranges name no session.
     #[test]
     fn engine_events_have_null_session_and_actor() {
-        use knsh_core::{EngineEventData, EventId, Timestamp, Ulid};
+        use knsh_core::{EventId, Timestamp, Ulid};
 
         let event = EngineEvent {
             id: EventId::from_ulid(Ulid::from_u128(9)),
@@ -909,6 +921,23 @@ mod tests {
         assert_eq!(
             written(engine_lost_notification(SubscriptionId::new(2), &EngineLost { from_seq: 1, to_seq: 4 }).unwrap()),
             r#"{"jsonrpc":"2.0","method":"events.lost","params":{"subscription_id":2,"session_id":null,"from_seq":1,"to_seq":4}}"#
+        );
+
+        // FR-POL-53 (KNSH-071): `policy.updated` names the pushed profile and when it expires.
+        let updated = EngineEvent {
+            data: EngineEventData::PolicyUpdated {
+                profile: knsh_core::ProfileName::new("web-app").unwrap(),
+                expires_at: Timestamp::from_unix_micros(60_000_000).unwrap(),
+            },
+            ..event
+        };
+        assert!(
+            written(engine_event_notification(SubscriptionId::new(2), &updated).unwrap())
+                .contains(r#""event":"policy.updated","id":"#)
+        );
+        assert!(
+            written(engine_event_notification(SubscriptionId::new(2), &updated).unwrap())
+                .contains(r#""data":{"profile":"web-app","expires_at":"1970-01-01T00:01:00.000000Z"}"#)
         );
     }
 
