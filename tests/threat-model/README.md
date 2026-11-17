@@ -53,8 +53,10 @@ Recorded in the report, never as passed:
   XPC; the authority checking `knshd`'s signature; the Keychain item that holds authority trust (FR-AUTH-11 –
   FR-AUTH-15). Only the ad-hoc refusal runs here.
 - **Phase 3.** Secret injection (FR-SEC-01 – FR-SEC-05); only process-information limits are tested.
-- **macOS versions.** CI runs the suite on macOS 14, 15 and 26 (`.github/workflows/ci.yml`, job `threat-model`).
-  macOS 27 has no hosted runner yet: **pending**, to be run by hand on a macOS 27 machine before the release.
+- **macOS versions.** CI runs the suite on macOS 15 and 26 (`.github/workflows/ci.yml`, job `threat-model`).
+  **Pending**, to be run by hand (`scripts/check.sh threat-model`) before the release: macOS 14, whose hosted runner
+  GitHub no longer supports ("The configuration 'macos-14-arm64-us-default' is not supported"), and macOS 27, which
+  has no hosted runner yet.
 
 ## Out of scope (not tested)
 

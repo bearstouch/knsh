@@ -98,14 +98,15 @@ jobs:
   threat-model:
     # KNSH-075 (NFR-SEC-01 – NFR-SEC-10): the threat-model end-to-end suite on every macOS release with a hosted
     # runner. Each run publishes its report (target/threat-model/report.md) to the job summary and as an artefact; the
-    # phase 2 release gate references these reports. A release without a hosted runner (macOS 27 at the time of
-    # writing) is recorded as pending in tests/threat-model/README.md, never as passed. No DEVELOPER_DIR: the cases
+    # phase 2 release gate references these reports. A release without a hosted runner (macOS 14, whose image GitHub
+    # no longer supports: "The configuration 'macos-14-arm64-us-default' is not supported", and macOS 27, at the time
+    # of writing) is recorded as pending in tests/threat-model/README.md, never as passed. No DEVELOPER_DIR: the cases
     # trust whichever developer directory the runner selects, as a user's profile would.
     name: threat model (${{ matrix.runner }})
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-14, macos-15, macos-26]
+        runner: [macos-15, macos-26]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
