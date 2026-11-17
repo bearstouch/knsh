@@ -9,7 +9,8 @@
 //! already expired, or names the built-in `unattended` profile is `-32602` and nothing changes. Otherwise it is saved
 //! to the state store, takes the place of any earlier snapshot and of the file of its name ([`crate::pushed`]), and
 //! `policy.updated` is published (FR-POL-53). Lines decided from then on load it; an envelope already running keeps
-//! the sandbox profile it was started with.
+//! the sandbox profile it was started with. Agent sessions paused because their snapshot had expired resume if their
+//! profile loads again (`crate::expiry`, KNSH-072).
 //!
 //! # Grants
 //!
@@ -37,6 +38,7 @@ use knsh_proto::{
 
 use crate::dispatch::{Call, Handler, Handlers, Reply, answer, params};
 use crate::events::EventHub;
+use crate::expiry::PolicyExpiry;
 use crate::grants::{GrantError, GrantStore};
 use crate::policy::ProfileLoader;
 use crate::pushed::{PushError, PushedPolicies, Snapshot};
@@ -51,6 +53,8 @@ pub(crate) struct PolicyAdmin {
     grants: Arc<GrantStore>,
     sessions: Arc<Sessions>,
     events: Arc<EventHub>,
+    /// Resumes the sessions a new snapshot lets load again (KNSH-072).
+    expiry: Arc<PolicyExpiry>,
     clock: Arc<dyn Clock>,
     random: Arc<dyn Random>,
     log: Arc<dyn SystemLog>,
@@ -68,6 +72,8 @@ pub(crate) struct PolicyAdminParts {
     pub(crate) sessions: Arc<Sessions>,
     /// Where `policy.updated` is published.
     pub(crate) events: Arc<EventHub>,
+    /// The sessions paused by expired pushed policy, resumed by a snapshot they load with (KNSH-072).
+    pub(crate) expiry: Arc<PolicyExpiry>,
     /// Expiry and grant IDs.
     pub(crate) clock: Arc<dyn Clock>,
     /// Grant IDs.
@@ -85,6 +91,7 @@ impl PolicyAdmin {
             grants,
             sessions,
             events,
+            expiry,
             clock,
             random,
             log,
@@ -95,6 +102,7 @@ impl PolicyAdmin {
             grants,
             sessions,
             events,
+            expiry,
             clock,
             random,
             log,
@@ -160,6 +168,8 @@ impl PolicyAdmin {
         let _ = self
             .events
             .publish_engine(EngineEventData::PolicyUpdated { profile, expires_at });
+        // FR-POL-51: the authority is back; sessions paused because their snapshot expired resume if they load now.
+        self.expiry.snapshot_pushed();
         answer(&PolicySetResult { replaced })
     }
 

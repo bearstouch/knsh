@@ -186,7 +186,7 @@ impl PolicyEditor {
 
 /// `-32003` unless the call came on `user.sock`. The catalogue lists both methods only there; this is the second
 /// lock on the door.
-fn user_only(call: &Call<'_>) -> Result<(), RpcError> {
+pub(crate) fn user_only(call: &Call<'_>) -> Result<(), RpcError> {
     match call.endpoint {
         Endpoint::User => Ok(()),
         // Signed policy files are edited by the user only (FR-POL-41); the authority pushes policy with
@@ -213,7 +213,7 @@ fn with_final_newline(mut text: String) -> String {
 }
 
 /// `-32602` with `data.reason`.
-fn invalid_text(reason: &str) -> RpcError {
+pub(crate) fn invalid_text(reason: &str) -> RpcError {
     let error = RpcError::new(ErrorCode::InvalidParams);
     match Object::new().with("reason", reason) {
         Ok(data) => error.with_data(Value::Object(data)),
@@ -222,7 +222,7 @@ fn invalid_text(reason: &str) -> RpcError {
 }
 
 /// `-32001` from the user: the prompt did not succeed, so nothing was signed (decision 12).
-fn not_authenticated(refusal: &NotAuthenticated) -> RpcError {
+pub(crate) fn not_authenticated(refusal: &NotAuthenticated) -> RpcError {
     Denial {
         rule_id: None,
         reason: Some(format!("not authenticated: {refusal}")),

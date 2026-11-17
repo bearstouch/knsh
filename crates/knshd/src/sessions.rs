@@ -41,6 +41,15 @@
 //! sessions ([`Sessions::end_for_authority`]), create ones with no envelope ([`Sessions::create_agent`]) and change
 //! their recording ([`Sessions::set_recording`]).
 //!
+//! # Paused by expired pushed policy (KNSH-072)
+//!
+//! When pushed policy expires, `crate::expiry` pauses each active agent session using it
+//! ([`Sessions::pause_for_expiry`]) and the registry remembers why. Such a session leaves `paused` only through
+//! [`Sessions::release_from_expiry`]: when the authority pushes a snapshot it loads again, or when the user selects a
+//! signed local profile for it with `knsh profile use` (FR-POL-51). `session.resume` is refused for it with `-32006`:
+//! resuming it under policy that no longer loads would only deny its lines, and nothing else may move it to another
+//! profile (FR-POL-52). The mark is dropped when the session ends.
+//!
 //! # Errors
 //!
 //! A telemetry call or `session.info` on a connection without a session is `-32003`; a second `session.start_human`
@@ -49,18 +58,21 @@
 //!
 //! # Locks
 //!
-//! Lock order: a connection's [`SessionBinding`], then the registry, then [`AgentAccess`] or [`Holds`] (never both),
-//! then the event hub's own lock. The registry lock is never held while waiting for the record store, and the agent
-//! table is never held while reading the process table.
+//! Lock order: a connection's [`SessionBinding`], then the registry, then the set of sessions paused by expired
+//! policy, then [`AgentAccess`] or [`Holds`] (never both), then the event hub's own lock. The registry lock is never
+//! held while waiting for the record store, and the agent table is never held while reading the process table.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use knsh_core::{
-    Actor, CoreError, EventData, ExecutionRecord, ProfileName, ProfileOrder, RecordDetails, RecordId, Redacted,
-    SessionId, SessionRegistry, SessionSpec, SessionState, Timestamp, Transition, Ulid,
+    Actor, ActorKind, CoreError, EventData, ExecutionRecord, ProfileName, ProfileOrder, RecordDetails, RecordId,
+    Redacted, SessionId, SessionRegistry, SessionSpec, SessionState, Timestamp, Transition, Ulid,
 };
 use knsh_json::{Object, Value};
-use knsh_platform::{AuditToken, Clock, ProcessGroupId, ProcessIdentity, ProcessTree, Processes, Random};
+use knsh_platform::{
+    AuditToken, Authenticated, Clock, ProcessGroupId, ProcessIdentity, ProcessTree, Processes, Random,
+};
 use knsh_proto::{
     ErrorCode, RpcError, SessionInfoResult, SessionStartHumanParams, SessionStartHumanResult, TelemetryCommandParams,
     TelemetryCommandResult, TelemetryCwdParams, TelemetryIdleParams,
@@ -107,6 +119,8 @@ pub(crate) struct Sessions {
     agents: AgentAccess,
     /// Agent sessions' kept process groups, stopped while paused (KNSH-054).
     holds: Holds,
+    /// Agent sessions paused because their pushed policy expired (module documentation, KNSH-072).
+    expiry_paused: Mutex<BTreeSet<SessionId>>,
 }
 
 /// A state change asked of a live session (KNSH-054): the edges of the state diagram other than ending, which has its
@@ -133,6 +147,17 @@ impl StateChange {
             Self::HandBack => Transition::HandBack,
         }
     }
+}
+
+/// Who asked for a state change, which decides how a session paused by expired pushed policy is treated (module
+/// documentation, "Paused by expired pushed policy").
+enum Cause {
+    /// The authority or the user, through `session.*`: a session paused by expiry is not resumed this way.
+    Request,
+    /// A pushed policy the session uses expired: the session is marked.
+    Expiry,
+    /// The session's policy loads again (`None`), or the user selected a local profile for it (`Some`).
+    Released(Option<ProfileName>),
 }
 
 /// The session bound to one connection, if any, and who is at its other end. Created by the connection, released
@@ -249,6 +274,7 @@ impl Sessions {
             random,
             agents: AgentAccess::new(processes),
             holds: Holds::new(),
+            expiry_paused: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -642,14 +668,126 @@ impl Sessions {
     /// # Errors
     ///
     /// `-32006` naming the session if it is not live, or if the state diagram has no such edge from its state
-    /// (pausing a paused session, resuming an active one, taking control of a paused one…): the state is unchanged
-    /// and no event is published.
+    /// (pausing a paused session, resuming an active one, taking control of a paused one…), or when resuming a
+    /// session paused by expired pushed policy (module documentation, KNSH-072): the state is unchanged and no event
+    /// is published.
     pub(crate) fn change_state(&self, session_id: SessionId, change: StateChange) -> Result<SessionState, RpcError> {
+        self.move_session(session_id, change, Cause::Request)
+    }
+
+    /// Pauses the live, active agent session `session_id` because the pushed policy it uses expired (FR-POL-51,
+    /// FR-SES-13), and remembers why: it then resumes only through [`Sessions::release_from_expiry`].
+    ///
+    /// # Errors
+    ///
+    /// `-32006` naming the session if it is not live or not active (paused, under human control); `-32003` for a
+    /// human session, which is never paused (FR-SES-22). Nothing changes then.
+    pub(crate) fn pause_for_expiry(&self, session_id: SessionId) -> Result<(), RpcError> {
+        self.move_session(session_id, StateChange::Pause, Cause::Expiry)
+            .map(drop)
+    }
+
+    /// Resumes the session `session_id` that [`Sessions::pause_for_expiry`] paused, under its own profile: the
+    /// authority pushed a snapshot it loads with again (FR-POL-51).
+    ///
+    /// # Errors
+    ///
+    /// `-32006` naming the session if it is not live or was not paused by expired policy (already released, or
+    /// paused by the authority); nothing changes then.
+    pub(crate) fn release_from_expiry(&self, session_id: SessionId) -> Result<(), RpcError> {
+        self.move_session(session_id, StateChange::Resume, Cause::Released(None))
+            .map(drop)
+    }
+
+    /// Runs the session `session_id` that [`Sessions::pause_for_expiry`] paused under the local `profile` and resumes
+    /// it: the user selected it with `knsh profile use` and passed the prompt, which `_proof` stands for (FR-POL-51).
+    /// The two moves happen under one lock, so no line runs between them. This is the only way a session's profile
+    /// changes (FR-POL-52).
+    ///
+    /// # Errors
+    ///
+    /// As [`Sessions::release_from_expiry`]; nothing changes then.
+    pub(crate) fn select_profile_after_expiry(
+        &self,
+        session_id: SessionId,
+        profile: ProfileName,
+        _proof: &Authenticated,
+    ) -> Result<(), RpcError> {
+        self.move_session(session_id, StateChange::Resume, Cause::Released(Some(profile)))
+            .map(drop)
+    }
+
+    /// The live agent sessions that are `active`, with their profiles, in ID (start) order: those a pushed policy's
+    /// expiry may pause.
+    pub(crate) fn active_agents(&self) -> Vec<(SessionId, ProfileName)> {
+        lock(&self.registry)
+            .iter()
+            .filter(|session| session.actor().kind() == ActorKind::Agent && session.state() == SessionState::Active)
+            .map(|session| (session.session_id(), session.profile().clone()))
+            .collect()
+    }
+
+    /// The live sessions paused by expired pushed policy, with their profiles, in ID (start) order.
+    pub(crate) fn expiry_paused(&self) -> Vec<(SessionId, ProfileName)> {
+        let registry = lock(&self.registry);
+        let paused = lock(&self.expiry_paused);
+        paused
+            .iter()
+            .filter_map(|session_id| registry.get(*session_id).ok())
+            .map(|session| (session.session_id(), session.profile().clone()))
+            .collect()
+    }
+
+    /// One state change of a live session, for `cause` (see [`Cause`]): the transition, its signals, the mark of a
+    /// session paused by expired policy, the row and `session.state_changed`.
+    fn move_session(&self, session_id: SessionId, change: StateChange, cause: Cause) -> Result<SessionState, RpcError> {
         let (session, change) = {
             let mut registry = lock(&self.registry);
+            let mut expiry_paused = lock(&self.expiry_paused);
+            let marked = expiry_paused.contains(&session_id);
+            // Every refusal is decided before anything moves, so a refused change leaves the session, its mark and its
+            // process groups as they were.
+            match &cause {
+                // FR-POL-52: resuming a session paused by expiry would only run its lines under policy that no longer
+                // loads, so `session.resume` is refused; only a new snapshot or `knsh profile use` releases it.
+                Cause::Request if marked && change == StateChange::Resume => return Err(session_gone(session_id)),
+                // FR-SES-22: a human session is never paused, so expiry refuses it outright rather than pausing it. An
+                // unknown or ended session is `-32006`, as the transition would answer.
+                Cause::Expiry => {
+                    let session = registry.get(session_id).map_err(|_| session_gone(session_id))?;
+                    if session.actor().kind() == ActorKind::Human {
+                        return Err(RpcError::new(ErrorCode::NotAllowed));
+                    }
+                }
+                // A release undoes only the expiry's own pause: a session paused by the authority, or already released
+                // by a snapshot or another selection, stays as it is.
+                Cause::Released(_) if !marked => return Err(session_gone(session_id)),
+                // Any other request, and a release of a marked session, meet the state diagram below as any change
+                // does: pausing or taking control of a paused session has no edge there.
+                Cause::Request | Cause::Released(_) => {}
+            }
+            // A session that is not live, or has no such edge from its state (an expiry pause of a session already
+            // paused or under human control), is refused here, before its mark changes.
             let change = registry
                 .transition(session_id, change.transition())
                 .map_err(|_| session_gone(session_id))?;
+            // The mark follows the transition under the same locks, so no caller sees a session paused by expiry
+            // without its mark, or resumed with it.
+            match cause {
+                Cause::Request => {}
+                Cause::Expiry => {
+                    expiry_paused.insert(session_id);
+                }
+                Cause::Released(profile) => {
+                    expiry_paused.remove(&session_id);
+                    if let Some(profile) = profile {
+                        // Never fails: only agent sessions are marked, and this one is live (it just resumed). The
+                        // profile changes before the registry lock is released, so no line runs between the resume
+                        // and the selection (FR-POL-51).
+                        let _ = registry.select_profile(session_id, profile);
+                    }
+                }
+            }
             self.holds.moved(session_id, change.from, change.to);
             let session = registry
                 .get(session_id)
@@ -784,6 +922,8 @@ impl Sessions {
             let Ok(change) = registry.transition(session_id, Transition::End) else {
                 return;
             };
+            // An ended session is no longer paused by anything.
+            lock(&self.expiry_paused).remove(&session_id);
             // A session ending while paused continues its kept groups: nothing it started may stay stopped.
             self.holds.moved(session_id, change.from, change.to);
             // The registry dropped the session; the copy follows it to `ended` for the store row.

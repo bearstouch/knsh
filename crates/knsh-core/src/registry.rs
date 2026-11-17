@@ -170,6 +170,19 @@ impl<P: ProfileOrder> SessionRegistry<P> {
         Ok(session)
     }
 
+    /// Runs the live agent session `id` under `profile` from now on (`knsh profile use`, FR-POL-51, KNSH-072;
+    /// [`Session::select_profile`]) and returns the session as it now is.
+    ///
+    /// # Errors
+    ///
+    /// - [`CoreError::SessionNotFoundOrEnded`] if the session is unknown or has ended.
+    /// - [`CoreError::HumanProfile`] for a human session; nothing changes.
+    pub fn select_profile(&mut self, id: SessionId, profile: ProfileName) -> Result<&Session, CoreError> {
+        let session = self.sessions.get_mut(&id).ok_or(CoreError::SessionNotFoundOrEnded)?;
+        session.select_profile(profile)?;
+        Ok(session)
+    }
+
     /// Whether any envelope or recording session is live: what keeps `knshd` running between connections
     /// (`specs/02-architecture/process-model.md`).
     #[must_use]

@@ -11,7 +11,8 @@
 //! (KNSH-024). [`policy`] implements `knsh policy edit` (KNSH-065): `knshd` signs the edited file after Touch ID or
 //! the password. [`approvals`] implements `knsh approvals`, `knsh approve` and `knsh deny` (KNSH-066), and
 //! [`authority`] implements `knsh authority trust` (KNSH-068): `knshd` stores the trust record after Touch ID or the
-//! password.
+//! password. [`profile`] implements `knsh profile use` (KNSH-072): `knshd` moves the sessions paused by expired pushed
+//! policy to a signed local profile after Touch ID or the password.
 
 #[cfg(unix)]
 pub mod agent;
@@ -27,6 +28,7 @@ pub mod events;
 pub mod forget;
 pub mod history;
 pub mod policy;
+pub mod profile;
 #[cfg(unix)]
 pub mod shell;
 pub mod terminal;

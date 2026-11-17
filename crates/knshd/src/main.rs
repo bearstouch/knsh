@@ -117,6 +117,9 @@ mod grants;
 // Reads the session binding, so built where the session registry is. Served with the supervisor (KNSH-051).
 #[cfg(target_os = "macos")]
 mod exec;
+// Pauses sessions on expired pushed policy; `profile.use` (KNSH-072).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod expiry;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod hello;
 // Policy the authority pushes (KNSH-071), read by the profile loader in place of files.
@@ -574,7 +577,7 @@ struct AuthoritySupervision {
     profiles: crate::policy::ProfileLoader,
     /// The live grants, saved in the state store; every line is evaluated with them.
     grants: std::sync::Arc<grants::GrantStore>,
-    /// The control service's `session.*`, `recording.set` and `policy.*` handlers.
+    /// The control service's `session.*`, `recording.set` and `policy.*` handlers, and `profile.use` (KNSH-072).
     handlers: dispatch::Handlers,
 }
 
@@ -601,6 +604,23 @@ fn authority_supervision(
     let grants = grants::GrantStore::persisted(state, Arc::clone(log), restored.grants, clock.now().ok());
     let profiles = profile_loader(paths, random.clone(), log).with_pushed(Arc::clone(&pushed));
     let mut handlers = supervise::Supervise::new(Arc::clone(sessions), profiles.clone()).handlers();
+    // KNSH-072: sessions on expired pushed policy are paused until a new snapshot or `knsh profile use`. A watcher
+    // that cannot start is logged: lines on expired policy are still denied, their sessions just are not paused.
+    let expiry = expiry::PolicyExpiry::new(
+        Arc::clone(sessions),
+        Arc::clone(&pushed),
+        profiles.clone(),
+        Arc::new(knsh_platform::macos::LocalAuthentication::new()),
+        Arc::clone(log),
+    );
+    if expiry.watch(expiry::CHECK_PERIOD).is_err() {
+        log.log(
+            knsh_platform::Level::Error,
+            "pushed-policy expiry watcher unavailable: sessions on expired policy are denied but not paused",
+            &[],
+        );
+    }
+    handlers.extend(expiry.handlers());
     handlers.extend(
         policy_admin::PolicyAdmin::new(policy_admin::PolicyAdminParts {
             profiles: profiles.clone(),
@@ -608,6 +628,7 @@ fn authority_supervision(
             grants: Arc::clone(&grants),
             sessions: Arc::clone(sessions),
             events: Arc::clone(events),
+            expiry,
             clock: clock.clone(),
             random: random.clone(),
             log: Arc::clone(log),

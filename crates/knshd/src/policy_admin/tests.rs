@@ -52,12 +52,20 @@ impl Admin {
         let pushed = PushedPolicies::new(Arc::clone(&state), clock.clone(), restored.snapshots);
         let grants = GrantStore::persisted(state, log.clone(), restored.grants, clock.now().ok());
         let profiles = loader(fs(&[("web", WEB)])).with_pushed(Arc::clone(&pushed));
+        let expiry = crate::expiry::PolicyExpiry::new(
+            Arc::clone(&fixture.sessions),
+            Arc::clone(&pushed),
+            profiles.clone(),
+            Arc::new(knsh_platform::testing::ScriptedPresence::new()),
+            log.clone(),
+        );
         let handlers = PolicyAdmin::new(PolicyAdminParts {
             profiles: profiles.clone(),
             pushed,
             grants: Arc::clone(&grants),
             sessions: Arc::clone(&fixture.sessions),
             events: Arc::clone(&fixture.hub),
+            expiry,
             clock: clock.clone(),
             random: Arc::new(SeededRandom::new(9)),
             log,

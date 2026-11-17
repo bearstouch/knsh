@@ -100,6 +100,7 @@ mod hello;
 mod method;
 mod policy;
 mod policy_edit;
+mod profile_use;
 mod records;
 mod session;
 mod start_agent;
@@ -157,6 +158,7 @@ pub use policy::{
 pub use policy_edit::{
     MAX_POLICY_TEXT_LEN, PolicyEditParams, PolicyEditResult, PolicyFileState, PolicyReadParams, PolicyReadResult,
 };
+pub use profile_use::{ProfileUseParams, ProfileUseResult};
 pub use records::{
     DEFAULT_RECORDS_PAGE, MAX_BASE64_OUTPUT, MAX_RECORDS_PAGE, MAX_RECORDS_TEXT_LEN, OUTPUT_CONTENT_TYPE, OutputData,
     RecordEntry, RecordsForgetParams, RecordsForgetResult, RecordsOutputParams, RecordsOutputResult,

@@ -67,6 +67,8 @@
 | Grant from a `decision.respond` answer | 1 s to 30 days (`duration_s`); longer is `-32602` | — | [control service](../06-api/control-service.md#decision-protocol) (KNSH-069) |
 | Grant from `policy.grant` | 1 s to 30 days (`duration_s`); rule 1 to 4096 bytes | — | [control service](../06-api/control-service.md#policygrant) (KNSH-071) |
 | Pushed policy snapshots | 64 profiles; each at most 1 MiB of text | — | [control service](../06-api/control-service.md#policyset) (KNSH-071) |
+| Pushed-policy expiry check | Every 1 s: sessions on an expired snapshot are paused at most about 1 s late (their lines are denied from `expires_at` on) | — | [control service](../06-api/control-service.md#policyset) (KNSH-072) |
+| `profile.use` prompt | Waits at most 120 s | — | [`profile.use`](../06-api/user-socket.md#profileuse) (KNSH-072) |
 | `reason` in a `decision.respond` answer | 1024 bytes, as a hook's reason; longer is `-32602` | — | [control service](../06-api/control-service.md#decision-protocol) (KNSH-069) |
 | Deprecated method lifetime | 2 engine minor releases | — | [API](../06-api/README.md) |
 | Human recording | Off | Per session | [privacy](../04-non-functional-requirements/privacy.md) |

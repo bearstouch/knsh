@@ -55,6 +55,7 @@ fn main() -> ExitCode {
             ["forget"] => forget(&parsed),
             ["history"] => history(&parsed),
             ["policy", "edit"] => policy_edit(&parsed),
+            ["profile", "use"] => profile_use(&parsed),
             ["events"] => events(&parsed),
             ["shell", "install"] => shell_install(parsed.json()),
             _ => not_implemented(&format!("'knsh {}'", parsed.path.join(" "))),
@@ -223,6 +224,40 @@ fn authority_trust(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Runs `knsh profile use <profile>` (KNSH-072, FR-POL-51): a malformed name is a usage error (exit 2) and sends
+/// nothing. Otherwise it says on stderr that `knshd` may show the Touch ID or password prompt, then waits for
+/// `profile.use`: the CLI never asks anything on the terminal and cannot skip the prompt. A refusal exits with 1.
+#[cfg(unix)]
+fn profile_use(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    use knsh::cli::{client, profile};
+
+    let params = match profile::params(parsed) {
+        Ok(params) => params,
+        Err(error) => return usage(&error, "profile use"),
+    };
+    let socket = match user_socket() {
+        Ok(socket) => socket,
+        Err(code) => return code,
+    };
+    report(&profile::confirm_notice(&params));
+    match client::connect_user(&socket).and_then(|mut client| profile::use_profile(&mut client, &params)) {
+        Ok(result) => {
+            let _ = std::io::stdout().write_all(profile::report(&result, parsed.json()).as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            report(&profile::failure_message(&error));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `user.sock` is a Unix socket; no other platform has one.
+#[cfg(not(unix))]
+fn profile_use(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    not_implemented("'knsh profile use' on this platform")
 }
 
 /// `user.sock` is a Unix socket; no other platform has one.
