@@ -631,6 +631,8 @@ fn authority_supervision(
             expiry,
             clock: clock.clone(),
             random: random.clone(),
+            // The user's `policy.grant` on user.sock (KNSH-073): knshd shows the prompt itself.
+            presence: Arc::new(knsh_platform::macos::LocalAuthentication::new()),
             log: Arc::clone(log),
         })
         .handlers(),

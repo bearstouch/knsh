@@ -12,7 +12,8 @@ Reachable by the user's processes outside envelopes. Every envelope and command 
 | `approval.list`, `approval.approve`, `approval.deny` | Pending asks; approving needs Touch ID or password, checked by `knshd` ([below](#approvals)) |
 | `policy.check` | Dry run of a line against a named session's or profile's policy ([parameters](agent-socket.md#policycheck)); no authentication |
 | `policy.read`, `policy.edit` | Read a policy file for editing, and save it signed after Touch ID or password ([below](#policy-files)) |
-| `profile.use`, `policy.grant` | Profile selection and grants need Touch ID or password |
+| `profile.use` | Profile selection needs Touch ID or password ([below](#profile-selection)) |
+| `policy.grant`, `policy.grants`, `policy.revoke` | Make a grant after Touch ID or password; list and revoke grants ([below](#grants)) |
 | `records.forget` | Delete records, optionally with checkpoints (`knsh forget`) |
 | `authority.trust` | Trust one authority app after Touch ID or password ([below](#authoritytrust)) |
 
@@ -294,6 +295,33 @@ it (`-32003` there).
    running keeps the sandbox profile it started with; its next lines are decided with `<name>`.
 
 Selections are serialised in `knshd`. A session's profile changes in no other way (FR-POL-52).
+
+## Grants
+
+`knsh policy grant`, `knsh policy grants` and `knsh policy revoke` ([CLI](cli.md#grants)) let a user without an
+authority app allow a repeated action for a limited time (KNSH-073, FR-POL-60 to FR-POL-62). The methods take and
+answer exactly what the [control service's](control-service.md#policygrant) do, and work on the same grants: a grant
+the user makes is listed and revoked like the authority's, on either endpoint. None of the three is on `agent.sock`
+(`-32003`, never listed): an agent can never widen its own policy.
+
+### `policy.grant`
+
+Params, result and errors as on the [control service](control-service.md#policygrant). In order:
+
+1. The params, the scope (`session`: a live agent session, `-32006` if not live, `-32003` for a human one) and the
+   rule (a command pattern) are checked; any refusal comes before a prompt.
+2. `knshd` shows the Touch ID or password prompt itself: `grant the agent command rule: <rule> (session <id>, for
+   <duration>)` or `(profile <name>, for <duration>)`, the rule escaped as in every prompt
+   ([decision 12](../09-reference/decisions.md)) and the duration exact (`1h 30m`, `1d 1m 1s`). It waits at most
+   120 s. Any outcome but success is `-32001` with `source: "user"`, `rule_id: null` and `reason: "not
+   authenticated: …"`; no grant exists. No parameter skips the prompt (NFR-SEC-04).
+3. A session scope is checked again (the session may have ended while the prompt was up). The grant then lasts
+   `duration_s` from that moment and is saved before it applies, as the authority's.
+
+### `policy.grants` and `policy.revoke`
+
+As on the [control service](control-service.md#policygrants): every live grant, the authority's, its answers' and the
+user's; and removal at once. No authentication: listing changes nothing, and a revocation only removes a permission.
 
 ## Authority trust
 

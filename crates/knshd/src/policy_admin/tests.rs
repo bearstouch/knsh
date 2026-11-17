@@ -6,8 +6,12 @@ use std::path::Path;
 use knsh_core::{AgentId, Delivery, EventScope, ProfileName, SessionId};
 use knsh_json::{Object, Value};
 use knsh_platform::engine_dirs::FILE_MODE;
-use knsh_platform::testing::{DEFAULT_UID, FakeClock, MemFs, RecordingLog, SeededRandom};
-use knsh_platform::{FileKind, Fs};
+use std::sync::Mutex;
+use std::time::Duration;
+
+use knsh_platform::testing::{DEFAULT_UID, FakeClock, MemFs, RecordingLog, ScriptedPresence, SeededRandom};
+use knsh_platform::{Authenticated, FileKind, Fs, NotAuthenticated};
+use knsh_proto::Denial;
 
 use super::*;
 use crate::dispatch::{Endpoint, Handlers};
@@ -24,6 +28,32 @@ fn at(seconds: u64) -> String {
     Timestamp::from_unix_micros(seconds * 1_000_000).unwrap().to_string()
 }
 
+/// Something that happens while the prompt is on the screen.
+type DuringPrompt = Box<dyn FnOnce() + Send>;
+
+/// The scripted prompt, which can also run something while it is up (the user takes their time).
+#[derive(Default)]
+struct Presence {
+    scripted: ScriptedPresence,
+    during: Mutex<Option<DuringPrompt>>,
+}
+
+impl Presence {
+    /// Runs `action` during the next prompt, before it is answered.
+    fn during_next(&self, action: impl FnOnce() + Send + 'static) {
+        *self.during.lock().unwrap() = Some(Box::new(action));
+    }
+}
+
+impl UserPresence for Presence {
+    fn authenticate(&self, reason: &PromptReason, timeout: Duration) -> Result<Authenticated, NotAuthenticated> {
+        if let Some(action) = self.during.lock().unwrap().take() {
+            action();
+        }
+        self.scripted.authenticate(reason, timeout)
+    }
+}
+
 /// Everything one test drives: the handlers and what they act on.
 struct Admin {
     fixture: Fixture,
@@ -33,6 +63,8 @@ struct Admin {
     /// The file system holding the state file.
     state_fs: Arc<MemFs>,
     clock: Arc<FakeClock>,
+    /// The prompt the user's `policy.grant` shows.
+    presence: Arc<Presence>,
 }
 
 impl Admin {
@@ -59,6 +91,7 @@ impl Admin {
             Arc::new(knsh_platform::testing::ScriptedPresence::new()),
             log.clone(),
         );
+        let presence = Arc::new(Presence::default());
         let handlers = PolicyAdmin::new(PolicyAdminParts {
             profiles: profiles.clone(),
             pushed,
@@ -68,6 +101,7 @@ impl Admin {
             expiry,
             clock: clock.clone(),
             random: Arc::new(SeededRandom::new(9)),
+            presence: presence.clone(),
             log,
         })
         .handlers();
@@ -78,6 +112,7 @@ impl Admin {
             grants,
             state_fs,
             clock,
+            presence,
         }
     }
 
@@ -89,6 +124,11 @@ impl Admin {
             method,
             params,
         )
+    }
+
+    /// `method` on `user.sock`.
+    fn user(&self, method: &'static str, params: &str) -> Reply {
+        call_with(&self.handlers, Endpoint::User, &SessionBinding::new(), method, params)
     }
 
     fn ok(&self, method: &'static str, params: &str) -> Object {
@@ -330,12 +370,226 @@ fn persists_pushed_policy_and_grants() {
     assert_eq!(restarted.grants.list(restarted.clock.now().unwrap()).len(), 1);
 }
 
-// The methods answer on the control service only.
+// Pushing and reading policy answer on the control service only.
 #[test]
 fn refuses_calls_off_the_control_service() {
     let admin = Admin::new();
     for endpoint in [Endpoint::User, Endpoint::Agent] {
-        let error = call_with(&admin.handlers, endpoint, &SessionBinding::new(), "policy.grants", "{}").unwrap_err();
-        assert_eq!(error.code, ErrorCode::NotAllowed);
+        for method in ["policy.set", "policy.get"] {
+            let error = call_with(&admin.handlers, endpoint, &SessionBinding::new(), method, "{}").unwrap_err();
+            assert_eq!(error.code, ErrorCode::NotAllowed, "{method}");
+        }
     }
+}
+
+/// `policy.grant` params for profile `web`.
+fn profile_grant(rule: &str, duration_s: u64) -> String {
+    format!(r#"{{"scope":"profile","profile":"web","rule":"{rule}","duration_s":{duration_s}}}"#)
+}
+
+// FR-POL-62, NFR-SEC-04 (KNSH-073): on user.sock a grant is made only after knshd's own prompt succeeds, and the prompt
+// names the rule, the scope and the duration. A refusal, a cancel, and no answer at all (nobody at the Mac) each deny
+// with source `user`, and nothing is granted or saved. No parameter skips the prompt.
+#[test]
+fn user_grant_requires_authentication() {
+    let admin = Admin::new();
+    admin.presence.scripted.refuse_next(NotAuthenticated::Failed);
+    admin.presence.scripted.refuse_next(NotAuthenticated::Cancelled);
+    for _ in 0..3 {
+        let error = admin
+            .user("policy.grant", &profile_grant("git push", 5400))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied);
+        let denial = Denial::from_error(&error).unwrap();
+        assert_eq!(denial.source.as_deref(), Some("user"));
+        assert!(denial.reason.unwrap().starts_with("not authenticated: "));
+        assert!(
+            admin.grants.list(admin.clock.now().unwrap()).is_empty(),
+            "nothing was granted"
+        );
+        let saved = admin
+            .state_fs
+            .contents(&crate::state::tests::path())
+            .unwrap_or_default();
+        assert!(!String::from_utf8_lossy(&saved).contains("git push"), "nothing saved");
+    }
+    // A member claiming the user is present is ignored like any unknown one: the prompt still decides.
+    let claimed = r#"{"scope":"profile","profile":"web","rule":"git push","duration_s":60,"authenticated":true}"#;
+    assert_eq!(admin.user("policy.grant", claimed).unwrap_err().code, ErrorCode::Denied);
+
+    admin.presence.scripted.approve_next();
+    let granted = admin.user("policy.grant", &profile_grant("git push", 5400)).unwrap();
+    let granted = granted.result.as_object().unwrap();
+    assert_eq!(granted.get("expires_at"), Some(&Value::from(at(NOW + 5400))));
+    assert_eq!(admin.grants.list(admin.clock.now().unwrap()).len(), 1);
+
+    let prompts = admin.presence.scripted.prompts();
+    assert_eq!(prompts.len(), 5, "every attempt prompts afresh");
+    assert_eq!(
+        prompts[4].reason,
+        "grant the agent command rule: git push (profile web, for 1h 30m)"
+    );
+    assert_eq!(prompts[4].timeout, GRANT_PROMPT_TIMEOUT);
+
+    // A session-scoped grant names the session; the rule is escaped so it reads exactly as it applies: an invisible
+    // zero-width space is shown, never hidden.
+    let session = admin.agent();
+    admin.presence.scripted.approve_next();
+    let params = format!(r#"{{"scope":"session","session_id":"{session}","rule":"git\u200bpush","duration_s":86461}}"#);
+    admin.user("policy.grant", &params).unwrap();
+    assert_eq!(
+        admin.presence.scripted.prompts()[5].reason,
+        format!("grant the agent command rule: git\\u{{200B}}push (session {session}, for 1d 1m 1s)")
+    );
+}
+
+// FR-POL-62: nothing the engine would refuse is put to the user: a rule that is not a command pattern, a session that
+// is not a live agent session, or a duration out of range is refused without a prompt.
+#[test]
+fn user_grant_checks_before_prompting() {
+    let admin = Admin::new();
+    let unknown = SessionId::from_ulid(knsh_core::Ulid::from_u128(77));
+    for (params, code) in [
+        (profile_grant("/bin/rm", 60), ErrorCode::InvalidParams),
+        (profile_grant("   ", 60), ErrorCode::InvalidParams),
+        (profile_grant("ls", 0), ErrorCode::InvalidParams),
+        (
+            format!(r#"{{"scope":"session","session_id":"{unknown}","rule":"ls","duration_s":60}}"#),
+            ErrorCode::SessionNotFound,
+        ),
+    ] {
+        assert_eq!(admin.user("policy.grant", &params).unwrap_err().code, code, "{params}");
+    }
+    assert!(admin.presence.scripted.prompts().is_empty(), "nothing was asked");
+}
+
+// FR-POL-62: the session may end while the prompt is up; no grant is made for it, even once the user agrees. And a
+// grant lasts its duration from when the user agreed, not from when it was asked.
+#[test]
+fn user_grant_rechecks_after_the_prompt() {
+    let admin = Admin::new();
+    let session = admin.agent();
+    let sessions = Arc::clone(&admin.fixture.sessions);
+    admin.presence.during_next(move || sessions.end_agent(session));
+    admin.presence.scripted.approve_next();
+    let params = format!(r#"{{"scope":"session","session_id":"{session}","rule":"ls","duration_s":60}}"#);
+    assert_eq!(
+        admin.user("policy.grant", &params).unwrap_err().code,
+        ErrorCode::SessionNotFound
+    );
+    assert!(
+        admin.grants.list(admin.clock.now().unwrap()).is_empty(),
+        "nothing was granted"
+    );
+
+    let clock = Arc::clone(&admin.clock);
+    admin
+        .presence
+        .during_next(move || clock.advance(Duration::from_secs(90)));
+    admin.presence.scripted.approve_next();
+    let granted = admin.user("policy.grant", &profile_grant("ls", 60)).unwrap();
+    assert_eq!(
+        granted.result.as_object().unwrap().get("expires_at"),
+        Some(&Value::from(at(NOW + 90 + 60)))
+    );
+}
+
+// FR-POL-61, FR-POL-62 (KNSH-073): the user's grants are the authority's kind: both list them, both revoke them, and
+// listing or revoking on user.sock needs no prompt.
+#[test]
+fn user_grants_are_listed_and_revocable_like_authority_grants() {
+    let admin = Admin::new();
+    admin.presence.scripted.approve_next();
+    let granted = admin.user("policy.grant", &profile_grant("git push", 60)).unwrap();
+    let grant_id = granted
+        .result
+        .as_object()
+        .unwrap()
+        .get("grant_id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+    let by_authority = admin.ok("policy.grant", &profile_grant("npm test", 60));
+    let authority_id = by_authority.get("grant_id").and_then(Value::as_str).unwrap().to_owned();
+    assert!(admin.state_file().contains(&grant_id), "saved before it applies");
+
+    for endpoint in [Endpoint::User, Endpoint::Control] {
+        let listed = call_with(&admin.handlers, endpoint, &SessionBinding::new(), "policy.grants", "{}").unwrap();
+        let grants = listed
+            .result
+            .as_object()
+            .unwrap()
+            .get("grants")
+            .and_then(Value::as_array)
+            .unwrap()
+            .clone();
+        let mut ids: Vec<_> = grants
+            .iter()
+            .map(|grant| {
+                grant
+                    .as_object()
+                    .unwrap()
+                    .get("grant_id")
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        // Listed in ID order; both were made in the same millisecond, so compare as a set.
+        ids.sort();
+        let mut expected = [grant_id.clone(), authority_id.clone()];
+        expected.sort();
+        assert_eq!(ids, expected, "{}", endpoint.name());
+    }
+    // The authority revokes the user's grant, the user the authority's.
+    for (endpoint, id) in [(Endpoint::Control, &grant_id), (Endpoint::User, &authority_id)] {
+        let revoke = format!(r#"{{"grant_id":"{id}"}}"#);
+        let answer = call_with(
+            &admin.handlers,
+            endpoint,
+            &SessionBinding::new(),
+            "policy.revoke",
+            &revoke,
+        )
+        .unwrap();
+        assert_eq!(
+            answer.result.as_object().unwrap().get("revoked"),
+            Some(&Value::from(true))
+        );
+    }
+    assert!(
+        admin.grants.list(admin.clock.now().unwrap()).is_empty(),
+        "nothing was granted"
+    );
+    assert_eq!(admin.presence.scripted.prompts().len(), 1, "only the grant prompted");
+}
+
+// FR-POL-62 (KNSH-073): agent.sock can never make, list or revoke a grant, whatever it sends; the prompt never shows.
+#[test]
+fn user_grant_absent_on_agent_socket() {
+    let admin = Admin::new();
+    admin.presence.scripted.approve_next();
+    for (method, params) in [
+        ("policy.grant", profile_grant("git push", 60)),
+        ("policy.grants", String::from("{}")),
+        (
+            "policy.revoke",
+            format!(r#"{{"grant_id":"{}"}}"#, knsh_core::Ulid::from_u128(1)),
+        ),
+    ] {
+        let error = call_with(
+            &admin.handlers,
+            Endpoint::Agent,
+            &SessionBinding::new(),
+            method,
+            &params,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotAllowed, "{method}");
+    }
+    assert!(admin.presence.scripted.prompts().is_empty(), "nothing was asked");
+    assert!(
+        admin.grants.list(admin.clock.now().unwrap()).is_empty(),
+        "nothing was granted"
+    );
 }

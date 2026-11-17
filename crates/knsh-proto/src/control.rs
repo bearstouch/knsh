@@ -360,6 +360,29 @@ impl ToJson for PolicyGrantParams {
     }
 }
 
+/// A duration in seconds as days, hours, minutes and seconds, leaving out the units that are zero: `90` is `1m 30s`,
+/// `86400` is `1d`. Exact, so `knshd`'s prompt for the
+/// user's `policy.grant` and `knsh policy grant` show precisely, and alike, how long the grant lasts (KNSH-073).
+#[must_use]
+pub fn grant_duration_text(seconds: u64) -> String {
+    let parts = [
+        (seconds / 86_400, "d"),
+        (seconds % 86_400 / 3_600, "h"),
+        (seconds % 3_600 / 60, "m"),
+        (seconds % 60, "s"),
+    ];
+    let text: Vec<String> = parts
+        .iter()
+        .filter(|(value, _)| *value > 0)
+        .map(|(value, unit)| format!("{value}{unit}"))
+        .collect();
+    if text.is_empty() {
+        String::from("0s")
+    } else {
+        text.join(" ")
+    }
+}
+
 /// The result of `policy.grant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyGrantResult {
@@ -367,6 +390,17 @@ pub struct PolicyGrantResult {
     pub grant_id: GrantId,
     /// When it stops applying.
     pub expires_at: Timestamp,
+}
+
+impl FromJson for PolicyGrantResult {
+    /// Read by `knsh policy grant` (KNSH-073).
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let mut fields = Fields::new(value)?;
+        let grant_id = parse(&fields.required::<String>("grant_id")?, "grant_id")?;
+        let expires_at = parse(&fields.required::<String>("expires_at")?, "expires_at")?;
+        fields.finish()?;
+        Ok(Self { grant_id, expires_at })
+    }
 }
 
 impl ToJson for PolicyGrantResult {
@@ -393,6 +427,34 @@ pub struct GrantEntry {
     pub expires_at: Timestamp,
 }
 
+impl FromJson for GrantEntry {
+    /// Read by `knsh policy grants` (KNSH-073). `session_id` and `profile` must match `scope`, as in
+    /// [`PolicyGrantParams`].
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let mut fields = Fields::new(value)?;
+        let grant_id = parse(&fields.required::<String>("grant_id")?, "grant_id")?;
+        let scope: String = fields.required("scope")?;
+        let session_id: Option<String> = fields.optional("session_id")?;
+        let profile: Option<String> = fields.optional("profile")?;
+        let rule: String = fields.required("rule")?;
+        let exact: bool = fields.required("exact")?;
+        let expires_at = parse(&fields.required::<String>("expires_at")?, "expires_at")?;
+        fields.finish()?;
+        let target = match (scope.as_str(), session_id, profile) {
+            ("session", Some(session_id), None) => GrantTargetParam::Session(parse(&session_id, "session_id")?),
+            ("profile", None, Some(profile)) => GrantTargetParam::Profile(profile_name(&profile)?),
+            _ => return Err(out_of_range("scope")),
+        };
+        Ok(Self {
+            grant_id,
+            target,
+            rule,
+            exact,
+            expires_at,
+        })
+    }
+}
+
 impl ToJson for GrantEntry {
     /// `grant_id`, `scope`, `session_id` (or `null`), `profile` (or `null`), `rule`, `exact`, `expires_at`.
     fn to_json(&self) -> Result<Value, JsonError> {
@@ -417,6 +479,15 @@ impl ToJson for GrantEntry {
 pub struct PolicyGrantsResult {
     /// The grants.
     pub grants: Vec<GrantEntry>,
+}
+
+impl FromJson for PolicyGrantsResult {
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let mut fields = Fields::new(value)?;
+        let grants: Vec<GrantEntry> = fields.required("grants")?;
+        fields.finish()?;
+        Ok(Self { grants })
+    }
 }
 
 impl ToJson for PolicyGrantsResult {
@@ -455,6 +526,15 @@ pub struct PolicyRevokeResult {
     /// `true` when a live grant was removed; `false` for an unknown or already expired one
     /// (`specs/05-models/grant.md`: an expired grant is reported as not found).
     pub revoked: bool,
+}
+
+impl FromJson for PolicyRevokeResult {
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let mut fields = Fields::new(value)?;
+        let revoked: bool = fields.required("revoked")?;
+        fields.finish()?;
+        Ok(Self { revoked })
+    }
 }
 
 impl ToJson for PolicyRevokeResult {
@@ -590,6 +670,57 @@ mod tests {
         assert!(
             RecordingSetParams::from_json(&value(&format!(r#"{{"session_id":"{SESSION}","output":"yes"}}"#))).is_err()
         );
+    }
+
+    // KNSH-073: `knsh policy grant`, `grants` and `revoke` read the grant results back exactly as written; an entry
+    // whose target does not match its scope is refused.
+    #[test]
+    fn reads_grant_results_back() {
+        let grant_id: GrantId = SESSION.parse().unwrap();
+        let expires_at = Timestamp::from_unix_micros(1_000_000).unwrap();
+        let made = PolicyGrantResult { grant_id, expires_at };
+        assert_eq!(PolicyGrantResult::from_json(&made.to_json().unwrap()).unwrap(), made);
+        let listed = PolicyGrantsResult {
+            grants: vec![
+                GrantEntry {
+                    grant_id,
+                    target: GrantTargetParam::Session(SESSION.parse().unwrap()),
+                    rule: "git push".to_owned(),
+                    exact: true,
+                    expires_at,
+                },
+                GrantEntry {
+                    grant_id,
+                    target: GrantTargetParam::Profile(ProfileName::new("web-app").unwrap()),
+                    rule: "npm test".to_owned(),
+                    exact: false,
+                    expires_at,
+                },
+            ],
+        };
+        assert_eq!(
+            PolicyGrantsResult::from_json(&listed.to_json().unwrap()).unwrap(),
+            listed
+        );
+        let mismatched = format!(
+            r#"{{"grants":[{{"grant_id":"{SESSION}","scope":"profile","session_id":"{SESSION}","profile":null,"rule":"ls","exact":false,"expires_at":"1970-01-01T00:00:00.000000Z"}}]}}"#
+        );
+        assert!(PolicyGrantsResult::from_json(&value(&mismatched)).is_err());
+        let revoked = PolicyRevokeResult { revoked: true };
+        assert_eq!(
+            PolicyRevokeResult::from_json(&revoked.to_json().unwrap()).unwrap(),
+            revoked
+        );
+    }
+
+    // KNSH-073: the duration the prompt and the CLI show is exact.
+    #[test]
+    fn writes_grant_durations_exactly() {
+        assert_eq!(grant_duration_text(1), "1s");
+        assert_eq!(grant_duration_text(90), "1m 30s");
+        assert_eq!(grant_duration_text(3600), "1h");
+        assert_eq!(grant_duration_text(MAX_GRANT_DURATION_S), "30d");
+        assert_eq!(grant_duration_text(90_061), "1d 1h 1m 1s");
     }
 
     // The results' wire shapes.

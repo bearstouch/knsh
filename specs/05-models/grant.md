@@ -10,7 +10,8 @@ A grant is a time-limited rule added on top of a profile, usually after an appro
 | `expires_at` | timestamp | From this instant on the grant no longer applies |
 
 - Created by the authority (`policy.grant` on the control service, KNSH-071, or a `grant` in `decision.respond` with `scope` and `duration_s`) or by the user with Touch ID (`policy.grant` on `user.sock`, KNSH-073).
-- Listed with `policy.grants`; revoked with `policy.revoke`.
+- Listed with `policy.grants`; revoked with `policy.revoke`, on the control service or `user.sock` alike (KNSH-073):
+  every grant is listed and revocable however it was made.
 - A grant can cover lines that would receive secrets and lines that need `approval_hosts`.
 
 ## Evaluation (KNSH-042)

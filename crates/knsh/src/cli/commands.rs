@@ -103,7 +103,7 @@ pub static KNSH: Command = group(
         },
         group(
             "policy",
-            "Check or edit policy",
+            "Check or edit policy, and manage grants",
             &[
                 leaf("check", "Dry-run a line against policy"),
                 Command {
@@ -112,6 +112,45 @@ pub static KNSH: Command = group(
                         help: "The profile to edit (its file in the policies directory); created if new",
                     }],
                     ..leaf("edit", "Edit a policy file; saving needs Touch ID or password")
+                },
+                // KNSH-073: grants without an authority app.
+                Command {
+                    options: &[
+                        OptionSpec {
+                            long: "session",
+                            value: Some("id"),
+                            required: false,
+                            help: "Grant for this agent session only",
+                        },
+                        OptionSpec {
+                            long: "profile",
+                            value: Some("name"),
+                            required: false,
+                            help: "Grant for every session under this profile",
+                        },
+                        OptionSpec {
+                            long: "for",
+                            value: Some("duration"),
+                            required: true,
+                            help: "How long it lasts: 90s, 15m, 2h or 1d, at most 30d",
+                        },
+                    ],
+                    positionals: &[Positional {
+                        name: "rule",
+                        help: "The command pattern it allows, quoted, as in exec.allow (\"git push\")",
+                    }],
+                    ..leaf(
+                        "grant",
+                        "Allow a command for a limited time; needs Touch ID or password",
+                    )
+                },
+                leaf("grants", "List the live grants"),
+                Command {
+                    positionals: &[Positional {
+                        name: "grant_id",
+                        help: "The grant to revoke (from 'knsh policy grants')",
+                    }],
+                    ..leaf("revoke", "Revoke a grant at once")
                 },
             ],
         ),

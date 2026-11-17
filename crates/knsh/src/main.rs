@@ -55,6 +55,9 @@ fn main() -> ExitCode {
             ["forget"] => forget(&parsed),
             ["history"] => history(&parsed),
             ["policy", "edit"] => policy_edit(&parsed),
+            ["policy", "grant"] => policy_grant(&parsed),
+            ["policy", "grants"] => policy_grants(&parsed),
+            ["policy", "revoke"] => policy_revoke(&parsed),
             ["profile", "use"] => profile_use(&parsed),
             ["events"] => events(&parsed),
             ["shell", "install"] => shell_install(parsed.json()),
@@ -252,6 +255,106 @@ fn profile_use(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Runs `knsh policy grant` (KNSH-073, FR-POL-62): a malformed command line is a usage error (exit 2) and sends
+/// nothing. Otherwise it says on stderr that `knshd` shows the Touch ID or password prompt, then waits for
+/// `policy.grant`: the CLI never asks anything on the terminal and cannot skip the prompt. A refusal exits with 1.
+#[cfg(unix)]
+fn policy_grant(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    use knsh::cli::{client, grants};
+
+    let params = match grants::grant_params(parsed) {
+        Ok(params) => params,
+        Err(error) => return usage(&error, "policy grant"),
+    };
+    let socket = match user_socket() {
+        Ok(socket) => socket,
+        Err(code) => return code,
+    };
+    report(&grants::confirm_notice(&params));
+    match client::connect_user(&socket).and_then(|mut client| grants::grant(&mut client, &params)) {
+        Ok(result) => {
+            let _ = std::io::stdout().write_all(grants::grant_report(&result, parsed.json()).as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            report(&grants::grant_failure_message(&error));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs `knsh policy grants` (KNSH-073, FR-POL-61): every live grant, the authority's and the user's.
+#[cfg(unix)]
+fn policy_grants(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    use knsh::cli::{client, grants};
+
+    let socket = match user_socket() {
+        Ok(socket) => socket,
+        Err(code) => return code,
+    };
+    let listed = client::connect_user(&socket)
+        .and_then(|mut client| grants::list(&mut client))
+        .map_err(|error| grants::failure_message("grants", &error))
+        .and_then(|list| {
+            grants::list_report(&list, parsed.json()).map_err(|error| format!("knsh: policy grants failed: {error}\n"))
+        });
+    match listed {
+        Ok(text) => {
+            // A closed stdout (`knsh policy grants | head`) is not an error worth reporting.
+            let _ = std::io::stdout().write_all(text.as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            report(&message);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs `knsh policy revoke <grant_id>` (KNSH-073, FR-POL-61): a malformed ID is a usage error (exit 2). No prompt:
+/// a revocation only removes a permission. A grant that was not live is reported, not an error.
+#[cfg(unix)]
+fn policy_revoke(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    use knsh::cli::{client, grants};
+
+    let grant_id = match grants::grant_id(parsed) {
+        Ok(grant_id) => grant_id,
+        Err(error) => return usage(&error, "policy revoke"),
+    };
+    let socket = match user_socket() {
+        Ok(socket) => socket,
+        Err(code) => return code,
+    };
+    match client::connect_user(&socket).and_then(|mut client| grants::revoke(&mut client, grant_id)) {
+        Ok(result) => {
+            let _ = std::io::stdout().write_all(grants::revoke_report(&result, grant_id, parsed.json()).as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            report(&grants::failure_message("revoke", &error));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `user.sock` is a Unix socket; no other platform has one.
+#[cfg(not(unix))]
+fn policy_grant(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    not_implemented("'knsh policy grant' on this platform")
+}
+
+/// `user.sock` is a Unix socket; no other platform has one.
+#[cfg(not(unix))]
+fn policy_grants(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    not_implemented("'knsh policy grants' on this platform")
+}
+
+/// `user.sock` is a Unix socket; no other platform has one.
+#[cfg(not(unix))]
+fn policy_revoke(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    not_implemented("'knsh policy revoke' on this platform")
 }
 
 /// `user.sock` is a Unix socket; no other platform has one.
