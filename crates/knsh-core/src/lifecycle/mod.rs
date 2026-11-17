@@ -187,6 +187,8 @@ pub struct AskRequest<'a> {
     pub rule_id: Option<&'a str>,
     /// The hook that asked, when one did.
     pub hook: Option<&'a str>,
+    /// The session's profile: what a `profile`-scoped grant made from the answer applies to (KNSH-069).
+    pub profile: &'a ProfileName,
 }
 
 /// How an ask ended.
@@ -708,6 +710,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
             proposal,
             rule_id: rule_id.as_deref(),
             hook: hook.as_deref(),
+            profile: &self.input.profile.name,
         };
         // `answered_by` is the source of an answer: the authority, or the user through `knsh approve`.
         // `unanswered` is the source of a deny nobody gave (a timeout or a failed ask): the authority's when it was

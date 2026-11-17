@@ -29,6 +29,7 @@ use knsh_proto::ByteTransport;
 
 use crate::authority::Registration;
 use crate::connection::{MessageConnection, Outgoing, delivery_message};
+use crate::decisions::AuthorityLink;
 use crate::dispatch::{Dispatcher, Endpoint};
 use crate::lifetime::Activity;
 
@@ -152,6 +153,16 @@ impl ControlHandler for ControlEndpoint {
             "control peer refused",
             &[Field::new("reason", Value::Static(reason.kind()))],
         );
+    }
+}
+
+/// Notifications to the authority (`decision.requested`, `decision.cancelled`; KNSH-069), sent under the connection's
+/// lock like an answer or an event, so they never interleave with one.
+impl AuthorityLink for ControlEndpoint {
+    fn notify(&self, connection: ConnectionId, json: &[u8]) -> Result<(), ()> {
+        let open = self.connection(connection).ok_or(())?;
+        let _state = lock(&open.state);
+        open.peer.send(json, None).map_err(|_| ())
     }
 }
 
@@ -347,6 +358,91 @@ mod tests {
         assert_eq!(endpoint.message(second, register, &reply), AfterMessage::KeepOpen);
         assert!(field(&reply.taken()[0], "result").is_some());
         assert!(registration.is_registered());
+    }
+
+    // KNSH-069: notifications reach the named connection's peer; an unknown connection is an error.
+    #[test]
+    fn notifies_the_named_connection() {
+        let (endpoint, _) = endpoint();
+        let peer = Arc::new(Collect::default());
+        endpoint.opened(ConnectionId(1), peer.clone());
+        let json = br#"{"jsonrpc":"2.0","method":"decision.cancelled","params":{}}"#;
+        assert!(endpoint.notify(ConnectionId(1), json).is_ok());
+        assert_eq!(peer.taken().len(), 1);
+        assert!(endpoint.notify(ConnectionId(2), json).is_err());
+    }
+
+    // FR-AUTH-24 (KNSH-069): a request made with no authority is sent to the connection that registers, through the
+    // control service, after the answer to its `authority.register` (queuing from inside that call cannot deadlock
+    // on the connection's lock).
+    #[test]
+    fn sends_pending_requests_after_registering() {
+        use std::time::{Duration, Instant};
+
+        use knsh_platform::testing::{FakeClock, SeededRandom};
+
+        use crate::decisions::{AuthorityLink, Decisions};
+
+        let log = Arc::new(RecordingLog::new());
+        let registration = Registration::new(crate::events::tests::hub(), log.clone());
+        let clock = Arc::new(FakeClock::new(
+            knsh_core::Timestamp::from_unix_micros(1_800_000_000_000_000).unwrap(),
+        ));
+        let decisions = Decisions::with_default_timeout(
+            clock,
+            Arc::new(SeededRandom::new(1)),
+            log.clone(),
+            crate::grants::GrantStore::new(),
+        );
+        registration.watch(decisions.clone());
+        let mut dispatcher =
+            Dispatcher::from_tables(Table::new(), Table::new()).serving(Endpoint::Control, HELLO, ok_handler());
+        for (name, handler) in registration.handlers().into_iter().chain(decisions.handlers()) {
+            dispatcher = dispatcher.serving(Endpoint::Control, name, handler);
+        }
+        let endpoint = ControlEndpoint::new(Arc::new(dispatcher), log, Arc::clone(&registration));
+        let link: Arc<dyn AuthorityLink> = endpoint.clone();
+        decisions.attach(Arc::downgrade(&link)).unwrap();
+
+        let asking = crate::decisions::tests::ask(&decisions, "git push", Arc::new(knsh_core::StillWaiting));
+        let peer = Arc::new(Collect::default());
+        let id = ConnectionId(1);
+        endpoint.opened(id, peer.clone());
+        let hello = br#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{}}"#;
+        let register = br#"{"jsonrpc":"2.0","id":2,"method":"authority.register","params":{}}"#;
+        // Answers go to `reply`, as XPC replies; notifications to the connection's peer.
+        assert_eq!(endpoint.message(id, hello, peer.as_ref()), AfterMessage::KeepOpen);
+        assert_eq!(endpoint.message(id, register, peer.as_ref()), AfterMessage::KeepOpen);
+        let started = Instant::now();
+        while lock(&peer.0).len() < 3 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the request was not sent again"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let sent = peer.taken();
+        assert!(field(&sent[1], "result").is_some(), "{sent:?}");
+        assert_eq!(
+            field(&sent[2], "method").and_then(Json::as_str),
+            Some("decision.requested")
+        );
+        let request_id = field(field(&sent[2], "params").unwrap(), "request_id")
+            .and_then(Json::as_str)
+            .unwrap()
+            .to_owned();
+        let deny = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"decision.respond","params":{{"request_id":"{request_id}","verdict":"deny"}}}}"#
+        );
+        assert_eq!(
+            endpoint.message(id, deny.as_bytes(), peer.as_ref()),
+            AfterMessage::KeepOpen
+        );
+        assert_eq!(asking.join().unwrap().reply, knsh_core::AskReply::Deny { reason: None });
+        assert_eq!(
+            field(field(&peer.taken()[0], "result").unwrap(), "applied"),
+            Some(&Json::Bool(true))
+        );
     }
 
     // Refusals are logged with a fixed reason only.

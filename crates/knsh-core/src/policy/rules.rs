@@ -154,6 +154,13 @@ pub(crate) fn matches_certainly(pattern: &str, command: &ClassifiedCommand) -> b
     Subject::of(command).is_some_and(|subject| subject.matches(pattern) == Match::Certain)
 }
 
+/// As [`matches_certainly`], but a pattern without `*` matches only the command with exactly its arguments, never
+/// more (no FR-POL-16 extension): the test for a grant made from one asked line (KNSH-069), which must cover that
+/// line and not, say, `rm -r build` followed by `/`.
+pub(crate) fn matches_exactly(pattern: &str, command: &ClassifiedCommand) -> bool {
+    Subject::of(command).is_some_and(|subject| subject.matches_as(pattern, false) == Match::Certain)
+}
+
 /// How far a pattern matches a command whose arguments may not all be known. Ordered: `No < Possible < Certain`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Match {
@@ -238,6 +245,12 @@ impl<'a> Subject<'a> {
 
     /// How far `pattern` matches this command: the best of its names, capped by the best of its argument lists.
     fn matches(&self, pattern: &str) -> Match {
+        self.matches_as(pattern, true)
+    }
+
+    /// As [`Subject::matches`]; `extend` says whether a pattern without `*` also matches with more arguments
+    /// (FR-POL-16), as every rule does. Only a grant made from one asked line is matched without it.
+    fn matches_as(&self, pattern: &str, extend: bool) -> Match {
         let mut words = pattern.split(' ').filter(|word| !word.is_empty());
         let Some(name) = words.next() else {
             // The loader refuses a pattern without words; such a pattern would name nothing.
@@ -255,7 +268,7 @@ impl<'a> Subject<'a> {
         }
         let mut words: Vec<Word<'_>> = words.map(Word::parse).collect();
         // FR-POL-16: a pattern without `*` also matches with more arguments.
-        if !pattern.contains('*') {
+        if extend && !pattern.contains('*') {
             words.push(Word::Any);
         }
         let arguments_match = if self.complete {
@@ -264,8 +277,9 @@ impl<'a> Subject<'a> {
                 .map(|arguments| match_arguments(&words, arguments, self.subcommand_unknown))
                 .max()
                 .unwrap_or(Match::No)
-        } else if words.iter().all(|word| matches!(word, Word::Any)) {
-            // Every argument may change at run time: only a tail of `*` words matches for certain.
+        } else if (extend || !words.is_empty()) && words.iter().all(|word| matches!(word, Word::Any)) {
+            // Every argument may change at run time: only a tail of `*` words matches for certain. Matched exactly,
+            // a pattern with no argument words says "no arguments", which unknown ones may break.
             Match::Certain
         } else {
             Match::Possible

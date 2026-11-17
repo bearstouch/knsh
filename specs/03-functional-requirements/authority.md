@@ -47,6 +47,13 @@ trust is not specified yet (proposed: `knsh authority untrust`, with Touch ID).
 | FR-AUTH-23 | The default timeout must be 90 seconds. At the timeout the request is denied (`-32002`). The timeout should be set shorter than the agent CLI's own tool timeout. |
 | FR-AUTH-24 | If the authority disconnects, pending requests must be sent again when it reconnects, if they have not timed out. |
 
+Implemented in KNSH-069 ([decision protocol](../06-api/control-service.md#decision-protocol)): while an authority is
+registered, asks are sent to it alone as `decision.requested` and answered with `decision.respond` (only from the
+registered authority's connection; `-32003` otherwise). An answer is applied once; a late or unknown one is ignored
+(`applied: false`) and logged without the command. Both a cancelled and a timed-out request send `decision.cancelled`
+to the authority. Requests survive the authority's disconnection and are sent again, unchanged, when one registers.
+A `grant` with an `allow` creates a grant for the asked line ([grant](../05-models/grant.md)).
+
 ## Rewrites
 
 | ID | Requirement |

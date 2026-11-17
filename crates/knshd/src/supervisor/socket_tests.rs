@@ -111,6 +111,7 @@ impl Running {
             }),
             authority: authority.clone(),
             approvals: crate::approvals::tests::unanswered(ask_timeout),
+            grants: crate::grants::GrantStore::new(),
             spawner: Arc::new(FakeSpawner::new(Arc::clone(&journal))),
             redaction: Arc::new(knsh_core::NoOutputRedaction),
         });

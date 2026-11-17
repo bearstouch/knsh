@@ -126,6 +126,7 @@ impl Daemon {
             hooks: Arc::new(NoHooks),
             authority: authority(&fixture.sessions, session_id),
             approvals: crate::approvals::tests::unanswered(Duration::from_millis(50)),
+            grants: crate::grants::GrantStore::new(),
             spawner: Arc::new(GroupSpawner {
                 processes: processes.clone(),
                 running: Mutex::new(running_tx),

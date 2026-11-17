@@ -89,6 +89,7 @@ mod approval;
 mod authority;
 mod capability;
 mod catalogue;
+mod decision;
 mod envelope;
 mod error;
 mod error_code;
@@ -114,6 +115,11 @@ pub use capability::{
 pub use catalogue::{
     Availability, Catalogue, CatalogueError, DEPRECATION_WINDOW, Deprecation, Endpoint, Endpoints, Lookup, MethodSpec,
     Release, SESSION_CREATING_METHODS, creates_session,
+};
+pub use decision::{
+    DECISION_CANCELLED, DECISION_REQUESTED, DecisionAnswer, DecisionCancelledParams, DecisionRequestedParams,
+    DecisionRespondParams, DecisionRespondResult, GrantRequest, GrantRequestScope, MAX_DECISION_REASON_LEN,
+    MAX_GRANT_DURATION_S, MAX_REWRITE_COMMAND_LEN,
 };
 pub use hello::{
     ByteTransport, HelloParams, HelloResult, MAX_CLIENT_FIELD_LEN, MAX_PROTOCOLS, MAX_SESSION_TOKEN_LEN,
