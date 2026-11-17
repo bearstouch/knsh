@@ -19,10 +19,10 @@ tests" are the test cases of the suite.
 - [x] Tests that need a Developer ID, Touch ID or macOS 27 are marked **pending** with the reason, never skipped
       silently. *(`Case::pending` prints the reason and the report lists it; a case that cannot run at all is pending
       only outside `KNSH_THREAT_MODEL_STRICT`, which CI sets.)*
-- [ ] The suite runs in CI on macOS 14, 15 and the current release where runners exist. Missing versions are
+- [x] The suite runs in CI on macOS 14, 15 and the current release where runners exist. Missing versions are
       recorded as pending. *(CI job `threat-model` on `macos-15` and `macos-26`. macOS 14 (GitHub no longer supports
-      the hosted runner) and macOS 27 (no hosted runner) are pending in `tests/threat-model/README.md`. Unchecked
-      until the CI runs are observed green.)*
+      the hosted runner) and macOS 27 (no hosted runner) are pending in `tests/threat-model/README.md`. Observed
+      green in CI on macOS 15.8.2 and 26, PR #75.)*
 - [x] The phase 2 release gate references this suite's report. *(`specs/01-overview/roadmap.md` gates and the test
       strategy's CI gates name `target/threat-model/report.md`, written by `scripts/check.sh threat-model`.)*
 
