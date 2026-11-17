@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs the quality gates: format, lint, build, docs, test, corpus, parser differential, dependency checks.
+# Runs the quality gates: format, lint, build, docs, test, threat-model suite, corpus, parser differential, dependency
+# checks.
 #
 #   scripts/check.sh            run every step, in order (the same order as CI)
 #   scripts/check.sh <step>...  run only the named steps (CI runs one step per job step)
@@ -13,7 +14,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-readonly ALL_STEPS=(fmt clippy build doc test corpus difftest deny)
+readonly ALL_STEPS=(fmt clippy build doc test threat-model corpus difftest deny)
 
 # Belt and braces with .cargo/config.toml ([net] offline = true): cargo itself never
 # touches the network (NFR-SUP-03).
@@ -45,6 +46,20 @@ step_doc() {
 
 step_test() {
     cargo test --workspace --offline --locked
+}
+
+step_threat-model() {
+    # Threat-model end-to-end suite (KNSH-075, NFR-SEC-01 – NFR-SEC-10): one case or more per row of
+    # specs/04-non-functional-requirements/security.md, against real envelopes and profiles. The cases need knsh-exec
+    # and knsh beside the test binary, so the workspace is built first, and KNSH_THREAT_MODEL_STRICT makes a case that
+    # cannot run fail instead of being pending. The report (target/threat-model/report.md) is written even when a
+    # case failed, then the step fails: it is what the phase 2 release gate references (specs/01-overview/roadmap.md).
+    rm -rf target/threat-model
+    cargo build --workspace --offline --locked
+    local status=0
+    KNSH_THREAT_MODEL_STRICT=1 cargo test -p knshd --offline --locked threat_model:: || status=$?
+    cargo test -p knshd --offline --locked threat_model::report::write_report -- --ignored --exact || status=$?
+    return "$status"
 }
 
 step_corpus() {

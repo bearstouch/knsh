@@ -178,6 +178,10 @@ mod sessions;
 // The reader is platform-neutral; its record sink is built where the record store is.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod violations;
+// The threat-model end-to-end suite (KNSH-075): one case or more per threat row, against a real `knshd` in miniature.
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod threat_model;
 
 use std::fmt;
 use std::process::ExitCode;

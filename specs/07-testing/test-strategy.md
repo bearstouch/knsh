@@ -17,11 +17,15 @@
 - Parser exit criterion met (phase 2): at least 95% of corpus lines parsed exactly, every accept/reject verdict matching bash.
 - Fuzzers running continuously for JSON, the TOML subset, bash and TLS handshake parsing.
 - Dependency checks clean.
+- Threat-model suite green (KNSH-075): `scripts/check.sh threat-model` on every macOS version with a runner, its
+  report (`target/threat-model/report.md`) published, and its pending items listed.
 - Compatibility list of tools published (self-sandboxing tools, proxy behaviour).
 
 ## Security test focus
 
-Each row of the threat model ([security](../04-non-functional-requirements/security.md)) should have at least one end-to-end test showing the mitigation holds, for example:
+Each row of the threat model ([security](../04-non-functional-requirements/security.md)) has at least one end-to-end
+test showing the mitigation holds: the threat-model suite (KNSH-075, [tests/threat-model](../../tests/threat-model/README.md)),
+which fails if a row is added without a case. Examples:
 
 - An envelope process cannot connect to `user.sock` or look up the control service.
 - `python3 -c "subprocess.run(['git','push'])"` cannot reach an `approval_hosts` host.

@@ -15,5 +15,6 @@ macOS ships first; Linux follows once the macOS engine is stable.
 
 - Phase 2 does not start until the platform claims in [../07-testing/verification-claims.md](../07-testing/verification-claims.md) are verified.
 - The phase 2 parser must meet the exit criterion in [../07-testing/conformance.md](../07-testing/conformance.md).
+- Phase 2 does not ship until the threat-model end-to-end suite (KNSH-075, [../../tests/threat-model/README.md](../../tests/threat-model/README.md)) is green on every macOS version with a CI runner. The release gate references each run's report (`target/threat-model/report.md`, published by the CI job `threat-model`). Its pending items (Touch ID, Developer ID, versions without a runner) are resolved by hand or listed as known limits.
 - The Endpoint Security entitlement application (decision 3 in [../09-reference/decisions.md](../09-reference/decisions.md)) should be submitted now, independent of phase.
 - Name checks (decision 2) must be completed before any public announcement.

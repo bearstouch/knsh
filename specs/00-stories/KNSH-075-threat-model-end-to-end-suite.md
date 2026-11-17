@@ -13,12 +13,18 @@ All tests use temporary directories and an isolated state directory. They are no
 tests" are the test cases of the suite.
 
 **Acceptance criteria**
-- [ ] Every row of the threat model has at least one passing end-to-end test, listed below.
-- [ ] Tests that need a Developer ID, Touch ID or macOS 27 are marked **pending** with the reason, never skipped
-      silently.
-- [ ] The suite runs in CI on macOS 14, 15 and the current release where runners exist. Missing versions are
-      recorded as pending.
-- [ ] The phase 2 release gate references this suite's report.
+- [x] Every row of the threat model has at least one passing end-to-end test, listed below. *(12 cases in
+      `crates/knshd/src/threat_model/`; `every_threat_row_has_a_case` fails if `security.md` gains a row without one.
+      All passed on macOS 26.6.2, Apple silicon.)*
+- [x] Tests that need a Developer ID, Touch ID or macOS 27 are marked **pending** with the reason, never skipped
+      silently. *(`Case::pending` prints the reason and the report lists it; a case that cannot run at all is pending
+      only outside `KNSH_THREAT_MODEL_STRICT`, which CI sets.)*
+- [x] The suite runs in CI on macOS 14, 15 and the current release where runners exist. Missing versions are
+      recorded as pending. *(CI job `threat-model` on `macos-15` and `macos-26`. macOS 14 (GitHub no longer supports
+      the hosted runner) and macOS 27 (no hosted runner) are pending in `tests/threat-model/README.md`. Observed
+      green in CI on macOS 15.8.2 and 26, PR #75.)*
+- [x] The phase 2 release gate references this suite's report. *(`specs/01-overview/roadmap.md` gates and the test
+      strategy's CI gates name `target/threat-model/report.md`, written by `scripts/check.sh threat-model`.)*
 
 **Unit tests**
 (end-to-end cases, one or more per threat row)
@@ -47,5 +53,11 @@ tests" are the test cases of the suite.
   suppresses the ask. (Approval fatigue.)
 
 **Notes**
+- The cases live in `knshd` (they drive its server, supervisor, proxy and envelope launcher in miniature);
+  `tests/threat-model/README.md` is the workspace-level map of rows, cases and pending items.
+- On macOS 26 `KERN_PROCARGS2` no longer returns another process's environment even without a sandbox, so the secret
+  case puts the secret in the holder's arguments too, where an unsandboxed reader still sees it.
+- User-only methods called on `agent.sock` are refused with `-32003` before any handler runs; the approval case
+  accepts that or `-32601`, and checks they are absent from `hello`.
 - Out-of-scope rows (malware outside sessions, a compromised authority, malicious user hooks, macOS sandbox flaws)
   are documented as not tested.

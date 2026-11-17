@@ -18,7 +18,12 @@ The engine protects the user from agents running as the same macOS user, not fro
 | An agent sends data out | Per-command host rules, `approval_hosts`, name and address checks, no local DNS. Residual risk: allowlisted hosts that accept uploads | FR-NET-01–08 |
 | Approval fatigue | Grants, `policy.check` dry runs, rate limiting of repeated denials, irreversible flags | FR-POL-60–70, FR-HOOK-20, FR-IRR-05 |
 
+Each row has at least one end-to-end case in the threat-model suite (KNSH-075,
+[tests/threat-model](../../tests/threat-model/README.md)).
+
 ### Out of scope
+
+Documented as not tested by the threat-model suite:
 
 - Malware running outside any session
 - A compromised authority

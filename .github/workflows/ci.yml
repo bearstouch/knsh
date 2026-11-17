@@ -95,6 +95,57 @@ jobs:
       - name: Dependency checks (licences, advisories, duplicate versions)
         run: scripts/check.sh deny
 
+  threat-model:
+    # KNSH-075 (NFR-SEC-01 – NFR-SEC-10): the threat-model end-to-end suite on every macOS release with a hosted
+    # runner. Each run publishes its report (target/threat-model/report.md) to the job summary and as an artefact; the
+    # phase 2 release gate references these reports. A release without a hosted runner (macOS 14, whose image GitHub
+    # no longer supports: "The configuration 'macos-14-arm64-us-default' is not supported", and macOS 27, at the time
+    # of writing) is recorded as pending in tests/threat-model/README.md, never as passed. No DEVELOPER_DIR: the cases
+    # trust whichever developer directory the runner selects, as a user's profile would.
+    name: threat model (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-26]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Record platform
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          xcode-select -p
+
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustc --version
+
+      - name: Threat-model suite
+        run: scripts/check.sh threat-model
+
+      - name: Publish threat-model report
+        if: always()
+        run: |
+          if [ -f target/threat-model/report.md ]; then
+            cat target/threat-model/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload threat-model report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: threat-model-report-${{ matrix.runner }}
+          path: target/threat-model/report.md
+          if-no-files-found: ignore
+
   fuzz:
     # KNSH-005 (NFR-SUP-06): a time-boxed smoke run of every fuzz target on every push.
     # Long runs are local (fuzz/README.md). A crash, hang or property failure fails the
