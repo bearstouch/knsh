@@ -163,6 +163,17 @@ pub trait Fs: Send + Sync {
     /// (`ENOENT` if nothing exists there, `EPERM` for a directory).
     fn remove_file(&self, path: &Path) -> Result<(), PlatformError>;
 
+    /// Renames the entry at `from` to `to` in one step, and only if nothing exists at `to`: it never replaces an
+    /// existing entry, a symlink included (`renamex_np` with `RENAME_EXCL` on macOS). Neither final component is
+    /// followed: a symlink at `from` is moved itself, never its target. Both paths must be on one volume. Used to set
+    /// an unreadable state file aside without overwriting it (KNSH-074).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::InvalidPath`]; [`PlatformError::Os`] with [`Operation::Rename`](crate::Operation::Rename)
+    /// (`EEXIST` if anything exists at `to`, `ENOENT` if nothing exists at `from`). On error nothing has moved.
+    fn rename_new(&self, from: &Path, to: &Path) -> Result<(), PlatformError>;
+
     /// The names of the entries of the directory `path` (not `.` or `..`), sorted bytewise, so callers see the same
     /// order on every backend. A final symlink is followed, as `opendir` does: callers that must not follow one
     /// check [`Fs::metadata`] first. At most `limit` names are returned; a larger directory is refused rather than

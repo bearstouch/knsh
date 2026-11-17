@@ -18,7 +18,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -87,26 +87,54 @@ struct Seen {
     lines: Vec<(ExecRunParams, usize)>,
 }
 
-/// The test envelope's supervisor, serving `agent.sock` under `home` until the test ends.
+/// The test envelope's supervisor, serving `agent.sock` under `home` until the test ends or [`Supervisor::kill`].
 struct Supervisor {
     seen: Arc<Mutex<Seen>>,
+    /// Set to stop accepting, as when `knshd` dies.
+    stopped: Arc<AtomicBool>,
+    accepting: thread::JoinHandle<()>,
 }
 
 impl Supervisor {
     fn start(home: &Home) -> Self {
+        // A stale socket file from a supervisor that died is replaced, as launchd's restart does.
+        let _ = fs::remove_file(home.paths().agent_socket());
         let listener = UnixListener::bind(home.paths().agent_socket()).expect("bind agent.sock");
+        // Polled, so that `kill` can close the listening socket.
+        listener.set_nonblocking(true).expect("non-blocking listener");
         let seen = Arc::new(Mutex::new(Seen::default()));
         let shared = Arc::clone(&seen);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stopped);
         let shims = home.paths().shim_dir();
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { return };
-                let seen = Arc::clone(&shared);
-                let shims = shims.clone();
-                thread::spawn(move || serve(&stream, &seen, &shims));
+        let accepting = thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).expect("blocking stream");
+                        let seen = Arc::clone(&shared);
+                        let shims = shims.clone();
+                        thread::spawn(move || serve(&stream, &seen, &shims));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
             }
+            // The listener closes here; the socket file stays behind, as after a crash.
         });
-        Self { seen }
+        Self {
+            seen,
+            stopped,
+            accepting,
+        }
+    }
+
+    /// Stops the supervisor as a crash would: nothing listens on `agent.sock` any more, but its file remains.
+    fn kill(self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        self.accepting.join().expect("accept loop");
     }
 
     fn lines(&self) -> Vec<(ExecRunParams, usize)> {
@@ -322,6 +350,35 @@ fn unreachable_supervisor_runs_nothing() {
         text(&output.stderr)
     );
     assert!(!marker.exists(), "the line must never run locally");
+}
+
+// KNSH-074 integration test (NFR-REL-01, NFR-REL-03): the supervisor dies during an agent session. The next
+// `knsh -c` runs nothing and exits 126 saying why; once the supervisor is back (launchd's restart), the next line runs
+// normally. The client keeps no state between lines, so nothing has to be reset.
+#[test]
+fn killed_supervisor_runs_nothing_until_restarted() {
+    let home = Home::new();
+    let supervisor = Supervisor::start(&home);
+    let output = home.knsh(&["-c", "echo before"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "before\n");
+
+    supervisor.kill();
+    let marker = home.0.join("marker");
+    let output = home.knsh(&["-c", &format!("touch {}", marker.display())]);
+    assert_eq!(output.status.code(), Some(126));
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("supervisor is unavailable"), "{stderr}");
+    assert!(stderr.contains("did not run"), "{stderr}");
+    assert_eq!(output.stdout, b"");
+    assert!(!marker.exists(), "the line must never run locally");
+
+    let restarted = Supervisor::start(&home);
+    let output = home.knsh(&["-c", &format!("touch {} && echo after", marker.display())]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "after\n");
+    assert!(marker.exists());
+    assert_eq!(restarted.lines().len(), 1);
 }
 
 // KNSH-054: a held line waits and then runs, without failing.

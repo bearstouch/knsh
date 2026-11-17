@@ -465,6 +465,57 @@ impl Fs for MemFs {
         }
     }
 
+    fn rename_new(&self, from: &Path, to: &Path) -> Result<(), PlatformError> {
+        split_target(from)?;
+        split_target(to)?;
+        let mut state = lock(&self.state);
+        state.check_fault(Operation::Rename)?;
+        // Like `renamex_np(RENAME_EXCL)`: neither final symlink is followed, and an existing `to` is refused.
+        let source = resolve(&state.nodes, from, false, Operation::Rename)?;
+        let target = resolve(&state.nodes, to, false, Operation::Rename)?;
+        if !state.nodes.contains_key(&source) {
+            return Err(os(Operation::Rename, libc::ENOENT));
+        }
+        if state.nodes.contains_key(&target) {
+            return Err(os(Operation::Rename, libc::EEXIST));
+        }
+        // Like the kernel: the target's directory must exist.
+        if !matches!(
+            target.parent().and_then(|parent| state.nodes.get(parent)),
+            Some(Node::Directory { .. })
+        ) {
+            return Err(os(Operation::Rename, libc::ENOENT));
+        }
+        if target.starts_with(&source) {
+            return Err(os(Operation::Rename, libc::EINVAL));
+        }
+        // The entry and, for a directory, everything under it move together, with their owners and attributes.
+        let moved: Vec<PathBuf> = state
+            .nodes
+            .keys()
+            .filter(|path| path.starts_with(&source))
+            .cloned()
+            .collect();
+        for path in moved {
+            let suffix = path.strip_prefix(&source).map(Path::to_path_buf).unwrap_or_default();
+            let renamed = if suffix.as_os_str().is_empty() {
+                target.clone()
+            } else {
+                target.join(suffix)
+            };
+            if let Some(node) = state.nodes.remove(&path) {
+                state.nodes.insert(renamed.clone(), node);
+            }
+            if let Some(owner) = state.owners.remove(&path) {
+                state.owners.insert(renamed.clone(), owner);
+            }
+            if let Some(attrs) = state.xattrs.remove(&path) {
+                state.xattrs.insert(renamed, attrs);
+            }
+        }
+        Ok(())
+    }
+
     fn list_dir(&self, path: &Path, limit: usize) -> Result<Vec<OsString>, PlatformError> {
         let mut state = lock(&self.state);
         require_absolute(path)?;
@@ -733,5 +784,46 @@ mod tests {
         assert!(fs.list_dir(Path::new("/nope"), 8).unwrap_err().is_not_found());
         fs.inject_fault(Operation::ReadDirectory, libc::EIO);
         assert_eq!(fs.list_dir(Path::new("/d"), 8).unwrap_err().errno(), Some(libc::EIO));
+    }
+
+    // KNSH-074: like `renamex_np(RENAME_EXCL)`: an existing target is refused and nothing moves; a symlink moves
+    // itself; a directory moves with what it holds; an injected fault fails before anything moves.
+    #[test]
+    fn rename_new_moves_without_replacing() {
+        let fs = MemFs::new();
+        fs.add_dir_all(Path::new("/d/sub")).unwrap();
+        fs.write(Path::new("/d/a"), b"a", 0o600).unwrap();
+        fs.write(Path::new("/d/b"), b"b", 0o644).unwrap();
+        fs.write(Path::new("/d/sub/c"), b"c", 0o600).unwrap();
+        fs.add_symlink(Path::new("/d/link"), Path::new("/d/a")).unwrap();
+
+        let refused = fs.rename_new(Path::new("/d/a"), Path::new("/d/b")).unwrap_err();
+        assert_eq!(refused.errno(), Some(libc::EEXIST));
+        assert_eq!(fs.contents(Path::new("/d/a")).unwrap(), b"a");
+        assert_eq!(fs.contents(Path::new("/d/b")).unwrap(), b"b");
+
+        fs.rename_new(Path::new("/d/b"), Path::new("/d/b2")).unwrap();
+        assert!(fs.contents(Path::new("/d/b")).is_none());
+        assert_eq!(fs.metadata(Path::new("/d/b2")).unwrap().mode, 0o644);
+
+        fs.rename_new(Path::new("/d/link"), Path::new("/d/link2")).unwrap();
+        assert_eq!(fs.metadata(Path::new("/d/link2")).unwrap().kind, FileKind::Symlink);
+        assert_eq!(fs.contents(Path::new("/d/a")).unwrap(), b"a");
+
+        fs.rename_new(Path::new("/d/sub"), Path::new("/d/sub2")).unwrap();
+        assert_eq!(fs.contents(Path::new("/d/sub2/c")).unwrap(), b"c");
+        assert!(fs.metadata(Path::new("/d/sub")).unwrap_err().is_not_found());
+
+        assert!(
+            fs.rename_new(Path::new("/d/none"), Path::new("/d/x"))
+                .unwrap_err()
+                .is_not_found()
+        );
+        fs.inject_fault(Operation::Rename, libc::EIO);
+        assert_eq!(
+            fs.rename_new(Path::new("/d/a"), Path::new("/d/x")).unwrap_err().errno(),
+            Some(libc::EIO)
+        );
+        assert_eq!(fs.contents(Path::new("/d/a")).unwrap(), b"a");
     }
 }

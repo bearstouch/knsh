@@ -408,6 +408,16 @@ impl PlatformError {
     pub fn is_not_found(&self) -> bool {
         self.errno() == Some(libc::ENOENT)
     }
+
+    /// Whether the failure means something already exists at the path (`EEXIST`), as from [`Fs::rename_new`] and
+    /// [`Fs::create_new`].
+    ///
+    /// [`Fs::rename_new`]: crate::Fs::rename_new
+    /// [`Fs::create_new`]: crate::Fs::create_new
+    #[must_use]
+    pub fn is_already_exists(&self) -> bool {
+        self.errno() == Some(libc::EEXIST)
+    }
 }
 
 impl fmt::Display for PlatformError {

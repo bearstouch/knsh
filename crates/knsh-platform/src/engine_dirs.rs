@@ -747,6 +747,9 @@ mod tests {
         fn remove_file(&self, path: &Path) -> Result<(), PlatformError> {
             self.0.remove_file(path)
         }
+        fn rename_new(&self, from: &Path, to: &Path) -> Result<(), PlatformError> {
+            self.0.rename_new(from, to)
+        }
         fn list_dir(&self, path: &Path, limit: usize) -> Result<Vec<std::ffi::OsString>, PlatformError> {
             self.0.list_dir(path, limit)
         }

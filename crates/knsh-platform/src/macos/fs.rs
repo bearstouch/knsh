@@ -227,6 +227,21 @@ impl Fs for RealFs {
         fs::remove_file(path).map_err(os(Operation::RemoveFile))
     }
 
+    fn rename_new(&self, from: &Path, to: &Path) -> Result<(), PlatformError> {
+        let (c_from, c_to) = (c_path(from)?, c_path(to)?);
+        // `rename(2)` would silently replace whatever is at `to`; `RENAME_EXCL` makes the kernel refuse with `EEXIST`
+        // in the same step, so no check-then-rename race can lose an entry. `renamex_np` never follows a final
+        // symlink of either path.
+        // SAFETY: both strings are valid and NUL-terminated and outlive the call, which reads nothing else from our
+        // memory.
+        let rc = unsafe { libc::renamex_np(c_from.as_ptr(), c_to.as_ptr(), libc::RENAME_EXCL) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(last_os_error(Operation::Rename))
+        }
+    }
+
     fn list_dir(&self, path: &Path, limit: usize) -> Result<Vec<OsString>, PlatformError> {
         require_absolute(path)?;
         let mut names = Vec::new();
@@ -322,6 +337,32 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    // KNSH-074: `rename_new` moves an entry, a symlink itself rather than its target, and never replaces one.
+    #[test]
+    fn rename_new_never_replaces_an_entry() {
+        let fs = RealFs::new();
+        let tmp = TempDir::new("rename");
+        let (from, to) = (tmp.0.join("from"), tmp.0.join("to"));
+        fs::write(&from, b"kept").unwrap();
+        fs::write(&to, b"there").unwrap();
+        assert_eq!(fs.rename_new(&from, &to).unwrap_err().errno(), Some(libc::EEXIST));
+        assert_eq!(fs::read(&from).unwrap(), b"kept");
+        assert_eq!(fs::read(&to).unwrap(), b"there");
+
+        let aside = tmp.0.join("aside");
+        fs.rename_new(&from, &aside).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read(&aside).unwrap(), b"kept");
+
+        let link = tmp.0.join("link");
+        symlink(&to, &link).unwrap();
+        let moved = tmp.0.join("moved");
+        fs.rename_new(&link, &moved).unwrap();
+        assert!(fs::symlink_metadata(&moved).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(&to).unwrap(), b"there", "the target stays where it was");
+        assert!(fs.rename_new(&link, &tmp.0.join("again")).unwrap_err().is_not_found());
     }
 
     // FR-POL-11: policy sees only resolved paths; `/var` is a symlink to `/private/var` on macOS.

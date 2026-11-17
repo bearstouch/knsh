@@ -599,7 +599,15 @@ fn authority_supervision(
     use knsh_platform::Clock;
     use knsh_platform::macos::RealFs;
 
-    let (state, restored) = state::StateStore::open(Arc::new(RealFs::new()), paths.state_file(), uid, Arc::clone(log));
+    // NFR-REL-06 (KNSH-074): grants and pushed policy come back after a restart; an unusable file is set aside,
+    // named after the start time, and the engine starts with neither.
+    let (state, restored) = state::StateStore::open(
+        Arc::new(RealFs::new()),
+        paths.state_file(),
+        uid,
+        clock.now().ok(),
+        Arc::clone(log),
+    );
     let pushed = pushed::PushedPolicies::new(Arc::clone(&state), clock.clone(), restored.snapshots);
     let grants = grants::GrantStore::persisted(state, Arc::clone(log), restored.grants, clock.now().ok());
     let profiles = profile_loader(paths, random.clone(), log).with_pushed(Arc::clone(&pushed));
