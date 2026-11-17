@@ -14,15 +14,15 @@
 //!
 //! From its `expires_at` on, a snapshot no longer loads, and neither does the file of the same name: the profile does
 //! not load at all, so every line of a session using it is denied (FR-POL-52) until the authority pushes a new
-//! snapshot. The same holds when the clock cannot be read. Pausing those sessions at expiry, and choosing a local
-//! profile instead with `knsh profile use`, is KNSH-072's.
+//! snapshot. The same holds when the clock cannot be read. `crate::expiry` pauses those sessions, until a new
+//! snapshot loads or the user selects a local profile for them with `knsh profile use` (KNSH-072).
 //!
 //! # Concurrency
 //!
 //! One lock, held while the change is saved, so the state file follows the order of changes. Lock order: this lock,
 //! then the state store's.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use knsh_core::{LookupError, ProfileName, ProfileSource, Timestamp};
@@ -106,6 +106,17 @@ impl PushedPolicies {
     /// The snapshot of `profile`, live or expired.
     pub(crate) fn get(&self, profile: &ProfileName) -> Option<Snapshot> {
         lock(&self.snapshots).get(profile).cloned()
+    }
+
+    /// The profiles whose snapshot no longer applies: expired, or every one while the clock cannot be read (as for
+    /// loading). These load from nothing until replaced (FR-POL-52); `crate::expiry` pauses their sessions.
+    pub(crate) fn expired(&self) -> BTreeSet<ProfileName> {
+        let now = self.now();
+        lock(&self.snapshots)
+            .values()
+            .filter(|snapshot| !snapshot.live_at(now))
+            .map(|snapshot| snapshot.profile.clone())
+            .collect()
     }
 
     /// The current wall time, `None` if the clock fails (which no snapshot is live at).
@@ -223,6 +234,12 @@ mod tests {
             pushed.get(&ProfileName::new("web").unwrap()).is_some(),
             "kept until replaced"
         );
+        assert_eq!(
+            pushed.expired().into_iter().collect::<Vec<_>>(),
+            [ProfileName::new("web").unwrap()]
+        );
+        pushed.set(snapshot("web", at(40))).unwrap();
+        assert!(pushed.expired().is_empty(), "a new snapshot applies again");
     }
 
     // A snapshot that cannot be saved is not stored.

@@ -326,8 +326,11 @@ pub struct SessionSpec {
 ///
 /// # Invariants
 ///
-/// - The actor, profile, envelope flag and parent link never change after creation: there are no setters, and the
-///   fields are private (FR-SES-01).
+/// - The actor, envelope flag and parent link never change after creation: there are no setters, and the fields are
+///   private (FR-SES-01).
+/// - The profile of an agent session changes only through [`select_profile`](Self::select_profile), when the user
+///   selects a local profile for a session paused by expired pushed policy (`knsh profile use`, FR-POL-51, KNSH-072);
+///   a human session's never changes.
 /// - The recording settings of an agent session change only through [`set_recording`](Self::set_recording)
 ///   (`recording.set`, KNSH-071); a human session's never change once it exists, and it never records output.
 /// - `envelope` is `true` only for agent sessions.
@@ -439,6 +442,21 @@ impl Session {
         if output.is_some() {
             self.output_recording = output;
         }
+        Ok(())
+    }
+
+    /// Runs an agent session under `profile` from now on: the user selected a local profile for it with
+    /// `knsh profile use` after its pushed policy expired (FR-POL-51, KNSH-072). Nothing else changes a session's
+    /// profile, so the engine never moves a session to another policy on its own (FR-POL-52).
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::HumanProfile`] for a human session, which is left unchanged.
+    pub fn select_profile(&mut self, profile: ProfileName) -> Result<(), CoreError> {
+        if self.actor.kind() == ActorKind::Human {
+            return Err(CoreError::HumanProfile);
+        }
+        self.profile = profile;
         Ok(())
     }
 
@@ -634,6 +652,20 @@ mod tests {
         assert_eq!(human.set_recording(Some(true), None), Err(CoreError::HumanRecording));
         assert_eq!(human.set_recording(None, Some(true)), Err(CoreError::HumanRecording));
         assert_eq!((human.recording(), human.output_recording()), (false, None));
+    }
+
+    // FR-POL-51 (KNSH-072): `knsh profile use` moves an agent session to a local profile; a human session's profile
+    // never changes.
+    #[test]
+    fn selects_profile_of_agent_sessions_only() {
+        let local = ProfileName::new("local").unwrap();
+        let mut session = Session::new(spec(agent())).unwrap();
+        session.select_profile(local.clone()).unwrap();
+        assert_eq!(session.profile(), &local);
+
+        let mut human = Session::new(spec(Actor::Human)).unwrap();
+        assert_eq!(human.select_profile(local), Err(CoreError::HumanProfile));
+        assert_eq!(human.profile().as_str(), "default");
     }
 
     // FR-SES-04: recording defaults to off for humans and on for agents; an explicit choice wins.

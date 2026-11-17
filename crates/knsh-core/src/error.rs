@@ -68,6 +68,9 @@ pub enum CoreError {
     /// Recording of a human session was to be changed by someone other than the human: its recording is the human's
     /// own choice (FR-SES-04, NFR-PRIV-01), and its output is never recorded (FR-REC-09).
     HumanRecording,
+    /// A human session's profile was to be changed: a human session is never enforced, and only an agent session
+    /// paused by expired pushed policy changes profile, with `knsh profile use` (FR-POL-51, KNSH-072).
+    HumanProfile,
     /// A human session named an agent session as its parent; a human session inside an agent session would escape
     /// the agent's profile (FR-SES-03, FR-SES-12).
     HumanChildOfAgent,
@@ -123,6 +126,7 @@ impl fmt::Display for CoreError {
             Self::SessionNotFoundOrEnded => f.write_str("session not found or ended"),
             Self::SessionExists => f.write_str("a session with this id already exists"),
             Self::HumanRecording => f.write_str("a human session's recording cannot be changed for it"),
+            Self::HumanProfile => f.write_str("a human session's profile cannot be changed"),
             Self::ParentNotFoundOrEnded => f.write_str("parent session not found or ended"),
             Self::ProfileNotStricter => {
                 f.write_str("a child agent's profile must equal or be stricter than its parent's")

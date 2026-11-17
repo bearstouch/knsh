@@ -11,8 +11,9 @@ use crate::events::Subscriber;
 use crate::events::tests::hub;
 use crate::sessions::SessionBinding;
 
-/// `authority.trust`, `authority.register`, `decision.respond` and the supervision methods (KNSH-071) with a store
-/// holding nothing and a prompt nobody answers: for dispatcher tests that need every catalogued handler.
+/// `authority.trust`, `authority.register`, `decision.respond`, the supervision methods (KNSH-071) and `profile.use`
+/// (KNSH-072) with a store holding nothing and a prompt nobody answers: for dispatcher tests that need every
+/// catalogued handler.
 pub(crate) fn idle_handlers() -> Handlers {
     let log: Arc<dyn SystemLog> = Arc::new(RecordingLog::new());
     let mut handlers = AuthorityTrust::new(
@@ -42,13 +43,24 @@ pub(crate) fn idle_handlers() -> Handlers {
     ));
     let state = crate::state::StateStore::in_memory(Arc::clone(&log));
     let pushed = crate::pushed::PushedPolicies::new(Arc::clone(&state), clock.clone(), Vec::new());
+    let profiles = profiles.with_pushed(Arc::clone(&pushed));
+    // `profile.use` (KNSH-072) with a prompt nobody answers.
+    let expiry = crate::expiry::PolicyExpiry::new(
+        Arc::clone(&sessions),
+        Arc::clone(&pushed),
+        profiles.clone(),
+        Arc::new(ScriptedPresence::new()),
+        Arc::clone(&log),
+    );
+    handlers.extend(expiry.handlers());
     handlers.extend(
         crate::policy_admin::PolicyAdmin::new(crate::policy_admin::PolicyAdminParts {
-            profiles: profiles.with_pushed(Arc::clone(&pushed)),
+            profiles,
             pushed,
             grants: crate::grants::GrantStore::new(),
             sessions,
             events: hub(),
+            expiry,
             clock,
             random: Arc::new(knsh_platform::testing::SeededRandom::new(1)),
             log,

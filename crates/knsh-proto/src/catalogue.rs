@@ -310,8 +310,9 @@ pub struct Catalogue {
 /// `records.forget` (KNSH-017), `events.subscribe` and `events.unsubscribe` (KNSH-018), and the human session and
 /// telemetry methods with `session.info` (KNSH-021). Phase 2 adds `policy.check` (KNSH-043), `exec.*` (KNSH-051,
 /// KNSH-053), `session.start_agent` (KNSH-056), `policy.read` and `policy.edit` (KNSH-065), `approval.*` (KNSH-066),
-/// `authority.trust` and `authority.register` (KNSH-068), `decision.respond` (KNSH-069), and the control service's
-/// `session.*`, `policy.*` and `recording.set` methods (KNSH-071); the rest arrive with their stories.
+/// `authority.trust` and `authority.register` (KNSH-068), `decision.respond` (KNSH-069), the control service's
+/// `session.*`, `policy.*` and `recording.set` methods (KNSH-071), and `profile.use` (KNSH-072); the rest arrive with
+/// their stories.
 const ENGINE_METHODS: &[MethodSpec] = &[
     // Handshake (specs/06-api/handshake.md).
     MethodSpec::planned("hello", Endpoints::ALL).available(),
@@ -369,7 +370,9 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     // the password. Never on agent.sock: an agent cannot read for editing or write policy.
     MethodSpec::planned("policy.read", Endpoints::USER).available(),
     MethodSpec::planned("policy.edit", Endpoints::USER).available(),
-    MethodSpec::planned("profile.use", Endpoints::USER),
+    // `knsh profile use` (KNSH-072): run the sessions paused by expired pushed policy under a signed local profile,
+    // after Touch ID or the password.
+    MethodSpec::planned("profile.use", Endpoints::USER).available(),
     // The authority's grants (KNSH-071); the user's, after Touch ID on user.sock, are KNSH-073's.
     MethodSpec::planned("policy.grant", Endpoints::USER_CONTROL).available_on(Endpoints::CONTROL),
     // Deleting records is for the user only: an agent can never erase its own trail (KNSH-017).
@@ -637,6 +640,7 @@ mod tests {
                     "approval.deny",
                     "policy.read",
                     "policy.edit",
+                    "profile.use",
                     "records.forget",
                     "authority.trust",
                 ],
@@ -692,6 +696,12 @@ mod tests {
                 "{method}"
             );
         }
+    }
+
+    // Methods kept off the endpoints that must never reach them, whatever is implemented.
+    #[test]
+    fn keeps_methods_off_the_wrong_endpoints() {
+        let caps = capabilities(Sandbox::Seatbelt);
         // FR-SES-02: an agent cannot create a session through the authority's method either.
         assert_eq!(
             Catalogue::ENGINE.lookup(Endpoint::Agent, "session.create", &caps),
@@ -708,10 +718,12 @@ mod tests {
             "an agent can never erase records"
         );
         // KNSH-065 (FR-POL-41): policy files are edited from user.sock only. KNSH-066 (FR-AUTH-43): asks are
-        // answered from user.sock only, never by the agent that made them.
+        // answered from user.sock only, never by the agent that made them. KNSH-072 (FR-POL-51): only the user
+        // selects a local profile.
         for method in [
             "policy.read",
             "policy.edit",
+            "profile.use",
             "approval.list",
             "approval.approve",
             "approval.deny",

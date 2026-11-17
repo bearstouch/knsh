@@ -40,7 +40,7 @@ pub const DEFAULT_EDITOR: &str = "vi";
 /// Hex digits of the SHA-256 printed before the prompt: the same prefix `knshd` shows in it.
 const HASH_PREFIX_BYTES: usize = 8;
 
-/// A `knsh policy edit` command line refused before anything was sent (exit 2).
+/// A `knsh policy edit` or `knsh profile use` command line refused before anything was sent (exit 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UsageError {
     /// The profile name is not 1 to 64 characters from `[A-Za-z0-9._-]`.

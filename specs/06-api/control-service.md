@@ -173,9 +173,15 @@ whether a snapshot of that profile was replaced.
   `session.create`, `policy.check`, and profiles that `extends` it), and `policy.updated` is published (FR-POL-53), an
   engine event with `{profile, expires_at}`. An envelope already running keeps the sandbox profile it started with.
 - From `expires_at` on (or while the clock cannot be read), the profile loads from nothing: not from the snapshot,
-  and never from the file of its name (FR-POL-52), so lines of sessions using it are denied until a new snapshot is
-  pushed. Pausing those sessions is [KNSH-072](../00-stories/KNSH-072-pushed-policy-expiry-and-knsh-profile-use.md)'s.
-  A snapshot is replaced only by another `policy.set`.
+  and never from the file of its name (FR-POL-52), so lines of sessions using it are denied. A snapshot is replaced
+  only by another `policy.set`.
+- **Expiry pauses sessions** (KNSH-072, FR-POL-51, FR-SES-13). `knshd` checks every second; each active agent session
+  whose profile is an expired snapshot, or `extends` one, is paused (`session.state_changed`). A session under human
+  control is paused once handed back; a human session never is. Such a session resumes only when (a) a `policy.set`
+  makes its profile load again (it resumes under its own profile, before the answer), or (b) the user runs
+  [`knsh profile use`](user-socket.md#profileuse) with Touch ID or the password (it then runs under that signed local
+  profile). `session.resume` on it is `-32006`, and nothing else changes its profile (FR-POL-52). A session the
+  authority paused itself is not resumed by a snapshot.
 
 ### `policy.get`
 

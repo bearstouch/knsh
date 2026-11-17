@@ -300,7 +300,7 @@ pub(crate) mod tests {
     const PROJECT: &str = "/Users/u/app";
 
     /// The policies directory of the fake home, from `EnginePaths` so no engine path literal is repeated here.
-    fn policies() -> PathBuf {
+    pub(crate) fn policies() -> PathBuf {
         EnginePaths::for_home(Path::new(HOME)).unwrap().policies_dir()
     }
 

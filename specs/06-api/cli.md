@@ -15,7 +15,7 @@ The `knsh` binary wraps the API. Every command takes `--json` for machine-readab
 | `knsh deny <request_id>` | `user.sock` | Deny an ask ([below](#approvals)) |
 | `knsh policy check` | `user.sock` | Dry-run a line against policy |
 | `knsh policy edit <profile>` | `user.sock` | Edit a policy file; saving needs Touch ID or password ([below](#policy-edit)) |
-| `knsh profile use <profile>` | `user.sock` | Select a local profile; needs Touch ID |
+| `knsh profile use <profile>` | `user.sock` | Run sessions paused by expired pushed policy under a signed local profile; needs Touch ID or password ([below](#profile-use)) |
 | `knsh authority trust --team-id <id> --identifier <bundle-id> --min-version <v>` | `user.sock` | Trust an authority; needs Touch ID or password ([below](#authority-trust)) |
 | `knsh forget [--session <id> \| --since <date>] [--with-checkpoints]` | `user.sock` | Delete records and optionally checkpoints |
 | `knsh shell install` | — (`/etc/shells`) | Add `knsh` to `/etc/shells` after asking, so `chsh` accepts it (see below) |
@@ -80,6 +80,21 @@ signs and writes policy files ([integrity](../03-functional-requirements/policy.
 A profile name outside `[A-Za-z0-9._-]{1,64}` is a usage error (exit 2). A failed editor, a refused prompt
 (`-32001`), text that does not load (`-32602`, with the loader's reason) or any other failure exits with 1; the edited
 text is then kept in its temporary file and the path printed. `unattended` is built in and cannot be edited.
+
+## Profile use
+
+`knsh profile use <profile>` (KNSH-072, FR-POL-51) calls [`profile.use`](user-socket.md#profileuse) on `user.sock`:
+the agent sessions paused because their pushed policy expired run under the signed local profile `<profile>` and
+resume.
+
+- A name outside `[A-Za-z0-9._-]{1,64}` is a usage error (status 2); nothing is sent.
+- It says on stderr that the prompt is on the Mac's screen, then waits for `knshd`'s Touch ID or password prompt. It
+  asks nothing on the terminal itself and has no option to skip the prompt.
+- On success it prints `Resumed <n> agent session(s) under the local profile <profile>:` and one session ID per
+  line, or `No agent session is paused by expired pushed policy; nothing changed.` `--json` prints
+  `{"profile", "sessions"}`.
+- A refusal exits with 1 and says why on stderr: not a signed local profile (`-32602`, with knshd's reason) or not
+  authenticated (`-32001`).
 
 ## Authority trust
 

@@ -7,7 +7,7 @@ A session has exactly one actor, fixed at start. Behaviour is specified in [../0
 | `session_id` | ULID | Unique, sortable by start time |
 | `actor.kind` | `human` \| `agent` | Fixed at start |
 | `actor.agent_id` | string | Required for agents, absent for humans, e.g. `claude-code`. 1–64 characters from `[A-Za-z0-9._-]` |
-| `profile` | string | Policy profile name. 1–64 characters from `[A-Za-z0-9._-]` |
+| `profile` | string | Policy profile name. 1–64 characters from `[A-Za-z0-9._-]`. Fixed at start, except that an agent session paused by expired pushed policy runs under the signed local profile the user selects with [`knsh profile use`](../06-api/user-socket.md#profileuse) (KNSH-072, FR-POL-51); nothing else changes it (FR-POL-52), and a human session's never changes |
 | `envelope` | bool | True for agent sessions started with `knsh agent`; always false for humans |
 | `recording` | bool | Off by default for humans, on by default for agents. The authority may change an agent session's with [`recording.set`](../06-api/control-service.md#recordingset) (KNSH-071), which may also set its output recording in place of the profile's; a human session's never changes |
 | `parent_session_id` | ULID or null | Set for sessions started from inside another session |
@@ -31,6 +31,8 @@ A child agent session's profile must equal or be stricter than its parent's (FR-
 the parent's, and a looser one is refused (`-32003`, [`session.start_agent`](../06-api/user-socket.md#sessionstart_agent)).
 A human session cannot have an agent session as its parent: it would be unenforced, an escape from the agent's
 profile (FR-SES-12).
+`knsh profile use` (KNSH-072) does not check strictness against a parent: the user, authenticated, chooses the profile.
+A nested session whose parent was not paused can thus be moved to a profile looser than its parent's (pending).
 
 ### Profile strictness
 

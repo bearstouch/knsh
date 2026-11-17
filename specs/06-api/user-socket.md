@@ -268,6 +268,33 @@ and gets a final newline if it lacks one. In order:
 
 Saves are serialised in `knshd`. `unattended` is `-32602`.
 
+## Profile selection
+
+### `profile.use`
+
+`knsh profile use` ([CLI](cli.md#profile-use)) runs the agent sessions paused by expired pushed policy under a signed
+local profile (KNSH-072, FR-POL-51, FR-POL-52). On `user.sock` only; `agent.sock` and the control service never list
+it (`-32003` there).
+
+`{"profile": "<name>"}` → `{"profile", "sessions"}`: `sessions` lists the IDs of the sessions now running under
+`<name>`, resumed, in ID order. In order:
+
+1. `<name>` must be a **signed local profile**: `<name>.toml` in the policies directory, loading with its `extends`
+   chain read from files only, every file's signature verifying (FR-POL-42). Otherwise `-32602` with the reason in
+   `data.reason`: the built-in `unattended` (no file), a name the authority pushed a snapshot for, a profile that
+   `extends` one (the loader reads a snapshot in place of a file of its name, so it would not run as the file says),
+   a missing, unsigned or invalid file. Nothing is asked.
+2. With no session paused by expired pushed policy: `sessions: []`; no prompt, nothing changes.
+3. `knshd` shows the Touch ID or password prompt itself: `use the local policy profile: <name> for <n> agent
+   session(s) paused by expired pushed policy`, waiting at most 120 s. Any outcome but success is `-32001` with
+   `source: "user"` and `reason: "not authenticated: …"`; nothing changes. No parameter skips the prompt.
+4. Step 1 is checked again (the authority may have pushed meanwhile). Each session the prompt counted that is still
+   paused by expiry then runs under `<name>` and resumes (`session.state_changed` to `active`), in one step: no line
+   runs between the two. A session resumed by a new snapshot meanwhile keeps its own profile. An envelope already
+   running keeps the sandbox profile it started with; its next lines are decided with `<name>`.
+
+Selections are serialised in `knshd`. A session's profile changes in no other way (FR-POL-52).
+
 ## Authority trust
 
 `knsh authority trust` ([CLI](cli.md#authority-trust)) trusts one authority app (KNSH-068, FR-AUTH-10, FR-AUTH-11).
