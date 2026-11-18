@@ -17,20 +17,27 @@ profiles, so that I know what to expect and when to use trusted tools.
 **Acceptance criteria**
 *Phase 2 performance qualification*
 
-- [ ] Supervisor decision without hooks or authority: p95 under 5 ms over the corpus.
-- [ ] Spawn overhead versus plain `bash -c`: p95 under 15 ms for trivial commands.
-- [ ] Hook time is reported per record, bounded by its timeout.
-- [ ] Event delivery: p95 under 10 ms.
-- [ ] `knshd` idle memory under 50 MB.
-- [ ] A report with the machine, macOS version and raw numbers is stored with the release. Misses are recorded,
-      not rounded away.
+- [x] Supervisor decision without hooks or authority: p95 under 5 ms over the corpus. *(0.29 ms over 2,350 lines,
+      allowed and refused.)*
+- [ ] Spawn overhead versus plain `bash -c`: p95 under 15 ms for trivial commands. **Missed:** 55.14 ms added at p95
+      (`true`; `echo hi` 53.77 ms), about 38 ms at p50. Measured and recorded; the cost is in the supervisor's spawn path
+      (follow-up below).
+- [x] Hook time is reported per record, bounded by its timeout. *(Every record lists its hook's `duration_ms`, never
+      above the timeout; a hook hanging past 500 ms has its line decided within 507.19 ms.)*
+- [x] Event delivery: p95 under 10 ms. *(0.05 ms over 2,355 events on a real `user.sock` subscriber; none lost.)*
+- [x] `knshd` idle memory under 50 MB. *(8.98 MB RSS after 60 s idle, real `knshd` under launchd.)*
+- [x] A report with the machine, macOS version and raw numbers is stored with the release. Misses are recorded,
+      not rounded away. *([qualification/](../07-testing/qualification/README.md): report and every raw sample.)*
 
 *Tool compatibility list*
 
 - [ ] The list covers at least curl, git (HTTPS and ssh remotes), npm, pip, cargo, Node HTTP clients, Chromium and
-      Playwright, `swift build` and Bazel, each with a status (works, blocked or needs a trusted tool).
-- [ ] Each entry records the macOS version and tool version tested.
-- [ ] The list is published in [developer tools](../08-integrations/developer-tools.md) for the release.
+      Playwright, `swift build` and Bazel, each with a status (works, blocked or needs a trusted tool). *(Observed for
+      all but Playwright's Node driver and Bazel, which are not installed on the qualification machine: listed as
+      pending with their expected status.)*
+- [ ] Each entry records the macOS version and tool version tested. *(Every tested entry does; Playwright's driver and
+      Bazel are pending.)*
+- [x] The list is published in [developer tools](../08-integrations/developer-tools.md) for the release.
 
 **Unit tests**
 *Phase 2 performance qualification*
@@ -40,3 +47,18 @@ profiles, so that I know what to expect and when to use trusted tools.
 *Tool compatibility list*
 
 - None. This is a documentation and verification story; results come from the KNSH-027 and KNSH-058 runs.
+
+**Notes (KNSH-076)**
+- Where it lives: `crates/knshd/src/qualification/` (not a workspace `benches/` crate). `knshd` has no library target,
+  and a real `knshd` runs agent lines only for profiles signed after Touch ID, so the runs drive the threat-model
+  suite's miniature `knshd` (`threat_model::harness::Stack`, now with `Wiring` for a stub spawner, real hooks and a
+  system-clock event hub). Idle memory uses the real `knshd` under a test launchd job. Run with
+  `scripts/qualify-phase2.sh`; method in [performance validation](../07-testing/performance-validation.md).
+- Found by the idle-memory run: `knshd` crashed at start-up under launchd (`CFRelease(NULL)`) whenever no authority
+  was trusted, because `bool::then_some` built the owning wrapper of a null Keychain result eagerly. Fixed in
+  `knsh-platform` (`keychain.rs`, `xpc.rs`, `presence.rs`), with regression tests; `tests/launchd_agent.rs`, which
+  failed on this machine before, passes again.
+- **Follow-up (NFR-PERF-02 missed):** break down the supervisor's spawn path (34 ms at p50 in-process, of which
+  `sandbox-exec` is about 10 ms) and bring the added p95 under 15 ms, or revisit the target.
+- **Pending:** the same runs on macOS 14 and 15; memory after a long busy period; trusted-tool runs of Chromium and
+  `swift build` (need an approval or a Touch ID grant); Playwright's Node driver and Bazel (not installed).

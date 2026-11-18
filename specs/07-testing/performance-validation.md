@@ -33,4 +33,37 @@ non-zero, and the report lists an open item, when the target is missed or the ma
 Not yet measured: the cost of `knsh` hosting **bash** (the target names zsh first; bash start-up is not benchmarked),
 older macOS versions, and a cold first start after boot (all runs here are warm).
 
+## Phase 2 qualification (NFR-PERF-01, -02, -03, -07, -08; KNSH-076)
+
+`scripts/qualify-phase2.sh perf` builds the workspace in release and runs `qualification::perf::phase_2_performance`
+(`crates/knshd/src/qualification/perf.rs`), an ignored test that drives the threat-model suite's miniature `knshd`
+(the parts `main` wires: record store, event hub, profile loader, supervisor, `knsh-exec`, proxy and the real
+sockets). A real `knshd` runs agent lines only for profiles signed after Touch ID, so an unattended run cannot use
+one, except for idle memory, which needs no session.
+
+| Target | How it is measured |
+| --- | --- |
+| Decision (NFR-PERF-01) | Every line of the agent-command corpus, under an allow-everything profile and a deny-everything one, with no hooks and no authority. An allowed line is timed until the supervisor hands it to the spawner (a stub that starts nothing); a refused line until it is answered, record write included, which is an upper bound. A new session every round, so the repeated-denial limiter never shortens a refusal. The record's own `latency_ms` is reported as a cross-check |
+| Spawn overhead (NFR-PERF-02) | A C timer (`posix_spawn` to `waitpid`, monotonic clock) runs `true` and `echo hi` repeatedly: inside a real envelope as `"$SHELL" -c <line>` (the `knsh` client, `agent.sock`, `exec.run`, decision, record, profile file, `knsh-exec`, `sandbox-exec`, `bash`), and outside any envelope as `/bin/bash -c <line>`. Overhead = p95 difference. Diagnostic series, not judged: `sandbox-exec` alone, and the supervisor's path in-process without the client |
+| Hooks (NFR-PERF-03) | Three hooks run by the real hook runner (immediate, 100 ms, hanging past a 500 ms timeout). Each record must list its hook with the expected result and a `duration_ms` no larger than the timeout; a line whose hook hangs must be decided within its timeout plus 500 ms (the runner's 250 ms drain and process exit) |
+| Event delivery (NFR-PERF-07) | A subscriber on the real `user.sock` (`hello`, `events.subscribe`) while the corpus runs: system clock when a notification has been read and parsed, minus its `ts`, which the hub stamps with the system clock as it publishes. Any `events.lost` fails the run |
+| Idle memory (NFR-PERF-08) | The release `knshd` started by launchd under a test job (own label, Mach service and home under `/private/tmp`). One `hello`, then no connection and no session; after the idle period (`KNSH_QUALIFICATION_IDLE_S`, default 60 s) `ps -o rss=` is read 10 times a second apart. MB = 10^6 bytes |
+
+Percentiles are nearest rank. Every bound is strict ("under"). The report (`performance.md`: machine, macOS version,
+commit, build, every series' n/min/p50/p95/p99/max, open items) and the raw samples (`performance-samples.csv`) go to
+`.build/qualification/<UTC stamp>/`; the release's copy is stored in [qualification/](qualification/). A miss is
+reported with its figure and listed as an open item; the script then exits non-zero.
+
+| Date | Machine | Commit | Decision p95 | Spawn overhead p95 | Hooks | Event delivery p95 | Idle RSS | Report |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-11-18 | MacBookPro18,3, Apple M1 Pro (8 CPUs, 16 GiB), macOS 26.6.2 (25G83), release build | 4dc927c | 0.29 ms: **met** | 55.14 ms added (`true`; `echo hi` 53.77 ms): **missed** | **met** (hanging hook's line decided ≤ 507.19 ms at a 500 ms timeout) | 0.05 ms: **met** | 8.98 MB: **met** | [qualification/](qualification/phase-2-performance-2026-11-18.md) |
+
+**Open: NFR-PERF-02 is missed.** A supervised trivial line adds about 38 ms at p50 and 54–55 ms at p95 over plain
+`bash -c`. The diagnostic series place the cost in the supervisor's spawn path, not in the client:
+the supervisor alone (in-process, no `knsh` client or socket) takes 34.0 ms at p50 and 51.2 ms at p95 for `true`,
+of which `sandbox-exec` with an allow-everything profile is 10.0 ms at p50. The remainder is the line's own
+bookkeeping before and after `sandbox-exec` (proxy credentials, profile file written and checked, record writes,
+`knsh-exec`, reaping), still to be broken down. Not measured: memory after a long busy period (a real `knshd` runs
+agent lines only for signed profiles), and machines other than this one.
+
 Related verification claims: per-file copy-on-write cloning speed, and FSEvents flushing ([verification-claims.md](verification-claims.md)).
