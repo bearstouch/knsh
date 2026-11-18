@@ -298,6 +298,9 @@ impl ToJson for RecordEntry<'_> {
                 .attribution
                 .map_or(Value::Null, |attribution| Value::from(attribution.as_str()));
             object.insert("attribution", attribution)?;
+            // The paths the line changed under its checkpoint roots, with post-image identities (KNSH-082), or null
+            // for a line that touched no protected root.
+            object.insert("files_changed", details.files_changed.to_json()?)?;
         }
         object.insert("stdout", self.stdout.as_ref().map(output_info).transpose()?.to_json()?)?;
         object.insert("stderr", self.stderr.as_ref().map(output_info).transpose()?.to_json()?)?;
@@ -553,6 +556,30 @@ mod tests {
         agent.details.attribution = Some(knsh_core::Attribution::Concurrent);
         let text = entry(&agent);
         assert!(text.contains(r#""attribution":"concurrent""#), "{text}");
+    }
+
+    // KNSH-082: an agent record's `files_changed` is null without checkpoints, and lists each changed path otherwise.
+    #[test]
+    fn record_json_files_changed() {
+        let entry = |record: &ExecutionRecord| {
+            json(&RecordEntry {
+                record,
+                stdout: None,
+                stderr: None,
+            })
+        };
+        let mut agent = record(Actor::Agent(AgentId::new("codex").unwrap()));
+        assert!(entry(&agent).contains(r#""files_changed":null"#));
+        agent.details.files_changed = Some(vec![knsh_core::ChangedFile {
+            path: CanonicalPath::new("/code/app/gone").unwrap(),
+            change: knsh_core::FileChange::Deleted,
+            post_image: None,
+        }]);
+        let text = entry(&agent);
+        assert!(
+            text.contains(r#""files_changed":[{"path":"/code/app/gone","change":"deleted","post_image":null}]"#),
+            "{text}"
+        );
     }
 
     // FR-REC-09: the human form carries only the telemetry fields; byte counts are strings.

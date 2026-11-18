@@ -99,6 +99,8 @@ pub enum CoreError {
     InvalidNetwork,
     /// A record's stored `unprotected` list is not in the form the engine writes (KNSH-079).
     InvalidUnprotected,
+    /// A record's stored `files_changed` list is not in the form the engine writes (KNSH-082).
+    InvalidFilesChanged,
 }
 
 impl fmt::Display for CoreError {
@@ -150,6 +152,7 @@ impl fmt::Display for CoreError {
             Self::InvalidArgv => f.write_str("not a stored record argv"),
             Self::InvalidNetwork => f.write_str("not a stored record network list"),
             Self::InvalidUnprotected => f.write_str("not a stored list of unprotected checkpoint roots"),
+            Self::InvalidFilesChanged => f.write_str("not a stored list of changed files"),
         }
     }
 }

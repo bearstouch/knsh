@@ -15,7 +15,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use knsh_json::{Fields, FromJson, JsonError, Object, ToJson, Value};
+use knsh_json::{Fields, FromJson, IntString, JsonError, Object, ToJson, Value};
 
 use crate::error::CoreError;
 use crate::id::{CheckpointId, RecordId, SessionId};
@@ -791,6 +791,206 @@ pub fn decode_unprotected(text: &str) -> Result<Vec<UnprotectedRoot>, CoreError>
         .map_err(|_| CoreError::InvalidUnprotected)
 }
 
+/// The most entries a record's `files_changed` lists (KNSH-082). A line may change tens of thousands of files; the
+/// record keeps the first of them, sorted, and its checkpoint keeps them all, so one `npm install` cannot make a record
+/// megabytes long. The `exec.run` result's `files_changed` is the full count.
+pub const MAX_RECORD_FILES_CHANGED: usize = 256;
+
+/// How a path under a checkpoint root changed (KNSH-082): one element's `change` in the record's `files_changed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FileChange {
+    /// Nothing was there before the change (its pre-image is the "did not exist" marker).
+    Created,
+    /// Something was there before and after (written, or replaced by another kind of entry).
+    Modified,
+    /// Something was there before, and nothing is after.
+    Deleted,
+}
+
+impl FileChange {
+    /// The wire value: `created`, `modified` or `deleted`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "created" => Some(Self::Created),
+            "modified" => Some(Self::Modified),
+            "deleted" => Some(Self::Deleted),
+            _ => None,
+        }
+    }
+}
+
+/// A path's post-image identity as a record shows it (FR-CKP-09, KNSH-082): what the path looked like right after
+/// the change, so undo can tell whether it still does (FR-CKP-20). Mirrors `knsh_checkpoint::PostImageIdentity`,
+/// which `knsh-core` cannot name (it has no platform types).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecordedIdentity {
+    /// The inode number.
+    pub inode: u64,
+    /// Size in bytes.
+    pub size: u64,
+    /// Modification time: whole seconds since 1970-01-01 UTC.
+    pub mtime_seconds: i64,
+    /// Modification time: nanoseconds within the second, `0..1_000_000_000`.
+    pub mtime_nanoseconds: u32,
+    /// SHA-256 of the contents, for regular files under 64 MiB only; `None` when no hash was taken.
+    pub sha256: Option<[u8; 32]>,
+}
+
+/// One element of a record's `files_changed` (KNSH-082): `{"path", "change", "post_image"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChangedFile {
+    /// The path, under one of the line's checkpoint roots. Written lossily if it is not UTF-8, as `cwd` is.
+    pub path: CanonicalPath,
+    /// How it changed.
+    pub change: FileChange,
+    /// Its post-image identity; `None` when it was deleted, or when the identity could not be read (the checkpoint
+    /// is then uncertain, never given a wrong identity).
+    pub post_image: Option<RecordedIdentity>,
+}
+
+impl ToJson for RecordedIdentity {
+    /// `inode` and `size` are decimal strings (they may exceed 2^53); `sha256` is lower-case hex or `null`.
+    fn to_json(&self) -> Result<Value, JsonError> {
+        let sha256 = self.sha256.map(|digest| hex(&digest));
+        Ok(Value::Object(
+            Object::new()
+                .with("inode", IntString(i128::from(self.inode)).to_json()?)?
+                .with("size", IntString(i128::from(self.size)).to_json()?)?
+                .with("mtime_seconds", self.mtime_seconds.to_json()?)?
+                .with("mtime_nanoseconds", self.mtime_nanoseconds.to_json()?)?
+                .with("sha256", sha256.to_json()?)?,
+        ))
+    }
+}
+
+impl FromJson for RecordedIdentity {
+    /// Reads the object [`ToJson`] writes, and nothing else.
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let mut fields = Fields::new(value)?;
+        let inode: IntString = fields.required("inode")?;
+        let size: IntString = fields.required("size")?;
+        let mtime_seconds: i64 = fields.required("mtime_seconds")?;
+        let mtime_nanoseconds: u32 = fields.required("mtime_nanoseconds")?;
+        let sha256: Option<String> = fields.optional("sha256")?;
+        fields.finish_closed()?;
+        let out_of_range = |field| JsonError::OutOfRange { field: Some(field) };
+        if mtime_nanoseconds >= 1_000_000_000 {
+            return Err(out_of_range("mtime_nanoseconds"));
+        }
+        Ok(Self {
+            inode: u64::try_from(inode.0).map_err(|_| out_of_range("inode"))?,
+            size: u64::try_from(size.0).map_err(|_| out_of_range("size"))?,
+            mtime_seconds,
+            mtime_nanoseconds,
+            sha256: sha256
+                .map(|text| unhex(&text).ok_or(out_of_range("sha256")))
+                .transpose()?,
+        })
+    }
+}
+
+impl ToJson for ChangedFile {
+    fn to_json(&self) -> Result<Value, JsonError> {
+        Ok(Value::Object(
+            Object::new()
+                .with("path", self.path.as_path().to_string_lossy().into_owned())?
+                .with("change", self.change.as_str())?
+                .with("post_image", self.post_image.to_json()?)?,
+        ))
+    }
+}
+
+impl FromJson for ChangedFile {
+    /// Reads the object [`ToJson`] writes: every member, nothing else, a canonical path and a known change.
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let mut fields = Fields::new(value)?;
+        let path: String = fields.required("path")?;
+        let change: String = fields.required("change")?;
+        let post_image: Option<RecordedIdentity> = fields.optional("post_image")?;
+        fields.finish_closed()?;
+        Ok(Self {
+            path: CanonicalPath::new(path).map_err(|_| JsonError::OutOfRange { field: Some("path") })?,
+            change: FileChange::parse(&change).ok_or(JsonError::OutOfRange { field: Some("change") })?,
+            post_image,
+        })
+    }
+}
+
+/// Lower-case hexadecimal.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut text, byte| {
+            // Writing to a `String` cannot fail.
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
+}
+
+/// A SHA-256 digest from exactly 64 lower-case hexadecimal digits, the only form [`hex`] writes.
+fn unhex(text: &str) -> Option<[u8; 32]> {
+    let digits = text.as_bytes();
+    if digits.len() != 64 {
+        return None;
+    }
+    let value = |digit: u8| match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        _ => None,
+    };
+    let mut digest = [0; 32];
+    let (pairs, _) = digits.as_chunks::<2>();
+    for (byte, [high, low]) in digest.iter_mut().zip(pairs) {
+        *byte = (value(*high)? << 4) | value(*low)?;
+    }
+    Some(digest)
+}
+
+/// The stored form of a record's `files_changed`: its JSON array as text.
+///
+/// # Errors
+///
+/// [`CoreError::InvalidFilesChanged`] if it cannot be written (a modification time outside ±2^53 seconds).
+pub fn encode_files_changed(files: &[ChangedFile]) -> Result<String, CoreError> {
+    let values = files
+        .iter()
+        .map(ToJson::to_json)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CoreError::InvalidFilesChanged)?;
+    knsh_json::write(&Value::Array(values)).map_err(|_| CoreError::InvalidFilesChanged)
+}
+
+/// Reads the stored form written by [`encode_files_changed`].
+///
+/// # Errors
+///
+/// [`CoreError::InvalidFilesChanged`] for text that is not such an array, or lists more than
+/// [`MAX_RECORD_FILES_CHANGED`].
+pub fn decode_files_changed(text: &str) -> Result<Vec<ChangedFile>, CoreError> {
+    let value = knsh_json::parse(text.as_bytes(), text.len()).map_err(|_| CoreError::InvalidFilesChanged)?;
+    let Value::Array(items) = value else {
+        return Err(CoreError::InvalidFilesChanged);
+    };
+    if items.len() > MAX_RECORD_FILES_CHANGED {
+        return Err(CoreError::InvalidFilesChanged);
+    }
+    items
+        .iter()
+        .map(ChangedFile::from_json)
+        .collect::<Result<_, _>>()
+        .map_err(|_| CoreError::InvalidFilesChanged)
+}
+
 /// How a record's file changes were attributed (FR-CKP-05 to FR-CKP-07, KNSH-081): the record's `attribution`, and
 /// the kind of the history-tree edge its changes belong to (`specs/05-models/checkpoint.md`).
 ///
@@ -880,6 +1080,11 @@ pub struct RecordDetails {
     /// How the line's file changes were attributed (KNSH-081): `command`, or `concurrent` when another line overlapped
     /// it in one of its checkpoint roots. `None` for a line that never ran (denied) and for records written before.
     pub attribution: Option<Attribution>,
+    /// The paths the line's changes created, modified or deleted under its checkpoint roots, with their post-image
+    /// identities (KNSH-082), sorted, at most [`MAX_RECORD_FILES_CHANGED`] (its checkpoint lists them all). For a
+    /// `concurrent` line, those of its whole set, which cannot be told apart (FR-CKP-07). `None` for a line that
+    /// touched no protected root or never ran; empty for one that changed nothing.
+    pub files_changed: Option<Vec<ChangedFile>>,
 }
 
 impl RecordDetails {
@@ -899,6 +1104,7 @@ impl RecordDetails {
             network,
             unprotected,
             attribution,
+            files_changed,
         } = self;
         rewritten_from.is_none()
             && pipestatus.is_empty()
@@ -912,6 +1118,7 @@ impl RecordDetails {
             && network.is_empty()
             && unprotected.is_empty()
             && attribution.is_none()
+            && files_changed.is_none()
     }
 }
 
@@ -1090,6 +1297,69 @@ mod tests {
             r#"[{"root":"/a","reason":"no_shadow","extra":1}]"#,
         ] {
             assert_eq!(decode_unprotected(bad), Err(CoreError::InvalidUnprotected), "{bad}");
+        }
+    }
+
+    // KNSH-082, FR-CKP-09: `files_changed` round-trips with its post-image identities (a hash only where one was
+    // taken, inode and size as decimal strings), and only the engine's own form is read back.
+    #[test]
+    fn files_changed_round_trip_and_refuse_other_forms() {
+        let files = vec![
+            ChangedFile {
+                path: CanonicalPath::new("/code/app/new.rs").unwrap(),
+                change: FileChange::Created,
+                post_image: Some(RecordedIdentity {
+                    inode: u64::MAX,
+                    size: 5,
+                    mtime_seconds: 1_763_000_000,
+                    mtime_nanoseconds: 123_456_789,
+                    sha256: Some([0xab; 32]),
+                }),
+            },
+            ChangedFile {
+                path: CanonicalPath::new("/code/app/big.bin").unwrap(),
+                change: FileChange::Modified,
+                post_image: Some(RecordedIdentity {
+                    inode: 7,
+                    size: 64 << 20,
+                    mtime_seconds: -1,
+                    mtime_nanoseconds: 0,
+                    sha256: None,
+                }),
+            },
+            ChangedFile {
+                path: CanonicalPath::new("/code/app/gone").unwrap(),
+                change: FileChange::Deleted,
+                post_image: None,
+            },
+        ];
+        let text = encode_files_changed(&files).unwrap();
+        assert!(text.contains(r#""inode":"18446744073709551615""#), "{text}");
+        assert!(text.contains(&format!(r#""sha256":"{}""#, "ab".repeat(32))), "{text}");
+        assert!(text.contains(r#""sha256":null"#), "{text}");
+        assert_eq!(decode_files_changed(&text).unwrap(), files);
+        assert_eq!(decode_files_changed("[]").unwrap(), Vec::new());
+
+        let identity = r#"{"inode":"1","size":"2","mtime_seconds":3,"mtime_nanoseconds":4,"sha256":null}"#;
+        for bad in [
+            "{}".to_owned(),
+            r#"[{"path":"/a","change":"renamed","post_image":null}]"#.to_owned(),
+            r#"[{"path":"rel","change":"created","post_image":null}]"#.to_owned(),
+            r#"[{"path":"/a","change":"deleted","post_image":null,"extra":1}]"#.to_owned(),
+            format!(
+                r#"[{{"path":"/a","change":"created","post_image":{}}}]"#,
+                identity.replace(":4,", ":1000000000,")
+            ),
+            format!(
+                r#"[{{"path":"/a","change":"created","post_image":{}}}]"#,
+                identity.replace("null", r#""AB""#)
+            ),
+            format!(
+                "[{}]",
+                vec![r#"{"path":"/a","change":"deleted","post_image":null}"#; 257].join(",")
+            ),
+        ] {
+            assert_eq!(decode_files_changed(&bad), Err(CoreError::InvalidFilesChanged), "{bad}");
         }
     }
 

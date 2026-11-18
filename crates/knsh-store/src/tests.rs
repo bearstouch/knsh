@@ -168,6 +168,17 @@ fn full_details() -> RecordDetails {
             reason: UnprotectedReason::ShadowBuilding,
         }],
         attribution: Some(knsh_core::Attribution::Concurrent),
+        files_changed: Some(vec![knsh_core::ChangedFile {
+            path: CanonicalPath::new("/code/app/README").unwrap(),
+            change: knsh_core::FileChange::Modified,
+            post_image: Some(knsh_core::RecordedIdentity {
+                inode: 42,
+                size: 5,
+                mtime_seconds: 1_763_000_000,
+                mtime_nanoseconds: 9,
+                sha256: Some([7; 32]),
+            }),
+        }]),
     }
 }
 
@@ -313,6 +324,8 @@ fn human_record_drops_non_telemetry_fields() {
     assert_eq!(details.unprotected, full_details().unprotected);
     // KNSH-081: the attribution reads back as written.
     assert_eq!(details.attribution, Some(knsh_core::Attribution::Concurrent));
+    // KNSH-082: the changed files read back with their post-image identities.
+    assert_eq!(details.files_changed, full_details().files_changed);
     assert_eq!(stored.stdout.map(|info| info.stored), Some(3));
     assert_eq!(stored.stderr.map(|info| info.stored), Some(0));
 }
@@ -946,6 +959,35 @@ fn corrupt_attribution_is_reported_not_repaired() {
         let raw = Connection::open(&RealFs::new(), &dir.db(), DEFAULT_BUSY_TIMEOUT).unwrap();
         raw.execute(
             "UPDATE records SET attribution = 'human' WHERE record_id = ?1",
+            &[Value::Text(&record_id(1).to_string())],
+        )
+        .unwrap();
+    }
+    let read = store.query(Scope::All, RecordQuery::default());
+    assert!(matches!(read, Err(StoreError::Corrupt)));
+}
+
+// KNSH-082: a stored `files_changed` the engine could not have written is reported as corrupt; an empty list stays
+// empty (the line changed nothing), distinct from none (it touched no protected root).
+#[test]
+fn files_changed_corrupt_is_reported_and_empty_is_kept() {
+    let dir = TempDir::new("files-changed");
+    let store = open(&dir);
+    let quiet = ExecutionRecord {
+        details: RecordDetails {
+            files_changed: Some(Vec::new()),
+            ..full_details()
+        },
+        ..record(1, session_id(1), agent(), "true")
+    };
+    store.write_record(quiet, RecordedOutput::default()).unwrap();
+    let page = store.query(Scope::All, RecordQuery::default()).unwrap();
+    assert_eq!(page.records[0].record.details.files_changed, Some(Vec::new()));
+    {
+        let raw = Connection::open(&RealFs::new(), &dir.db(), DEFAULT_BUSY_TIMEOUT).unwrap();
+        raw.execute(
+            "UPDATE records SET files_changed = '[{\"path\":\"/a\",\"change\":\"renamed\",\"post_image\":null}]' \
+             WHERE record_id = ?1",
             &[Value::Text(&record_id(1).to_string())],
         )
         .unwrap();

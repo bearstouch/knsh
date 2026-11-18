@@ -418,7 +418,8 @@ fn subscribe_error(error: SubscribeError, session_id: Option<SessionId>) -> RpcE
             | CoreError::InvalidViolation
             | CoreError::InvalidArgv
             | CoreError::InvalidNetwork
-            | CoreError::InvalidUnprotected,
+            | CoreError::InvalidUnprotected
+            | CoreError::InvalidFilesChanged,
         )
         | SubscribeError::Closed => RpcError::new(ErrorCode::InternalError),
     }

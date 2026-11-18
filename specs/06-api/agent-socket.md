@@ -98,8 +98,8 @@ result carries its output in the requested mode.
 | `exit_code`, `signal` | Exactly one is set: the exit code (0–255), or the signal (1–127) that ended the line, for example after `exec.kill` |
 | `duration_ms` | From the spawn to the end |
 | `decision` | `verdict`, `source`, `rule_id` |
-| `files_changed` | Count of changed paths under checkpoint roots; null until checkpoints exist (phase 3) |
-| `checkpoint_id` | Checkpoint holding the pre-images, or null |
+| `files_changed` | Count of paths created, modified or deleted under the line's protected checkpoint roots (all of them, unlike the record's list of at most 256); 0 when it changed nothing there, null when it touched no protected root (KNSH-082) |
+| `checkpoint_id` | Checkpoint holding the pre-images, or null when it changed nothing in a protected root |
 | `output_mode` | The mode applied: the caller's, or the profile's default |
 | `stdout_size`, `stderr_size` | Bytes the line wrote to each stream (decimal strings), in every mode |
 | `stdout_lines`, `stderr_lines` | Lines it wrote to each stream, in every mode |

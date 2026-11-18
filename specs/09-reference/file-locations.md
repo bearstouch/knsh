@@ -23,6 +23,7 @@ unusable state file is set aside as `state.json.corrupt-<µs>` or `state.json.ne
 
 - All engine paths are denied to every envelope and command, readable by the user only, and excluded from Spotlight and Time Machine. The shim directory is not an engine path in this sense: it sits beside the data directory, not in it.
 - Checkpoints sit on the same volume as the files they protect, because copy-on-write clones only work within one APFS volume.
+- Inside a store: `shadows/<session>/<root index>/` (each root's shadow, KNSH-079), `markers/<session>/<root index>/` (line-end markers, KNSH-080), `held/<session>/<root index>/` (pre-images taken out of a shadow, until capture moves them on) and `checkpoints/<checkpoint id>/` (each checkpoint's pre-images, KNSH-082). Every move between them is a rename on the store's volume.
 - `.knsh-checkpoints` is a reserved name: every path with that component is a fixed deny, wherever the volume is mounted ([policy](../03-functional-requirements/policy.md#fixed-denies)).
 
 ## Environment variables

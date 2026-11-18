@@ -41,8 +41,20 @@
 //! a repeated flag) reports nothing. A missing parent in the shadow is created first. If the root itself is gone or
 //! is no longer a folder, nothing is removed from the shadow: it keeps the last known state until the root returns.
 //!
-//! **Pre-images.** Capture (KNSH-082) will take each changed path's shadow copy as its pre-image before this step
-//! replaces it; until then the shadow simply follows the live tree.
+//! **Pre-images (KNSH-082, FR-CKP-08).** A shadow copy is never simply deleted: before a file or symlink copy is
+//! replaced or removed, it is **moved** (one rename, on the store's volume) into the root's holding folder
+//! ([`held_dir`]), and the change is reported with it as its pre-image ([`Change`]). A path that was not in the shadow
+//! is reported with the "did not exist" marker, and a folder with a folder marker; a removed folder reports each entry
+//! below it as deleted too, each with its own pre-image. The report then decides what to keep ([`crate::capture`]).
+//! Right after the shadow follows the path, its **post-image identity** is read from the live tree (FR-CKP-09).
+//! Only changed paths are touched, so capture costs as much as the change, not as the root (FR-CKP-10).
+//!
+//! **Capture failures** never record wrong data and never leave the shadow behind the tree. A copy that cannot be
+//! moved is removed as before (the shadow stays consistent) and reported with a *lost* pre-image; a new version that
+//! cannot be cloned puts the held copy back, so the shadow keeps its last known state and a later event retries; a
+//! post-image that cannot be read is reported *unknown*. Each makes its checkpoint uncertain. Should the copy be
+//! neither cloned nor put back, the path is remembered, so a retry reports its pre-image as lost rather than claiming
+//! it did not exist.
 //!
 //! # Lost events and uncertain windows (FR-CKP-04)
 //!
@@ -81,7 +93,9 @@ use knsh_platform::{
     PlatformError,
 };
 
+use crate::capture::{Change, PostImage, PreImage};
 use crate::error::CheckpointError;
+use crate::identity::post_image_identity_of;
 use crate::shadow::{MAX_FOLDER_ENTRIES, Shadow, ShadowFiles, ShadowStatus};
 
 /// How long the system may hold events before delivering them. The line-end procedure flushes, so this only bounds
@@ -101,6 +115,20 @@ pub const FLUSH_INTERVAL: Duration = Duration::from_millis(1);
 /// The folder below a store that holds marker folders: `<store>/markers/<session>/<root index>/`.
 pub const MARKERS_DIR: &str = "markers";
 
+/// The folder below a store that holds pre-images taken out of a shadow, until capture moves them into their
+/// checkpoint: `<store>/held/<session>/<root index>/` (KNSH-082).
+pub const HELD_DIR: &str = "held";
+
+/// Where the holding folder of a session's root number `index` lives in `store`, and its parents to create, outermost
+/// first (KNSH-082). In the store, on the root's volume (a shadow copy is moved, never copied), owner-only and never
+/// shadowed or watched.
+#[must_use]
+pub fn held_dir(store: &Path, session: &str, index: usize) -> (PathBuf, Vec<PathBuf>) {
+    let held = store.join(HELD_DIR);
+    let session_dir = held.join(session);
+    (session_dir.join(index.to_string()), vec![held, session_dir])
+}
+
 /// Where the marker folder of a session's root number `index` lives in `store`, and its parents to create, outermost
 /// first. In the store, so on the root's volume and owner-only, and never shadowed.
 #[must_use]
@@ -112,8 +140,10 @@ pub fn marker_dir(store: &Path, session: &str, index: usize) -> (PathBuf, Vec<Pa
 
 /// Where the watcher reports what it found. Called on the watcher's own thread; must not block for long.
 pub trait WatchReport: Send + Sync {
-    /// `path` under `root` changed, and the shadow now follows it (`file.changed`, FR-EVT-08).
-    fn changed(&self, root: &CanonicalPath, path: &CanonicalPath);
+    /// `change.path` under `root` changed, and the shadow now follows it (`file.changed`, FR-EVT-08), with its
+    /// pre-image and post-image identity (KNSH-082). A [`PreImage::Held`] file now belongs to the report: it moves it
+    /// into a checkpoint or removes it.
+    fn changed(&self, root: &CanonicalPath, change: Change);
 
     /// Events of `root` may have been lost while no line was open, so the root was rescanned
     /// (`checkpoint.uncertain` with no record, FR-CKP-04, NFR-REL-04). Lines learn of theirs from
@@ -138,6 +168,11 @@ pub struct WatchPlan {
     pub markers: PathBuf,
     /// Its parents to create if missing, outermost first, each inside the store.
     pub marker_parents: Vec<PathBuf>,
+    /// The holding folder for pre-images ([`held_dir`], KNSH-082), created by [`start_watch`] if missing. On the
+    /// shadow's volume, and not watched.
+    pub held: PathBuf,
+    /// Its parents to create if missing, outermost first, each inside the store.
+    pub held_parents: Vec<PathBuf>,
     /// Folder names not shadowed, at any depth (`checkpoints.exclude`, FR-CKP-31).
     pub exclude: Vec<String>,
     /// Folders never shadowed, by full path: the checkpoint store and the engine directories.
@@ -279,7 +314,13 @@ pub fn start_watch(
         clock,
         stream: Mutex::new(Some(stream)),
     });
-    let worker = Worker { inner, files, report };
+    let worker = Worker {
+        inner,
+        files,
+        report,
+        held_made: AtomicU64::new(0),
+        orphans: Mutex::new(Orphans::default()),
+    };
     if thread::Builder::new()
         .name("knsh-watch".into())
         .spawn(move || worker.run())
@@ -291,10 +332,12 @@ pub fn start_watch(
     Ok(watcher)
 }
 
-/// Creates the marker folder and its parents, accepting ones that exist only if they are real folders (never a
-/// symlink that would carry markers elsewhere).
+/// Creates the marker and holding folders and their parents, accepting ones that exist only if they are real folders
+/// (never a symlink that would carry markers or pre-images elsewhere).
 fn make_marker_dirs(files: &dyn ShadowFiles, plan: &WatchPlan) -> Result<(), CheckpointError> {
-    for dir in plan.marker_parents.iter().chain(std::iter::once(&plan.markers)) {
+    let markers = plan.marker_parents.iter().chain(std::iter::once(&plan.markers));
+    let held = plan.held_parents.iter().chain(std::iter::once(&plan.held));
+    for dir in markers.chain(held) {
         match files.make_dir(dir) {
             Ok(()) => {}
             Err(error) if is_exists(&error) => match files.kind(dir) {
@@ -660,11 +703,51 @@ struct Batch {
     received: u64,
 }
 
+/// Paths remembered as having lost their shadow copy ([`Worker::orphans`]) at most. Beyond, the watcher no longer
+/// knows which paths the shadow lacks, so every path missing from the shadow reports a lost pre-image from then on:
+/// uncertain, never "did not exist".
+const MAX_ORPHANS: usize = 8192;
+
+/// How many names in the holding folder [`InStep::discard`] tries before giving a pre-image up as lost: a name can be
+/// taken by a pre-image an earlier run left behind (it never replaces one).
+const HELD_ATTEMPTS: usize = 64;
+
+/// The paths whose shadow copy was taken out and could be neither replaced nor put back ([`Worker::orphans`]).
+#[derive(Default)]
+struct Orphans {
+    /// Relative to the root, at most [`MAX_ORPHANS`].
+    paths: BTreeSet<PathBuf>,
+    /// One more did not fit: any path missing from the shadow may be one.
+    overflowed: bool,
+}
+
+impl Orphans {
+    /// Remembers `relative` as an orphan.
+    fn remember(&mut self, relative: &Path) {
+        if self.paths.len() < MAX_ORPHANS {
+            self.paths.insert(relative.to_path_buf());
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    /// Whether `relative`, missing from the shadow, may have held something the shadow lost.
+    fn may_hold(&self, relative: &Path) -> bool {
+        self.overflowed || self.paths.contains(relative)
+    }
+}
+
 /// The worker thread.
 struct Worker {
     inner: Arc<Inner>,
     files: Arc<dyn ShadowFiles>,
     report: Arc<dyn WatchReport>,
+    /// Pre-images held so far, for unique names in the holding folder.
+    held_made: AtomicU64,
+    /// Paths, relative to the root, whose shadow copy was taken out and could be neither replaced nor put back
+    /// (module documentation, "Capture failures"): the shadow no longer knows what they held, so their next change
+    /// reports a lost pre-image, never "did not exist". Only the worker uses it; the lock is uncontended.
+    orphans: Mutex<Orphans>,
 }
 
 impl Worker {
@@ -756,6 +839,8 @@ impl Worker {
             plan: &self.inner.plan,
             files: self.files.as_ref(),
             report: self.report.as_ref(),
+            held_made: &self.held_made,
+            orphans: &self.orphans,
         };
         // The root must still be a folder; otherwise the shadow keeps its last known state (module documentation).
         match self.files.kind(self.inner.plan.root.as_path()) {
@@ -790,6 +875,8 @@ struct InStep<'a> {
     plan: &'a WatchPlan,
     files: &'a dyn ShadowFiles,
     report: &'a dyn WatchReport,
+    held_made: &'a AtomicU64,
+    orphans: &'a Mutex<Orphans>,
 }
 
 /// A file operation failed; the path stays as it was.
@@ -844,10 +931,11 @@ impl InStep<'_> {
         let then = self.read(&copy)?;
         match (now, then) {
             (None, None) => Ok(()),
-            // Gone from the live tree: so from the shadow (a folder with everything below it).
+            // Gone from the live tree: so from the shadow (a folder with everything below it), each copy kept as a
+            // pre-image.
             (None, Some(then)) => {
-                self.remove(&copy, then.kind)?;
-                self.changed(&live);
+                let pre = self.discard(&live, &copy, then.kind)?;
+                self.report(relative, &live, pre, PostImage::Deleted);
                 Ok(())
             }
             (Some(now), then) => match now.kind {
@@ -856,24 +944,28 @@ impl InStep<'_> {
                     if then.is_some_and(|then| same(&now, &then)) {
                         return Ok(());
                     }
-                    if let Some(then) = then {
-                        self.remove(&copy, then.kind)?;
-                    }
+                    let pre = self.pre_image(relative, &live, &copy, then)?;
                     match self.files.clone_file(&live, &copy) {
                         Ok(()) => {}
-                        // Removed since it was read: its own event follows.
-                        Err(error) if error.is_not_found() => return Ok(()),
-                        Err(_) => return Err(Failed),
+                        // Removed since it was read: what the shadow held is now deleted. Its own event finds nothing
+                        // left to do, so the change is reported here.
+                        Err(error) if error.is_not_found() => {
+                            self.report(relative, &live, pre, PostImage::Deleted);
+                            return Ok(());
+                        }
+                        Err(_) => return Err(self.put_back(relative, &live, &copy, pre)),
                     }
-                    self.changed(&live);
+                    let post = self.post_image(&live);
+                    self.report(relative, &live, pre, post);
                     Ok(())
                 }
                 // Special files hold no contents to restore and are never shadowed; a copy of what was there before
-                // is removed, since the path no longer holds it.
+                // is taken out, since the path no longer holds it.
                 FileKind::Other => {
                     if let Some(then) = then {
-                        self.remove(&copy, then.kind)?;
-                        self.changed(&live);
+                        let pre = self.discard(&live, &copy, then.kind)?;
+                        let post = self.post_image(&live);
+                        self.report(relative, &live, pre, post);
                     }
                     Ok(())
                 }
@@ -894,21 +986,19 @@ impl InStep<'_> {
         if self.excluded_name(relative) {
             return Ok(());
         }
-        let created = match then {
-            Some(then) if then.kind == FileKind::Directory => false,
-            Some(then) => {
-                self.remove(copy, then.kind)?;
-                true
-            }
-            None => true,
+        let pre = match then {
+            Some(then) if then.kind == FileKind::Directory => None,
+            then => Some(self.pre_image(relative, live, copy, then)?),
         };
-        if created {
+        let created = pre.is_some();
+        if let Some(pre) = pre {
             match self.files.make_dir(copy) {
                 Ok(()) => {}
                 Err(error) if is_exists(&error) => {}
-                Err(_) => return Err(Failed),
+                Err(_) => return Err(self.put_back(relative, live, copy, pre)),
             }
-            self.changed(live);
+            let post = self.post_image(live);
+            self.report(relative, live, pre, post);
         }
         if created || depth == Depth::Tree {
             self.reconcile(relative, live, copy)?;
@@ -960,23 +1050,108 @@ impl InStep<'_> {
         }
     }
 
-    /// Removes the shadow entry `copy` of kind `kind`, a folder with everything below it. Never follows a symlink:
-    /// a folder is entered only if `lstat` says it is one.
-    fn remove(&self, copy: &Path, kind: FileKind) -> Result<(), Failed> {
-        if kind == FileKind::Directory {
-            let names = match self.files.list(copy, MAX_FOLDER_ENTRIES) {
-                Ok(names) => names,
-                Err(error) if error.is_not_found() => return Ok(()),
-                Err(_) => return Err(Failed),
-            };
-            for name in names.iter().filter(|name| is_entry_name(name)) {
-                let entry = copy.join(name);
-                if let Some(identity) = self.read(&entry)? {
-                    self.remove(&entry, identity.kind)?;
+    /// What the shadow held at `relative` before this change, taken out of the shadow so the new version can take its
+    /// place: the "did not exist" marker when it held nothing (or a lost pre-image for an [orphan](Worker::orphans)),
+    /// else [`InStep::discard`].
+    fn pre_image(
+        &self,
+        relative: &Path,
+        live: &Path,
+        copy: &Path,
+        then: Option<FileIdentity>,
+    ) -> Result<PreImage, Failed> {
+        match then {
+            Some(then) => self.discard(live, copy, then.kind),
+            None if lock(self.orphans).may_hold(relative) => Ok(PreImage::Lost),
+            None => Ok(PreImage::NotExisted),
+        }
+    }
+
+    /// Takes the shadow entry `copy` (of the live path `live`) out of the shadow and returns it as a pre-image
+    /// (FR-CKP-08). A file or symlink is moved into the holding folder; if that fails it is removed instead, so the
+    /// shadow stays consistent, and its pre-image is lost. A folder is a folder marker: everything below it is taken out
+    /// first, and each entry reported deleted with its own pre-image. Never follows a symlink: a folder is entered only
+    /// if `lstat` says it is one.
+    fn discard(&self, live: &Path, copy: &Path, kind: FileKind) -> Result<PreImage, Failed> {
+        match kind {
+            FileKind::File | FileKind::Symlink => {
+                for _ in 0..HELD_ATTEMPTS {
+                    let held = self.next_held();
+                    match self.files.rename_new(copy, &held) {
+                        Ok(()) => return Ok(PreImage::Held(held)),
+                        // A name an earlier run left taken: never replaced, the next one is tried.
+                        Err(error) if is_exists(&error) => {}
+                        // Gone since it was read: nothing left to keep or remove.
+                        Err(error) if error.is_not_found() => return Ok(PreImage::Lost),
+                        Err(_) => break,
+                    }
                 }
+                self.remove_entry(copy, false)?;
+                Ok(PreImage::Lost)
+            }
+            FileKind::Directory => {
+                let names = match self.files.list(copy, MAX_FOLDER_ENTRIES) {
+                    Ok(names) => names,
+                    Err(error) if error.is_not_found() => return Ok(PreImage::Folder),
+                    Err(_) => return Err(Failed),
+                };
+                for name in names.iter().filter(|name| is_entry_name(name)) {
+                    let (entry, below) = (copy.join(name), live.join(name));
+                    if let Some(identity) = self.read(&entry)? {
+                        let pre = self.discard(&below, &entry, identity.kind)?;
+                        if let Ok(relative) = below.strip_prefix(self.plan.root.as_path()) {
+                            self.report(relative, &below, pre, PostImage::Deleted);
+                        }
+                    }
+                }
+                self.remove_entry(copy, true)?;
+                Ok(PreImage::Folder)
+            }
+            // The shadow never holds special files; one found there is removed, and what it held is unknown.
+            FileKind::Other => {
+                self.remove_entry(copy, false)?;
+                Ok(PreImage::Lost)
             }
         }
-        match self.files.remove(copy, kind == FileKind::Directory) {
+    }
+
+    /// The new version of `relative` could not be put in the shadow after its copy was taken out as `pre`. The copy is
+    /// moved back, so the shadow keeps its last known state and a later event retries (module documentation,
+    /// "Capture failures"). If it cannot be, the change is reported with the pre-image it has and an unknown
+    /// post-image, and the path is remembered as an orphan.
+    fn put_back(&self, relative: &Path, live: &Path, copy: &Path, pre: PreImage) -> Failed {
+        match &pre {
+            // Nothing was taken out: the shadow is as it was.
+            PreImage::NotExisted => return Failed,
+            PreImage::Held(held) if self.files.rename_new(held, copy).is_ok() => return Failed,
+            PreImage::Held(_) | PreImage::Folder | PreImage::Lost => {}
+        }
+        self.report(relative, live, pre, PostImage::Unknown);
+        lock(self.orphans).remember(relative);
+        Failed
+    }
+
+    /// The post-image identity of the live path `live`, read right after the shadow followed it (FR-CKP-09).
+    fn post_image(&self, live: &Path) -> PostImage {
+        match post_image_identity_of(self.files, live) {
+            Ok(identity) => PostImage::Present(identity),
+            // Removed since: its own event follows, and reports the removal.
+            Err(CheckpointError::Platform(error)) if error.is_not_found() => PostImage::Deleted,
+            Err(CheckpointError::Platform(_) | CheckpointError::IdentityUnstable | CheckpointError::Threads) => {
+                PostImage::Unknown
+            }
+        }
+    }
+
+    /// A new path in the holding folder, unique for this watcher.
+    fn next_held(&self) -> PathBuf {
+        let n = self.held_made.fetch_add(1, Ordering::Relaxed);
+        self.plan.held.join(format!("p-{n}"))
+    }
+
+    /// Removes the shadow entry `copy`: an empty folder (`folder`), or a file or symlink. Gone already is fine.
+    fn remove_entry(&self, copy: &Path, folder: bool) -> Result<(), Failed> {
+        match self.files.remove(copy, folder) {
             Ok(()) => Ok(()),
             Err(error) if error.is_not_found() => Ok(()),
             Err(_) => Err(Failed),
@@ -1013,11 +1188,20 @@ impl InStep<'_> {
             .is_some_and(|name| self.plan.exclude.iter().any(|excluded| excluded == name))
     }
 
-    /// Reports `live` as changed. A path that is not canonical (it cannot be, from a canonical root and normal
-    /// names) is not reported.
-    fn changed(&self, live: &Path) {
-        if let Ok(path) = CanonicalPath::new(live) {
-            self.report.changed(&self.plan.root, &path);
+    /// Reports the change of `relative` (at `live`) with its pre-image and post-image. A path that is not canonical (it
+    /// cannot be, from a canonical root and normal names) is not reported, and its held pre-image is removed. The path
+    /// is no longer an [orphan](Worker::orphans): the shadow follows it again, or its change was reported.
+    fn report(&self, relative: &Path, live: &Path, pre: PreImage, post: PostImage) {
+        if !matches!(post, PostImage::Unknown) {
+            lock(self.orphans).paths.remove(relative);
+        }
+        match CanonicalPath::new(live) {
+            Ok(path) => self.report.changed(&self.plan.root, Change { path, pre, post }),
+            Err(_) => {
+                if let PreImage::Held(held) = pre {
+                    let _ = self.files.remove(&held, false);
+                }
+            }
         }
     }
 }

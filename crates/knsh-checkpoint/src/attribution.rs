@@ -366,19 +366,26 @@ impl Ledger {
     /// lines running in the root, else to an agent-edit run if an envelope watches it, else to an external run.
     /// Dropped when no line runs there and nothing watches the root any more (the last batch of a watcher stopped
     /// with its session): no session protects it, and an idle run opened now would never close.
-    pub fn changed(&mut self, root: &CanonicalPath, path: &CanonicalPath) {
-        let Some(edge) = self.edge_for_change(root) else {
-            return;
-        };
-        let Some(open) = self.open.get_mut(&edge) else {
-            return;
-        };
+    ///
+    /// Returns the edge the change belongs to, `None` when it was dropped: capture (KNSH-082) keeps its pre-image in
+    /// that edge's checkpoint.
+    pub fn changed(&mut self, root: &CanonicalPath, path: &CanonicalPath) -> Option<EdgeId> {
+        let edge = self.edge_for_change(root)?;
+        let open = self.open.get_mut(&edge)?;
         open.edge.add_path(root, path);
         if open.edge.attribution == Attribution::AgentEdit
             && let Some(state) = self.roots.get_mut(root)
         {
             state.pending.record(&open.edge.sessions, path);
         }
+        Some(edge)
+    }
+
+    /// The open edge the next change in `root` would belong to, opened now as an idle run if none is (as
+    /// [`Ledger::changed`] would); `None` when no line runs there and nothing watches it. For an uncertain window
+    /// outside any line (KNSH-082): the checkpoint of that edge is marked uncertain.
+    pub fn edge_of(&mut self, root: &CanonicalPath) -> Option<EdgeId> {
+        self.edge_for_change(root)
     }
 
     /// The agent edits of `root` not reported yet, for one `agent.edit` event (FR-CKP-06); `None` when there are

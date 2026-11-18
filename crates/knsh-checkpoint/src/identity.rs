@@ -13,9 +13,10 @@
 
 use std::path::Path;
 
-use knsh_platform::{ContentHash, FileIdentity, FileKind, Volumes};
+use knsh_platform::{ContentHash, FileIdentity, FileKind, PlatformError, Volumes};
 
 use crate::error::CheckpointError;
+use crate::shadow::ShadowFiles;
 
 /// Files of this many bytes or more get no content hash: 64 MiB (`specs/09-reference/defaults-and-limits.md`,
 /// "under 64 MB").
@@ -41,8 +42,34 @@ pub struct PostImageIdentity {
 /// [`CheckpointError::Platform`] if the path cannot be read (for example `ENOENT` if it was removed);
 /// [`CheckpointError::IdentityUnstable`] if it changed during every attempt.
 pub fn post_image_identity(volumes: &dyn Volumes, path: &Path) -> Result<PostImageIdentity, CheckpointError> {
+    read(
+        path,
+        |path| volumes.identity(path),
+        |path, limit| volumes.hash(path, limit),
+    )
+}
+
+/// [`post_image_identity`] through the watcher's file operations (KNSH-082): what capture records for a changed path
+/// right after the shadow follows it.
+///
+/// # Errors
+///
+/// As [`post_image_identity`].
+pub(crate) fn post_image_identity_of(
+    files: &dyn ShadowFiles,
+    path: &Path,
+) -> Result<PostImageIdentity, CheckpointError> {
+    read(path, |path| files.identity(path), |path, limit| files.hash(path, limit))
+}
+
+/// Reads an identity, and a hash between two identity reads that must agree (module documentation).
+fn read(
+    path: &Path,
+    identity: impl Fn(&Path) -> Result<FileIdentity, PlatformError>,
+    hash: impl Fn(&Path, u64) -> Result<Option<ContentHash>, PlatformError>,
+) -> Result<PostImageIdentity, CheckpointError> {
     for _ in 0..ATTEMPTS {
-        let before = volumes.identity(path)?;
+        let before = identity(path)?;
         if before.kind != FileKind::File || before.size >= HASH_LIMIT {
             return Ok(PostImageIdentity {
                 identity: before,
@@ -50,10 +77,13 @@ pub fn post_image_identity(volumes: &dyn Volumes, path: &Path) -> Result<PostIma
             });
         }
         // `HASH_LIMIT - 1`: a file that grew to exactly 64 MiB while being read is not hashed either.
-        let hash = volumes.hash(path, HASH_LIMIT - 1)?;
-        let after = volumes.identity(path)?;
+        let digest = hash(path, HASH_LIMIT - 1)?;
+        let after = identity(path)?;
         if after == before {
-            return Ok(PostImageIdentity { identity: after, hash });
+            return Ok(PostImageIdentity {
+                identity: after,
+                hash: digest,
+            });
         }
         // Changed while it was read: the hash may describe neither version. Read again.
     }
@@ -65,7 +95,7 @@ mod tests {
     use std::sync::Mutex;
 
     use knsh_platform::testing::FakeVolumes;
-    use knsh_platform::{FileSystemKind, ModifiedTime, PlatformError, Volume, VolumeId};
+    use knsh_platform::{FileSystemKind, ModifiedTime, Volume, VolumeId};
 
     use super::*;
 

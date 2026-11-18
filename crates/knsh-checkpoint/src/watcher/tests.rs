@@ -51,9 +51,9 @@ struct Reports {
 }
 
 impl WatchReport for Reports {
-    fn changed(&self, root: &CanonicalPath, path: &CanonicalPath) {
+    fn changed(&self, root: &CanonicalPath, change: Change) {
         assert_eq!(root.as_path(), Path::new(ROOT));
-        lock(&self.changed).push(path.as_path().to_path_buf());
+        lock(&self.changed).push(change.path.as_path().to_path_buf());
     }
 
     fn uncertain(&self, root: &CanonicalPath, reason: UncertainReason) {
@@ -95,11 +95,14 @@ fn tree() -> Arc<FakeTree> {
 
 fn plan() -> WatchPlan {
     let (markers, marker_parents) = marker_dir(Path::new(STORE), "S1", 0);
+    let (held, held_parents) = held_dir(Path::new(STORE), "S1", 0);
     WatchPlan {
         root: canonical(ROOT),
         shadow: shadow(),
         markers,
         marker_parents,
+        held,
+        held_parents,
         exclude: exclude(),
         skip: vec![PathBuf::from(STORE)],
         latency: STREAM_LATENCY,
@@ -666,12 +669,15 @@ fn events_for_a_store_inside_the_root_are_dropped_at_once() {
     tree.add_dir(&store);
     tree.add_file(live("README"), b"hello");
     let (markers, marker_parents) = marker_dir(&store, "S1", 0);
+    let (held, held_parents) = held_dir(&store, "S1", 0);
     let shadow = shadow_dir(&store, "S1", 0).0;
     let plan = WatchPlan {
         root: canonical(ROOT),
         shadow: shadow.clone(),
         markers,
         marker_parents,
+        held,
+        held_parents,
         exclude: exclude(),
         skip: vec![store.clone()],
         latency: STREAM_LATENCY,
@@ -700,4 +706,20 @@ fn events_for_a_store_inside_the_root_are_dropped_at_once() {
     events.emit(&[FileEvent::new(live("README"), F::ITEM_MODIFIED)]);
     assert_eq!(lock(&watcher.inner.state).pending.len(), 1);
     watcher.stop();
+}
+
+// KNSH-082: once more orphans exist than are remembered, any path missing from the shadow may be one, so its pre-image
+// is reported lost, never "did not exist" (a wrong marker would let undo delete what the path held).
+#[test]
+fn orphans_beyond_the_limit_make_every_missing_path_lost() {
+    let mut orphans = Orphans::default();
+    for n in 0..MAX_ORPHANS {
+        orphans.remember(Path::new(&format!("f{n}")));
+    }
+    assert!(orphans.may_hold(Path::new("f0")));
+    assert!(!orphans.may_hold(Path::new("never")));
+    orphans.remember(Path::new("one-more"));
+    assert_eq!(orphans.paths.len(), MAX_ORPHANS);
+    assert!(orphans.may_hold(Path::new("one-more")));
+    assert!(orphans.may_hold(Path::new("never")));
 }

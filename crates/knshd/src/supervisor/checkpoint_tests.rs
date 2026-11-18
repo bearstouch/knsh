@@ -485,3 +485,88 @@ fn denied_line_has_no_attribution() {
     assert!(!records.is_empty());
     assert!(records.iter().all(|record| record.details.attribution.is_none()));
 }
+
+// KNSH-082 (FR-CKP-08, FR-CKP-09, FR-CKP-11): a line's change is captured as a checkpoint: `checkpoint.created` names
+// it and the line, the record carries `checkpoint_id` and `files_changed` with the post-image identity, and the
+// `exec.run` result counts the change.
+#[test]
+fn line_record_carries_checkpoint_and_files_changed() {
+    let tree = Arc::new(FakeTree::new());
+    let writer_tree = Arc::clone(&tree);
+    let rig = Rig::with_spawner(&tree, true, false, move |journal, file_events| {
+        Arc::new(WritingSpawner {
+            inner: FakeSpawner::new(journal),
+            tree: writer_tree,
+            file_events,
+        })
+    });
+    assert_eq!(
+        crate::shadows::tests::settled_in(&rig.fixture.sessions, rig.session_id, &Rig::root()),
+        knsh_checkpoint::RootReadiness::Ready
+    );
+    let subscriber = crate::events::Subscriber::new();
+    subscriber
+        .subscribe(&rig.fixture.hub, knsh_core::EventScope::Session(rig.session_id), None)
+        .unwrap();
+    let finished = rig.lifecycle.run(rig.line("echo hi", true), &StillWaiting).unwrap();
+    let record_id = finished.record_id.unwrap();
+    let checkpoint_id = finished.checkpoint_id.expect("the line's checkpoint");
+    assert_eq!(finished.files_changed, Some(1));
+
+    let records = rig.records();
+    let record = records.iter().find(|record| record.record_id == record_id).unwrap();
+    assert_eq!(record.details.checkpoint_id, Some(checkpoint_id));
+    let files = record.details.files_changed.as_ref().expect("files_changed");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path.as_path(), std::path::Path::new(ROOT).join("built.txt"));
+    assert_eq!(files[0].change, knsh_core::FileChange::Created);
+    let identity = files[0].post_image.expect("a post-image identity");
+    assert_eq!(identity.size, 6);
+    assert_eq!(identity.sha256, Some(*FakeTree::digest_of(b"output").as_bytes()));
+
+    let created: Vec<EventData> = subscriber
+        .take(100)
+        .into_iter()
+        .filter_map(|(_, delivery)| match delivery {
+            knsh_core::Delivery::Event(event) if event.name() == "checkpoint.created" => Some(event.data.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(created.len(), 1, "{created:?}");
+    let EventData::CheckpointCreated {
+        checkpoint_id: created_id,
+        attribution,
+        record_ids,
+        roots,
+        files_changed,
+        uncertain,
+    } = &created[0]
+    else {
+        panic!("not a checkpoint.created payload");
+    };
+    assert_eq!(*created_id, checkpoint_id);
+    assert_eq!(*attribution, knsh_core::Attribution::Command);
+    assert_eq!(record_ids, &[record_id]);
+    assert_eq!(roots, &[Rig::root()]);
+    assert_eq!((*files_changed, *uncertain), (1, false));
+}
+
+// KNSH-082: a protected line that changed nothing has `files_changed` 0 and no checkpoint; one outside every root
+// has neither, since nothing was counted.
+#[test]
+fn files_changed_is_zero_in_a_root_and_null_outside() {
+    let tree = Arc::new(FakeTree::new());
+    let rig = Rig::new(&tree, true, false);
+    assert_eq!(settled_root(&rig), knsh_checkpoint::RootReadiness::Ready);
+    let quiet = rig.lifecycle.run(rig.line("echo hi", true), &StillWaiting).unwrap();
+    assert_eq!((quiet.files_changed, quiet.checkpoint_id), (Some(0), None));
+    let mut outside = rig.line("ls", true);
+    outside.proposal.cwd = CanonicalPath::new("/tmp").unwrap();
+    let outside = rig.lifecycle.run(outside, &StillWaiting).unwrap();
+    assert_eq!((outside.files_changed, outside.checkpoint_id), (None, None));
+    let records = rig.records();
+    let record = |id| records.iter().find(|record| Some(record.record_id) == id).unwrap();
+    assert_eq!(record(quiet.record_id).details.files_changed, Some(Vec::new()));
+    assert_eq!(record(outside.record_id).details.files_changed, None);
+    assert_eq!(record(quiet.record_id).details.checkpoint_id, None);
+}

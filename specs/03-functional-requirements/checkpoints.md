@@ -55,9 +55,9 @@ worker thread brings the shadow in step: each path's live entry and shadow copy 
 modification time (flags are only hints, decision 16), a changed file or symlink is cloned again, a removed entry is
 removed from the shadow (a folder with everything below it), a folder created or moved in is reconciled with
 everything below it, and excluded folders, the store, the engine folders and special files are never shadowed. Each
-path that really changed is published as `file.changed` on the session, whoever changed it. While the root itself is
-gone or not a folder, the shadow keeps its last known state. Capture (KNSH-082) will take each changed path's shadow
-copy as its pre-image before this replaces it.
+path that really changed is published as `file.changed` on the session, whoever changed it (a removed folder
+publishes itself and each entry that was below it). While the root itself is gone or not a folder, the shadow keeps
+its last known state. Before a shadow copy is replaced or removed, capture takes it as the change's pre-image (below).
 
 **Lost events (FR-CKP-04).** `MustScanSubDirs`, `UserDropped` or `KernelDropped` rescans the folder named (the root,
 as observed); on the marker folder, `EventIdsWrapped` and `RootChanged` (after checking the root is still a folder)
@@ -96,13 +96,48 @@ the flush deadline each, their uncertainty staying their own), so none reports a
 
 A line's record gets its `attribution` (`command` or `concurrent`) only after the line-end procedure has applied every
 event of the line, so it is final and always equals the attribution of the closed edge that holds the line. A denied
-line has none. An edge lists at most 65,536 paths and is then marked overflowed. Closed edges are what capture
-(KNSH-082) and the history tree (KNSH-083) store; until those exist they are dropped, and only records carry the
-attribution.
+line has none. An edge lists at most 65,536 paths and is then marked overflowed. Each edge's changes are captured as
+its checkpoint (below); storing edges in the history tree is KNSH-083, and until then closed edges themselves are
+dropped.
 **Known limit:** opening a line never waits for the watcher (decision 16), so a change made just before the line whose
 event had not been applied yet is attributed to the line.
 
 File events carry no process ID, so a human edit made at the same moment can be attributed to the agent; the post-image check below keeps that from causing damage.
+
+**Capture (KNSH-082, FR-CKP-08 to FR-CKP-11).** One checkpoint per edge that changed something, identified by
+`checkpoint_id`:
+
+- **Pre-images.** Before the watcher replaces or removes a file's or symlink's shadow copy, it **moves** it (a rename on
+  the store's volume, never a copy) into the root's holding folder `held/<session>/<root index>/` in the store, then
+  into the checkpoint's own folder `checkpoints/<checkpoint id>/`. A path the shadow did not hold gets the "did not
+  exist" marker, a folder a folder marker; a removed folder lists itself and every entry below it, each with its own
+  pre-image. The first pre-image of a path in an edge is kept (what it held before the edge); later changes of it in
+  the same edge only update its post-image, and their intermediate copies are removed. A path created and removed
+  within one edge is not listed.
+- **Post-image identity.** Right after the shadow follows a changed path, the live path's inode, size and modification
+  time are read, and a SHA-256 of its contents for regular files under 64 MiB (read between two identity reads that
+  must agree); a deleted path has a "deleted" post-image.
+- **Cost.** Only changed paths are touched (a few renames and one hash each); nothing walks the root and nothing is
+  predicted before a line runs.
+- **Uncertain, never wrong.** A copy that cannot be moved aside is removed as before (the shadow stays consistent) and
+  its pre-image is *lost*; a new version that cannot be cloned puts the held copy back so the shadow keeps its last
+  known state; a post-image that cannot be read is *unknown*. Each marks the checkpoint uncertain (`capture_failed`),
+  as do the line's uncertain roots (FR-CKP-04) and an uncertain window outside lines, for the run of edits it opens.
+  A checkpoint lists at most 65,536 paths, then is uncertain (`too_many_events`).
+- **`checkpoint.created`** is published when the edge closes and every change of it has been added, on each session
+  of the edge and each session whose watcher reported one of its changes. A line's record carries the checkpoint's
+  `checkpoint_id` and `files_changed` (at most 256 paths with their post-image identities; the checkpoint holds them
+  all); `exec.run` returns the full count. A line that touched a protected root but changed nothing has
+  `files_changed` 0 (`[]` in the record) and no checkpoint, unless one of its roots was uncertain (it then gets an
+  empty, uncertain checkpoint, so its record says changes may be missing); one that touched none has `null`. A line of a concurrent
+  set that ends before the set closes gets the set's changes so far.
+- **Pending:** only a summary of the last 64 checkpoints is kept in memory, and their pre-images on disk; an index written to disk
+  with the history tree is KNSH-083, removal by retention KNSH-087, and plain-copy roots (which have no shadow yet)
+  are not captured.
+- **Known limit (sessions sharing a root):** each session's watcher reports every change in the root. If one of them
+  applies a change after the next line has started (the KNSH-081 limit), that change can be captured in the line's
+  checkpoint with that watcher's older shadow copy as its pre-image, so undoing the line could also undo the agent edit
+  before it. One capturing watcher per root, or flushing peer watchers when a line starts, closes this (KNSH-084).
 
 ## Restore rules
 

@@ -39,9 +39,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use crate::error::CoreError;
-use crate::id::{EventId, RecordId, RequestId, SessionId};
+use crate::id::{CheckpointId, EventId, RecordId, RequestId, SessionId};
 use crate::path::CanonicalPath;
 use crate::policy::DecisionSource;
+use crate::record::Attribution;
 use crate::redacted::Redacted;
 use crate::session::{Actor, ProfileName, Session, SessionState, StateChanged};
 use crate::time::Timestamp;
@@ -238,6 +239,24 @@ pub enum EventData {
         /// Why.
         reason: UncertainReason,
     },
+    /// `checkpoint.created`: the pre-images and post-image identities of one change were stored as a checkpoint
+    /// (FR-CKP-11, KNSH-082). Published once the change's edge has closed, on each session it belongs to.
+    CheckpointCreated {
+        /// The checkpoint.
+        checkpoint_id: CheckpointId,
+        /// How its change was attributed.
+        attribution: Attribution,
+        /// The lines whose change it holds: one for `command`, the set for `concurrent`, none for agent or external
+        /// edits.
+        record_ids: Vec<RecordId>,
+        /// The checkpoint roots it covers.
+        roots: Vec<CanonicalPath>,
+        /// How many paths it holds.
+        files_changed: u64,
+        /// Whether it is uncertain: events may have been lost, or a pre-image or post-image could not be captured,
+        /// so it may be incomplete (never wrong).
+        uncertain: bool,
+    },
 }
 
 /// Why the changes of a window in a checkpoint root are uncertain (`checkpoint.uncertain`, FR-CKP-04, KNSH-080).
@@ -260,11 +279,14 @@ pub enum UncertainReason {
     NotWatched,
     /// The shadow could not be brought in step with a change (a file operation failed).
     ShadowUpdateFailed,
+    /// A changed path's pre-image could not be moved into its checkpoint, or its post-image identity could not be
+    /// read (KNSH-082): the checkpoint lacks that path's data rather than holding a wrong one.
+    CaptureFailed,
 }
 
 impl UncertainReason {
     /// The wire value: `events_dropped`, `event_ids_wrapped`, `root_changed`, `too_many_events`, `flush_timed_out`,
-    /// `restart_gap`, `not_watched` or `shadow_update_failed`.
+    /// `restart_gap`, `not_watched`, `shadow_update_failed` or `capture_failed`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -276,6 +298,7 @@ impl UncertainReason {
             Self::RestartGap => "restart_gap",
             Self::NotWatched => "not_watched",
             Self::ShadowUpdateFailed => "shadow_update_failed",
+            Self::CaptureFailed => "capture_failed",
         }
     }
 }
@@ -376,7 +399,8 @@ impl EventData {
             | Self::CommandLongRunning { .. }
             | Self::FileChanged { .. }
             | Self::AgentEdit { .. }
-            | Self::CheckpointUncertain { .. } => None,
+            | Self::CheckpointUncertain { .. }
+            | Self::CheckpointCreated { .. } => None,
         }
     }
 
@@ -403,6 +427,7 @@ impl EventData {
             Self::FileChanged { .. } => "file.changed",
             Self::AgentEdit { .. } => "agent.edit",
             Self::CheckpointUncertain { .. } => "checkpoint.uncertain",
+            Self::CheckpointCreated { .. } => "checkpoint.created",
         }
     }
 

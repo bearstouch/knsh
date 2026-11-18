@@ -43,7 +43,9 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use knsh_core::{CanonicalPath, CapturedStream, Decision, OutputMode, RecordId, Redacted, SessionId, shape};
+use knsh_core::{
+    CanonicalPath, CapturedStream, CheckpointId, Decision, OutputMode, RecordId, Redacted, SessionId, shape,
+};
 use knsh_proto::{
     DEFAULT_POLICY_CHECK_PATH, ErrorCode, ExecHandleParams, ExecKillResult, ExecOutcome, ExecRunParams, ExecRunResult,
     ExecStartResult, ExecStdio, Interpreter, LineStatus, MAX_EXEC_RESULT_LEN, OutputOptions, RpcError,
@@ -125,6 +127,10 @@ pub(crate) struct Finished {
     pub(crate) decision: Decision,
     /// From the spawn to the end.
     pub(crate) duration_ms: u64,
+    /// How many paths it changed under its checkpoint roots; `None` when it touched no protected root (KNSH-082).
+    pub(crate) files_changed: Option<u64>,
+    /// The checkpoint holding its pre-images; `None` when it changed nothing protected (KNSH-082).
+    pub(crate) checkpoint_id: Option<CheckpointId>,
     /// Its profile's default output mode (FR-OUT-02).
     pub(crate) default_mode: OutputMode,
     /// Its captured output; `None` when it ran on passed descriptors without capture.
@@ -322,6 +328,8 @@ fn captured_answer(finished: Finished, options: OutputOptions) -> Reply {
         status: finished.status,
         duration_ms: finished.duration_ms,
         decision: finished.decision,
+        files_changed: finished.files_changed,
+        checkpoint_id: finished.checkpoint_id,
         mode: request.mode,
         stdout: totals(&output.stdout),
         stderr: totals(&output.stderr),
@@ -537,6 +545,8 @@ mod tests {
                 hooks: Vec::new(),
             },
             duration_ms: 42,
+            files_changed: None,
+            checkpoint_id: None,
             default_mode: mode,
             output: Some(LineOutput {
                 stdout: captured(stdout),

@@ -13,10 +13,11 @@ use std::path::{Path, PathBuf};
 
 use knsh_core::{
     Actor, ActorKind, AgentId, ArgvEntry, Attribution, CanonicalPath, CappedOutput, CheckpointId, ExecutionRecord,
-    MAX_NETWORK_ENTRIES, NetworkEntry, OutputInfo, OutputStream, RecordDecision, RecordDetails, RecordId, Redacted,
-    SandboxViolation, Session, SessionId, Timestamp, UnprotectedRoot, decode_argv, decode_decision, decode_network,
-    decode_unprotected, decode_violations, encode_argv, encode_decision, encode_network, encode_unprotected,
-    encode_violations, merge_into, merge_network,
+    MAX_NETWORK_ENTRIES, MAX_RECORD_FILES_CHANGED, NetworkEntry, OutputInfo, OutputStream, RecordDecision,
+    RecordDetails, RecordId, Redacted, SandboxViolation, Session, SessionId, Timestamp, UnprotectedRoot, decode_argv,
+    decode_decision, decode_files_changed, decode_network, decode_unprotected, decode_violations, encode_argv,
+    encode_decision, encode_files_changed, encode_network, encode_unprotected, encode_violations, merge_into,
+    merge_network,
 };
 use knsh_platform::sqlite::{Connection, DATABASE_MODE, DEFAULT_BUSY_TIMEOUT, Statement, Step, Value};
 use knsh_platform::{FileKind, Fs};
@@ -58,7 +59,7 @@ impl RecordedOutput {
 /// The columns [`read_record`] expects, in order.
 const RECORD_COLUMNS: &str = "record_id, session_id, actor_kind, agent_id, command, rewritten_from, cwd, started_at, \
      ended_at, exit_code, pipestatus, signal, sandbox_profile, secrets_injected, checkpoint_id, sandbox_violations, \
-     decision, argv, network, unprotected, attribution";
+     decision, argv, network, unprotected, attribution, files_changed";
 
 /// The most distinct sandbox violations one record keeps (FR-SBX-08). Repeats of a kept one only add to its count;
 /// further distinct ones are dropped, so one noisy command cannot grow its record without bound.
@@ -146,7 +147,7 @@ impl Database {
         transaction.execute(
             &format!(
                 "INSERT INTO records ({RECORD_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"
             ),
             &encoded.values(&record),
         )?;
@@ -487,6 +488,7 @@ struct Encoded {
     argv: Option<String>,
     network: Option<String>,
     unprotected: Option<String>,
+    files_changed: Option<String>,
     started_at: i64,
     ended_at: Option<i64>,
 }
@@ -545,6 +547,15 @@ impl Encoded {
             .then(|| encode_unprotected(&details.unprotected))
             .transpose()
             .map_err(|_| StoreError::InvalidRecord("unprotected"))?;
+        // The `files_changed` array as JSON text (KNSH-082; the column has been in the schema since version 1, always
+        // NULL before). `None` stays NULL and an empty list is `[]`: "nothing protected" and "nothing changed" differ.
+        // Capped like the network list, so a caller over the limit cannot grow a record without bound.
+        let files_changed = details
+            .files_changed
+            .as_ref()
+            .map(|files| encode_files_changed(&files[..files.len().min(MAX_RECORD_FILES_CHANGED)]))
+            .transpose()
+            .map_err(|_| StoreError::InvalidRecord("files_changed"))?;
         Ok(Self {
             record_id: record.record_id.to_string(),
             session_id: record.session_id.to_string(),
@@ -556,13 +567,14 @@ impl Encoded {
             argv,
             network,
             unprotected,
+            files_changed,
             started_at: micros(record.started_at)?,
             ended_at: record.ended_at.map(micros).transpose()?,
         })
     }
 
     /// The bound values, in [`RECORD_COLUMNS`] order.
-    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 21] {
+    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 22] {
         let details = &record.details;
         [
             Value::Text(&self.record_id),
@@ -589,6 +601,7 @@ impl Encoded {
             optional_text(self.unprotected.as_deref()),
             // KNSH-081: the column has been in the schema since version 1, always NULL before.
             optional_text(details.attribution.map(Attribution::as_str)),
+            optional_text(self.files_changed.as_deref()),
         ]
     }
 }
@@ -649,6 +662,11 @@ fn read_record(statement: &Statement<'_>) -> Result<ExecutionRecord, StoreError>
             network: stored_network(statement.column_text(18)?.as_deref())?,
             unprotected: stored_unprotected(statement.column_text(19)?.as_deref())?,
             attribution: stored_attribution(statement.column_text(20)?.as_deref())?,
+            files_changed: statement
+                .column_text(21)?
+                .map(|text| decode_files_changed(&text))
+                .transpose()
+                .map_err(corrupt)?,
         },
     })
 }

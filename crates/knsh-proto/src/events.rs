@@ -473,6 +473,25 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
             .with("root", path(root))?
             .with("record_id", record_id.map(|id| id.to_string()).to_json()?)?
             .with("reason", reason.as_str()),
+        // KNSH-082 (FR-CKP-11): roots are shown like `cwd`; `files_changed` is a count, like `exec.run`'s.
+        EventData::CheckpointCreated {
+            checkpoint_id,
+            attribution,
+            record_ids,
+            roots,
+            files_changed,
+            uncertain,
+        } => {
+            let records = record_ids.iter().map(|id| Value::String(id.to_string())).collect();
+            let roots = roots.iter().map(|root| Value::String(path(root))).collect();
+            Object::new()
+                .with("checkpoint_id", checkpoint_id.to_string())?
+                .with("attribution", attribution.as_str())?
+                .with("record_ids", Value::Array(records))?
+                .with("roots", Value::Array(roots))?
+                .with("files_changed", files_changed.to_json()?)?
+                .with("uncertain", *uncertain)
+        }
     }
 }
 
@@ -898,6 +917,37 @@ mod tests {
                 r#""data":{"root":"/Users/me/app","paths":["/Users/me/app/README","/Users/me/app/src/main.rs"],"omitted":3}"#
             ),
             "{edit}"
+        );
+    }
+
+    // KNSH-082 (FR-CKP-11): `checkpoint.created` names the checkpoint, its attribution, lines, roots and size.
+    #[test]
+    fn checkpoint_created_payload() {
+        let record = RecordId::from_ulid(Ulid::from_u128(5));
+        let checkpoint = knsh_core::CheckpointId::from_ulid(Ulid::from_u128(6));
+        let created = written(
+            event_notification(
+                SubscriptionId::new(1),
+                &event(
+                    EventData::CheckpointCreated {
+                        checkpoint_id: checkpoint,
+                        attribution: knsh_core::Attribution::Command,
+                        record_ids: vec![record],
+                        roots: vec![CanonicalPath::new("/Users/me/app").unwrap()],
+                        files_changed: 2,
+                        uncertain: false,
+                    },
+                    Actor::Agent(AgentId::new("claude-code").unwrap()),
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(created.contains(r#""event":"checkpoint.created""#), "{created}");
+        assert!(
+            created.contains(&format!(
+                r#""data":{{"checkpoint_id":"{checkpoint}","attribution":"command","record_ids":["{record}"],"roots":["/Users/me/app"],"files_changed":2,"uncertain":false}}"#
+            )),
+            "{created}"
         );
     }
 
