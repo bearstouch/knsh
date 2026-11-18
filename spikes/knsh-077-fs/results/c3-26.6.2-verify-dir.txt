@@ -1,0 +1,16 @@
+# date: 2026-11-18T08:57:11Z
+# macOS: 26.6.2 (25G83), arm64
+# cpu: Apple M1 Pro, 8 CPUs, 16 GiB
+# volume:  File System Personality=APFS; Protocol=Apple Fabric; Solid State=Yes; 
+# clonetree verify <tree> <shadow> after: dir
+checked	100000
+same_inode	0
+size_differs	0
+mtime_differs	0
+birthtime_differs	0
+mode_differs	0
+flags_differ	0
+owner_differs	0
+xattr_list_differs	0
+content_checked	2000
+content_differs	0

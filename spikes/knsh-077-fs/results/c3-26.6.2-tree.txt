@@ -1,0 +1,15 @@
+# date: 2026-11-18T08:54:16Z
+# macOS: 26.6.2 (25G83), arm64
+# cpu: Apple M1 Pro, 8 CPUs, 16 GiB
+# volume:  File System Personality=APFS; Protocol=Apple Fabric; Solid State=Yes; 
+# generator: gentree <dest> 100000 77
+files	100000
+directories	3906 (fan-out 5, depth 0..5)
+bytes	2967571839 (2.76 GiB)
+mean_file_bytes	29676
+bucket	0B	2051 files	0 bytes
+bucket	1B-1KiB	30031 files	4397466 bytes
+bucket	1-8KiB	42616 files	146145658 bytes
+bucket	8-64KiB	20090 files	554527941 bytes
+bucket	64KiB-1MiB	5022 files	1811349805 bytes
+bucket	1-4MiB	190 files	451150969 bytes
