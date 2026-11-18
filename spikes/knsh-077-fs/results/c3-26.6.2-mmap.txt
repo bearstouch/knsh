@@ -1,0 +1,43 @@
+# date: 2026-11-18T09:03:51Z
+# macOS: 26.6.2 (25G83), arm64
+# cpu: Apple M1 Pro, 8 CPUs, 16 GiB
+# volume:  File System Personality=APFS; Protocol=Apple Fabric; Solid State=Yes; 
+dirty.before	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992632.070194515
+dirty.after_store_B_no_msync	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992632.070194515
+dirty.after_store_B_no_msync.read	content	A=8388608	B=8388608
+dirty.clone_unflushed	clone_ms	2.447
+dirty.clone_unflushed.source	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992632.070194515
+dirty.clone_unflushed	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992633.136818180
+dirty.clone_unflushed	content	A=8388608	B=8388608
+observe.open_rw_and_mapped	listpidspath	pids=1	ms=619.53	62903
+observe.open_rw_and_mapped	fd	pid=62903	fd=4	openflags=0x3	write=yes
+observe.open_rw_and_mapped	map	pid=62903	addr=0x1097c4000	size=16777216	prot=3	share_mode=PRIVATE
+dirty.after_msync	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992632.070194515
+dirty.clone_after_msync	clone_ms	0.194
+dirty.clone_after_msync.source	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992632.070194515
+dirty.clone_after_msync	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992633.806674730
+dirty.clone_after_msync	content	A=8388608	B=8388608
+observe.closed_fd_still_mapped	listpidspath	pids=1	ms=284.14	62903
+observe.closed_fd_still_mapped	map	pid=62903	addr=0x1097c4000	size=16777216	prot=3	share_mode=PRIVATE
+observe.after_exit	listpidspath	pids=0	ms=305.68
+dirty.after_store_C_unmap_exit	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992634.141728631
+dirty.clone_after_exit	clone_ms	0.317
+dirty.clone_after_exit.source	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992634.141728631
+dirty.clone_after_exit	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992634.451655286
+dirty.clone_after_exit	content	B=8388608	C=8388608
+dirty.settle_5s	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992634.141728631
+dirty.settle_10s	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992634.141728631
+dirty.settle_15s	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992634.141728631
+dirty.settle_20s	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992634.141728631
+dirty.settle_25s	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992634.141728631
+dirty.settle_30s	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992634.141728631
+dirty.settle_35s	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992634.141728631
+dirty.settle_40s	stat	size=16777216	mtime=1794992632.070194515	ctime=1794992634.141728631
+extend.before	stat	size=16777216	mtime=1794992674.569685598	ctime=1794992674.569685598
+extend.after_ftruncate_and_store	stat	size=33554432	mtime=1794992675.584591598	ctime=1794992675.584591598
+extend.clone_unflushed	clone_ms	13.008
+extend.clone_unflushed.source	stat	size=33554432	mtime=1794992675.612084605	ctime=1794992675.612084605
+extend.clone_unflushed	stat	size=33554432	mtime=1794992675.612084605	ctime=1794992675.612174856
+extend.clone_unflushed	content	A=16777216	D=16777216
+torn.mmap	torn	clones=200	torn_clones=195	max_generation_runs=182
+torn.pwrite	torn	clones=200	torn_clones=200	max_generation_runs=2

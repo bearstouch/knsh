@@ -1,0 +1,676 @@
+# date: 2026-11-18T10:14:18Z
+# macOS: 26.6.2 (25G83), arm64
+# cpu: Apple M1 Pro, 8 CPUs, 16 GiB
+# volume:  File System Personality=APFS; Protocol=Apple Fabric; Solid State=Yes; 
+== writers=1 latency=0.5 procedure=flush 
+config	writers=1	rounds=100	ops_per_writer=50	latency_s=0.500	procedure=flush	nodefer=0	marker=in_root
+expected	13350	on_time	8	late	13342	missing	0	miss_rate_at_line_end	0.99940
+last_ops	101	on_time	0	late	101	missing	0
+events_total	12027	drop_or_rescan_flags	0
+rounds_with_drop_flags	0/100
+clean_rounds_ops	13350	on_time	8	late	13342	missing	0
+latency_ms_op_to_event	n=13350	min=0.32	p50=4.98	p95=15.50	p99=19.64	max=255.44
+latency_ms_last_op_to_event	n=101	min=4.68	p50=12.79	p95=24.73	p99=30.33	max=255.06
+gap_ms_last_op_to_line_end	n=101	min=0.38	p50=0.50	p95=0.63	p99=1.82	max=2.24
+procedure_ms_line_end_to_ready	n=100	min=0.05	p50=0.08	p95=0.11	p99=0.35	max=1.62
+late_by_ms_after_ready	n=13342	min=0.12	p50=0.74	p95=12.55	p99=15.05	max=254.52
+flags	Created|Modified|XattrMod|IsFile	4042
+flags	Created|Renamed|Modified|XattrMod|IsFile	1300
+flags	Removed|Renamed|IsFile	1287
+flags	Renamed|IsFile	1231
+flags	Created|Removed|Modified|XattrMod|IsFile	3658
+flags	Modified|IsFile	504
+flags	Removed|IsFile	5
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-6	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-7	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-8	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-9	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-10	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-11	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-12	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-13	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-14	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-15	late	last=0
+
+== writers=1 latency=0.5 procedure=mloop outside
+config	writers=1	rounds=100	ops_per_writer=50	latency_s=0.500	procedure=mloop	nodefer=0	marker=outside_root
+expected	13350	on_time	13350	late	0	missing	0	miss_rate_at_line_end	0.00000
+last_ops	101	on_time	101	late	0	missing	0
+events_total	12311	drop_or_rescan_flags	0
+rounds_with_drop_flags	0/100
+clean_rounds_ops	13350	on_time	13350	late	0	missing	0
+marker_seen_at_line_end	100/100
+latency_ms_op_to_event	n=13350	min=1.29	p50=5.36	p95=11.06	p99=17.23	max=32.05
+latency_ms_last_op_to_event	n=101	min=1.46	p50=5.87	p95=11.33	p99=18.41	max=18.81
+gap_ms_last_op_to_line_end	n=101	min=0.39	p50=0.50	p95=0.59	p99=3.04	max=4.74
+procedure_ms_line_end_to_ready	n=100	min=2.69	p50=6.57	p95=12.95	p99=18.12	max=18.49
+late_by_ms_after_ready	n=0
+flags	Created|Modified|XattrMod|IsFile	4082
+flags	Created|Renamed|Modified|XattrMod|IsFile	1302
+flags	Renamed|IsFile	1300
+flags	Created|XattrMod|IsFile	100
+flags	Removed|Renamed|IsFile	1287
+flags	Created|Removed|Modified|XattrMod|IsFile	3663
+flags	XattrMod|IsFile	1
+flags	Modified|IsFile	576
+
+== writers=4 latency=0.5 procedure=flush 
+config	writers=4	rounds=100	ops_per_writer=50	latency_s=0.500	procedure=flush	nodefer=0	marker=in_root
+expected	53400	on_time	30307	late	20436	missing	2657	miss_rate_at_line_end	0.43245
+last_ops	404	on_time	10	late	357	missing	37
+events_total	46656	drop_or_rescan_flags	18
+rounds_with_drop_flags	16/100
+clean_rounds_ops	44824	on_time	26877	late	16068	missing	1879
+latency_ms_op_to_event	n=50743	min=0.28	p50=9.99	p95=46.23	p99=98.40	max=128.45
+latency_ms_last_op_to_event	n=367	min=1.02	p50=19.04	p95=48.05	p99=71.53	max=112.21
+gap_ms_last_op_to_line_end	n=404	min=0.40	p50=1.26	p95=5.09	p99=10.37	max=25.17
+procedure_ms_line_end_to_ready	n=100	min=0.04	p50=0.08	p95=0.81	p99=20.18	max=28.51
+late_by_ms_after_ready	n=20436	min=0.01	p50=10.49	p95=58.13	p99=89.61	max=110.37
+flags	Created|Modified|XattrMod|IsFile	16099
+flags	Created|Renamed|Modified|XattrMod|IsFile	5074
+flags	Renamed|IsFile	4608
+flags	Modified|IsFile	2979
+flags	Removed|Renamed|IsFile	4631
+flags	Created|Removed|Modified|XattrMod|IsFile	12203
+flags	Removed|IsFile	1044
+flags	MustScanSubDirs|UserDropped	18
+special	index=17925/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518134145
+special	index=19228/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518139943
+special	index=19494/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518142485
+special	index=21468/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518153271
+special	index=22676/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518161173
+special	index=26966/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518185768
+special	index=28357/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518194114
+special	index=29512/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518201693
+special	index=30855/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518215051
+special	index=31220/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518217309
+special	index=32679/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518226535
+special	index=34457/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518237387
+special	index=35787/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518247768
+special	index=36172/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518250042
+special	index=39477/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518267061
+special	index=42429/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518286058
+special	index=42683/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518288534
+special	index=46553/46656	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518307684
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-0	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-1	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-2	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-3	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-4	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-5	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-6	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-7	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-8	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-9	late	last=0
+
+== writers=4 latency=0.5 procedure=mloop outside
+config	writers=4	rounds=100	ops_per_writer=50	latency_s=0.500	procedure=mloop	nodefer=0	marker=outside_root
+expected	53400	on_time	53292	late	2	missing	106	miss_rate_at_line_end	0.00202
+last_ops	404	on_time	399	late	0	missing	5
+events_total	50651	drop_or_rescan_flags	8
+rounds_with_drop_flags	4/100
+clean_rounds_ops	51256	on_time	51256	late	0	missing	0
+marker_seen_at_line_end	99/100
+latency_ms_op_to_event	n=53294	min=0.29	p50=8.20	p95=20.84	p99=30.87	max=5054.52
+latency_ms_last_op_to_event	n=399	min=0.98	p50=4.50	p95=12.68	p99=29.41	max=40.59
+gap_ms_last_op_to_line_end	n=404	min=0.40	p50=1.38	p95=5.44	p99=10.13	max=30.56
+procedure_ms_line_end_to_ready	n=100	min=1.91	p50=9.23	p95=13.25	p99=29.35	max=5000.51
+late_by_ms_after_ready	n=2	min=36.22	p50=38.51	p95=38.51	p99=38.51	max=38.51
+flags	Created|Modified|XattrMod|IsFile	17306
+flags	Created|XattrMod|IsFile	101
+flags	Modified|IsFile	3096
+flags	Created|Renamed|Modified|XattrMod|IsFile	5246
+flags	Renamed|IsFile	5200
+flags	MustScanSubDirs|UserDropped	8
+flags	Removed|Renamed|IsFile	4821
+flags	Created|Removed|Modified|XattrMod|IsFile	13067
+flags	Removed|IsFile	1806
+special	index=301/50651	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518343053
+special	index=302/50651	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976518343053
+special	index=30991/50651	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518507999
+special	index=30992/50651	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976518507999
+special	index=34458/50651	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518527081
+special	index=34459/50651	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976518527081
+special	index=42242/50651	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518567767
+special	index=42243/50651	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976518567767
+example	round=1	round_had_drop=1	flag=Created	path=/w0/c-1-17	late	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w0/c-0-39	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w0/c-0-40.mv	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w0/c-0-41	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w0/c-0-42	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w0/c-0-43	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w0/c-0-44.mv	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w0/c-0-45	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w0/c-0-46	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w0/c-0-47	missing	last=0
+
+== writers=16 latency=0.5 procedure=flush 
+config	writers=16	rounds=100	ops_per_writer=50	latency_s=0.500	procedure=flush	nodefer=0	marker=in_root
+expected	213600	on_time	119567	late	32147	missing	61886	miss_rate_at_line_end	0.44023
+last_ops	1616	on_time	366	late	691	missing	559
+events_total	140511	drop_or_rescan_flags	158
+rounds_with_drop_flags	92/100
+clean_rounds_ops	17152	on_time	7974	late	3637	missing	5541
+latency_ms_op_to_event	n=151714	min=-10.09	p50=25.04	p95=108.17	p99=197.98	max=610.08
+latency_ms_last_op_to_event	n=1057	min=1.81	p50=15.16	p95=74.68	p99=112.74	max=501.68
+gap_ms_last_op_to_line_end	n=1616	min=0.42	p50=8.30	p95=40.60	p99=61.03	max=109.06
+procedure_ms_line_end_to_ready	n=100	min=0.04	p50=0.09	p95=5.35	p99=12.55	max=30.20
+late_by_ms_after_ready	n=32147	min=0.00	p50=16.52	p95=145.35	p99=189.08	max=583.68
+flags	Created|Modified|XattrMod|IsFile	59677
+flags	Modified|IsFile	8064
+flags	Created|Renamed|Modified|XattrMod|IsFile	14307
+flags	Renamed|IsFile	12374
+flags	MustScanSubDirs|UserDropped	158
+flags	Removed|Renamed|IsFile	7130
+flags	Created|Removed|Modified|XattrMod|IsFile	14750
+flags	Created|XattrMod|IsFile	61
+flags	Removed|IsFile	23980
+flags	XattrMod|IsFile	9
+flags	Created|Renamed|Modified|IsFile	1
+special	index=768/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518738057
+special	index=2702/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518748532
+special	index=3684/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518756570
+special	index=4134/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518759573
+special	index=7311/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518779662
+special	index=7759/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518781109
+special	index=9081/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518790973
+special	index=10459/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518800074
+special	index=10872/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518802678
+special	index=12063/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518811341
+special	index=12398/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518813200
+special	index=13722/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518822406
+special	index=14119/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518824532
+special	index=15027/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518832550
+special	index=16245/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518838865
+special	index=16662/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518843492
+special	index=16874/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518845622
+special	index=17331/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518846150
+special	index=18223/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518856014
+special	index=19223/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518860323
+special	index=20494/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518877475
+special	index=20943/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518878462
+special	index=21195/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518883839
+special	index=21652/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518884567
+special	index=22238/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518905244
+special	index=22695/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518911325
+special	index=23828/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518922981
+special	index=24428/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518926967
+special	index=24879/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518934655
+special	index=25257/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518941242
+special	index=25989/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518943422
+special	index=26669/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518952147
+special	index=27126/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518954493
+special	index=27604/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518960081
+special	index=30191/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518976276
+special	index=31308/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518984440
+special	index=31758/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518986975
+special	index=32071/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518990763
+special	index=32490/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976518993817
+special	index=34208/140511	flags=MustScanSubDirs|UserDropped	path=	id=18430981976519003022
+example	round=32	round_had_drop=0	flag=Renamed	path=/w0/c-32-16	late	last=0
+example	round=32	round_had_drop=0	flag=Renamed	path=/w0/c-32-16.mv	late	last=0
+example	round=32	round_had_drop=0	flag=Renamed	path=/w0/c-32-20	late	last=0
+example	round=32	round_had_drop=0	flag=Renamed	path=/w0/c-32-20.mv	late	last=0
+example	round=32	round_had_drop=0	flag=Renamed	path=/w0/c-32-24	late	last=0
+example	round=32	round_had_drop=0	flag=Renamed	path=/w0/c-32-24.mv	late	last=0
+example	round=32	round_had_drop=0	flag=Renamed	path=/w0/c-32-28	late	last=0
+example	round=32	round_had_drop=0	flag=Renamed	path=/w0/c-32-28.mv	late	last=0
+example	round=32	round_had_drop=0	flag=Renamed	path=/w0/c-32-32	late	last=0
+example	round=32	round_had_drop=0	flag=Renamed	path=/w0/c-32-32.mv	late	last=0
+
+== writers=16 latency=0.5 procedure=mloop outside
+config	writers=16	rounds=100	ops_per_writer=50	latency_s=0.500	procedure=mloop	nodefer=0	marker=outside_root
+expected	213600	on_time	190671	late	2340	missing	20589	miss_rate_at_line_end	0.10735
+last_ops	1616	on_time	1396	late	0	missing	220
+events_total	189307	drop_or_rescan_flags	236
+rounds_with_drop_flags	68/100
+clean_rounds_ops	67808	on_time	67808	late	0	missing	0
+marker_seen_at_line_end	99/100
+latency_ms_op_to_event	n=193011	min=-5.99	p50=18.05	p95=47.53	p99=168.98	max=290.20
+latency_ms_last_op_to_event	n=1396	min=1.41	p50=10.03	p95=25.83	p99=36.80	max=50.04
+gap_ms_last_op_to_line_end	n=1616	min=0.43	p50=8.77	p95=38.82	p99=57.76	max=120.15
+procedure_ms_line_end_to_ready	n=100	min=1.52	p50=9.33	p95=15.81	p99=19.64	max=5000.14
+late_by_ms_after_ready	n=2340	min=60.11	p50=143.69	p95=200.21	p99=241.21	max=242.97
+flags	Created|Modified|XattrMod|IsFile	76390
+flags	Created|Renamed|Modified|XattrMod|IsFile	17332
+flags	Modified|IsFile	11552
+flags	Renamed|IsFile	18801
+flags	Created|XattrMod|IsFile	228
+flags	Removed|Renamed|IsFile	9769
+flags	Created|Removed|Modified|XattrMod|IsFile	19727
+flags	MustScanSubDirs|UserDropped	236
+flags	XattrMod|IsFile	25
+flags	Removed|IsFile	35247
+special	index=2620/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976519948128
+special	index=2621/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976519948128
+special	index=4638/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976519958518
+special	index=4639/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976519958518
+special	index=6520/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976519969411
+special	index=6521/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976519969411
+special	index=8134/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976519980063
+special	index=8135/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976519980063
+special	index=8495/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976519981699
+special	index=8496/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976519981699
+special	index=9094/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976519987326
+special	index=9095/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976519987326
+special	index=9749/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976519990507
+special	index=9750/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976519990507
+special	index=10127/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976519991450
+special	index=10128/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976519991450
+special	index=10511/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976519992428
+special	index=10512/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976519992428
+special	index=11050/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976519998470
+special	index=11051/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976519998470
+special	index=11500/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976519998765
+special	index=11501/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976519998765
+special	index=17540/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976520033910
+special	index=17541/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976520033910
+special	index=19575/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976520044886
+special	index=19576/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976520044886
+special	index=19936/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976520046176
+special	index=19937/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976520046176
+special	index=26001/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976520078741
+special	index=26002/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976520078741
+special	index=29525/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976520098902
+special	index=29526/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976520098902
+special	index=29972/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976520099106
+special	index=29973/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976520099106
+special	index=33114/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976520116765
+special	index=33115/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976520116765
+special	index=33459/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976520119895
+special	index=33460/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976520119895
+special	index=35113/189307	flags=MustScanSubDirs|UserDropped	path=	id=18430981976520129185
+special	index=35114/189307	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976520129185
+example	round=1	round_had_drop=1	flag=Removed	path=/w2/c-0-31	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w3/c-0-47	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w4/c-0-35	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w5/c-0-14	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w5/c-0-15	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w5/c-0-17	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w7/c-0-7	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w8/c-0-31	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w9/c-0-2	missing	last=0
+example	round=1	round_had_drop=1	flag=Removed	path=/w9/c-0-3	missing	last=0
+
+== writers=4 latency=0.5 procedure=none 
+config	writers=4	rounds=100	ops_per_writer=50	latency_s=0.500	procedure=none	nodefer=0	marker=in_root
+expected	53400	on_time	28898	late	21822	missing	2680	miss_rate_at_line_end	0.45884
+last_ops	404	on_time	18	late	353	missing	33
+events_total	45667	drop_or_rescan_flags	20
+rounds_with_drop_flags	19/100
+clean_rounds_ops	43216	on_time	25179	late	16722	missing	1315
+latency_ms_op_to_event	n=50720	min=0.20	p50=11.74	p95=50.06	p99=80.41	max=510.56
+latency_ms_last_op_to_event	n=371	min=1.78	p50=17.85	p95=54.72	p99=66.30	max=508.21
+gap_ms_last_op_to_line_end	n=404	min=0.40	p50=1.24	p95=6.22	p99=16.56	max=22.32
+procedure_ms_line_end_to_ready	n=100	min=0.00	p50=0.00	p95=0.00	p99=0.00	max=0.00
+late_by_ms_after_ready	n=21822	min=0.01	p50=15.00	p95=51.71	p99=93.63	max=505.47
+flags	Created|Modified|XattrMod|IsFile	15620
+flags	Created|Renamed|Modified|XattrMod|IsFile	4951
+flags	Renamed|IsFile	4323
+flags	Removed|Renamed|IsFile	4651
+flags	Created|Removed|Modified|XattrMod|IsFile	12530
+flags	Modified|IsFile	2879
+flags	Removed|IsFile	693
+flags	MustScanSubDirs|UserDropped	20
+special	index=19352/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521146098
+special	index=20679/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521154077
+special	index=21776/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521162726
+special	index=22233/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521163518
+special	index=25192/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521184064
+special	index=25649/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521184343
+special	index=28221/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521202770
+special	index=28678/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521202837
+special	index=31156/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521219315
+special	index=32202/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521229038
+special	index=32625/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521229753
+special	index=33574/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521238588
+special	index=34947/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521246898
+special	index=35379/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521248969
+special	index=38546/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521267999
+special	index=38907/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521269544
+special	index=39952/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521275956
+special	index=40906/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521284443
+special	index=41128/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521287021
+special	index=42721/45667	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521295283
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-1	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-2	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-3	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-4	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-5	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-6	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-7	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-8	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-9	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-10	late	last=0
+
+== writers=4 latency=0.5 procedure=mflush 
+config	writers=4	rounds=100	ops_per_writer=50	latency_s=0.500	procedure=mflush	nodefer=0	marker=in_root
+expected	53400	on_time	26447	late	21051	missing	5902	miss_rate_at_line_end	0.50474
+last_ops	404	on_time	21	late	322	missing	61
+events_total	41262	drop_or_rescan_flags	23
+rounds_with_drop_flags	22/100
+clean_rounds_ops	41608	on_time	22247	late	15568	missing	3793
+marker_seen_at_line_end	0/100
+latency_ms_op_to_event	n=47498	min=0.32	p50=9.66	p95=66.65	p99=117.58	max=502.26
+latency_ms_last_op_to_event	n=343	min=0.99	p50=19.07	p95=64.79	p99=139.21	max=501.35
+gap_ms_last_op_to_line_end	n=404	min=0.41	p50=1.07	p95=4.99	p99=11.75	max=22.27
+procedure_ms_line_end_to_ready	n=100	min=0.10	p50=0.15	p95=0.62	p99=5.66	max=11.71
+late_by_ms_after_ready	n=21051	min=0.00	p50=20.66	p95=77.37	p99=130.74	max=500.34
+flags	Created|Modified|XattrMod|IsFile	13384
+flags	Modified|IsFile	2519
+flags	Created|Renamed|Modified|XattrMod|IsFile	4641
+flags	Renamed|IsFile	3672
+flags	Created|XattrMod|IsFile	82
+flags	Removed|Renamed|IsFile	4270
+flags	Created|Removed|Modified|XattrMod|IsFile	11647
+flags	Removed|IsFile	1023
+flags	MustScanSubDirs|UserDropped	23
+flags	XattrMod|IsFile	1
+special	index=13754/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521417641
+special	index=16071/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521430980
+special	index=17930/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521442468
+special	index=19472/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521450506
+special	index=20542/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521459461
+special	index=22162/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521469482
+special	index=22563/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521476003
+special	index=24315/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521487791
+special	index=27206/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521504942
+special	index=28180/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521513132
+special	index=28637/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521514731
+special	index=29742/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521529302
+special	index=30087/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521536750
+special	index=31091/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521545670
+special	index=31548/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521546501
+special	index=32412/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521556210
+special	index=32869/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521556636
+special	index=35314/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521575510
+special	index=37110/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521588964
+special	index=38585/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521597205
+special	index=39042/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521597301
+special	index=39464/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521604835
+special	index=40486/41262	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521610765
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-0	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-1	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-2	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-3	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-4	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-5	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-6	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-7	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-8	late	last=0
+example	round=0	round_had_drop=0	flag=Created	path=/w0/c-0-9	late	last=0
+
+== writers=4 latency=0.5 procedure=marker 
+config	writers=4	rounds=100	ops_per_writer=50	latency_s=0.500	procedure=marker	nodefer=0	marker=in_root
+expected	53400	on_time	53004	late	0	missing	396	miss_rate_at_line_end	0.00742
+last_ops	404	on_time	372	late	0	missing	32
+events_total	48714	drop_or_rescan_flags	20
+rounds_with_drop_flags	17/100
+clean_rounds_ops	44288	on_time	44288	late	0	missing	0
+marker_seen_at_line_end	95/100
+latency_ms_op_to_event	n=53004	min=0.19	p50=15.43	p95=510.73	p99=520.38	max=530.95
+latency_ms_last_op_to_event	n=372	min=2.61	p50=499.49	p95=516.49	p99=519.05	max=522.75
+gap_ms_last_op_to_line_end	n=404	min=0.40	p50=1.24	p95=9.09	p99=21.92	max=53.88
+procedure_ms_line_end_to_ready	n=100	min=2.62	p50=501.73	p95=521.39	p99=5000.88	max=5001.06
+late_by_ms_after_ready	n=0
+flags	Created|Modified|XattrMod|IsFile	15647
+flags	Modified|IsFile	3128
+flags	Created|Renamed|Modified|XattrMod|IsFile	5211
+flags	Renamed|IsFile	5207
+flags	Created|XattrMod|IsFile	97
+flags	Removed|Renamed|IsFile	4893
+flags	Created|Removed|Modified|XattrMod|IsFile	13459
+flags	MustScanSubDirs|UserDropped	20
+flags	Removed|IsFile	1052
+special	index=1764/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521659259
+special	index=8140/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521696173
+special	index=16336/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521740250
+special	index=17001/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521746252
+special	index=17458/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521746288
+special	index=18941/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521757142
+special	index=19398/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521757148
+special	index=21299/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521767988
+special	index=22372/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521776167
+special	index=24295/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521787287
+special	index=32631/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521832081
+special	index=36674/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521859489
+special	index=39416/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521873854
+special	index=42416/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521891940
+special	index=42504/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521894796
+special	index=42965/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521897631
+special	index=43908/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521903429
+special	index=45853/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521915422
+special	index=46310/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521915506
+special	index=48637/48714	flags=MustScanSubDirs|UserDropped	path=	id=18430981976521930474
+example	round=4	round_had_drop=1	flag=Removed	path=/w0/c-3-44.mv	missing	last=0
+example	round=4	round_had_drop=1	flag=Removed	path=/w0/c-3-45	missing	last=0
+example	round=4	round_had_drop=1	flag=Removed	path=/w0/c-3-46	missing	last=0
+example	round=4	round_had_drop=1	flag=Removed	path=/w0/c-3-47	missing	last=0
+example	round=4	round_had_drop=1	flag=Removed	path=/w0/c-3-48.mv	missing	last=0
+example	round=4	round_had_drop=1	flag=Removed	path=/w0/c-3-49	missing	last=1
+example	round=4	round_had_drop=1	flag=Removed	path=/w1/c-3-49	missing	last=1
+example	round=4	round_had_drop=1	flag=Removed	path=/w2/c-3-32.mv	missing	last=0
+example	round=4	round_had_drop=1	flag=Removed	path=/w2/c-3-33	missing	last=0
+example	round=4	round_had_drop=1	flag=Removed	path=/w2/c-3-34	missing	last=0
+
+== writers=16 latency=0.05 procedure=flush 
+config	writers=16	rounds=100	ops_per_writer=50	latency_s=0.050	procedure=flush	nodefer=0	marker=in_root
+expected	213600	on_time	157409	late	25934	missing	30257	miss_rate_at_line_end	0.26307
+last_ops	1616	on_time	479	late	809	missing	328
+events_total	177569	drop_or_rescan_flags	157
+rounds_with_drop_flags	93/100
+clean_rounds_ops	15008	on_time	12975	late	1464	missing	569
+latency_ms_op_to_event	n=183343	min=-11.17	p50=20.15	p95=60.10	p99=175.04	max=313.69
+latency_ms_last_op_to_event	n=1288	min=1.53	p50=13.35	p95=50.69	p99=76.41	max=81.50
+gap_ms_last_op_to_line_end	n=1616	min=0.41	p50=7.80	p95=42.28	p99=79.79	max=127.35
+procedure_ms_line_end_to_ready	n=100	min=0.05	p50=0.10	p95=0.58	p99=7.72	max=8.09
+late_by_ms_after_ready	n=25934	min=0.01	p50=1.66	p95=133.34	p99=174.79	max=238.08
+flags	Created|Modified|XattrMod|IsFile	73628
+flags	Created|Renamed|Modified|XattrMod|IsFile	16746
+flags	Modified|IsFile	10685
+flags	Renamed|IsFile	16980
+flags	MustScanSubDirs|UserDropped	157
+flags	Created|XattrMod|IsFile	118
+flags	Removed|Renamed|IsFile	8629
+flags	Created|Removed|Modified|XattrMod|IsFile	17152
+flags	Removed|IsFile	33451
+flags	XattrMod|IsFile	23
+special	index=988/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522058173
+special	index=1967/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522065344
+special	index=2424/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522066738
+special	index=4110/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522078381
+special	index=4553/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522078459
+special	index=6131/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522088634
+special	index=6470/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522090162
+special	index=8058/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522099328
+special	index=10082/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522110636
+special	index=10522/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522111740
+special	index=12196/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522121996
+special	index=14191/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522131857
+special	index=20181/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522163835
+special	index=22496/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522175666
+special	index=23999/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522185046
+special	index=24446/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522185514
+special	index=26538/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522197394
+special	index=26995/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522198317
+special	index=28292/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522208047
+special	index=28692/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522209144
+special	index=30000/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522218110
+special	index=30452/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522218532
+special	index=30874/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522220153
+special	index=32216/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522229855
+special	index=32668/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522230221
+special	index=34082/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522239317
+special	index=34323/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522240975
+special	index=38576/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522262982
+special	index=39000/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522263732
+special	index=40812/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522278314
+special	index=41893/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522284112
+special	index=42306/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522284611
+special	index=43694/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522293868
+special	index=44104/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522295272
+special	index=45140/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522304166
+special	index=45596/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522305615
+special	index=46436/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522314896
+special	index=46893/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522316164
+special	index=48557/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522326908
+special	index=49914/177569	flags=MustScanSubDirs|UserDropped	path=	id=18430981976522337330
+example	round=8	round_had_drop=0	flag=Removed	path=/w0/c-7-16.mv	late	last=0
+example	round=8	round_had_drop=0	flag=Removed	path=/w0/c-7-17	late	last=0
+example	round=8	round_had_drop=0	flag=Removed	path=/w0/c-7-18	late	last=0
+example	round=8	round_had_drop=0	flag=Removed	path=/w0/c-7-19	late	last=0
+example	round=8	round_had_drop=0	flag=Removed	path=/w0/c-7-20.mv	late	last=0
+example	round=8	round_had_drop=0	flag=Removed	path=/w0/c-7-21	late	last=0
+example	round=8	round_had_drop=0	flag=Removed	path=/w0/c-7-22	late	last=0
+example	round=8	round_had_drop=0	flag=Removed	path=/w0/c-7-23	late	last=0
+example	round=8	round_had_drop=0	flag=Removed	path=/w0/c-7-24.mv	late	last=0
+example	round=8	round_had_drop=0	flag=Removed	path=/w0/c-7-25	late	last=0
+
+== writers=16 latency=0.05 procedure=mloop outside
+config	writers=16	rounds=100	ops_per_writer=50	latency_s=0.050	procedure=mloop	nodefer=0	marker=outside_root
+expected	213600	on_time	188003	late	2010	missing	23587	miss_rate_at_line_end	0.11984
+last_ops	1616	on_time	1362	late	0	missing	254
+events_total	186888	drop_or_rescan_flags	266
+rounds_with_drop_flags	79/100
+clean_rounds_ops	44224	on_time	44224	late	0	missing	0
+marker_seen_at_line_end	99/100
+latency_ms_op_to_event	n=190013	min=-18.47	p50=18.76	p95=43.69	p99=145.23	max=254.13
+latency_ms_last_op_to_event	n=1362	min=1.32	p50=9.04	p95=27.41	p99=38.09	max=50.90
+gap_ms_last_op_to_line_end	n=1616	min=0.41	p50=7.62	p95=37.35	p99=56.49	max=154.35
+procedure_ms_line_end_to_ready	n=100	min=2.69	p50=7.54	p95=14.67	p99=28.38	max=5001.13
+late_by_ms_after_ready	n=2010	min=67.83	p50=127.88	p95=161.46	p99=175.81	max=213.59
+flags	Created|Modified|XattrMod|IsFile	77392
+flags	Created|XattrMod|IsFile	243
+flags	Modified|IsFile	11516
+flags	Created|Renamed|Modified|XattrMod|IsFile	16650
+flags	Renamed|IsFile	18144
+flags	XattrMod|IsFile	25
+flags	Removed|Renamed|IsFile	9118
+flags	Created|Removed|Modified|XattrMod|IsFile	17942
+flags	MustScanSubDirs|UserDropped	266
+flags	Removed|IsFile	35592
+special	index=2314/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523275784
+special	index=2315/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523275784
+special	index=2738/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523276965
+special	index=2739/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523276965
+special	index=3984/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523285377
+special	index=3985/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523285377
+special	index=6303/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523298440
+special	index=6304/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523298440
+special	index=7385/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523307723
+special	index=7386/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523307723
+special	index=7804/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523309103
+special	index=7805/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523309103
+special	index=10956/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523329970
+special	index=10957/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523329970
+special	index=11414/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523330896
+special	index=11415/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523330896
+special	index=12624/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523340272
+special	index=12625/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523340272
+special	index=13042/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523341782
+special	index=13043/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523341782
+special	index=16547/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523362127
+special	index=16548/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523362127
+special	index=16971/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523363284
+special	index=16972/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523363284
+special	index=18492/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523373775
+special	index=18493/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523373775
+special	index=18950/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523374351
+special	index=18951/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523374351
+special	index=20736/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523384638
+special	index=20737/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523384638
+special	index=22290/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523395146
+special	index=22291/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523395146
+special	index=24656/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523407153
+special	index=24657/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523407153
+special	index=26401/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523417722
+special	index=26402/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523417722
+special	index=26829/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523418589
+special	index=26830/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523418589
+special	index=28433/186888	flags=MustScanSubDirs|UserDropped	path=	id=18430981976523427789
+special	index=28434/186888	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976523427789
+example	round=1	round_had_drop=1	flag=Modified	path=/w0/m-1-4	missing	last=0
+example	round=1	round_had_drop=1	flag=Renamed	path=/w0/c-1-0	missing	last=0
+example	round=1	round_had_drop=1	flag=Renamed	path=/w0/c-1-0.mv	missing	last=0
+example	round=1	round_had_drop=1	flag=Renamed	path=/w0/c-1-8	missing	last=0
+example	round=1	round_had_drop=1	flag=Renamed	path=/w0/c-1-8.mv	missing	last=0
+example	round=1	round_had_drop=1	flag=Renamed	path=/w0/c-1-12	missing	last=0
+example	round=1	round_had_drop=1	flag=Renamed	path=/w0/c-1-12.mv	missing	last=0
+example	round=1	round_had_drop=1	flag=Renamed	path=/w0/c-1-20	missing	last=0
+example	round=1	round_had_drop=1	flag=Renamed	path=/w0/c-1-20.mv	missing	last=0
+example	round=1	round_had_drop=1	flag=Renamed	path=/w0/c-1-24	missing	last=0
+
+== writers=16 latency=0.0 procedure=mloop outside nodefer
+config	writers=16	rounds=100	ops_per_writer=50	latency_s=0.000	procedure=mloop	nodefer=1	marker=outside_root
+expected	213600	on_time	188483	late	2281	missing	22836	miss_rate_at_line_end	0.11759
+last_ops	1616	on_time	1372	late	1	missing	243
+events_total	196970	drop_or_rescan_flags	256
+rounds_with_drop_flags	78/100
+clean_rounds_ops	47168	on_time	47168	late	0	missing	0
+marker_seen_at_line_end	100/100
+latency_ms_op_to_event	n=190764	min=-35.43	p50=15.64	p95=46.80	p99=157.50	max=334.46
+latency_ms_last_op_to_event	n=1373	min=0.58	p50=8.05	p95=25.80	p99=40.91	max=117.13
+gap_ms_last_op_to_line_end	n=1616	min=0.41	p50=8.12	p95=39.50	p99=58.90	max=135.28
+procedure_ms_line_end_to_ready	n=100	min=1.39	p50=6.58	p95=14.55	p99=19.93	max=29.67
+late_by_ms_after_ready	n=2281	min=69.82	p50=132.76	p95=190.37	p99=257.02	max=287.64
+flags	Created|Modified|XattrMod|IsFile	77059
+flags	Created|XattrMod|IsFile	9264
+flags	XattrMod|IsFile	694
+flags	Modified|IsFile	11167
+flags	Created|Renamed|Modified|XattrMod|IsFile	16650
+flags	Renamed|IsFile	18182
+flags	MustScanSubDirs|UserDropped	256
+flags	Removed|Renamed|IsFile	9268
+flags	Created|Removed|Modified|XattrMod|IsFile	18505
+flags	Removed|IsFile	35925
+special	index=670/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524474516
+special	index=671/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524474516
+special	index=1426/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524480132
+special	index=1427/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524480132
+special	index=3309/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524495326
+special	index=3310/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524495326
+special	index=7119/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524516881
+special	index=7120/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524516881
+special	index=7801/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524518624
+special	index=7802/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524518624
+special	index=9540/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524527237
+special	index=9541/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524527237
+special	index=9998/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524529927
+special	index=9999/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524529927
+special	index=11713/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524540293
+special	index=11714/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524540293
+special	index=15903/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524560691
+special	index=15904/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524560691
+special	index=16307/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524561214
+special	index=16308/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524561214
+special	index=17901/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524571009
+special	index=17902/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524571009
+special	index=20060/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524582760
+special	index=20061/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524582760
+special	index=20488/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524583935
+special	index=20489/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524583935
+special	index=21439/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524592254
+special	index=21440/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524592254
+special	index=21872/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524593088
+special	index=21873/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524593088
+special	index=23270/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524603005
+special	index=23271/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524603005
+special	index=23646/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524603852
+special	index=23647/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524603852
+special	index=24078/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524604993
+special	index=24079/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524604993
+special	index=30727/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524636986
+special	index=30728/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524636986
+special	index=32468/196970	flags=MustScanSubDirs|UserDropped	path=	id=18430981976524646580
+special	index=32469/196970	flags=MustScanSubDirs|UserDropped	path=-markers	id=18430981976524646580
+example	round=0	round_had_drop=1	flag=Modified	path=/w2/m-0-6	missing	last=0
+example	round=0	round_had_drop=1	flag=Modified	path=/w2/m-0-7	missing	last=0
+example	round=0	round_had_drop=1	flag=Renamed	path=/w2/c-0-0	missing	last=0
+example	round=0	round_had_drop=1	flag=Renamed	path=/w2/c-0-0.mv	late	last=0
+example	round=0	round_had_drop=1	flag=Renamed	path=/w2/c-0-4	missing	last=0
+example	round=0	round_had_drop=1	flag=Renamed	path=/w2/c-0-4.mv	late	last=0
+example	round=0	round_had_drop=1	flag=Renamed	path=/w2/c-0-8	missing	last=0
+example	round=0	round_had_drop=1	flag=Renamed	path=/w2/c-0-8.mv	late	last=0
+example	round=0	round_had_drop=1	flag=Renamed	path=/w2/c-0-12	missing	last=0
+example	round=0	round_had_drop=1	flag=Renamed	path=/w2/c-0-12.mv	late	last=0
+

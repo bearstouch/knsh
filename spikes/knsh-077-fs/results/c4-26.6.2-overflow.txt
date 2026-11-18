@@ -1,0 +1,92 @@
+# date: 2026-11-18T10:18:22Z
+# macOS: 26.6.2 (25G83), arm64
+# cpu: Apple M1 Pro, 8 CPUs, 16 GiB
+# volume:  File System Personality=APFS; Protocol=Apple Fabric; Solid State=Yes; 
+== overflow writers=16 ops=20000 block_s=10
+config	writers=16	ops_per_writer=20000	block_s=10	burst_ms=50643
+events_total	319626
+flags	Created|XattrMod|IsDir	5
+flags	Created|XattrMod|IsFile	22330
+flags	Created|Removed|Modified|XattrMod|IsFile	253514
+flags	Created|Modified|XattrMod|IsFile	39436
+flags	XattrMod|IsFile	4300
+flags	MustScanSubDirs|UserDropped	38
+flags	Removed|IsFile	1
+flags	Removed|XattrMod|IsFile	1
+flags	Created|Removed|XattrMod|IsFile	1
+special	index=46/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976525560553
+special	index=495/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976526313320
+special	index=12755/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976526430100
+special	index=19032/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976526491762
+special	index=28013/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976526575909
+special	index=28439/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976526577313
+special	index=66817/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976526940618
+special	index=103684/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976527293669
+special	index=111385/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976527366569
+special	index=116270/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976527414137
+special	index=128643/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976527532091
+special	index=133752/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976527584210
+special	index=134134/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976527587174
+special	index=134521/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976527592355
+special	index=143219/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976527673873
+special	index=149955/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976527746443
+special	index=174858/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976527981986
+special	index=180091/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976528038812
+special	index=180519/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976528041128
+special	index=186560/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976528093204
+special	index=189806/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976528131919
+special	index=190239/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976528135738
+special	index=202553/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976528254158
+special	index=202979/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976528255166
+special	index=215947/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976528387971
+special	index=223821/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976528459623
+special	index=266200/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976528858084
+special	index=274537/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976528941651
+special	index=274974/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976528943229
+special	index=275377/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976528952721
+special	index=284900/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529044129
+special	index=285356/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529045845
+special	index=288512/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529083507
+special	index=292611/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529133045
+special	index=293054/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529133693
+special	index=293485/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529150682
+special	index=305660/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529266976
+special	index=306109/319626	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529269607
+
+== overflow writers=16 ops=20000 block_s=0
+config	writers=16	ops_per_writer=20000	block_s=0	burst_ms=52466
+events_total	417845
+flags	Created|XattrMod|IsFile	34468
+flags	Created|Removed|Modified|XattrMod|IsFile	320216
+flags	Created|Modified|XattrMod|IsFile	57691
+flags	XattrMod|IsFile	5451
+flags	MustScanSubDirs|UserDropped	18
+flags	Modified|IsFile	1
+special	index=6468/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529474431
+special	index=7930/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529495150
+special	index=8380/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529495309
+special	index=25345/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529650381
+special	index=28426/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529682580
+special	index=28852/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529684437
+special	index=48657/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529873410
+special	index=49096/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976529875426
+special	index=107539/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976530420589
+special	index=170919/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976531001855
+special	index=214117/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976531401330
+special	index=217884/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976531436380
+special	index=219509/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976531455031
+special	index=350914/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976532630341
+special	index=389640/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976532997943
+special	index=390091/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976532998012
+special	index=407964/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976533166010
+special	index=408304/417845	flags=MustScanSubDirs|UserDropped	path=	id=18430981976533171719
+
+== overflow writers=1 ops=2000 block_s=0
+config	writers=1	ops_per_writer=2000	block_s=0	burst_ms=259
+events_total	2265
+flags	Created|XattrMod|IsDir	1
+flags	Created|XattrMod|IsFile	126
+flags	Created|Removed|Modified|XattrMod|IsFile	2004
+flags	Created|Modified|XattrMod|IsFile	128
+flags	XattrMod|IsFile	6
+

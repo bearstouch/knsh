@@ -6,8 +6,8 @@ The design relies on these platform behaviours. Each must be verified before pha
 | --- | --- | --- |
 | C1 | A sandboxed process cannot apply a second sandbox | Run Chromium, Playwright, `swift build` and the agent CLIs inside an envelope on macOS 14, 15 and current. **Confirmed on macOS 26.6** ([results](#c1-sandbox-nesting)); macOS 14 and 15 and Codex CLI pending |
 | C2 | Sandbox denials can be read from the system log as a non-admin user | `log stream` with the knsh tag: latency, duplicates, format. **Read without root on macOS 26.6, from an account in `admin`; best effort with gaps** ([results](#c2-denials-in-the-unified-log)); a standard (non-admin) account and macOS 14 and 15 pending |
-| C3 | Per-file copy-on-write cloning is fast enough | Time a 100,000-file root; check files with unflushed memory-mapped writes |
-| C4 | Flushing file events catches writes made milliseconds earlier by another process | Stress test with concurrent writers |
+| C3 | Per-file copy-on-write cloning is fast enough | Time a 100,000-file root; check files with unflushed memory-mapped writes. **Partially verified on macOS 26.6 (warm cache): 7.3–7.7 s with 4 threads at normal or utility QoS, 11.6–12.4 s single-threaded, 33–51 s in the background band; a clone holds unflushed mapped stores, but mapped writes never change `mtime` and a clone during continuous stores is torn** ([results](#c3-copy-on-write-shadows)); macOS 14 and 15 and cold cache pending |
+| C4 | Flushing file events catches writes made milliseconds earlier by another process | Stress test with concurrent writers. **Refuted for a flush alone on macOS 26.6 (26–99.9% of a line's events missed); verified for a marker file plus repeated flushes (no event missed in any round without a drop flag, 1, 4 and 16 writers); 16 writers cause `UserDropped\|MustScanSubDirs` on the root in 68–93% of lines** ([results](#c4-file-event-flushing-with-concurrent-writers)); macOS 14 and 15 pending |
 | C5 | Keychain items stay readable only by `knshd` across updates and Homebrew builds | Access-control behaviour for ad-hoc and Developer ID signatures. **On macOS 26.6: holds across updates for Developer ID only; refuted for ad-hoc and Homebrew builds; any same-user process can overwrite the value unless sandboxed** ([results](#c5-keychain-access-control)); macOS 14 and 15 and the data-protection keychain with a provisioning profile pending |
 | C6 | A launchd user agent can show the Touch ID prompt | LocalAuthentication from `knshd` with and without a logged-in GUI session. **Confirmed on macOS 26.6 with the password fallback (lid closed), custom text shown in full** ([results](#c6-localauthentication-from-a-launchd-agent)); the Touch ID sensor, an SSH login with nobody at the console, cancellation and timeout pending |
 | C7 | XPC peer code-signing requirements work on macOS 14 | Both directions, including after the peer execs. **Confirmed on macOS 26.6 with APIs available since macOS 12 and earlier** ([results](#c7-xpc-peer-code-signing-requirements)); macOS 14 and 15 pending |
@@ -471,6 +471,162 @@ For every tunnel to port 443 the proxy read the first TLS record without decrypt
 - **Risk:** a client that adopts Encrypted Client Hello sends the provider's public name in the outer ClientHello,
   which will not match the requested host. KNSH-061 refuses that (fail closed); a preset may need to turn ECH off for
   such a tool. None in scope offered it here.
+
+## File-system results (KNSH-077: C3, C4)
+
+Observed on 2026-11-18 on an Apple M1 Pro (8 CPUs, 16 GiB), macOS 26.6.2 (25G83), internal SSD, APFS, from a normal
+account; nothing ran as root. Work files sat in a `*.noindex` folder on the data volume, out of Spotlight. The
+harnesses and raw results are in [`spikes/knsh-077-fs/`](../../spikes/knsh-077-fs/README.md); rerun them on each
+macOS version.
+
+**Pending (not observed, not claimed):** macOS 14 and 15 for both claims; cold-cache shadow timings (`purge` needs
+root, so every timing had a warm cache); roots on external or slower APFS volumes; very large or heavily fragmented
+files; a real envelope (writers ran unsandboxed); `KernelDropped` (never produced here).
+
+### C3: copy-on-write shadows
+
+**Tree** (`gentree`, seed 77; [`results/c3-26.6.2-tree.txt`](../../spikes/knsh-077-fs/results/c3-26.6.2-tree.txt)):
+100,000 regular files in 3,906 folders (fan-out 5, depth 0 to 5), 1 to 50 files per folder, 2.76 GiB in all
+(mean 29.7 KB). Sizes: 2% empty, 30% up to 1 KiB, 43% 1–8 KiB, 20% 8–64 KiB, 5% 64 KiB–1 MiB, 0.2% 1–4 MiB.
+
+**Timings**, three runs each, warm cache
+([`results/c3-26.6.2-timings.tsv`](../../spikes/knsh-077-fs/results/c3-26.6.2-timings.tsv)). "Per file" walks the
+tree with `readdir`, recreates folders with `mkdirat` and clones each file with `clonefileat(2)`; "directory" is one
+`clonefile(2)` of the root. "Background" is the Darwin background band (`PRIO_DARWIN_BG`, throttled I/O), which
+QoS background is documented to apply (QoS background itself was not run); "utility" is QoS utility on every thread.
+
+| Strategy | Threads | Priority | Wall time, 3 runs (s) | CPU time (user + system, s) | Under 10 s? |
+| --- | --- | --- | --- | --- | --- |
+| Per file | 1 | normal | 12.36, 11.70, 11.63 | 10.3–10.5 | **no** |
+| Per file | 4 | normal | 7.36, 7.39, 7.28 | 23.6–24.3 | yes |
+| Per file | 4 | utility | 7.72, 7.43, 7.36 | 22.6–23.0 | yes |
+| Per file | 8 | normal | 7.50, 7.51, 7.51 | 31.1–33.6 | yes |
+| Per file | 8 | utility | 7.27, 7.18, 7.28 | 27.9–28.2 | yes |
+| Per file | 1 | background | 49.23, 51.44, 51.22 | 25.8–31.3 | **no** |
+| Per file | 4 | background | 38.02, 34.07, 33.29 | 25.7–26.1 | **no** |
+| Directory | 1 call | normal | 1.57, 1.59, 1.61 | 0.92–0.93 | yes |
+| Directory | 1 call | utility | 1.70, 1.69, 1.68 | 0.93–0.96 | yes |
+| Directory | 1 call | background | 3.69, 4.23, 4.38 | 3.0–3.5 | yes |
+
+- **Extra disk usage** (free space before and after, after `sync`): 29 to 40 MB per shadow, the same for every
+  strategy, about 340 bytes per file; the data blocks are shared. Removing a shadow (`removefile`) took 4.8 to 5.8 s
+  and gave the space back.
+- **CPU** is almost all system time; per-file cloning is bound by metadata updates in the kernel, so threads beyond 4
+  add CPU but no speed.
+
+**Attributes** ([`verify-file`](../../spikes/knsh-077-fs/results/c3-26.6.2-verify-file.txt),
+[`verify-dir`](../../spikes/knsh-077-fs/results/c3-26.6.2-verify-dir.txt),
+[`attrs`](../../spikes/knsh-077-fs/results/c3-26.6.2-attrs.txt)). For all 100,000 files, with both strategies: size,
+`mtime` and birth time (to the nanosecond), mode, flags, owner equal the source's, and the extended-attribute name list has the same length (names and values were compared only on the hand-made file below);
+content equal for every 50th file checked; the inode always differs. On one hand-made file (mode 6755): setuid and
+setgid are cleared on the clone (as `clonefile(2)` documents), `UF_HIDDEN` and a custom xattr are kept, a hard link is not (the
+clone has one link), and `ctime` is the clone's creation time. Post-image identity can therefore use size and
+`mtime` of the shadow copy; restoring a setuid file from a shadow would lose the bit.
+
+**Clones during unflushed memory-mapped writes** ([`results/c3-26.6.2-mmap.txt`](../../spikes/knsh-077-fs/results/c3-26.6.2-mmap.txt)).
+A separate process mapped a 16 MiB file `MAP_SHARED` and stored into it without `msync`:
+
+- `read(2)` by another process and a clone both held the stored bytes. The clone took 2.4 ms in the recorded run (up to 3.7 ms in two earlier runs, *ad hoc*), against
+  about 0.2 ms once the pages were clean: dirty pages are written back before cloning.
+- The file's **`mtime` and size never changed**: not after the stores, not after `msync(MS_SYNC)`, not after the
+  writer exited, and not during the 40 s after. Only `ctime` moved, when the writer exited. Extending with
+  `ftruncate` changed size and `mtime` at once, and the clone held the stores past the old end.
+- With a writer storing continuously (each pass stamps a generation into every 16 KiB page), **195 of 200 clones
+  were torn**, with up to 182 runs of different generations across the pages (197 and 198 of 200 in two earlier runs, *ad hoc*, not in the results file). A `pwrite(2)` writer also left
+  every clone mid-pass, but as one clean cut (two runs of generations).
+- **Finding the writer**: while it held the file open for writing and mapped, and after it closed the descriptor
+  but kept the mapping, `proc_listpidspath(3)` found it, and per-process `PROC_PIDLISTFDS` +
+  `PROC_PIDFDVNODEPATHINFO` (open flags with `FWRITE`) and `PROC_PIDREGIONPATHINFO` (protection read/write) showed
+  how, all as the same user without privileges. The region's share mode read `PRIVATE` for a `MAP_SHARED` mapping,
+  so it cannot tell shared from private mappings. One `proc_listpidspath` over all processes took 284 to 620 ms.
+  After the writer exited, nothing distinguished the file.
+
+**Exit questions.**
+
+- *Is per-file cloning within budget?* Per file on one thread, no: 11.6 to 12.4 s. Per file on 4 threads, yes on
+  this machine with a warm cache: 7.3 to 7.7 s at normal priority or QoS utility, with no gain from 8 threads. In the
+  Darwin background band (`PRIO_DARWIN_BG`; QoS background, documented to apply it, was not run) no strategy except the directory clone fits: 33 to 51 s. The
+  margin is small and cold-cache and slower-machine runs are pending, so proposed
+  [decision 15](../09-reference/decisions.md) keeps per-file cloning on a 4-thread pool at QoS utility, makes the
+  shadow builder report its time, and records the directory clone (1.6 to 1.7 s) as the fallback to evaluate.
+- *Can a torn memory-mapped write be detected after the fact?* No. Size, `mtime` and file events all miss a change
+  made through a live mapping; only a content comparison sees it, and a torn state looks like any other content. It
+  can be detected only by observing open and mapped files during the change (proposed
+  [decision 17](../09-reference/decisions.md)).
+- *Does cloning preserve the attributes post-image identity needs?* Yes: size, `mtime` (nanoseconds), mode except
+  setuid (and, as documented but not observed, setgid), flags, owner and xattrs; the inode differs by design. But `mtime` does not move for memory-mapped
+  writes, so identity of such files rests on the content hash (decision 17).
+
+### C4: file-event flushing with concurrent writers
+
+One FSEvents stream with file events watched an empty root; each **round** was one line: 1, 4 or 16 writer
+processes started together, each made 50 creates (512 bytes), 8 appends to existing files, 13 renames and the removal
+of its previous round's 50 files, logging the time after each call. The line ended when every writer had been reaped;
+then a line-end procedure ran and every operation was checked against the events delivered so far (matched by path
+and flag). 100 rounds per case, stream latency 0.5 s unless stated
+([`results/c4-26.6.2-runs.txt`](../../spikes/knsh-077-fs/results/c4-26.6.2-runs.txt)). "Missed at line end" counts
+operations whose event had not arrived when the procedure finished (late or never). A drop event is counted in the
+round during which it arrived; without the marker, a drop can arrive after its round ended, which is why the flush-only
+rows show events that never arrived even in rounds counted as without drop flags.
+
+| Writers | Procedure at line end | Missed at line end | Rounds with drop flags | Missed in rounds without drop flags | Procedure time p50 / p95 / max |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `FSEventStreamFlushSync` | 99.9% (13,342 of 13,350) | 0 | 99.9% | 0.08 / 0.11 / 1.62 ms |
+| 4 | `FSEventStreamFlushSync` | 43.2% | 16 | 40.0% | 0.08 / 0.81 / 28.5 ms |
+| 16 | `FSEventStreamFlushSync` | 44.0% | 92 | 53.5% | 0.09 / 5.35 / 30.2 ms |
+| 16 | `FSEventStreamFlushSync`, latency 0.05 s | 26.3% | 93 | 13.5% | 0.10 / 0.58 / 8.09 ms |
+| 4 | nothing (control) | 45.9% | 19 | 41.7% | 0 |
+| 4 | marker file in the root, one flush | 50.5% | 22 | 46.5% | 0.15 / 0.62 / 11.7 ms |
+| 4 | marker file in the root, wait for its event, no flush | 0.74% | 17 | **0** | 502 / 521 / 5,001 ms (marker not seen in 5 rounds) |
+| 1 | **marker outside the root, flush every 1 ms until its event** | **0** | 0 | **0** | 6.57 / 12.95 / 18.5 ms |
+| 4 | same | 0.20% | 4 | **0** | 9.23 / 13.25 / 5,001 ms (marker not seen in 1 round) |
+| 16 | same | 10.7% | 68 | **0** | 9.33 / 15.81 / 5,000 ms (marker not seen in 1 round) |
+| 16 | same, latency 0.05 s | 12.0% | 79 | **0** | 7.54 / 14.67 / 5,001 ms (marker not seen in 1 round) |
+| 16 | same, latency 0, `NoDefer` | 11.8% | 78 | **0** | 6.58 / 14.55 / 29.7 ms |
+
+The marker wait had a 5 s clock deadline; "5,000 ms" is a round whose marker event never came.
+
+- **Latency** from an operation to its event, with the marker procedure: p50 5.4 / 8.2 / 18.1 ms and p95 11.1 /
+  20.8 / 47.5 ms for 1 / 4 / 16 writers (latency 0.5 s). The last operation of each writer happened 0.5 ms (p50,
+  1 writer) to 39 ms (p95, 16 writers) before the line end.
+- **A flush is not enough.** `FSEventStreamFlushSync` returns in well under a millisecond at p50 and delivers only
+  what the service already holds; events still on their way arrive after it, 12.6 to 145 ms later at p95 and up to
+  0.11 to 0.58 s later (about one stream latency) when they miss the flush; some never arrive. A marker without a
+  flush waits out the latency (502 ms p50).
+- **The marker procedure** creates a file in a folder outside the root that the same stream also watches, then
+  flushes every millisecond until the marker's event arrives (the stream callback notes the marker's arrival, so the
+  check is free). In every round without a drop flag, in all five marker-loop cases (223,806 operations), every
+  operation had arrived; late and missing events occurred only in rounds with drop flags. In 3 of 500 rounds the
+  marker's event never came and the 5 s deadline expired; those cases had drop flags in other rounds, and the marker
+  folder also receives the drop event (below), so a watcher can stop waiting as soon as a drop flag arrives.
+- **Dropped events** ([`results/c4-26.6.2-overflow.txt`](../../spikes/knsh-077-fs/results/c4-26.6.2-overflow.txt)):
+  every drop came as one event flagged `MustScanSubDirs|UserDropped` whose path is a **watched path itself** (the
+  root, and the marker folder, each got one), never a sub-folder. `KernelDropped` was never seen. 16 concurrent
+  writers (about 2,100 operations per line) caused drops in 68 to 93 of 100 rounds at every latency tried; 4 writers
+  in 4 to 22 of 100; 1 writer never, not even 2,000 creates and removes in 0.26 s. Blocking the stream's callback for
+  10 s while 16 writers created and removed 320,000 files gave 38 drop events; not blocking it gave 18. Drops are
+  common under bursts of concurrent writers, so the rescan they force must be cheap.
+- **Flags accumulate** per path: a file created, written and removed within one delivery shows
+  `Created|Removed|Modified`; later events for a file still carry `Created`; every new file carries `XattrMod` (the
+  system's `com.apple.provenance` attribute). Flags cannot say what happened, only that a path may have changed.
+- **Root changes** ([`rootchange`](../../spikes/knsh-077-fs/results/c4-26.6.2-rootchange.txt)): with `WatchRoot`,
+  renaming the watched folder away and back gave `RootChanged` each time, followed by a `Created|Renamed|XattrMod|IsDir`
+  event on the root path.
+- **Memory-mapped writers** ([`results/c4-26.6.2-mmap.txt`](../../spikes/knsh-077-fs/results/c4-26.6.2-mmap.txt)):
+  a writer that stored through a shared mapping and stayed alive produced **no event for 40 s**, with or without
+  `msync(MS_SYNC)`; it produced one `Modified` event when it exited. A writer that exited at once (with or without
+  `msync`) produced its event by the line end, like a `pwrite` writer.
+
+**Exit questions.**
+
+- *After a flush, can the event set be treated as complete for a line?* Not after a flush alone. After the marker
+  procedure, yes, unless a drop flag arrived in the line's window or the marker did not arrive before a deadline:
+  then the line's checkpoints are uncertain and the root is rescanned. Changes through a mapping that is still alive
+  at the line end are not in any event set; they are handled by decision 17. Proposed
+  [decision 16](../09-reference/decisions.md).
+- *Which flags must trigger a rescan and an `uncertain` mark?* `MustScanSubDirs`, `UserDropped`, `KernelDropped`
+  (rescan the path given, observed to be the watched root), `EventIdsWrapped` (rescan every root) and `RootChanged`
+  (re-resolve the root, then rescan it). Item flags never do.
 
 ## Endpoint Security (macOS 27+)
 

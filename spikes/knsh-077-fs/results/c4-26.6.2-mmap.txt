@@ -1,0 +1,65 @@
+# date: 2026-11-18T10:20:40Z
+# macOS: 26.6.2 (25G83), arm64
+# cpu: Apple M1 Pro, 8 CPUs, 16 GiB
+# volume:  File System Personality=APFS; Protocol=Apple Fabric; Solid State=Yes; 
+mmap-nomsync.at_exit_flush	event	flags=Created|Modified|XattrMod|IsFile
+mmap-nomsync.after_5s	events=1
+mmap-nomsync.after_10s	events=1
+mmap-nomsync.after_15s	events=1
+mmap-nomsync.after_20s	events=1
+mmap-nomsync.after_25s	events=1
+mmap-nomsync.after_30s	events=1
+mmap-nomsync.after_35s	events=1
+mmap-nomsync.after_40s	events=1
+mmap-nomsync.final	event	flags=Created|Modified|XattrMod|IsFile
+mmap-msync.at_exit_flush	event	flags=Created|Modified|XattrMod|IsFile
+mmap-msync.after_5s	events=1
+mmap-msync.after_10s	events=1
+mmap-msync.after_15s	events=1
+mmap-msync.after_20s	events=1
+mmap-msync.after_25s	events=1
+mmap-msync.after_30s	events=1
+mmap-msync.after_35s	events=1
+mmap-msync.after_40s	events=1
+mmap-msync.final	event	flags=Created|Modified|XattrMod|IsFile
+pwrite.at_exit_flush	event	flags=Created|Modified|XattrMod|IsFile
+pwrite.after_5s	events=1
+pwrite.final	event	flags=Created|Modified|XattrMod|IsFile
+mmap-alive.writer_alive	no_event
+mmap-alive.writer_alive_5s	no_event
+mmap-alive.writer_alive_10s	no_event
+mmap-alive.writer_alive_15s	no_event
+mmap-alive.writer_alive_20s	no_event
+mmap-alive.writer_alive_25s	no_event
+mmap-alive.writer_alive_30s	no_event
+mmap-alive.writer_alive_35s	no_event
+mmap-alive.writer_alive_40s	no_event
+mmap-alive.at_exit_flush	event	flags=Modified|IsFile
+mmap-alive.after_5s	events=1
+mmap-alive.after_10s	events=1
+mmap-alive.after_15s	events=1
+mmap-alive.after_20s	events=1
+mmap-alive.after_25s	events=1
+mmap-alive.after_30s	events=1
+mmap-alive.after_35s	events=1
+mmap-alive.after_40s	events=1
+mmap-alive.final	event	flags=Modified|IsFile
+mmap-msync-alive.writer_alive	no_event
+mmap-msync-alive.writer_alive_5s	no_event
+mmap-msync-alive.writer_alive_10s	no_event
+mmap-msync-alive.writer_alive_15s	no_event
+mmap-msync-alive.writer_alive_20s	no_event
+mmap-msync-alive.writer_alive_25s	no_event
+mmap-msync-alive.writer_alive_30s	no_event
+mmap-msync-alive.writer_alive_35s	no_event
+mmap-msync-alive.writer_alive_40s	no_event
+mmap-msync-alive.at_exit_flush	event	flags=Modified|IsFile
+mmap-msync-alive.after_5s	events=1
+mmap-msync-alive.after_10s	events=1
+mmap-msync-alive.after_15s	events=1
+mmap-msync-alive.after_20s	events=1
+mmap-msync-alive.after_25s	events=1
+mmap-msync-alive.after_30s	events=1
+mmap-msync-alive.after_35s	events=1
+mmap-msync-alive.after_40s	events=1
+mmap-msync-alive.final	event	flags=Modified|IsFile

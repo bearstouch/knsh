@@ -1,0 +1,7 @@
+# date: 2026-11-18T10:14:27Z
+# macOS: 26.6.2 (25G83), arm64
+# cpu: Apple M1 Pro, 8 CPUs, 16 GiB
+# volume:  File System Personality=APFS; Protocol=Apple Fabric; Solid State=Yes; 
+source	ino=162326898	size=6	mode=6755	flags=0x8000	nlink=2	mtime=1700000000.123456789	birth=1700000000.123456789	ctime=1794996868.430999751	xattrs=com.apple.provenance,org.knsh.spike
+clone	ino=162326901	size=6	mode=755	flags=0x8000	nlink=1	mtime=1700000000.123456789	birth=1700000000.123456789	ctime=1794996868.431163917	xattrs=com.apple.provenance,org.knsh.spike
+source_after	ino=162326898	size=6	mode=6755	flags=0x8000	nlink=2	mtime=1700000000.123456789	birth=1700000000.123456789	ctime=1794996868.430999751	xattrs=com.apple.provenance,org.knsh.spike
