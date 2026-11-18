@@ -346,7 +346,8 @@ fn new_context() -> Option<Owned> {
         }
         send(allocated, selector(c"init"))
     };
-    (!context.is_null()).then_some(Owned(context))
+    // Not `then_some`: its argument is built eagerly, so a null would be wrapped and then released on drop.
+    if context.is_null() { None } else { Some(Owned(context)) }
 }
 
 /// A new (+1) `NSString` holding `text`, or `None` if it cannot be made.
@@ -356,7 +357,8 @@ fn ns_string(text: &str) -> Option<Owned> {
     // (`is_external` false). A `CFString` is toll-free bridged with `NSString`, so `release` frees it.
     let string =
         unsafe { CFStringCreateWithBytes(std::ptr::null(), text.as_ptr(), length, K_CF_STRING_ENCODING_UTF8, 0) };
-    (!string.is_null()).then_some(Owned(string))
+    // Not `then_some`: its argument is built eagerly, so a null would be wrapped and then released on drop.
+    if string.is_null() { None } else { Some(Owned(string)) }
 }
 
 /// An autorelease pool for the duration of one prompt, popped on drop.

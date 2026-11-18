@@ -116,7 +116,8 @@ struct Owned(CfRef);
 impl Owned {
     /// Takes ownership of `object` (a "Create" or "Copy" result), or `None` if it is null.
     fn new(object: CfRef) -> Option<Self> {
-        (!object.is_null()).then_some(Self(object))
+        // Not `then_some`: its argument is built eagerly, so a null would be wrapped and then released on drop.
+        if object.is_null() { None } else { Some(Self(object)) }
     }
 }
 
@@ -436,6 +437,13 @@ impl TrustStore for KeychainTrustStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A missing item reads back as a null reference: it must be `None` and never be released. `CFRelease(NULL)` traps,
+    // which crashed `knshd` at start-up whenever no authority was trusted (found by KNSH-076's idle-memory run).
+    #[test]
+    fn null_is_none_and_never_released() {
+        assert!(Owned::new(std::ptr::null()).is_none());
+    }
 
     // Manual (claim C5, pending): writes a throwaway item to the login keychain, so it never runs by default
     // (CLAUDE.md: tests never touch the user's real state). Run with `--ignored` on a test machine, then delete the
