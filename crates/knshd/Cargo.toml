@@ -26,6 +26,8 @@ knsh-toml = { path = "../knsh-toml" }
 [dev-dependencies]
 # Fakes for socket activation, peer credentials and the system log (KNSH-012). Test builds only.
 knsh-platform = { path = "../knsh-platform", features = ["testing"] }
+# The in-memory tree checkpoint shadows are built from in tests (KNSH-079). Test builds only.
+knsh-checkpoint = { path = "../knsh-checkpoint", features = ["testing"] }
 # Classified lines for the hook runner tests (KNSH-062). Test builds only.
 knsh-bash = { path = "../knsh-bash" }
 

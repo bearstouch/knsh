@@ -20,6 +20,7 @@ mod process;
 mod random;
 mod resolver;
 mod shell_host;
+mod thread;
 mod volumes;
 mod xpc;
 
@@ -41,6 +42,7 @@ pub use process::SystemProcesses;
 pub use random::SystemRandom;
 pub use resolver::SystemResolver;
 pub use shell_host::{JobSignalsIgnored, TelemetryPipe, reraise_default};
+pub use thread::set_current_thread_utility_qos;
 pub use volumes::SystemVolumes;
 pub use xpc::{SecCodeSigning, XpcControlService, XpcMessage};
 

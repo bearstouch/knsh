@@ -169,6 +169,8 @@ pub fn request(line: &Line, cwd: &Path, env: &[(OsString, OsString)]) -> Result<
         timeout_s: None,
         // Output modes are for captured lines only (FR-OUT-03): `knsh -c` output goes to its own descriptors.
         output: knsh_proto::OutputOptions::default(),
+        // `knsh -c` behaves like the shell it stands in for: a line waits for a checkpoint shadow (FR-CKP-02).
+        checkpoint_wait: true,
     })
 }
 

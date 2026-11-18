@@ -7,6 +7,10 @@
 //!   capability report shows ([`Method`], [`capability_report`]).
 //! - [`identity`]: post-image identity (inode, size, modification time, and a content hash for files under 64 MiB).
 //!
+//! KNSH-079 adds [`shadow`]: the background, file-by-file copy-on-write shadow of each root built when an agent
+//! session starts, and the gate that makes lines touching a root wait for it, fail with `-32010`, or be denied when
+//! checkpoints are required and the root cannot be protected.
+//!
 //! # Boundaries
 //!
 //! Checkpoints live on the same APFS volume as the files they protect. Depends on `knsh-core` and `knsh-platform`:
@@ -15,7 +19,8 @@
 //!
 //! # Specification
 //!
-//! - `specs/03-functional-requirements/checkpoints.md`: FR-CKP-01, FR-CKP-09, FR-CKP-35
+//! - `specs/03-functional-requirements/checkpoints.md`: FR-CKP-01, FR-CKP-02, FR-CKP-09, FR-CKP-31, FR-CKP-35
+//! - NFR-PERF-06 and decision 15 (`specs/09-reference/decisions.md`): how the initial shadow is built and timed
 //! - `specs/05-models/checkpoint.md` (storage), `specs/05-models/capabilities.md` (`checkpoints` per root)
 //! - `specs/09-reference/file-locations.md`, NFR-PRIV-04 (owner-only stores, excluded from Spotlight and Time
 //!   Machine, denied to envelopes and commands)
@@ -26,10 +31,19 @@
 
 mod error;
 pub mod identity;
+pub mod shadow;
 pub mod store;
+
+// Also built for `cargo doc`, so the fakes are documented.
+#[cfg(any(test, doc, feature = "testing"))]
+pub mod testing;
 
 pub use error::CheckpointError;
 pub use identity::{HASH_LIMIT, PostImageIdentity, post_image_identity};
+pub use shadow::{
+    Gate, PlatformShadowFiles, RootReadiness, SHADOW_BUDGET, SHADOW_THREADS, Shadow, ShadowFailure, ShadowFiles,
+    ShadowPlan, ShadowProgress, ShadowStatus, ShadowSummary, gate, line_touches_root, shadow_dir, start_shadow,
+};
 pub use store::{
     FORMAT_FILE, FORMAT_VERSION, Fallback, Method, PLAIN_COPY_LIMIT, Protection, RootStore, StoreFault, Unprotected,
     capability_report, place_roots,

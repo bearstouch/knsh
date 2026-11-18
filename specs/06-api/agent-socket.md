@@ -49,6 +49,7 @@ call and is closed. The session outlives its connections: closing one does not e
 | `env` | object | The caller's whole environment, name to value (KNSH-049). Names are non-empty and hold no `=`; nothing holds NUL; at most 4096 entries. Absent is empty |
 | `interpreter` | string | `knsh` (default), `bash`, `sh` or `zsh`: the shell the line runs with once allowed (FR-LC-14). It never affects the decision |
 | `args` | array of strings | The operands after the line (`bash -c 'line' name arg…`): `$0`, then `$1`, …; at most 4096 |
+| `checkpoint_wait` | bool | Whether a line touching a checkpoint root whose shadow is still being built waits for it when the profile sets `checkpoints.required = true` (FR-CKP-02). `false`: the call fails at once with `-32010` (`root`, `progress`) instead. Default `true` (KNSH-079) |
 | `stdio` | string | `passed`: the request carries the caller's stdin, stdout and stderr as three descriptors (`SCM_RIGHTS`, [wire format](wire-format.md#descriptors)). The line runs on them, and the result holds no output (FR-OUT-04). Absent: output is captured and returned in `output.mode` (KNSH-053) |
 
 The line is at most 65536 bytes and holds no NUL; `cwd` is absolute and resolved; `timeout_s` is positive. Anything
@@ -119,6 +120,14 @@ code, or with 128 plus the signal (NFR-COMPAT-09).
 ### Errors
 
 `-32001` denied, `-32002` no decision before timeout, `-32007` session held, `-32008` killed at timeout, `-32010` checkpoint not ready, `-32011` cancelled. See [errors.md](errors.md).
+
+Checkpoint shadows (FR-CKP-02, KNSH-079): an allowed line that touches a checkpoint root whose shadow is not complete,
+under `checkpoints.required = true`, waits for it before it is spawned (or is `-32010` with `checkpoint_wait: false`);
+one whose root has no shadow, or whose build failed, is denied (`-32001`, fail closed). A caller that disconnects while
+the line waits cancels it (`-32011`); a session paused or ended meanwhile answers as for a held line. A line stopped
+this way is recorded as a deny, like a held line. With `required = false` the line runs at once and its record lists
+the roots whose changes were not protected (`unprotected`). Which lines touch a root is defined in
+[checkpoints](../03-functional-requirements/checkpoints.md#taking-checkpoints).
 
 `-32002` and `-32011` carry `request_id`, which is `null` when no request had been made yet (for example a line
 cancelled while its hooks ran). `-32011` is only ever seen by a caller that is still reading: it is the answer to a

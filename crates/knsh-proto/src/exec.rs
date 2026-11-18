@@ -118,6 +118,10 @@ pub struct ExecRunParams {
     /// How much output comes back (FR-OUT-01). Only for captured lines: with [`ExecStdio::Passed`] the output goes
     /// to the caller's descriptors and modes do not apply (FR-OUT-03), so any `output` is refused.
     pub output: OutputOptions,
+    /// `checkpoint_wait`: whether a line touching a checkpoint root whose shadow is still being built waits for it
+    /// under `checkpoints.required = true` (`false`: the call fails with `-32010` instead, FR-CKP-02). `true` when
+    /// absent.
+    pub checkpoint_wait: bool,
 }
 
 /// The `output` member of `exec.run` and `exec.start`: what the caller asked for, before the profile's default
@@ -202,6 +206,7 @@ impl FromJson for ExecRunParams {
         let stdio: Option<String> = fields.optional("stdio")?;
         let timeout_s: Option<u64> = fields.optional("timeout_s")?;
         let output: Option<Value> = fields.optional("output")?;
+        let checkpoint_wait: Option<bool> = fields.optional("checkpoint_wait")?;
         fields.finish()?;
         if command.len() > MAX_EXEC_COMMAND_LEN || command.contains('\0') {
             return Err(out_of_range("command"));
@@ -241,6 +246,7 @@ impl FromJson for ExecRunParams {
             stdio,
             timeout_s,
             output,
+            checkpoint_wait: checkpoint_wait.unwrap_or(true),
         })
     }
 }
@@ -296,6 +302,10 @@ impl ToJson for ExecRunParams {
         }
         if !self.output.is_empty() {
             object.insert("output", Value::Object(self.output.to_object()?))?;
+        }
+        // Sent only when it differs from the default, so older engines keep reading what they always read.
+        if !self.checkpoint_wait {
+            object.insert("checkpoint_wait", Value::from(false))?;
         }
         Ok(Value::Object(object))
     }
@@ -725,8 +735,10 @@ mod tests {
             stdio: ExecStdio::Passed,
             timeout_s: Some(600),
             output: OutputOptions::default(),
+            checkpoint_wait: false,
         };
         let text = knsh_json::write(&sent.to_json().unwrap()).unwrap();
+        assert!(text.contains(r#""checkpoint_wait":false"#), "{text}");
         assert_eq!(params(&text).unwrap(), sent);
     }
 
@@ -738,6 +750,8 @@ mod tests {
         assert_eq!(read.stdio, ExecStdio::Captured);
         assert!(read.env.is_empty() && read.args.is_empty());
         assert_eq!(read.timeout_s, None);
+        // FR-CKP-02: a caller waits for a shadow unless it says otherwise.
+        assert!(read.checkpoint_wait);
     }
 
     // Untrusted input: every malformed field is refused, never repaired.
@@ -761,6 +775,7 @@ mod tests {
             r#"{"command":"true","cwd":"/w","args":["a\u0000"]}"#.to_owned(),
             r#"{"command":"true","cwd":"/w","args":[1]}"#.to_owned(),
             r#"{"command":"true","cwd":"/w","timeout_s":0}"#.to_owned(),
+            r#"{"command":"true","cwd":"/w","checkpoint_wait":"no"}"#.to_owned(),
             r#"{"command":"true","cwd":"/w","timeout_s":-1}"#.to_owned(),
         ] {
             assert!(params(&bad).is_err(), "{bad}");

@@ -175,6 +175,9 @@ mod server;
 // Writes records, so built where the record store is.
 #[cfg(target_os = "macos")]
 mod sessions;
+// Checkpoint shadows of agent sessions (KNSH-079); built with the sessions that start them.
+#[cfg(target_os = "macos")]
+mod shadows;
 // The reader is platform-neutral; its record sink is built where the record store is.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod violations;
@@ -877,6 +880,9 @@ impl Supervision<'_> {
     /// `session.start_agent` (KNSH-056) and `exec.*` (KNSH-050 to KNSH-053), over the same paths, sessions,
     /// profiles and clock.
     fn handlers(self) -> dispatch::Handlers {
+        // Lines wait on, and envelopes start, the checkpoint shadows of their sessions (KNSH-079).
+        self.sessions
+            .attach_shadows(checkpoint_shadows(self.paths, self.uid, &self.clock, self.log));
         // One proxy issues every envelope's and line's credentials (KNSH-059).
         let proxy = start_proxy(self.clock.clone(), self.random.clone(), self.log, self.events);
         let mut handlers = self.start_agent_handlers(&proxy);
@@ -934,6 +940,33 @@ impl Supervision<'_> {
         )
         .handlers()
     }
+}
+
+/// The checkpoint shadows of agent sessions (KNSH-079): stores placed on the real volumes, files cloned with APFS
+/// clones, one background build per root when an agent session starts, stopped when it ends.
+#[cfg(target_os = "macos")]
+fn checkpoint_shadows(
+    paths: &knsh_platform::EnginePaths,
+    uid: u32,
+    clock: &std::sync::Arc<knsh_platform::macos::SystemClock>,
+    log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+) -> std::sync::Arc<shadows::Shadows> {
+    use std::sync::Arc;
+
+    let fs: Arc<dyn knsh_platform::Fs> = Arc::new(knsh_platform::macos::RealFs::new());
+    let volumes: Arc<dyn knsh_platform::Volumes> = Arc::new(knsh_platform::macos::SystemVolumes::new());
+    shadows::Shadows::new(shadows::ShadowParts {
+        files: Arc::new(knsh_checkpoint::PlatformShadowFiles::new(
+            Arc::clone(&fs),
+            Arc::clone(&volumes),
+        )),
+        fs,
+        volumes,
+        clock: clock.clone(),
+        paths: paths.clone(),
+        uid,
+        log: Arc::clone(log),
+    })
 }
 
 /// Removes the compiled profile files an earlier run left behind: no line runs yet, so none is in use (FR-SBX-07). A

@@ -23,6 +23,7 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 | `children` | array | Processes seen in the command's process groups, best effort |
 | `files_changed` | array | Paths created, modified or deleted under checkpoint roots, with post-image identity |
 | `network` | array | Hosts contacted or refused, as reported by the proxy ([below](#network)) |
+| `unprotected` | array | Checkpoint roots the line touched whose changes were not protected: `{root, reason}`, `reason` one of `shadow_building` (the root's shadow was not complete yet, with `checkpoints.required = false`), `shadow_failed`, `no_shadow`. Empty when every root it touched was protected (KNSH-079, FR-CKP-02). Stored from record schema version 2 |
 | `checkpoint_id` | ID or null | Checkpoint holding the pre-images |
 | `irreversible` | bool + reasons | From classification and observed behaviour |
 | `sandbox_violations` | array | Denials the system reported for this command, best effort |

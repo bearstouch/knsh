@@ -417,7 +417,8 @@ fn subscribe_error(error: SubscribeError, session_id: Option<SessionId>) -> RpcE
             | CoreError::InvalidDenialTag
             | CoreError::InvalidViolation
             | CoreError::InvalidArgv
-            | CoreError::InvalidNetwork,
+            | CoreError::InvalidNetwork
+            | CoreError::InvalidUnprotected,
         )
         | SubscribeError::Closed => RpcError::new(ErrorCode::InternalError),
     }

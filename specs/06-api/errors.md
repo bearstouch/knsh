@@ -27,6 +27,10 @@ codes:
 | -32010 | Checkpoint not ready: the root's shadow is still being built | `root`, `progress` |
 | -32011 | Request cancelled | `request_id` |
 
+`-32010`'s `progress` is an object (KNSH-079): `files` (files and symlinks cloned so far), `folders` (folders listed)
+and `folders_pending` (folders found but not listed yet). It is answered only when the caller sent
+`checkpoint_wait: false`; otherwise the line waits ([`exec.run`](agent-socket.md#execrun)).
+
 `-32009` is answered on `agent.sock` when a `hello` matches neither a live session token nor a registered envelope by
 audit token, or when the session the connection was bound to has ended. The connection is closed after the answer
 ([binding](agent-socket.md#binding-a-connection-to-its-session)).

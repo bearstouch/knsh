@@ -58,7 +58,14 @@ impl Handshake {
         // method list is the same either way.
         let mut capabilities = self.probed.capabilities.as_ref().clone();
         capabilities.sandbox_violations = self.violations.current();
-        let capabilities = &capabilities;
+        // The methods come from the capabilities the dispatch tables were built from, so `hello` never lists one the
+        // endpoint does not serve.
+        let methods = self
+            .catalogue
+            .available(call.endpoint.catalogue(), &capabilities)
+            .collect();
+        // KNSH-079: the checkpoint roots of running agent sessions, read live, each once its shadow has settled.
+        capabilities.checkpoints = self.sessions.checkpoint_report();
         let result = HelloResult {
             engine_version: env!("CARGO_PKG_VERSION"),
             protocol,
@@ -66,11 +73,8 @@ impl Handshake {
             session_id,
             advisory: self.advisory,
             bytes: params.bytes,
-            capabilities,
-            methods: self
-                .catalogue
-                .available(call.endpoint.catalogue(), capabilities)
-                .collect(),
+            capabilities: &capabilities,
+            methods,
         };
         // Writing fixed keys and bounded values cannot fail; if it ever did, the client gets no partial report.
         result

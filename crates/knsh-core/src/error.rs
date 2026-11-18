@@ -97,6 +97,8 @@ pub enum CoreError {
     InvalidArgv,
     /// A record's stored `network` is not in the form the engine writes (KNSH-060).
     InvalidNetwork,
+    /// A record's stored `unprotected` list is not in the form the engine writes (KNSH-079).
+    InvalidUnprotected,
 }
 
 impl fmt::Display for CoreError {
@@ -147,6 +149,7 @@ impl fmt::Display for CoreError {
             Self::InvalidViolation => f.write_str("not a stored list of sandbox violations"),
             Self::InvalidArgv => f.write_str("not a stored record argv"),
             Self::InvalidNetwork => f.write_str("not a stored record network list"),
+            Self::InvalidUnprotected => f.write_str("not a stored list of unprotected checkpoint roots"),
         }
     }
 }

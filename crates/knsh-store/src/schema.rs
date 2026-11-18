@@ -83,8 +83,12 @@ CREATE TABLE outputs (
 );
 ";
 
+/// Version 2: the record's `unprotected` list (KNSH-079), checkpoint roots a line touched whose changes were not
+/// protected, as JSON text; `NULL` (every record written before) reads as an empty list.
+const V2: Migration = "ALTER TABLE records ADD COLUMN unprotected TEXT;";
+
 /// Every migration, in order: entry `n` takes the schema from version `n` to `n + 1`.
-pub(crate) const MIGRATIONS: &[Migration] = &[V1];
+pub(crate) const MIGRATIONS: &[Migration] = &[V1, V2];
 
 /// The schema version this build writes and understands.
 #[must_use]
@@ -218,6 +222,28 @@ mod tests {
         assert!(matches!(error, StoreError::Platform(_)), "{error:?}");
         assert_eq!(pragma(&connection, "user_version").unwrap(), 1);
         assert_eq!(tables(&connection), ["first"]);
+    }
+
+    // KNSH-079: a version-1 file with records gains the `unprotected` column, keeping its rows (read back as NULL).
+    #[test]
+    fn version_one_file_gains_the_unprotected_column() {
+        let dir = TempDir::new("v2");
+        let mut connection = open(&dir);
+        migrate_with(&mut connection, &MIGRATIONS[..1]).unwrap();
+        connection
+            .exec(
+                "INSERT INTO records (record_id, session_id, actor_kind, command, cwd, started_at) \
+                 VALUES ('R', 'S', 'agent', 'ls', x'2f', 1)",
+            )
+            .unwrap();
+        migrate(&mut connection).unwrap();
+        assert_eq!(pragma(&connection, "user_version").unwrap(), 2);
+        let mut statement = connection
+            .prepare("SELECT record_id, unprotected FROM records")
+            .unwrap();
+        assert_eq!(statement.step().unwrap(), Step::Row);
+        assert_eq!(statement.column_text(0).unwrap().as_deref(), Some("R"));
+        assert_eq!(statement.column_text(1).unwrap(), None);
     }
 
     #[test]

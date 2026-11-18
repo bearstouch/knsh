@@ -389,6 +389,7 @@ pub(super) fn forwarded(session_id: SessionId, command: &str) -> ForwardedLine {
         env: Vec::new(),
         stdio: None,
         timeout_s: None,
+        checkpoint_wait: true,
         control: crate::jobs::LineControl::new(),
     }
 }
