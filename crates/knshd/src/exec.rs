@@ -106,6 +106,8 @@ pub(crate) struct ForwardedLine {
     pub(crate) stdio: Option<Stdio>,
     /// Kill the line after this many seconds (FR-LC-40).
     pub(crate) timeout_s: Option<u64>,
+    /// Whether the line waits for a checkpoint shadow still being built, or fails with `-32010` (FR-CKP-02).
+    pub(crate) checkpoint_wait: bool,
     /// Its handle: start mark, kill flag and answer (`exec.start`, `exec.kill`).
     pub(crate) control: Arc<LineControl>,
 }
@@ -386,6 +388,7 @@ fn forwarded(session_id: SessionId, params: ExecRunParams, stdio: Option<Stdio>,
         env,
         stdio,
         timeout_s: params.timeout_s,
+        checkpoint_wait: params.checkpoint_wait,
         control: LineControl::new(),
     }
 }

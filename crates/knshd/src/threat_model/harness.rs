@@ -390,6 +390,7 @@ impl Stack {
             env: vars,
             stdio: None,
             timeout_s,
+            checkpoint_wait: true,
             control: crate::jobs::LineControl::new(),
         };
         crate::exec::Supervisor::run(&*self.lifecycle, line, &StillWaiting)

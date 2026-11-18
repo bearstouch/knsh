@@ -693,6 +693,104 @@ pub fn decode_network(text: &str) -> Result<Vec<NetworkEntry>, CoreError> {
         .map_err(|_| CoreError::InvalidNetwork)
 }
 
+/// Why a line's changes in a checkpoint root were not protected (FR-CKP-02, KNSH-079): the record's
+/// `unprotected[].reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnprotectedReason {
+    /// The root's shadow was still being built when the line started (`checkpoints.required = false`).
+    ShadowBuilding,
+    /// The root's shadow build failed, or was stopped.
+    ShadowFailed,
+    /// The root has no shadow: its store could not be used, its volume cannot hold one, or none was started for it.
+    NoShadow,
+}
+
+impl UnprotectedReason {
+    /// The wire value: `shadow_building`, `shadow_failed` or `no_shadow`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ShadowBuilding => "shadow_building",
+            Self::ShadowFailed => "shadow_failed",
+            Self::NoShadow => "no_shadow",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "shadow_building" => Some(Self::ShadowBuilding),
+            "shadow_failed" => Some(Self::ShadowFailed),
+            "no_shadow" => Some(Self::NoShadow),
+            _ => None,
+        }
+    }
+}
+
+/// A checkpoint root a line touched whose changes were not protected, and why (FR-CKP-02, KNSH-079): one element of
+/// the record's `unprotected` array, `{"root", "reason"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnprotectedRoot {
+    /// The root. Roots come from profile text, so they are UTF-8; one that is not is written lossily.
+    pub root: CanonicalPath,
+    /// Why.
+    pub reason: UnprotectedReason,
+}
+
+impl ToJson for UnprotectedRoot {
+    fn to_json(&self) -> Result<Value, JsonError> {
+        Ok(Value::Object(
+            Object::new()
+                .with("root", self.root.as_path().to_string_lossy().into_owned())?
+                .with("reason", self.reason.as_str())?,
+        ))
+    }
+}
+
+impl FromJson for UnprotectedRoot {
+    /// Reads the object [`ToJson`] writes: both members, nothing else, a canonical root and a known reason.
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let mut fields = Fields::new(value)?;
+        let root: String = fields.required("root")?;
+        let reason: String = fields.required("reason")?;
+        fields.finish_closed()?;
+        Ok(Self {
+            root: CanonicalPath::new(root).map_err(|_| JsonError::OutOfRange { field: Some("root") })?,
+            reason: UnprotectedReason::parse(&reason).ok_or(JsonError::OutOfRange { field: Some("reason") })?,
+        })
+    }
+}
+
+/// The stored form of a record's `unprotected`: its JSON array as text.
+///
+/// # Errors
+///
+/// [`CoreError::InvalidUnprotected`] if it cannot be written (it always can).
+pub fn encode_unprotected(unprotected: &[UnprotectedRoot]) -> Result<String, CoreError> {
+    let values = unprotected
+        .iter()
+        .map(ToJson::to_json)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CoreError::InvalidUnprotected)?;
+    knsh_json::write(&Value::Array(values)).map_err(|_| CoreError::InvalidUnprotected)
+}
+
+/// Reads the stored form written by [`encode_unprotected`].
+///
+/// # Errors
+///
+/// [`CoreError::InvalidUnprotected`] for text that is not such an array.
+pub fn decode_unprotected(text: &str) -> Result<Vec<UnprotectedRoot>, CoreError> {
+    let value = knsh_json::parse(text.as_bytes(), text.len()).map_err(|_| CoreError::InvalidUnprotected)?;
+    let Value::Array(items) = value else {
+        return Err(CoreError::InvalidUnprotected);
+    };
+    items
+        .iter()
+        .map(UnprotectedRoot::from_json)
+        .collect::<Result<_, _>>()
+        .map_err(|_| CoreError::InvalidUnprotected)
+}
+
 /// The fields of an execution record that only agent records carry.
 ///
 /// A human telemetry record keeps none of them (FR-REC-09): the store replaces them with
@@ -722,6 +820,10 @@ pub struct RecordDetails {
     /// The hosts the proxy let the line contact or refused it, as it reported them (FR-NET-09, KNSH-060). Empty for
     /// a line that asked the proxy for nothing.
     pub network: Vec<NetworkEntry>,
+    /// Checkpoint roots the line touched whose changes were not protected, and why (FR-CKP-02, KNSH-079): with
+    /// `checkpoints.required = false`, a line runs at once even if a root's shadow is not ready. Empty when every
+    /// root it touched was protected, or it touched none.
+    pub unprotected: Vec<UnprotectedRoot>,
 }
 
 impl RecordDetails {
@@ -739,6 +841,7 @@ impl RecordDetails {
             decision,
             argv,
             network,
+            unprotected,
         } = self;
         rewritten_from.is_none()
             && pipestatus.is_empty()
@@ -750,6 +853,7 @@ impl RecordDetails {
             && decision.is_none()
             && argv.is_empty()
             && network.is_empty()
+            && unprotected.is_empty()
     }
 }
 
@@ -882,6 +986,36 @@ mod tests {
             encode_network(&[entry("a", 1, NetworkResult::Refused("free text".to_owned()))]),
             Err(CoreError::InvalidNetwork)
         );
+    }
+
+    // KNSH-079: the `unprotected` list round-trips, and only the engine's own form is read back.
+    #[test]
+    fn unprotected_roots_round_trip_and_refuse_other_forms() {
+        let roots = vec![
+            UnprotectedRoot {
+                root: CanonicalPath::new("/code/app").unwrap(),
+                reason: UnprotectedReason::ShadowBuilding,
+            },
+            UnprotectedRoot {
+                root: CanonicalPath::new("/Volumes/Stick/x").unwrap(),
+                reason: UnprotectedReason::NoShadow,
+            },
+        ];
+        let text = encode_unprotected(&roots).unwrap();
+        assert_eq!(
+            text,
+            r#"[{"root":"/code/app","reason":"shadow_building"},{"root":"/Volumes/Stick/x","reason":"no_shadow"}]"#
+        );
+        assert_eq!(decode_unprotected(&text).unwrap(), roots);
+        for bad in [
+            "{}",
+            r#"[{"root":"/a"}]"#,
+            r#"[{"root":"relative","reason":"no_shadow"}]"#,
+            r#"[{"root":"/a","reason":"other"}]"#,
+            r#"[{"root":"/a","reason":"no_shadow","extra":1}]"#,
+        ] {
+            assert_eq!(decode_unprotected(bad), Err(CoreError::InvalidUnprotected), "{bad}");
+        }
     }
 
     #[test]

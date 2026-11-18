@@ -58,11 +58,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use knsh_checkpoint::{Gate, ShadowProgress, gate, line_touches_root};
 use knsh_core::{
     Actor, Allowed, Authority, BinaryLookup, Caller, CancelReason, CanonicalPath, Counted, Decision, DecisionSource,
     DenialLimiter, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR, LineInput, LineKey, LocalApprovals,
     NetworkEntry, Observer, Outcome, OutputRedaction, OutputStream, Profile, Proposal, RateLimits, RecordDetails,
-    RecordId, Redacted, Refusal, RefusalKind, RequestId, SessionId, Timestamp, Ulid, argv_of, decide, redact,
+    RecordId, Redacted, Refusal, RefusalKind, RequestId, SessionId, Timestamp, Ulid, UnprotectedReason,
+    UnprotectedRoot, argv_of, decide, redact,
 };
 use knsh_json::{Object, ToJson, Value};
 use knsh_platform::{Clock, ProcessGroupId, Processes, Random};
@@ -96,6 +98,14 @@ const HELD_AFTER_DECISION: &str =
 const ENDED_AFTER_DECISION: &str = "the session ended while the line was decided, so it did not start";
 /// Reason for a line allowed by the pipeline whose caller left before it could be spawned (FR-LC-41).
 const GONE_BEFORE_SPAWN: &str = "the caller disconnected before the line started, so it was cancelled";
+/// Reason for a line refused because a checkpoint root it touches has no shadow, or its shadow failed, while the
+/// profile requires checkpoints (FR-CKP-02, KNSH-079): it would have run unprotected.
+const NO_SHADOW: &str = "checkpoints are required but a checkpoint root the line touches cannot be protected, so it was denied (fail closed)";
+/// Reason recorded for a line answered `-32010`: a root's shadow was still being built and the caller did not wait.
+const SHADOW_NOT_READY: &str =
+    "a checkpoint root the line touches is still being shadowed and the caller did not wait, so it did not start";
+/// How long one wait for a shadow lasts before the caller and the session are checked again (FR-CKP-02).
+const SHADOW_WAIT_SLICE: Duration = Duration::from_millis(100);
 
 /// Lifecycle steps 9 and 10: starting an allowed line through `knsh-exec` and waiting for it (KNSH-051,
 /// [`crate::spawn::TrampolineSpawner`]).
@@ -299,6 +309,23 @@ struct Ready {
     latency_ms: u64,
     /// When the line was received: the record's start if the clock cannot be read at the spawn.
     received_at: Timestamp,
+    /// Checkpoint roots it touches whose changes are not protected: the record's `unprotected` (KNSH-079).
+    unprotected: Vec<UnprotectedRoot>,
+}
+
+/// Why the checkpoint gate stopped an allowed line (FR-CKP-02).
+enum Blocked {
+    /// The caller did not wait for a shadow still being built: `-32010`.
+    NotReady {
+        root: CanonicalPath,
+        progress: ShadowProgress,
+    },
+    /// A root will never be protected and the profile requires checkpoints: denied (fail closed).
+    NoShadow,
+    /// The caller left while it waited.
+    CallerGone,
+    /// The session was paused, taken over or ended while it waited: the hold (`-32007`) or `-32006`.
+    Held(RpcError),
 }
 
 impl Lifecycle {
@@ -390,40 +417,135 @@ impl Lifecycle {
             // The session was paused or taken over while the line was decided (module documentation, "Held lines"):
             // recorded as a deny so the decision is not lost, and answered with the hold so the client retries.
             Outcome::Run(allowed) if let Err(hold) = parts.sessions.runnable(session_id) => {
-                let refusal = Refusal {
-                    decision: Decision::deny(DecisionSource::Standalone, None, None),
-                    command: allowed.command,
-                    rewritten_from: allowed.rewritten_from,
-                    // The session may also have ended meanwhile (`-32006`): still a deny, with its own reason.
-                    reason: Some(
-                        if hold.code == ErrorCode::SessionHeld {
-                            HELD_AFTER_DECISION
-                        } else {
-                            ENDED_AFTER_DECISION
-                        }
-                        .to_owned(),
-                    ),
-                    kind: RefusalKind::Denied,
-                    classification: Some(allowed.classification),
-                    // The line was allowed; a hold is not a denial of it, so it is not counted (FR-HOOK-20).
-                    line_key: None,
-                };
-                let _ = self.refused(line, &actor, record_id, received_at, latency_ms, &refusal);
-                return Err(hold);
-            }
-            Outcome::Run(allowed) => {
-                return Ok(Ready {
-                    record_id,
-                    actor,
+                return Err(self.blocked(
+                    line,
+                    &actor,
+                    (record_id, received_at, latency_ms),
                     allowed,
-                    profile: Box::new(profile),
-                    latency_ms,
-                    received_at,
-                });
+                    Blocked::Held(hold),
+                ));
             }
+            // FR-CKP-02: an allowed line touching a checkpoint root whose shadow is not ready waits, fails with
+            // `-32010`, or is denied, as `checkpoints.required` and the caller ask. Recorded as a deny when stopped,
+            // like a held line, so the decision is not lost.
+            Outcome::Run(allowed) => match self.checkpoint_gate(line, &profile, caller) {
+                Ok(unprotected) => {
+                    return Ok(Ready {
+                        record_id,
+                        actor,
+                        allowed,
+                        profile: Box::new(profile),
+                        latency_ms,
+                        received_at,
+                        unprotected,
+                    });
+                }
+                Err(blocked) => {
+                    return Err(self.blocked(line, &actor, (record_id, received_at, latency_ms), allowed, blocked));
+                }
+            },
             Outcome::Refused(refusal) => *refusal,
         };
         Err(self.refused(line, &actor, record_id, received_at, latency_ms, &refusal))
+    }
+
+    /// Records an allowed line that may not be spawned as a deny, so its decision is not lost, and returns its answer
+    /// (module documentation, "Held lines"; FR-CKP-02, KNSH-079): the session's hold (`-32007`, or `-32006` if it
+    /// ended), `-32010` with the root and progress, `-32001` (no shadow, fail closed) or `-32011` (caller gone).
+    /// `record` is the line's record ID, receipt time and decision latency. The rules allowed the line, so none of
+    /// these counts as a denial of it (FR-HOOK-20).
+    fn blocked(
+        &self,
+        line: &ForwardedLine,
+        actor: &Actor,
+        (record_id, received_at, latency_ms): (RecordId, Timestamp, u64),
+        allowed: Box<Allowed>,
+        blocked: Blocked,
+    ) -> RpcError {
+        let (reason, kind) = match &blocked {
+            Blocked::NotReady { .. } => (SHADOW_NOT_READY, RefusalKind::Denied),
+            Blocked::NoShadow => (NO_SHADOW, RefusalKind::Denied),
+            Blocked::CallerGone => (GONE_BEFORE_SPAWN, RefusalKind::Cancelled { request_id: None }),
+            Blocked::Held(hold) if hold.code == ErrorCode::SessionHeld => (HELD_AFTER_DECISION, RefusalKind::Denied),
+            Blocked::Held(_) => (ENDED_AFTER_DECISION, RefusalKind::Denied),
+        };
+        let refusal = Refusal {
+            decision: Decision::deny(DecisionSource::Standalone, None, None),
+            command: allowed.command,
+            rewritten_from: allowed.rewritten_from,
+            reason: Some(reason.to_owned()),
+            kind,
+            classification: Some(allowed.classification),
+            line_key: None,
+        };
+        let error = self.refused(line, actor, record_id, received_at, latency_ms, &refusal);
+        match blocked {
+            Blocked::NotReady { root, progress } => not_ready(&root, progress),
+            Blocked::Held(hold) => hold,
+            Blocked::NoShadow | Blocked::CallerGone => error,
+        }
+    }
+
+    /// The checkpoint gate for an allowed line (FR-CKP-02, KNSH-079): the roots of `profile` the line touches
+    /// ([`line_touches_root`]), each with its session's shadow, decided by [`gate`]. A waiting caller waits in slices
+    /// of [`SHADOW_WAIT_SLICE`], and stops waiting when it disconnects or its session is held or ends. Returns the
+    /// roots whose changes are not protected, for the record.
+    fn checkpoint_gate(
+        &self,
+        line: &ForwardedLine,
+        profile: &Profile,
+        caller: &dyn Caller,
+    ) -> Result<Vec<UnprotectedRoot>, Blocked> {
+        let sessions = &self.parts.sessions;
+        let session_id = line.session_id;
+        let touched: Vec<&CanonicalPath> = profile
+            .checkpoints
+            .roots
+            .iter()
+            .filter(|root| line_touches_root(root, &line.proposal.cwd, &profile.fs.write))
+            .collect();
+        let mut waited = false;
+        loop {
+            let roots: Vec<_> = touched
+                .iter()
+                .map(|root| ((*root).clone(), sessions.shadow_readiness(session_id, root)))
+                .collect();
+            match gate(profile.checkpoints.required, line.checkpoint_wait, &roots) {
+                Gate::Run { unprotected } => {
+                    // After a wait, the caller and the session are checked once more: either may have changed during
+                    // the last slice, and a line held or abandoned meanwhile must not start (FR-LC-41, "Held lines").
+                    if waited {
+                        if caller.gone() {
+                            return Err(Blocked::CallerGone);
+                        }
+                        if let Err(hold) = sessions.runnable(session_id) {
+                            return Err(Blocked::Held(hold));
+                        }
+                    }
+                    return Ok(unprotected
+                        .into_iter()
+                        .map(|(root, reason)| UnprotectedRoot { root, reason })
+                        .collect());
+                }
+                Gate::NotReady { root, progress } => return Err(Blocked::NotReady { root, progress }),
+                // Every reason denies alike; listed so a new one is considered here.
+                Gate::Deny {
+                    reason:
+                        UnprotectedReason::ShadowBuilding | UnprotectedReason::ShadowFailed | UnprotectedReason::NoShadow,
+                    ..
+                } => return Err(Blocked::NoShadow),
+                Gate::Wait { root } => {
+                    if caller.gone() {
+                        return Err(Blocked::CallerGone);
+                    }
+                    if let Err(hold) = sessions.runnable(session_id) {
+                        return Err(Blocked::Held(hold));
+                    }
+                    let _ = sessions.wait_for_shadow(session_id, &root, SHADOW_WAIT_SLICE);
+                    waited = true;
+                }
+            }
+        }
     }
 
     /// The time the line was received and its record ID, or `None` if the clock or random source failed.
@@ -571,7 +693,7 @@ impl Lifecycle {
     /// (FR-REC-06), then `command.finished`. Returns whether the record was written, and when the line ended; the
     /// caller answers only after this returns, so the reply never precedes the commit (FR-REC-02, NFR-REL-05). A line
     /// that did not run to its end is recorded too, with neither exit code nor signal (NFR-REL-08). File changes
-    /// (checkpoints) are not recorded yet.
+    /// (checkpoints) are not recorded yet; roots whose changes were not protected are (`unprotected`, KNSH-079).
     #[allow(clippy::too_many_arguments)]
     fn finished(
         &self,
@@ -584,6 +706,7 @@ impl Lifecycle {
         latency_ms: u64,
         report: &SpawnReport,
         record_output: bool,
+        unprotected: Vec<UnprotectedRoot>,
     ) -> (bool, Timestamp) {
         let ended_at = self.parts.clock.now().unwrap_or(started_at);
         let ran = report.outcome.as_ref().ok();
@@ -618,6 +741,8 @@ impl Lifecycle {
                 signal,
                 sandbox_profile: report.sandbox_profile.clone(),
                 network: report.network.clone(),
+                // FR-CKP-02 with `required = false`: the roots this line changed unprotected (KNSH-079).
+                unprotected,
                 // `pipestatus` stays empty: the line runs in a separate bash whose `PIPESTATUS` is not reported back
                 // yet (KNSH-100). `secrets_injected` stays empty: no secret is injected in phase 2 (FR-REC-11).
                 ..RecordDetails::default()
@@ -689,6 +814,7 @@ impl Supervisor for Lifecycle {
             profile,
             latency_ms,
             received_at,
+            unprotected,
         } = panic::catch_unwind(AssertUnwindSafe(|| self.prepare(&line, caller)))
             .unwrap_or_else(|_| Err(denial(None, Some(INTERNAL_ERROR.to_owned()), DecisionSource::Rule)))?;
         let session_id = line.session_id;
@@ -734,6 +860,7 @@ impl Supervisor for Lifecycle {
             latency_ms,
             &report,
             record_output,
+            unprotected,
         );
         let record_id = written.then_some(record_id);
         match report.outcome {
@@ -851,6 +978,25 @@ fn record_error(code: ErrorCode, record_id: Option<RecordId>) -> RpcError {
     }
 }
 
+/// `-32010` (FR-CKP-02, `specs/06-api/errors.md`): `data.root`, the first root still being shadowed, and
+/// `data.progress`, how far its build is: `{"files", "folders", "folders_pending"}`.
+fn not_ready(root: &CanonicalPath, progress: ShadowProgress) -> RpcError {
+    // Counts beyond 2^53 cannot be exact JSON integers (I-JSON); no tree comes near, and then `data` is left out.
+    let data = || -> Result<Object, knsh_json::JsonError> {
+        let progress = Object::new()
+            .with("files", progress.files.to_json()?)?
+            .with("folders", progress.folders.to_json()?)?
+            .with("folders_pending", progress.folders_pending.to_json()?)?;
+        Object::new()
+            .with("root", root.as_path().to_string_lossy().into_owned())?
+            .with("progress", progress)
+    };
+    match data() {
+        Ok(data) => RpcError::new(ErrorCode::CheckpointNotReady).with_data(Value::Object(data)),
+        Err(_) => RpcError::new(ErrorCode::CheckpointNotReady),
+    }
+}
+
 /// The record's `signal` for signal `number`: its macOS name, such as `SIGKILL`, or `SIG<number>` for one without.
 pub(crate) fn signal_name(number: u8) -> String {
     const NAMES: [&str; 31] = [
@@ -907,6 +1053,8 @@ fn request_error(code: ErrorCode, request_id: Option<RequestId>) -> RpcError {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod checkpoint_tests;
 #[cfg(test)]
 mod hold_tests;
 #[cfg(test)]

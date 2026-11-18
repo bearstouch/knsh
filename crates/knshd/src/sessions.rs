@@ -62,20 +62,23 @@
 //! policy, then [`AgentAccess`] or [`Holds`] (never both), then the event hub's own lock. The registry lock is never
 //! held while waiting for the record store, and the agent table is never held while reading the process table.
 
-use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Duration;
 
+use knsh_checkpoint::RootReadiness;
 use knsh_core::{
-    Actor, ActorKind, CoreError, EventData, ExecutionRecord, ProfileName, ProfileOrder, RecordDetails, RecordId,
-    Redacted, SessionId, SessionRegistry, SessionSpec, SessionState, Timestamp, Transition, Ulid,
+    Actor, ActorKind, CanonicalPath, CoreError, EventData, ExecutionRecord, Profile, ProfileName, ProfileOrder,
+    RecordDetails, RecordId, Redacted, SessionId, SessionRegistry, SessionSpec, SessionState, Timestamp, Transition,
+    Ulid, UnprotectedReason,
 };
 use knsh_json::{Object, Value};
 use knsh_platform::{
     AuditToken, Authenticated, Clock, ProcessGroupId, ProcessIdentity, ProcessTree, Processes, Random,
 };
 use knsh_proto::{
-    ErrorCode, RpcError, SessionInfoResult, SessionStartHumanParams, SessionStartHumanResult, TelemetryCommandParams,
-    TelemetryCommandResult, TelemetryCwdParams, TelemetryIdleParams,
+    CheckpointBackend, ErrorCode, RpcError, SessionInfoResult, SessionStartHumanParams, SessionStartHumanResult,
+    TelemetryCommandParams, TelemetryCommandResult, TelemetryCwdParams, TelemetryIdleParams,
 };
 use knsh_store::RecordStore;
 
@@ -84,6 +87,7 @@ use crate::dispatch::{Answer, Call, Endpoint, Handler, Handlers, Reply, answer, 
 use crate::events::EventHub;
 use crate::holds::{GroupKind, Holds, Kept};
 use crate::lifetime::Activity;
+use crate::shadows::Shadows;
 
 /// The profile recorded for human sessions. Nothing in a human session is enforced (FR-SES-22); profiles are loaded
 /// from files in phase 2 (KNSH-039), and until then every session runs under this name.
@@ -121,6 +125,8 @@ pub(crate) struct Sessions {
     holds: Holds,
     /// Agent sessions paused because their pushed policy expired (module documentation, KNSH-072).
     expiry_paused: Mutex<BTreeSet<SessionId>>,
+    /// Agent sessions' checkpoint shadows (KNSH-079), attached once at start-up; absent in tests that need none.
+    shadows: OnceLock<Arc<Shadows>>,
 }
 
 /// A state change asked of a live session (KNSH-054): the edges of the state diagram other than ending, which has its
@@ -275,7 +281,58 @@ impl Sessions {
             agents: AgentAccess::new(processes),
             holds: Holds::new(),
             expiry_paused: Mutex::new(BTreeSet::new()),
+            shadows: OnceLock::new(),
         })
+    }
+
+    /// Attaches the checkpoint shadows (KNSH-079): from now on every agent session that ends, however it ends, has
+    /// its shadow builds stopped. Only the first call has an effect.
+    pub(crate) fn attach_shadows(&self, shadows: Arc<Shadows>) {
+        let _ = self.shadows.set(shadows);
+    }
+
+    /// How far the shadow of `root` is for `session_id` (FR-CKP-02). Without attached shadows no root has one.
+    pub(crate) fn shadow_readiness(&self, session_id: SessionId, root: &CanonicalPath) -> RootReadiness {
+        match self.shadows.get() {
+            Some(shadows) => shadows.readiness(session_id, root),
+            None => RootReadiness::Unavailable(UnprotectedReason::NoShadow),
+        }
+    }
+
+    /// Waits at most `slice` for the shadow of `root` to settle, and returns its readiness then.
+    pub(crate) fn wait_for_shadow(
+        &self,
+        session_id: SessionId,
+        root: &CanonicalPath,
+        slice: Duration,
+    ) -> RootReadiness {
+        match self.shadows.get() {
+            Some(shadows) => shadows.wait(session_id, root, slice),
+            None => RootReadiness::Unavailable(UnprotectedReason::NoShadow),
+        }
+    }
+
+    /// `hello`'s `checkpoints` (KNSH-079): each root of a running agent session once its shadow settled. Empty
+    /// without attached shadows.
+    pub(crate) fn checkpoint_report(&self) -> BTreeMap<String, CheckpointBackend> {
+        self.shadows
+            .get()
+            .map(|shadows| shadows.capability_report())
+            .unwrap_or_default()
+    }
+
+    /// Starts the checkpoint shadows of the agent session `session_id`, which runs `profile` (FR-CKP-01). Returns at
+    /// once: the builds run in the background. Nothing happens without attached shadows.
+    pub(crate) fn start_shadows(&self, session_id: SessionId, profile: &Profile) {
+        if let Some(shadows) = self.shadows.get() {
+            shadows.start(session_id, profile);
+            // The session may have ended between opening and here, and `end` then found no builds to stop. Checked
+            // after the builds are in the table: an end that comes later stops them itself, one that came earlier is
+            // seen now, so a build never outlives its session (KNSH-079).
+            if lock(&self.registry).get(session_id).is_err() {
+                shadows.end(session_id);
+            }
+        }
     }
 
     /// Every session handler, by method name.
@@ -935,6 +992,10 @@ impl Sessions {
             let _ = store.write_session(&session, now);
         }
         let _ = self.events.state_changed(&change);
+        // Outside every lock: the shadow table is a leaf, and its builds are only told to stop.
+        if let Some(shadows) = self.shadows.get() {
+            shadows.end(session_id);
+        }
     }
 
     /// The record store, or `-32603` when it could not be opened at start.

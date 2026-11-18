@@ -206,8 +206,9 @@ pub use ratelimit::{
 };
 pub use record::{
     ArgvClass, ArgvEntry, DecisionVerdict, ExecutionRecord, HookResult, HookRun, MAX_HOOK_RUNS, MAX_NETWORK_ENTRIES,
-    NetworkEntry, NetworkResult, OutputInfo, OutputStream, RecordDecision, RecordDetails, argv_of, decode_argv,
-    decode_decision, decode_network, encode_argv, encode_decision, encode_network, merge_network,
+    NetworkEntry, NetworkResult, OutputInfo, OutputStream, RecordDecision, RecordDetails, UnprotectedReason,
+    UnprotectedRoot, argv_of, decode_argv, decode_decision, decode_network, decode_unprotected, encode_argv,
+    encode_decision, encode_network, encode_unprotected, merge_network,
 };
 pub use redacted::{REDACTED_MARKER, Redacted};
 pub use registry::{EqualProfileOnly, ProfileOrder, SessionRegistry};

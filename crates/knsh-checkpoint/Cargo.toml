@@ -11,6 +11,10 @@ license.workspace = true
 knsh-core = { path = "../knsh-core" }
 knsh-platform = { path = "../knsh-platform" }
 
+[features]
+# In-memory fakes (`knsh_checkpoint::testing`), for other crates' tests only (`[dev-dependencies]`).
+testing = []
+
 [dev-dependencies]
 # Fakes for the filesystem and volume services (KNSH-078).
 knsh-platform = { path = "../knsh-platform", features = ["testing"] }

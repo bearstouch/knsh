@@ -28,6 +28,24 @@ flowchart LR
 | FR-CKP-10 | Checkpoint cost must grow with the number of files changed, not with the size of the project. Nothing has to be predicted before a command runs. |
 | FR-CKP-11 | `checkpoint.created` must be emitted for each checkpoint. |
 
+**Shadow builder (KNSH-079).** One build per root that clones (`apfs-clone`), started when the agent session starts
+(`session.start_agent`, `session.create`) and stopped when it ends; session start never waits for it. Per decision 15
+it clones file by file on 4 threads at QoS utility, into a new owner-only folder `shadows/<session>/<root index>/` in
+the root's store. Every entry is read with `lstat`: a symlink is cloned as the link (its target is never read or
+entered), a folder is entered only if it is one, folders named in `checkpoints.exclude` are skipped at any depth (files
+of that name are not), special files (sockets, FIFOs, devices) are skipped and listed, and the store and the engine
+directories are never entered (a root may contain them). An entry removed during the build is skipped; any other error
+fails the build, and the root becomes `none`. Each build's file count and duration are logged, and one over 10 s is
+logged as an error (NFR-PERF-06). Roots whose store is `plain-copy` get no shadow yet (`none`). Shadows are not removed
+when their session ends yet (retention, KNSH-087).
+**Known limit (pending):** the walk goes by path, so a folder swapped for a symlink between its `lstat` and its
+listing (by a writer racing the build, such as the envelope) is still followed for that folder; an `openat`-relative
+walk with `O_NOFOLLOW` closes this, and restore (KNSH-08x) must not trust shadow contents until it does.
+
+**Lines that touch a root (FR-CKP-02).** A line touches a root when its `cwd` is in the root, or the profile's
+`fs.write` holds a path in the root or one containing it: lines are sandboxed to `fs.write`, so a line meeting neither
+cannot change the root. A required root that will never have a shadow denies the line before any waiting.
+
 File events carry no process ID, so a human edit made at the same moment can be attributed to the agent; the post-image check below keeps that from causing damage.
 
 ## Restore rules

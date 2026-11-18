@@ -7,7 +7,7 @@ use knsh_core::{
     Actor, AgentId, ArgvClass, ArgvEntry, CanonicalPath, CheckpointId, DecisionSource, DecisionVerdict, DenialReport,
     DenialTag, ExecutionRecord, NetworkEntry, NetworkResult, OutputStream, ProfileName, RecordDecision, RecordDetails,
     RecordId, Redacted, SandboxViolation, Session, SessionId, SessionSpec, TaggedCommand, Timestamp, Ulid,
-    encode_decision,
+    UnprotectedReason, UnprotectedRoot, encode_decision,
 };
 use knsh_platform::macos::{RealFs, effective_uid};
 use knsh_platform::sqlite::{Connection, DEFAULT_BUSY_TIMEOUT, Step, Value};
@@ -163,6 +163,10 @@ fn full_details() -> RecordDetails {
                 NetworkResult::Contacted,
             ),
         ],
+        unprotected: vec![UnprotectedRoot {
+            root: CanonicalPath::new("/code/app").unwrap(),
+            reason: UnprotectedReason::ShadowBuilding,
+        }],
     }
 }
 
@@ -304,6 +308,8 @@ fn human_record_drops_non_telemetry_fields() {
             ("github.com", 443, Some("approval_required"), 1)
         ]
     );
+    // KNSH-079: the roots whose changes were not protected read back as written.
+    assert_eq!(details.unprotected, full_details().unprotected);
     assert_eq!(stored.stdout.map(|info| info.stored), Some(3));
     assert_eq!(stored.stderr.map(|info| info.stored), Some(0));
 }

@@ -28,7 +28,8 @@
 //!    up on the `PATH` of the caller's environment (absolute entries only, the shim directory skipped). It must be
 //!    an executable file; otherwise `-32602`.
 //! 6. **Session.** Opened with its parent ([`Sessions::open_agent_in`]): row written, `session.started` published,
-//!    token issued.
+//!    token issued. Its checkpoint roots' shadows start building in the background (KNSH-079,
+//!    [`Sessions::start_shadows`]); nothing waits for them here.
 //! 7. **Launch (KNSH-057).** The proxy issues the envelope's credentials ([`ProxyIssuer`]; none if no proxy
 //!    runs), revoked with the session's lines' when the envelope ends. The [`Launcher`] compiles the envelope profile ([`envelope_profile`]) and starts the CLI through
 //!    `knsh-exec`, in a new process group, on the caller's descriptors, with the envelope environment
@@ -270,6 +271,9 @@ impl AgentStarter {
         let session_id = opened.session_id;
         let profile = Arc::new(profile);
         self.running().insert(session_id, Arc::clone(&profile));
+        // FR-CKP-01: one background shadow build per checkpoint root, from the profile exactly as the session runs
+        // it; the envelope starts without waiting for them. They stop when the session ends.
+        self.sessions.start_shadows(session_id, &profile);
         // Steps 7 to 9. Whatever happens, the session ends before the answer.
         let ran = self.run(session_id, &opened.token, &profile, &program, &params, stdio, call);
         // Revoked first: once the envelope is gone, nothing may use its credentials (FR-NET-01).

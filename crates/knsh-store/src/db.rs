@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 use knsh_core::{
     Actor, ActorKind, AgentId, ArgvEntry, CanonicalPath, CappedOutput, CheckpointId, ExecutionRecord,
     MAX_NETWORK_ENTRIES, NetworkEntry, OutputInfo, OutputStream, RecordDecision, RecordDetails, RecordId, Redacted,
-    SandboxViolation, Session, SessionId, Timestamp, decode_argv, decode_decision, decode_network, decode_violations,
-    encode_argv, encode_decision, encode_network, encode_violations, merge_into, merge_network,
+    SandboxViolation, Session, SessionId, Timestamp, UnprotectedRoot, decode_argv, decode_decision, decode_network,
+    decode_unprotected, decode_violations, encode_argv, encode_decision, encode_network, encode_unprotected,
+    encode_violations, merge_into, merge_network,
 };
 use knsh_platform::sqlite::{Connection, DATABASE_MODE, DEFAULT_BUSY_TIMEOUT, Statement, Step, Value};
 use knsh_platform::{FileKind, Fs};
@@ -57,7 +58,7 @@ impl RecordedOutput {
 /// The columns [`read_record`] expects, in order.
 const RECORD_COLUMNS: &str = "record_id, session_id, actor_kind, agent_id, command, rewritten_from, cwd, started_at, \
      ended_at, exit_code, pipestatus, signal, sandbox_profile, secrets_injected, checkpoint_id, sandbox_violations, \
-     decision, argv, network";
+     decision, argv, network, unprotected";
 
 /// The most distinct sandbox violations one record keeps (FR-SBX-08). Repeats of a kept one only add to its count;
 /// further distinct ones are dropped, so one noisy command cannot grow its record without bound.
@@ -145,7 +146,7 @@ impl Database {
         transaction.execute(
             &format!(
                 "INSERT INTO records ({RECORD_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-                 ?13, ?14, ?15, ?16, ?17, ?18, ?19)"
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
             ),
             &encoded.values(&record),
         )?;
@@ -485,6 +486,7 @@ struct Encoded {
     decision: Option<String>,
     argv: Option<String>,
     network: Option<String>,
+    unprotected: Option<String>,
     started_at: i64,
     ended_at: Option<i64>,
 }
@@ -538,6 +540,11 @@ impl Encoded {
             merge_network(&mut kept, details.network.clone(), MAX_NETWORK_ENTRIES);
             Some(encode_network(&kept).map_err(|_| StoreError::InvalidRecord("network"))?)
         };
+        // The `unprotected` array as JSON text (KNSH-079, schema version 2). Empty is NULL.
+        let unprotected = (!details.unprotected.is_empty())
+            .then(|| encode_unprotected(&details.unprotected))
+            .transpose()
+            .map_err(|_| StoreError::InvalidRecord("unprotected"))?;
         Ok(Self {
             record_id: record.record_id.to_string(),
             session_id: record.session_id.to_string(),
@@ -548,13 +555,14 @@ impl Encoded {
             decision,
             argv,
             network,
+            unprotected,
             started_at: micros(record.started_at)?,
             ended_at: record.ended_at.map(micros).transpose()?,
         })
     }
 
     /// The bound values, in [`RECORD_COLUMNS`] order.
-    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 19] {
+    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 20] {
         let details = &record.details;
         [
             Value::Text(&self.record_id),
@@ -578,6 +586,7 @@ impl Encoded {
             optional_text(self.decision.as_deref()),
             optional_text(self.argv.as_deref()),
             optional_text(self.network.as_deref()),
+            optional_text(self.unprotected.as_deref()),
         ]
     }
 }
@@ -636,6 +645,7 @@ fn read_record(statement: &Statement<'_>) -> Result<ExecutionRecord, StoreError>
             decision: stored_decision(statement.column_text(16)?.as_deref())?,
             argv: stored_argv(statement.column_text(17)?.as_deref())?,
             network: stored_network(statement.column_text(18)?.as_deref())?,
+            unprotected: stored_unprotected(statement.column_text(19)?.as_deref())?,
         },
     })
 }
@@ -711,4 +721,14 @@ fn timestamp(micros: i64) -> Result<Timestamp, StoreError> {
 /// A byte count as stored. Counts above `i64::MAX` cannot occur for in-memory output.
 fn count(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::Corrupt)
+}
+
+/// A record's stored `unprotected` column: `NULL` is an empty list (every root the line touched was protected, it
+/// touched none, or it was written before KNSH-079), and text the engine could not have written is
+/// [`StoreError::Corrupt`].
+fn stored_unprotected(text: Option<&str>) -> Result<Vec<UnprotectedRoot>, StoreError> {
+    text.map(decode_unprotected)
+        .transpose()
+        .map_err(|_| StoreError::Corrupt)
+        .map(Option::unwrap_or_default)
 }

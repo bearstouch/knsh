@@ -79,7 +79,7 @@ impl Supervise {
         let SessionCreateParams { agent, profile } = params(call)?;
         // The profile must load now, as the session's first line will load it, so a session never exists for a
         // profile that cannot decide anything. Paths resolve from the home directory, as for `policy.set`.
-        self.profiles.load(&profile, self.profiles.home()).map_err(|error| {
+        let loaded = self.profiles.load(&profile, self.profiles.home()).map_err(|error| {
             let missing = *error.kind() == ProfileErrorKind::ProfileNotFound
                 && error.origin() == Some(&ProfileOrigin::Profile(profile.clone()));
             RpcError::new(if missing {
@@ -89,6 +89,8 @@ impl Supervise {
             })
         })?;
         let opened = self.sessions.create_agent(Actor::Agent(agent), profile)?;
+        // FR-CKP-01: its roots' shadows start building now, in the background, from the profile as just loaded.
+        self.sessions.start_shadows(opened.session_id, &loaded);
         answer(&SessionCreateResult {
             session_id: opened.session_id,
             session_token: opened.token.encode().expose().clone(),

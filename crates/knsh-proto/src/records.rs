@@ -290,6 +290,8 @@ impl ToJson for RecordEntry<'_> {
             object.insert("argv", details.argv.to_json()?)?;
             // The hosts the proxy let the line contact or refused it (KNSH-060, FR-NET-09).
             object.insert("network", details.network.to_json()?)?;
+            // Checkpoint roots the line touched whose changes were not protected, and why (KNSH-079, FR-CKP-02).
+            object.insert("unprotected", details.unprotected.to_json()?)?;
         }
         object.insert("stdout", self.stdout.as_ref().map(output_info).transpose()?.to_json()?)?;
         object.insert("stderr", self.stderr.as_ref().map(output_info).transpose()?.to_json()?)?;
@@ -570,6 +572,8 @@ mod tests {
         assert!(text.contains(r#""argv":[]"#), "{text}");
         // KNSH-060: `network` is always an array.
         assert!(text.contains(r#""network":[]"#), "{text}");
+        // KNSH-079: `unprotected` is always an array.
+        assert!(text.contains(r#""unprotected":[]"#), "{text}");
         let mut classified = record(Actor::Agent(AgentId::new("codex").unwrap()));
         classified.details.argv = vec![
             knsh_core::ArgvEntry {

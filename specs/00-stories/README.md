@@ -360,7 +360,7 @@ Critical path: [KNSH-110](KNSH-110-portable-platform-split-and-linux-ci.md) → 
 | --- | --- | --- | --- | --- | --- |
 | [KNSH-077](KNSH-077-spike-file-system-behaviour-copy-on-write-cloning-memory.md) | Spike: file-system behaviour: copy-on-write cloning, memory-mapped writes and file-event flushing (C3, C4) | Spikes | XL (8) | — | Done |
 | [KNSH-078](KNSH-078-apfs-platform-services-and-checkpoint-storage-layout.md) | APFS platform services and checkpoint storage layout | Checkpoints | XL (8) | [KNSH-007](KNSH-007-platform-interface-and-test-fakes.md), [KNSH-011](KNSH-011-engine-directories-permissions-and-backup-exclusion.md), [KNSH-077](KNSH-077-spike-file-system-behaviour-copy-on-write-cloning-memory.md) | Done |
-| [KNSH-079](KNSH-079-shadow-builder.md) | Shadow builder | Checkpoints | L (5) | [KNSH-078](KNSH-078-apfs-platform-services-and-checkpoint-storage-layout.md) | Not started |
+| [KNSH-079](KNSH-079-shadow-builder.md) | Shadow builder | Checkpoints | L (5) | [KNSH-078](KNSH-078-apfs-platform-services-and-checkpoint-storage-layout.md) | Done |
 | [KNSH-080](KNSH-080-file-event-watcher-and-rescans.md) | File-event watcher and rescans | Checkpoints | L (5) | [KNSH-077](KNSH-077-spike-file-system-behaviour-copy-on-write-cloning-memory.md), [KNSH-079](KNSH-079-shadow-builder.md) | Not started |
 | [KNSH-081](KNSH-081-change-attribution.md) | Change attribution | Checkpoints | L (5) | [KNSH-050](KNSH-050-supervisor-lifecycle-orchestrator.md), [KNSH-080](KNSH-080-file-event-watcher-and-rescans.md) | Not started |
 | [KNSH-082](KNSH-082-capture-pre-images-and-post-image-identity.md) | Capture: pre-images and post-image identity | Checkpoints | L (5) | [KNSH-081](KNSH-081-change-attribution.md) | Not started |
