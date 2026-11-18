@@ -311,6 +311,9 @@ struct Ready {
     received_at: Timestamp,
     /// Checkpoint roots it touches whose changes are not protected: the record's `unprotected` (KNSH-079).
     unprotected: Vec<UnprotectedRoot>,
+    /// Checkpoint roots it touches whose shadow is ready: their watchers mark its start and run the line-end flush
+    /// (KNSH-080).
+    protected: Vec<CanonicalPath>,
 }
 
 /// Why the checkpoint gate stopped an allowed line (FR-CKP-02).
@@ -429,7 +432,7 @@ impl Lifecycle {
             // `-32010`, or is denied, as `checkpoints.required` and the caller ask. Recorded as a deny when stopped,
             // like a held line, so the decision is not lost.
             Outcome::Run(allowed) => match self.checkpoint_gate(line, &profile, caller) {
-                Ok(unprotected) => {
+                Ok((unprotected, protected)) => {
                     return Ok(Ready {
                         record_id,
                         actor,
@@ -438,6 +441,7 @@ impl Lifecycle {
                         latency_ms,
                         received_at,
                         unprotected,
+                        protected,
                     });
                 }
                 Err(blocked) => {
@@ -489,13 +493,13 @@ impl Lifecycle {
     /// The checkpoint gate for an allowed line (FR-CKP-02, KNSH-079): the roots of `profile` the line touches
     /// ([`line_touches_root`]), each with its session's shadow, decided by [`gate`]. A waiting caller waits in slices
     /// of [`SHADOW_WAIT_SLICE`], and stops waiting when it disconnects or its session is held or ends. Returns the
-    /// roots whose changes are not protected, for the record.
+    /// roots whose changes are not protected, for the record, and the touched roots that are (KNSH-080).
     fn checkpoint_gate(
         &self,
         line: &ForwardedLine,
         profile: &Profile,
         caller: &dyn Caller,
-    ) -> Result<Vec<UnprotectedRoot>, Blocked> {
+    ) -> Result<(Vec<UnprotectedRoot>, Vec<CanonicalPath>), Blocked> {
         let sessions = &self.parts.sessions;
         let session_id = line.session_id;
         let touched: Vec<&CanonicalPath> = profile
@@ -522,10 +526,16 @@ impl Lifecycle {
                             return Err(Blocked::Held(hold));
                         }
                     }
-                    return Ok(unprotected
+                    let protected = touched
+                        .iter()
+                        .filter(|root| unprotected.iter().all(|(other, _)| other != **root))
+                        .map(|root| (*root).clone())
+                        .collect();
+                    let unprotected = unprotected
                         .into_iter()
                         .map(|(root, reason)| UnprotectedRoot { root, reason })
-                        .collect());
+                        .collect();
+                    return Ok((unprotected, protected));
                 }
                 Gate::NotReady { root, progress } => return Err(Blocked::NotReady { root, progress }),
                 // Every reason denies alike; listed so a new one is considered here.
@@ -815,6 +825,7 @@ impl Supervisor for Lifecycle {
             latency_ms,
             received_at,
             unprotected,
+            protected,
         } = panic::catch_unwind(AssertUnwindSafe(|| self.prepare(&line, caller)))
             .unwrap_or_else(|_| Err(denial(None, Some(INTERNAL_ERROR.to_owned()), DecisionSource::Rule)))?;
         let session_id = line.session_id;
@@ -849,7 +860,12 @@ impl Supervisor for Lifecycle {
             profile: *profile,
             capture,
         };
+        // KNSH-080: the start of the line's window in each protected root it touches. Never waits.
+        let checkpoint_lines = self.parts.sessions.open_checkpoint_lines(session_id, &protected);
         let report = self.parts.spawner.spawn(plan, &events);
+        // Decision 16: the line has been reaped; its file events are flushed with a marker before it is recorded, the
+        // one place the decision path waits for the watcher (bounded per root).
+        let uncertain = Sessions::close_checkpoint_lines(checkpoint_lines);
         let (written, ended_at) = self.finished(
             session_id,
             &actor,
@@ -863,6 +879,15 @@ impl Supervisor for Lifecycle {
             unprotected,
         );
         let record_id = written.then_some(record_id);
+        // FR-CKP-04: the line's checkpoints in these roots are uncertain (the roots were rescanned).
+        for (root, reason) in uncertain {
+            let data = EventData::CheckpointUncertain {
+                root,
+                record_id,
+                reason,
+            };
+            let _ = self.parts.events.publish(session_id, &actor, data);
+        }
         match report.outcome {
             Ok(Ran {
                 timed_out: false,

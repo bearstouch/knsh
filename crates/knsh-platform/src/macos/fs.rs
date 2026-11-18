@@ -227,6 +227,12 @@ impl Fs for RealFs {
         fs::remove_file(path).map_err(os(Operation::RemoveFile))
     }
 
+    fn remove_dir(&self, path: &Path) -> Result<(), PlatformError> {
+        require_absolute(path)?;
+        // `rmdir(2)` never follows a final symlink: it fails with `ENOTDIR` on one.
+        fs::remove_dir(path).map_err(os(Operation::RemoveDirectory))
+    }
+
     fn rename_new(&self, from: &Path, to: &Path) -> Result<(), PlatformError> {
         let (c_from, c_to) = (c_path(from)?, c_path(to)?);
         // `rename(2)` would silently replace whatever is at `to`; `RENAME_EXCL` makes the kernel refuse with `EEXIST`
@@ -545,6 +551,24 @@ mod tests {
     }
 
     // KNSH-012: removal unlinks a symlink itself, never its target, and refuses a directory.
+    // KNSH-080: `rmdir` removes an empty directory, and refuses a symlink to one without touching the target.
+    #[test]
+    fn remove_dir_does_not_follow_symlinks() {
+        let dir = TempDir::new("rmdir");
+        let target = dir.0.join("target");
+        let link = dir.0.join("link");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+        let real = RealFs::new();
+        assert_eq!(real.remove_dir(&link).unwrap_err().errno(), Some(libc::ENOTDIR));
+        assert!(target.is_dir());
+        fs::write(target.join("f"), b"x").unwrap();
+        assert_eq!(real.remove_dir(&target).unwrap_err().errno(), Some(libc::ENOTEMPTY));
+        fs::remove_file(target.join("f")).unwrap();
+        real.remove_dir(&target).unwrap();
+        assert!(real.remove_dir(&target).unwrap_err().is_not_found());
+    }
+
     #[test]
     fn remove_file_does_not_follow_symlinks_or_remove_directories() {
         let dir = TempDir::new("remove");

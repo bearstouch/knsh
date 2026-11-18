@@ -62,6 +62,8 @@ pub enum Operation {
     WriteAttribute,
     /// Removing a file (`unlink`).
     RemoveFile,
+    /// Removing an empty directory (`rmdir`; keeping checkpoint shadows in step, KNSH-080).
+    RemoveDirectory,
     /// Listing a directory's entries (`readdir`; sweeping unused sandbox profiles, KNSH-045).
     ReadDirectory,
     /// Receiving a listening socket that launchd created for this job (`launch_activate_socket`, KNSH-012).
@@ -136,6 +138,7 @@ impl Operation {
             Self::ReadAttribute => "read extended attribute",
             Self::WriteAttribute => "write extended attribute",
             Self::RemoveFile => "remove file",
+            Self::RemoveDirectory => "remove directory",
             Self::ReadDirectory => "read directory",
             Self::ActivateSocket => "activate launchd socket",
             Self::PeerCredentials => "read peer credentials",

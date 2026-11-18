@@ -46,6 +46,38 @@ walk with `O_NOFOLLOW` closes this, and restore (KNSH-08x) must not trust shadow
 `fs.write` holds a path in the root or one containing it: lines are sandboxed to `fs.write`, so a line meeting neither
 cannot change the root. A required root that will never have a shadow denies the line before any waiting.
 
+**Keeping current (KNSH-080, FR-CKP-03, FR-CKP-04, FR-EVT-08).** Each root with a shadow has one FSEvents stream
+(file-level events, `WatchRoot`) on the root and on its marker folder `markers/<session>/<root index>/` in the root's
+store, started **before** the shadow build so changes made while it runs are kept and applied once it completes, and
+stopped when the session ends. The stream's thread only records which paths may have changed, coalesced to one entry
+per path and at most 8,192 paths per root; more collapse into one rescan of the whole root (`too_many_events`). A
+worker thread brings the shadow in step: each path's live entry and shadow copy are compared by kind, size and
+modification time (flags are only hints, decision 16), a changed file or symlink is cloned again, a removed entry is
+removed from the shadow (a folder with everything below it), a folder created or moved in is reconciled with
+everything below it, and excluded folders, the store, the engine folders and special files are never shadowed. Each
+path that really changed is published as `file.changed` on the session, whoever changed it. While the root itself is
+gone or not a folder, the shadow keeps its last known state. Capture (KNSH-082) will take each changed path's shadow
+copy as its pre-image before this replaces it.
+
+**Lost events (FR-CKP-04).** `MustScanSubDirs`, `UserDropped` or `KernelDropped` rescans the folder named (the root,
+as observed); on the marker folder, `EventIdsWrapped` and `RootChanged` (after checking the root is still a folder)
+rescan the whole root. Each starts a new **uncertain window**. A line takes the window when it starts and compares it
+when it ends: if it moved, `checkpoint.uncertain` is published with the line's `record_id` after its
+`command.finished`. A window that opens while no line runs is published at once with `record_id: null` (the agent
+edits of that window). A shadow update that fails also makes the window uncertain (`shadow_update_failed`).
+
+**Closing a line (decision 16).** Once the supervisor has reaped a line, for each protected root it touches, the
+watcher creates a marker file in the marker folder and flushes the stream every millisecond until the marker's event
+arrives (so every earlier event of the line has too), a drop arrives, or 1 s passes on the clock; it then waits, within
+the same second, until the worker has applied everything received. A drop, a missing marker (`flush_timed_out`) or a
+root without a running watcher (`not_watched`) makes the line's checkpoints uncertain. This is the only place the
+decision path waits for the watcher.
+
+**Restart (NFR-REL-04).** A watcher can take over a shadow an earlier `knshd` run left: it rescans the whole root
+against it and publishes the gap as `checkpoint.uncertain` (`restart_gap`). **Pending:** sessions do not survive a
+`knshd` restart yet, so `knshd` has no shadow to take over after one; the takeover is wired when agent sessions are
+re-adopted after a restart.
+
 File events carry no process ID, so a human edit made at the same moment can be attributed to the agent; the post-image check below keeps that from causing damage.
 
 ## Restore rules

@@ -1,19 +1,21 @@
-//! Deterministic fakes for checkpoint tests (KNSH-079). Built only for tests and with the `testing` feature, which
-//! other crates enable in their `[dev-dependencies]` alone, so no fake reaches a shipped binary.
+//! Deterministic fakes for checkpoint tests (KNSH-079, KNSH-080). Built only for tests and with the `testing` feature,
+//! which other crates enable in their `[dev-dependencies]` alone, so no fake reaches a shipped binary.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
-use knsh_platform::{FileKind, Operation, PlatformError};
+use knsh_platform::{FileIdentity, FileKind, ModifiedTime, Operation, PlatformError};
 
 use crate::shadow::ShadowFiles;
 
 /// `errno` values (macOS); `libc` is reserved to `knsh-platform` (NFR-SUP-02).
+const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
 const EEXIST: i32 = 17;
 const ENOTDIR: i32 = 20;
+const ENOTEMPTY: i32 = 66;
 
 /// One entry of a [`FakeTree`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +44,13 @@ impl FakeNode {
 #[derive(Debug, Default)]
 struct State {
     nodes: BTreeMap<PathBuf, FakeNode>,
+    /// Each node's modification "time": a counter bumped whenever the test writes a node, copied by a clone (as an
+    /// APFS clone keeps `mtime`), so a changed live file differs from its shadow copy.
+    modified: BTreeMap<PathBuf, i64>,
+    /// The last modification counter handed out.
+    tick: i64,
+    /// Every path removed through [`ShadowFiles::remove`], in order.
+    removed: Vec<PathBuf>,
     /// `errno` a clone of a path fails with.
     clone_failures: BTreeMap<PathBuf, i32>,
     /// Every folder listed, in order.
@@ -51,9 +60,10 @@ struct State {
     held: bool,
 }
 
-/// An in-memory file tree implementing [`ShadowFiles`]. `/` always exists. Clones copy the node (a symlink stays a
-/// symlink, its target is never resolved). [`FakeTree::hold`] makes clones wait, so a test can observe a build in
-/// progress.
+/// An in-memory file tree implementing [`ShadowFiles`]. `/` always exists. Clones copy the node and its modification
+/// time (a symlink stays a symlink, its target is never resolved). [`FakeTree::hold`] makes clones wait, so a test can
+/// observe a build in progress. [`FakeTree::remove_all`] and [`FakeTree::rename`] change the tree as another process
+/// would.
 #[derive(Debug)]
 pub struct FakeTree {
     state: Mutex<State>,
@@ -72,6 +82,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn os(operation: Operation, errno: i32) -> PlatformError {
     PlatformError::Os { operation, errno }
+}
+
+impl State {
+    /// Inserts `node` at `path` with a new modification time.
+    fn put(&mut self, path: &Path, node: FakeNode) {
+        self.tick += 1;
+        self.modified.insert(path.to_path_buf(), self.tick);
+        self.nodes.insert(path.to_path_buf(), node);
+    }
+
+    /// Removes `path` and everything below it.
+    fn drop_below(&mut self, path: &Path) {
+        self.nodes.retain(|other, _| !other.starts_with(path));
+        self.modified.retain(|other, _| !other.starts_with(path));
+    }
 }
 
 impl FakeTree {
@@ -94,9 +119,64 @@ impl FakeTree {
         let path = path.as_ref();
         let mut state = lock(&self.state);
         for ancestor in path.ancestors().skip(1) {
-            state.nodes.entry(ancestor.to_path_buf()).or_insert(FakeNode::Dir);
+            if !state.nodes.contains_key(ancestor) {
+                state.put(ancestor, FakeNode::Dir);
+            }
         }
-        state.nodes.insert(path.to_path_buf(), node);
+        state.put(path, node);
+    }
+
+    /// Removes `path` and everything below it, as another process would.
+    pub fn remove_all(&self, path: impl AsRef<Path>) {
+        lock(&self.state).drop_below(path.as_ref());
+    }
+
+    /// Moves `from` (and everything below it) to `to`, replacing whatever was there, keeping modification times, as
+    /// `rename(2)` does.
+    pub fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) {
+        let (from, to) = (from.as_ref(), to.as_ref());
+        let mut state = lock(&self.state);
+        state.drop_below(to);
+        let moved: Vec<(PathBuf, FakeNode, i64)> = state
+            .nodes
+            .iter()
+            .filter(|(path, _)| path.starts_with(from))
+            .map(|(path, node)| {
+                let modified = state.modified.get(path).copied().unwrap_or_default();
+                (path.clone(), node.clone(), modified)
+            })
+            .collect();
+        state.drop_below(from);
+        for (path, node, modified) in moved {
+            let Ok(rest) = path.strip_prefix(from) else { continue };
+            let target = if rest.as_os_str().is_empty() {
+                to.to_path_buf()
+            } else {
+                to.join(rest)
+            };
+            state.modified.insert(target.clone(), modified);
+            state.nodes.insert(target, node);
+        }
+    }
+
+    /// Every path removed through [`ShadowFiles::remove`] so far, in order.
+    #[must_use]
+    pub fn removed(&self) -> Vec<PathBuf> {
+        lock(&self.state).removed.clone()
+    }
+
+    /// Every entry at or below `dir`, relative to it, with its node: what a test compares a shadow with its root by.
+    #[must_use]
+    pub fn snapshot(&self, dir: impl AsRef<Path>) -> BTreeMap<PathBuf, FakeNode> {
+        let dir = dir.as_ref();
+        lock(&self.state)
+            .nodes
+            .iter()
+            .filter_map(|(path, node)| {
+                let relative = path.strip_prefix(dir).ok()?;
+                (!relative.as_os_str().is_empty()).then(|| (relative.to_path_buf(), node.clone()))
+            })
+            .collect()
     }
 
     /// Adds a folder at `path`.
@@ -195,7 +275,7 @@ impl ShadowFiles for FakeTree {
         if state.nodes.get(parent) != Some(&FakeNode::Dir) {
             return Err(os(Operation::CreateDirectory, ENOENT));
         }
-        state.nodes.insert(path.to_path_buf(), FakeNode::Dir);
+        state.put(path, FakeNode::Dir);
         Ok(())
     }
 
@@ -221,8 +301,71 @@ impl ShadowFiles for FakeTree {
         if !parent_is_dir {
             return Err(os(Operation::Clone, ENOENT));
         }
+        let modified = state.modified.get(src).copied().unwrap_or_default();
         state.nodes.insert(dst.to_path_buf(), node);
+        state.modified.insert(dst.to_path_buf(), modified);
         state.clones += 1;
+        Ok(())
+    }
+
+    fn identity(&self, path: &Path) -> Result<FileIdentity, PlatformError> {
+        let state = lock(&self.state);
+        let node = state.nodes.get(path).ok_or(os(Operation::Metadata, ENOENT))?;
+        let size = match node {
+            FakeNode::File(contents) => contents.len() as u64,
+            FakeNode::Symlink(target) => target.as_os_str().len() as u64,
+            FakeNode::Dir | FakeNode::Special => 0,
+        };
+        Ok(FileIdentity {
+            kind: node.kind(),
+            inode: 0,
+            size,
+            modified: ModifiedTime {
+                seconds: state.modified.get(path).copied().unwrap_or_default(),
+                nanoseconds: 0,
+            },
+        })
+    }
+
+    fn remove(&self, path: &Path, folder: bool) -> Result<(), PlatformError> {
+        let mut state = lock(&self.state);
+        let operation = if folder {
+            Operation::RemoveDirectory
+        } else {
+            Operation::RemoveFile
+        };
+        let Some(node) = state.nodes.get(path) else {
+            return Err(os(operation, ENOENT));
+        };
+        // Like `rmdir(2)` and `unlink(2)`: each refuses the other's kind.
+        match (folder, node) {
+            (true, FakeNode::Dir) => {
+                if state.nodes.keys().any(|other| other.parent() == Some(path)) {
+                    return Err(os(operation, ENOTEMPTY));
+                }
+            }
+            (false, FakeNode::File(_) | FakeNode::Symlink(_) | FakeNode::Special) => {}
+            (true, _) => return Err(os(operation, ENOTDIR)),
+            (false, FakeNode::Dir) => return Err(os(operation, EPERM)),
+        }
+        state.nodes.remove(path);
+        state.modified.remove(path);
+        state.removed.push(path.to_path_buf());
+        Ok(())
+    }
+
+    fn create_file(&self, path: &Path) -> Result<(), PlatformError> {
+        let mut state = lock(&self.state);
+        if state.nodes.contains_key(path) {
+            return Err(os(Operation::Write, EEXIST));
+        }
+        let parent_is_dir = path
+            .parent()
+            .is_some_and(|parent| state.nodes.get(parent) == Some(&FakeNode::Dir));
+        if !parent_is_dir {
+            return Err(os(Operation::Write, ENOENT));
+        }
+        state.put(path, FakeNode::File(Vec::new()));
         Ok(())
     }
 }

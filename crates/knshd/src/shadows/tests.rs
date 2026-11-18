@@ -1,11 +1,12 @@
 //! The shadow registry over fake volumes and an in-memory tree (KNSH-079).
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use knsh_checkpoint::testing::FakeTree;
 use knsh_core::{ProfileName, SessionId, Ulid};
-use knsh_platform::testing::{FakeClock, FakeVolumes, MemFs, RecordingLog};
-use knsh_platform::{FileSystemKind, ensure_engine_dirs};
+use knsh_platform::testing::{FakeClock, FakeVolumes, MemFs, RecordingLog, ScriptedFileEvents};
+use knsh_platform::{FileEvent, FileEventFlags, FileSystemKind, ensure_engine_dirs};
 
 use super::*;
 
@@ -15,9 +16,62 @@ pub(crate) const ROOT: &str = "/Users/u/app";
 /// Long enough for any build here; a hung build fails the test instead of hanging it.
 pub(crate) const SETTLE: Duration = Duration::from_secs(20);
 
+/// Every checkpoint event published, by session.
+#[derive(Default)]
+pub(crate) struct RecordedEvents {
+    pub(crate) changed: Mutex<Vec<(SessionId, PathBuf)>>,
+    pub(crate) uncertain: Mutex<Vec<(SessionId, Option<RecordId>, UncertainReason)>>,
+}
+
+impl CheckpointEvents for RecordedEvents {
+    fn file_changed(&self, session_id: SessionId, _root: &CanonicalPath, path: &CanonicalPath) {
+        self.changed
+            .lock()
+            .unwrap()
+            .push((session_id, path.as_path().to_path_buf()));
+    }
+
+    fn uncertain(
+        &self,
+        session_id: SessionId,
+        _root: &CanonicalPath,
+        record_id: Option<RecordId>,
+        reason: UncertainReason,
+    ) {
+        self.uncertain.lock().unwrap().push((session_id, record_id, reason));
+    }
+}
+
+/// File events whose flushes deliver the event of every marker file present in a watched marker folder (the second
+/// folder of each stream), as the real stream does after the line-end procedure creates one.
+pub(crate) fn echoing_events(tree: &Arc<FakeTree>) -> ScriptedFileEvents {
+    let events = ScriptedFileEvents::new();
+    let tree = Arc::clone(tree);
+    events.on_flush(Box::new(move |watched| {
+        let Some(markers) = watched.get(1) else {
+            return Vec::new();
+        };
+        tree.paths_below(markers)
+            .into_iter()
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .map(|relative| FileEvent::new(markers.join(relative), FileEventFlags::ITEM_CREATED))
+            .collect()
+    }));
+    events
+}
+
 /// A machine whose home is on one APFS volume, with a non-APFS stick, and the engine directories ready. Returns the
 /// shadows over `tree`, which already holds the home store and `ROOT` with a few files.
 pub(crate) fn shadows(tree: &Arc<FakeTree>) -> Arc<Shadows> {
+    shadows_with(tree, echoing_events(tree), Arc::new(RecordedEvents::default()))
+}
+
+/// [`shadows`], with the file events and the checkpoint event sink given.
+pub(crate) fn shadows_with(
+    tree: &Arc<FakeTree>,
+    file_events: ScriptedFileEvents,
+    events: Arc<dyn CheckpointEvents>,
+) -> Arc<Shadows> {
     let fs = MemFs::new();
     for dir in [HOME, ROOT, "/Volumes/Stick/code"] {
         fs.add_dir_all(Path::new(dir)).unwrap();
@@ -42,6 +96,8 @@ pub(crate) fn shadows(tree: &Arc<FakeTree>) -> Arc<Shadows> {
         paths,
         uid,
         log: Arc::new(RecordingLog::new()),
+        file_events: Arc::new(file_events),
+        events,
     })
 }
 
@@ -81,6 +137,15 @@ fn session(n: u128) -> SessionId {
 
 fn root(path: &str) -> CanonicalPath {
     CanonicalPath::new(path).unwrap()
+}
+
+/// Waits until the shadow of `root` for `session_id` has settled, through the sessions it is attached to.
+pub(crate) fn settled_in(
+    sessions: &crate::sessions::Sessions,
+    session_id: SessionId,
+    root: &CanonicalPath,
+) -> RootReadiness {
+    sessions.wait_for_shadow(session_id, root, SETTLE)
 }
 
 /// Waits until the shadow of `root` for `session_id` has settled.
@@ -202,4 +267,96 @@ fn a_session_without_roots_starts_nothing() {
     shadows.start(session(1), &profile(&[], true));
     assert!(shadows.table().is_empty());
     assert_eq!(tree.clones(), 0);
+}
+
+/// A session over `ROOT` whose shadow is ready, with its file events and checkpoint events recorded.
+fn watched_session() -> (Arc<FakeTree>, ScriptedFileEvents, Arc<RecordedEvents>, Arc<Shadows>) {
+    let tree = Arc::new(FakeTree::new());
+    let file_events = echoing_events(&tree);
+    let events = Arc::new(RecordedEvents::default());
+    let shadows = shadows_with(
+        &tree,
+        file_events.clone(),
+        Arc::clone(&events) as Arc<dyn CheckpointEvents>,
+    );
+    shadows.start(session(1), &profile(&[ROOT], true));
+    assert_eq!(settled(&shadows, session(1), &root(ROOT)), RootReadiness::Ready);
+    (tree, file_events, events, shadows)
+}
+
+fn store_dir() -> PathBuf {
+    EnginePaths::for_home(Path::new(HOME)).unwrap().checkpoints_dir()
+}
+
+// KNSH-080 (FR-EVT-08, FR-CKP-03): each shadowed root gets a stream on itself and its marker folder in the store; a
+// change by any process reaches the shadow and is published as `file.changed` on the session.
+#[test]
+fn a_change_under_a_root_is_published_as_file_changed() {
+    let (tree, file_events, events, shadows) = watched_session();
+    let markers = store_dir().join("markers").join(session(1).to_string()).join("0");
+    assert_eq!(file_events.watched(), [vec![PathBuf::from(ROOT), markers]]);
+    let new = Path::new(ROOT).join("new.txt");
+    tree.add_file(&new, b"by another process");
+    file_events.emit(&[FileEvent::new(&new, FileEventFlags::ITEM_CREATED)]);
+    let lines = shadows.open_lines(session(1), &[root(ROOT)]);
+    assert_eq!(close_lines(lines), Vec::new());
+    assert_eq!(*events.changed.lock().unwrap(), [(session(1), new.clone())]);
+    let shadow = store_dir()
+        .join("shadows")
+        .join(session(1).to_string())
+        .join("0/new.txt");
+    assert!(tree.node(shadow).is_some());
+}
+
+// KNSH-080 (FR-CKP-04): a drop while a line runs makes that line's root uncertain at its end; a drop while no line
+// runs is published at once, with no record.
+#[test]
+fn dropped_events_make_the_line_uncertain() {
+    let (_tree, file_events, events, shadows) = watched_session();
+    let drop = || {
+        file_events.emit(&[FileEvent::new(
+            ROOT,
+            FileEventFlags::MUST_SCAN_SUB_DIRS.union(FileEventFlags::USER_DROPPED),
+        )]);
+    };
+    let lines = shadows.open_lines(session(1), &[root(ROOT)]);
+    drop();
+    assert_eq!(close_lines(lines), [(root(ROOT), UncertainReason::EventsDropped)]);
+    assert_eq!(*events.uncertain.lock().unwrap(), Vec::new());
+    drop();
+    let lines = shadows.open_lines(session(1), &[root(ROOT)]);
+    assert_eq!(close_lines(lines), Vec::new());
+    assert_eq!(
+        *events.uncertain.lock().unwrap(),
+        [(session(1), None, UncertainReason::EventsDropped)]
+    );
+}
+
+// KNSH-080: ending the session stops its watchers; roots without a shadow are not opened at all.
+#[test]
+fn ending_the_session_stops_its_watchers() {
+    let (_tree, file_events, _events, shadows) = watched_session();
+    assert_eq!(file_events.live_streams(), 1);
+    assert!(shadows.open_lines(session(1), &[root("/Users/u/elsewhere")]).is_empty());
+    let lines = shadows.open_lines(session(1), &[root(ROOT)]);
+    shadows.end(session(1));
+    assert_eq!(file_events.live_streams(), 0);
+    // A line that was running when its session ended: its root is no longer watched.
+    assert_eq!(close_lines(lines), [(root(ROOT), UncertainReason::NotWatched)]);
+    assert!(shadows.open_lines(session(1), &[root(ROOT)]).is_empty());
+}
+
+// KNSH-080: a watcher that cannot start leaves the shadow built (the gate still lets lines run) but every line in the
+// root is uncertain, and the failure is logged.
+#[test]
+fn a_watcher_that_cannot_start_makes_lines_uncertain() {
+    let tree = Arc::new(FakeTree::new());
+    let file_events = echoing_events(&tree);
+    file_events.fail_next_watch(knsh_platform::testing::watch_failure());
+    let shadows = shadows_with(&tree, file_events.clone(), Arc::new(RecordedEvents::default()));
+    shadows.start(session(1), &profile(&[ROOT], true));
+    assert_eq!(settled(&shadows, session(1), &root(ROOT)), RootReadiness::Ready);
+    let lines = shadows.open_lines(session(1), &[root(ROOT)]);
+    assert_eq!(close_lines(lines), [(root(ROOT), UncertainReason::NotWatched)]);
+    assert_eq!(file_events.live_streams(), 0);
 }

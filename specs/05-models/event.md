@@ -52,6 +52,15 @@ A `cwd` that is not valid UTF-8 is shown with U+FFFD replacements, as in records
 | `policy.updated` | `profile` (the profile the snapshot defines) and `expires_at`. An engine event, like `authority.connected`: `session_id` and `actor` are `null`, and only subscriptions to every session receive it. Published when the authority's `policy.set` snapshot was checked and stored (FR-POL-53, KNSH-071) |
 | `sandbox.violation` | A [sandbox violation](execution-record.md#sandbox_violations): `session_id`, `record_id` (ULID, or `null` for a denial inside an envelope), `rule`, `operation`, `argument` (string or `null`), `process`, `pid`, `count`, `at`. Published only for a live session named by the denial's tag; repeats within 3 s are one event with their `count` (KNSH-047) |
 
+## Phase 3 payloads
+
+| Event | `data` |
+| --- | --- |
+| `file.changed` | `root` (the checkpoint root), `path` (the path inside it that changed: created, written, removed or replaced). Published on every agent session protecting the root, once its shadow follows the change, whichever process made it; an event that changed nothing is not published (FR-EVT-08, KNSH-080) |
+| `checkpoint.uncertain` | `root`, `record_id` (the line whose checkpoints are uncertain, published after its `command.finished`; `null` for a window outside any line), `reason`: `events_dropped`, `event_ids_wrapped`, `root_changed`, `too_many_events`, `flush_timed_out`, `restart_gap`, `not_watched` or `shadow_update_failed`. The root is rescanned (FR-CKP-04, NFR-REL-04, KNSH-080) |
+
+Paths that are not valid UTF-8 are shown with U+FFFD replacements, as in records.
+
 ## Catalog
 
 | Event | Emitted when | Can block |

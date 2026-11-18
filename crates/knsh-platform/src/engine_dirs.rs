@@ -763,6 +763,9 @@ mod tests {
         fn remove_file(&self, path: &Path) -> Result<(), PlatformError> {
             self.0.remove_file(path)
         }
+        fn remove_dir(&self, path: &Path) -> Result<(), PlatformError> {
+            self.0.remove_dir(path)
+        }
         fn rename_new(&self, from: &Path, to: &Path) -> Result<(), PlatformError> {
             self.0.rename_new(from, to)
         }

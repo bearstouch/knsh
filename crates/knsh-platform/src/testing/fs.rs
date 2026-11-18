@@ -465,6 +465,31 @@ impl Fs for MemFs {
         }
     }
 
+    fn remove_dir(&self, path: &Path) -> Result<(), PlatformError> {
+        let mut state = lock(&self.state);
+        require_absolute(path)?;
+        state.check_fault(Operation::RemoveDirectory)?;
+        // Like `rmdir`: a final symlink is not followed, so it is refused as not a directory.
+        let resolved = resolve(&state.nodes, path, false, Operation::RemoveDirectory)?;
+        match state.nodes.get(&resolved) {
+            Some(Node::Directory { .. }) => {
+                let has_entries = state
+                    .nodes
+                    .keys()
+                    .any(|other| other.parent() == Some(resolved.as_path()) && other != &resolved);
+                if has_entries {
+                    return Err(os(Operation::RemoveDirectory, libc::ENOTEMPTY));
+                }
+                state.nodes.remove(&resolved);
+                state.owners.remove(&resolved);
+                state.xattrs.remove(&resolved);
+                Ok(())
+            }
+            Some(Node::File { .. } | Node::Symlink { .. }) => Err(os(Operation::RemoveDirectory, libc::ENOTDIR)),
+            None => Err(os(Operation::RemoveDirectory, libc::ENOENT)),
+        }
+    }
+
     fn rename_new(&self, from: &Path, to: &Path) -> Result<(), PlatformError> {
         split_target(from)?;
         split_target(to)?;
@@ -764,6 +789,28 @@ mod tests {
         fs.create_dir(Path::new("/d"), 0o700).unwrap();
         assert_eq!(fs.remove_file(Path::new("/d")).unwrap_err().errno(), Some(libc::EPERM));
         assert_eq!(fs.remove_file(Path::new("rel")), Err(PlatformError::InvalidPath));
+    }
+
+    // KNSH-080: `rmdir` removes only an empty directory, never a file or a symlink.
+    #[test]
+    fn remove_dir_removes_only_empty_directories() {
+        let fs = MemFs::new();
+        fs.add_dir_all(Path::new("/d/sub")).unwrap();
+        fs.add_symlink(Path::new("/link"), Path::new("/d")).unwrap();
+        fs.write(Path::new("/f"), b"x", 0o600).unwrap();
+        assert_eq!(
+            fs.remove_dir(Path::new("/d")).unwrap_err().errno(),
+            Some(libc::ENOTEMPTY)
+        );
+        assert_eq!(
+            fs.remove_dir(Path::new("/link")).unwrap_err().errno(),
+            Some(libc::ENOTDIR)
+        );
+        assert_eq!(fs.remove_dir(Path::new("/f")).unwrap_err().errno(), Some(libc::ENOTDIR));
+        fs.remove_dir(Path::new("/d/sub")).unwrap();
+        fs.remove_dir(Path::new("/d")).unwrap();
+        assert!(fs.remove_dir(Path::new("/d")).unwrap_err().is_not_found());
+        assert_eq!(fs.remove_dir(Path::new("rel")), Err(PlatformError::InvalidPath));
     }
 
     #[test]

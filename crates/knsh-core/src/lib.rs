@@ -168,6 +168,7 @@ pub use error::{CoreError, MAX_KEY_DISPLAY_LEN, ProfileError, ProfileErrorKind, 
 pub use event::{
     BusLimits, CancelReason, Delivery, EVENT_BUFFER_LEN, EngineEvent, EngineEventData, EngineLost, Event, EventBus,
     EventData, EventScope, Lost, MAX_ENDED_BUFFERS, Published, PublishedEngine, Subscribed, SubscriptionId,
+    UncertainReason,
 };
 pub use hook::{
     ConfigProblem, Ended, Execution, HOOK_EVENT, HOOKS_KEY, HookConfig, HookEntry, HookExecutor, HookExit, HookId,

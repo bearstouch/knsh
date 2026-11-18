@@ -284,6 +284,15 @@ fn a_slow_build_is_marked_over_budget() {
             self.clock.advance(Duration::from_secs(6));
             self.tree.clone_file(src, dst)
         }
+        fn identity(&self, path: &Path) -> Result<FileIdentity, PlatformError> {
+            self.tree.identity(path)
+        }
+        fn remove(&self, path: &Path, folder: bool) -> Result<(), PlatformError> {
+            self.tree.remove(path, folder)
+        }
+        fn create_file(&self, path: &Path) -> Result<(), PlatformError> {
+            self.tree.create_file(path)
+        }
     }
     let tree = tree();
     tree.add_file(Path::new(ROOT).join("a"), b"a");
