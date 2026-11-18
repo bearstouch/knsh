@@ -31,5 +31,5 @@
 //! gate references (`specs/01-overview/roadmap.md`). A case that failed leaves no result and the report fails.
 
 mod cases;
-mod harness;
+pub(crate) mod harness;
 mod report;

@@ -49,56 +49,65 @@ use crate::dispatch::{Call, Endpoint, Passed, START_AGENT};
 use crate::endpoints::Listeners;
 use crate::exec::{ExecRun, Finished, ForwardedLine, Proposal};
 use crate::grants::GrantStore;
+use crate::hooks::HookRunner;
 use crate::policy::ProfileLoader;
 use crate::profiles::ProfileFiles;
 use crate::proxy::{LiveProxy, NetworkReport, ProxyIssuer};
 use crate::server::{Config as ServerConfig, Server, Services, StopHandle};
 use crate::sessions::SessionBinding;
-use crate::sessions::tests::{Fixture, fixture_on};
+use crate::sessions::tests::{Fixture, fixture_on, fixture_with};
 use crate::spawn::{Limits, TrampolineSpawner};
 use crate::start_agent::{AgentStarter, TrampolineLauncher};
-use crate::supervisor::{Lifecycle, Parts};
+use crate::supervisor::{Lifecycle, Parts, Spawner};
 
 /// The `PATH` lines and envelopes run with.
-pub(super) const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+pub(crate) const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// How long an ask waits before it is denied: nobody answers in these cases.
 const ASK_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// How long [`Stack::line`] lets a line run before it is killed, in seconds.
-pub(super) const LINE_TIMEOUT_S: u64 = 60;
+pub(crate) const LINE_TIMEOUT_S: u64 = 60;
 
 /// The binaries a case needs beside this test binary.
-pub(super) struct Binaries {
+pub(crate) struct Binaries {
     /// `knsh-exec`.
-    pub(super) trampoline: PathBuf,
+    pub(crate) trampoline: PathBuf,
     /// `knsh`, canonical: the envelope's `SHELL` and the client inside it.
-    pub(super) knsh: CanonicalPath,
+    pub(crate) knsh: CanonicalPath,
 }
 
 /// `knsh-exec` and `knsh` built beside this test binary (`target/<profile>/`), or `None` after marking `case`
 /// blocked: `cargo test -p knshd` alone does not build them.
 pub(super) fn binaries(case: Case) -> Option<(Case, Binaries)> {
-    let built = |name: &str| {
-        let exe = std::env::current_exe().ok()?;
-        let path = exe.parent()?.parent()?.join(name);
-        path.is_file().then_some(path)
-    };
-    if let (Some(trampoline), Some(knsh)) = (built("knsh-exec"), built("knsh")) {
-        let knsh = CanonicalPath::new(std::fs::canonicalize(knsh).unwrap()).unwrap();
-        return Some((case, Binaries { trampoline, knsh }));
+    if let Some(binaries) = built_binaries() {
+        return Some((case, binaries));
     }
     case.blocked("knsh-exec or knsh is not built beside the test binary: run `cargo test --workspace`");
     None
 }
 
+/// `knsh-exec` and `knsh` built beside this test binary, or `None` when either is missing.
+pub(crate) fn built_binaries() -> Option<Binaries> {
+    let trampoline = built("knsh-exec")?;
+    let knsh = CanonicalPath::new(std::fs::canonicalize(built("knsh")?).ok()?).ok()?;
+    Some(Binaries { trampoline, knsh })
+}
+
+/// The workspace binary `name` built beside this test binary (`target/<profile>/<name>`), if it was built.
+pub(crate) fn built(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let path = exe.parent()?.parent()?.join(name);
+    path.is_file().then_some(path)
+}
+
 /// A private, canonical temporary directory, removed on drop. Short and under `/private/tmp`, so the engine sockets
 /// below it fit in a socket address (104 bytes).
-pub(super) struct Scratch(pub(super) PathBuf);
+pub(crate) struct Scratch(pub(crate) PathBuf);
 
 impl Scratch {
     /// A new directory for `tag` (at most 8 characters).
-    pub(super) fn new(tag: &str) -> Self {
+    pub(crate) fn new(tag: &str) -> Self {
         let dir = PathBuf::from(format!("/private/tmp/knsh-tm-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
@@ -107,7 +116,7 @@ impl Scratch {
     }
 
     /// A new owner-only directory `name` inside.
-    pub(super) fn dir(&self, name: &str) -> PathBuf {
+    pub(crate) fn dir(&self, name: &str) -> PathBuf {
         let dir = self.0.join(name);
         owner_only_dir(&dir);
         dir
@@ -127,22 +136,22 @@ impl Drop for Scratch {
 }
 
 /// The real `knshd` parts, running (module documentation).
-pub(super) struct Stack {
+pub(crate) struct Stack {
     /// The user's home: engine directories, sockets and policies below it.
-    pub(super) home: PathBuf,
+    pub(crate) home: PathBuf,
     /// The engine paths of [`Stack::home`].
-    pub(super) paths: EnginePaths,
+    pub(crate) paths: EnginePaths,
     /// The project lines run in: `${PROJECT}`.
-    pub(super) project: PathBuf,
+    pub(crate) project: PathBuf,
     /// A folder the cases' profiles trust (`exec.trusted_folders`) and never make writable: probes go here.
-    pub(super) tools: PathBuf,
+    pub(crate) tools: PathBuf,
     /// A folder no profile can write.
-    pub(super) outside: PathBuf,
+    pub(crate) outside: PathBuf,
     fixture: Fixture,
     /// The names the proxy resolves, and to what.
-    pub(super) resolver: Arc<FakeResolver>,
+    pub(crate) resolver: Arc<FakeResolver>,
     /// The live grants every line is evaluated with.
-    pub(super) grants: Arc<GrantStore>,
+    pub(crate) grants: Arc<GrantStore>,
     lifecycle: Arc<Lifecycle>,
     starter: Arc<AgentStarter>,
     /// The server's stop handle and thread, taken once when `knshd` goes away.
@@ -151,9 +160,59 @@ pub(super) struct Stack {
     _scratch: Scratch,
 }
 
+/// What [`Stack::start_with`] wires differently from the threat-model cases. The default is what they use.
+#[derive(Default)]
+pub(crate) struct Wiring {
+    /// Replaces the real [`TrampolineSpawner`]: lines are decided and recorded but this spawner runs them. The phase
+    /// 2 qualification (KNSH-076) times the decision with one that starts nothing.
+    pub(crate) spawner: Option<Arc<dyn Spawner>>,
+    /// Runs the hooks registered in the home's configuration file through the real [`HookRunner`], instead of none.
+    pub(crate) hooks: bool,
+    /// Stamps events with the system clock instead of the fixture's fake one, so an event's `ts` is the time it was
+    /// published.
+    pub(crate) real_clock: bool,
+}
+
+impl Wiring {
+    /// The sessions, record store and event hub over the real process table, the hub stamping events with the
+    /// system clock when `real_clock`.
+    fn fixture(real_clock: bool) -> Fixture {
+        let processes: Arc<dyn knsh_platform::ProcessTree> = Arc::new(SystemProcessTree::new());
+        if !real_clock {
+            return fixture_on(Some(processes));
+        }
+        let hub = crate::events::EventHub::new(
+            knsh_core::EventBus::new(knsh_core::BusLimits::default()),
+            Arc::new(SystemClock::new()),
+            Arc::new(SystemRandom::new()),
+        );
+        fixture_with(Some(processes), hub)
+    }
+
+    /// The hooks the supervisor runs: when `real`, as `main` wires them (the configuration file under `paths` read
+    /// for every line, hooks started as real processes); otherwise none.
+    fn hooks(real: bool, paths: &EnginePaths, home: &Path) -> Arc<dyn knsh_core::Hooks + Send + Sync> {
+        if !real {
+            return Arc::new(NoHooks);
+        }
+        Arc::new(HookRunner::new(
+            Arc::new(RealFs::new()),
+            Arc::new(SystemProcesses::new()),
+            paths.config_file(),
+            home.to_path_buf(),
+            effective_uid(),
+        ))
+    }
+}
+
 impl Stack {
     /// Starts the parts. `tag` names the scratch directory (at most 8 characters: socket paths are short).
-    pub(super) fn start(tag: &str, binaries: &Binaries) -> Self {
+    pub(crate) fn start(tag: &str, binaries: &Binaries) -> Self {
+        Self::start_with(tag, binaries, Wiring::default())
+    }
+
+    /// [`Stack::start`], wired as `wiring` says.
+    pub(crate) fn start_with(tag: &str, binaries: &Binaries, wiring: Wiring) -> Self {
         let scratch = Scratch::new(tag);
         let home = scratch.dir("h");
         let paths = EnginePaths::for_home(&home).unwrap();
@@ -164,7 +223,7 @@ impl Stack {
         std::fs::create_dir_all(&project).unwrap();
         let (tools, outside) = (scratch.dir("tools"), scratch.dir("out"));
 
-        let fixture = fixture_on(Some(Arc::new(SystemProcessTree::new())));
+        let fixture = Wiring::fixture(wiring.real_clock);
         let log: Arc<dyn SystemLog> = Arc::new(RecordingLog::new());
         let clock = Arc::new(SystemClock::new());
         let random = Arc::new(SystemRandom::new());
@@ -192,6 +251,8 @@ impl Stack {
             proxy: Arc::clone(&proxy),
         };
         let grants = GrantStore::new();
+        let spawner: Arc<dyn Spawner> = wiring.spawner.unwrap_or_else(|| Arc::new(spawner));
+        let hooks = Wiring::hooks(wiring.hooks, &paths, &home);
         let lifecycle = Lifecycle::new(Parts {
             sessions: Arc::clone(&fixture.sessions),
             profiles: loader.clone(),
@@ -199,11 +260,11 @@ impl Stack {
             store: Some(fixture.store.clone()),
             clock: clock.clone(),
             random: random.clone(),
-            hooks: Arc::new(NoHooks),
+            hooks,
             authority: Arc::new(NoAuthority),
             approvals: crate::approvals::tests::unanswered(ASK_TIMEOUT),
             grants: Arc::clone(&grants),
-            spawner: Arc::new(spawner),
+            spawner,
             redaction: Arc::new(knsh_core::NoOutputRedaction),
         });
         let launcher = TrampolineLauncher {
@@ -254,7 +315,7 @@ impl Stack {
 
     /// Writes profile `name` (`text` without its `name` key) into the policies directory, signed as `knsh policy
     /// edit` signs it. Profiles are read for every line, so it takes effect at once.
-    pub(super) fn profile(&self, name: &str, text: &str) {
+    pub(crate) fn profile(&self, name: &str, text: &str) {
         std::fs::write(
             self.policy_file(name),
             crate::policy::tests::signed(name, &format!("name = \"{name}\"\n{text}")),
@@ -263,13 +324,13 @@ impl Stack {
     }
 
     /// The file profile `name` is read from.
-    pub(super) fn policy_file(&self, name: &str) -> PathBuf {
+    pub(crate) fn policy_file(&self, name: &str) -> PathBuf {
         self.paths.policies_dir().join(format!("{name}.toml"))
     }
 
     /// `knshd` goes away: the server stops and its listeners close, as when the process dies. The socket files
     /// stay, as launchd's would.
-    pub(super) fn stop_knshd(&self) {
+    pub(crate) fn stop_knshd(&self) {
         let taken = self.stop.lock().unwrap().take();
         if let Some((stop, server)) = taken {
             let _ = stop.stop();
@@ -278,12 +339,12 @@ impl Stack {
     }
 
     /// Every event published from now on, for every session.
-    pub(super) fn watch(&self) -> crate::events::Subscriber {
+    pub(crate) fn watch(&self) -> crate::events::Subscriber {
         crate::sessions::tests::watch(&self.fixture.hub)
     }
 
     /// Opens an agent session under `profile`, as `session.start_agent` would before its envelope starts.
-    pub(super) fn session(&self, profile: &str) -> SessionId {
+    pub(crate) fn session(&self, profile: &str) -> SessionId {
         self.fixture
             .sessions
             .open_agent(
@@ -296,12 +357,12 @@ impl Stack {
 
     /// Forwards `command` for `session` as `knsh -c` would (`exec.run`, captured output), in the project, with
     /// `env` on top of `HOME` and `PATH`, and waits for the answer.
-    pub(super) fn line(&self, session: SessionId, command: &str, env: &[(&str, &str)]) -> Result<Finished, RpcError> {
+    pub(crate) fn line(&self, session: SessionId, command: &str, env: &[(&str, &str)]) -> Result<Finished, RpcError> {
         self.line_with(session, command, env, PATH, Some(LINE_TIMEOUT_S))
     }
 
     /// As [`Stack::line`], with names resolved on `path`, and killed after `timeout_s`.
-    pub(super) fn line_with(
+    pub(crate) fn line_with(
         &self,
         session: SessionId,
         command: &str,
@@ -335,7 +396,7 @@ impl Stack {
     }
 
     /// The record `finished` was written to.
-    pub(super) fn record_of(&self, session: SessionId, finished: &Finished) -> ExecutionRecord {
+    pub(crate) fn record_of(&self, session: SessionId, finished: &Finished) -> ExecutionRecord {
         let id = finished.record_id.expect("the line was recorded");
         self.records(session)
             .into_iter()
@@ -343,30 +404,38 @@ impl Stack {
             .expect("the record is stored")
     }
 
-    /// Every record of `session`.
-    pub(super) fn records(&self, session: SessionId) -> Vec<ExecutionRecord> {
-        let page = self
-            .fixture
-            .store
-            .query(
-                Scope::All,
-                RecordQuery {
-                    session: Some(session),
-                    since: None,
-                    until: None,
-                    text: None,
-                    after: None,
-                    limit: PageSize::new(100).unwrap(),
-                },
-            )
-            .unwrap();
-        page.records.into_iter().map(|stored| stored.record).collect()
+    /// Every record of `session`, page after page.
+    pub(crate) fn records(&self, session: SessionId) -> Vec<ExecutionRecord> {
+        let mut records = Vec::new();
+        let mut after = None;
+        loop {
+            let page = self
+                .fixture
+                .store
+                .query(
+                    Scope::All,
+                    RecordQuery {
+                        session: Some(session),
+                        since: None,
+                        until: None,
+                        text: None,
+                        after,
+                        limit: PageSize::new(100).unwrap(),
+                    },
+                )
+                .unwrap();
+            records.extend(page.records.into_iter().map(|stored| stored.record));
+            match page.next_cursor {
+                Some(cursor) => after = Some(cursor),
+                None => return records,
+            }
+        }
     }
 
     /// Starts `/bin/sh -c script` as the agent CLI through `session.start_agent` on `user.sock`'s handler, under
     /// `profile`, in the project, with `HOME` at the stack's home. Answers how it ended and everything it wrote to
     /// stdout and stderr.
-    pub(super) fn envelope(&self, profile: &str, script: &str) -> (LineStatus, String) {
+    pub(crate) fn envelope(&self, profile: &str, script: &str) -> (LineStatus, String) {
         let command = knsh_json::write(
             &knsh_json::ToJson::to_json(&vec!["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()]).unwrap(),
         )
@@ -410,7 +479,7 @@ impl Stack {
     }
 
     /// Builds the C program `source` with `cc` into [`Stack::tools`] as `name`.
-    pub(super) fn build_probe(&self, name: &str, source: &str) -> PathBuf {
+    pub(crate) fn build_probe(&self, name: &str, source: &str) -> PathBuf {
         let program = self.tools.join(name);
         compile_c(source, &program);
         program
@@ -419,7 +488,7 @@ impl Stack {
 
 /// Builds the C program `source` with `cc` into `program`. The linker signs it ad hoc, as it signs any program
 /// built here.
-pub(super) fn compile_c(source: &str, program: &Path) {
+pub(crate) fn compile_c(source: &str, program: &Path) {
     let mut cc = Command::new("/usr/bin/cc")
         .args(["-x", "c", "-", "-o"])
         .arg(program)
@@ -493,7 +562,7 @@ impl Drop for Stack {
 }
 
 /// The text of a captured stream of `finished`: stdout and stderr.
-pub(super) fn output(finished: &Finished) -> (String, String) {
+pub(crate) fn output(finished: &Finished) -> (String, String) {
     let text = |stream: &knsh_core::CapturedStream| {
         let (data, _) = stream.output.clone().into_parts();
         String::from_utf8_lossy(data.expose()).into_owned()
@@ -505,13 +574,13 @@ pub(super) fn output(finished: &Finished) -> (String, String) {
 }
 
 /// The value `key=` has in `out`, one `key=value` per line.
-pub(super) fn field<'a>(out: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn field<'a>(out: &'a str, key: &str) -> Option<&'a str> {
     out.lines().find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
 }
 
 /// The active developer directory (`xcode-select -p`), canonical: `/usr/bin` stubs (`git`, `python3`) run its
 /// tools, so profiles that run them trust it, as a user's profile would.
-pub(super) fn developer_dir() -> PathBuf {
+pub(crate) fn developer_dir() -> PathBuf {
     let output = Command::new("/usr/bin/xcode-select").arg("-p").output().unwrap();
     assert!(
         output.status.success(),
@@ -521,11 +590,11 @@ pub(super) fn developer_dir() -> PathBuf {
 }
 
 /// What a local server received, connection by connection.
-pub(super) type Received = Arc<Mutex<Vec<Vec<u8>>>>;
+pub(crate) type Received = Arc<Mutex<Vec<Vec<u8>>>>;
 
 /// A TCP server on loopback that records each connection's first bytes (for up to two seconds) and closes. Speaks
 /// no TLS: a TLS client fails after its hello, which is all a case needs to see where its bytes went.
-pub(super) fn recording_tcp() -> (SocketAddr, Received) {
+pub(crate) fn recording_tcp() -> (SocketAddr, Received) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let received: Received = Arc::default();
@@ -552,7 +621,7 @@ pub(super) fn recording_tcp() -> (SocketAddr, Received) {
 }
 
 /// A UDP socket on loopback that records every datagram it receives: a DNS server a line might query directly.
-pub(super) fn recording_udp() -> (SocketAddr, Received) {
+pub(crate) fn recording_udp() -> (SocketAddr, Received) {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
     let received: Received = Arc::default();
@@ -567,7 +636,7 @@ pub(super) fn recording_udp() -> (SocketAddr, Received) {
 }
 
 /// Waits up to `limit` for `condition`.
-pub(super) fn wait_for(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
+pub(crate) fn wait_for(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + limit;
     while !condition() {
         if Instant::now() > deadline {
@@ -579,16 +648,16 @@ pub(super) fn wait_for(limit: Duration, mut condition: impl FnMut() -> bool) -> 
 }
 
 /// `bootstrap_look_up` of `argv[1]`, printing the kernel result (KNSH-025's probe).
-pub(super) const LOOKUP_C: &str = "#include <servers/bootstrap.h>\n#include <stdio.h>\n\
+pub(crate) const LOOKUP_C: &str = "#include <servers/bootstrap.h>\n#include <stdio.h>\n\
     int main(int argc, char **argv) { mach_port_t port; if (argc < 2) return 2;\n\
     printf(\"%d\\n\", bootstrap_look_up(bootstrap_port, argv[1], &port)); return 0; }\n";
 
 /// `bootstrap_look_up`'s answer when the sandbox refuses the lookup.
-pub(super) const BOOTSTRAP_NOT_PRIVILEGED: &str = "1100";
+pub(crate) const BOOTSTRAP_NOT_PRIVILEGED: &str = "1100";
 
 /// Reads process `argv[1]`'s arguments and environment (`KERN_PROCARGS2`) and looks for `argv[2]` in them: prints
 /// `found`, `absent`, or `refused <errno>` when the kernel will not tell.
-pub(super) const PROCARGS_C: &str = "#include <sys/sysctl.h>\n#include <stdio.h>\n#include <stdlib.h>\n\
+pub(crate) const PROCARGS_C: &str = "#include <sys/sysctl.h>\n#include <stdio.h>\n#include <stdlib.h>\n\
     #include <string.h>\n#include <errno.h>\n\
     int main(int argc, char **argv) { if (argc < 3) return 2;\n\
     int mib[3] = { CTL_KERN, KERN_PROCARGS2, atoi(argv[1]) }; static char buf[1 << 18]; size_t size = sizeof buf;\n\
@@ -599,6 +668,6 @@ pub(super) const PROCARGS_C: &str = "#include <sys/sysctl.h>\n#include <stdio.h>
     puts(\"absent\"); return 0; }\n";
 
 /// Whether `path` (a directory or file) exists, as the test process (outside any sandbox) sees it.
-pub(super) fn exists(path: &Path) -> bool {
+pub(crate) fn exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }

@@ -1044,6 +1044,12 @@ pub(crate) mod tests {
 
     /// [`fixture`], matching agent callers against `processes` (the real process table, say) instead of the fake.
     pub(crate) fn fixture_on(processes: Option<Arc<dyn ProcessTree>>) -> Fixture {
+        fixture_with(processes, crate::events::tests::hub())
+    }
+
+    /// [`fixture_on`], publishing through `hub`: the phase 2 qualification (KNSH-076) stamps events with the system
+    /// clock, so their `ts` can be compared with the time a subscriber receives them.
+    pub(crate) fn fixture_with(processes: Option<Arc<dyn ProcessTree>>, hub: Arc<EventHub>) -> Fixture {
         let dir = TempDir::new();
         let clock = Arc::new(FakeClock::new(
             Timestamp::from_unix_micros(1_800_000_000_000_000).unwrap(),
@@ -1056,7 +1062,6 @@ pub(crate) mod tests {
             StoreConfig::default(),
         )
         .unwrap();
-        let hub = crate::events::tests::hub();
         let fake = Arc::new(FakeProcessTree::new());
         let sessions = Sessions::new(
             Some(store.clone()),

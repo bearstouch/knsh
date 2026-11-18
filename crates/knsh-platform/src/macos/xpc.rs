@@ -147,7 +147,8 @@ struct Cf(CfRef);
 impl Cf {
     /// Takes ownership of `object` (a Create or Copy result), or `None` if it is null.
     fn new(object: CfRef) -> Option<Self> {
-        (!object.is_null()).then_some(Self(object))
+        // Not `then_some`: its argument is built eagerly, so a null would be wrapped and then released on drop.
+        if object.is_null() { None } else { Some(Self(object)) }
     }
 }
 
@@ -991,6 +992,12 @@ mod tests {
     use super::*;
     use crate::control::{BundleVersion, SigningIdentifier, TeamId, TrustedAuthority, peer_requirement};
     use crate::testing::FakeCodeSigning;
+
+    // A null Core Foundation result is `None` and never released: `CFRelease(NULL)` traps.
+    #[test]
+    fn null_cf_is_none_and_never_released() {
+        assert!(Cf::new(std::ptr::null()).is_none());
+    }
 
     // Anonymous listeners and in-process clients: the real service needs launchd, these do not.
     unsafe extern "C" {

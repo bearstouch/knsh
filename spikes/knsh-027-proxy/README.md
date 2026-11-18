@@ -41,8 +41,10 @@ the proxy port.
 ## Still to do
 
 - Rerun on macOS 14 and 15 (the system curl and git differ by macOS release).
-- Inside a real envelope (KNSH-057), to confirm that the tools that ignore the proxy fail instead of going direct,
-  and that no DNS is needed for the `socks5h` and HTTP CONNECT cases.
+- ~~Inside a real envelope~~: done by KNSH-076 for the HTTP proxy setting (curl, git, npm, pip, cargo, Node): the
+  tools that ignore the proxy fail instead of going direct, and the others work without local DNS. See the
+  [compatibility list](../../specs/08-integrations/developer-tools.md#compatibility-list). SOCKS5 inside an envelope
+  is still to do.
 - Homebrew curl and git (OpenSSL instead of the system LibreSSL), Yarn, pnpm, Bun, Deno, Go modules, Python
   `urllib`/`httpx`, Java.
 - Credentials that need percent-encoding (production tokens should avoid them; see decision 14).
