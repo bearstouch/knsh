@@ -6,13 +6,15 @@ use std::thread;
 use knsh_checkpoint::testing::FakeTree;
 use knsh_core::{AgentId, NoAuthority, NoHooks, ProfileName, StillWaiting};
 use knsh_json::Value;
-use knsh_platform::testing::{FakeClock, SeededRandom};
+use knsh_platform::testing::{FakeClock, ScriptedFileEvents, SeededRandom};
+use knsh_platform::{FileEvent, FileEventFlags};
 use knsh_store::{PageSize, RecordQuery, Scope};
 
 use super::tests::{FakeSpawner, Journal, filesystem, forwarded};
 use super::*;
 use crate::sessions::tests::{Fixture, fixture};
-use crate::shadows::tests::{ROOT, SETTLE, profile_with, shadows};
+use crate::shadows::CheckpointEvents;
+use crate::shadows::tests::{ROOT, SETTLE, echoing_events, profile_with, shadows, shadows_with};
 
 /// Lines the profile allows.
 const ALLOW: &str = "[exec]\nallow = [\"echo\", \"ls\"]\n";
@@ -28,8 +30,24 @@ struct Rig {
 impl Rig {
     /// The session's shadows start building at once; `hold` keeps every clone waiting until the tree is released.
     fn new(tree: &Arc<FakeTree>, required: bool, hold: bool) -> Self {
+        Self::with_spawner(tree, required, hold, |journal, _| Arc::new(FakeSpawner::new(journal)))
+    }
+
+    /// [`Rig::new`] with the spawner `spawner` makes from the journal and the root's scripted file events; checkpoint
+    /// events are published on the real hub (KNSH-080).
+    fn with_spawner(
+        tree: &Arc<FakeTree>,
+        required: bool,
+        hold: bool,
+        spawner: impl FnOnce(Arc<Journal>, ScriptedFileEvents) -> Arc<dyn Spawner>,
+    ) -> Self {
         let fixture = fixture();
-        fixture.sessions.attach_shadows(shadows(tree));
+        let file_events = echoing_events(tree);
+        fixture.sessions.attach_shadows(shadows_with(
+            tree,
+            file_events.clone(),
+            Arc::clone(&fixture.hub) as Arc<dyn CheckpointEvents>,
+        ));
         let opened = fixture
             .sessions
             .open_agent(
@@ -59,7 +77,7 @@ impl Rig {
             authority: Arc::new(NoAuthority),
             approvals: crate::approvals::tests::unanswered(Duration::from_millis(50)),
             grants: crate::grants::GrantStore::new(),
-            spawner: Arc::new(FakeSpawner::new(Arc::clone(&journal))),
+            spawner: spawner(Arc::clone(&journal), file_events),
             redaction: Arc::new(knsh_core::NoOutputRedaction),
         });
         Self {
@@ -312,4 +330,92 @@ fn shadows_of_a_session_that_already_ended_are_stopped() {
         knsh_checkpoint::RootReadiness::Unavailable(UnprotectedReason::NoShadow)
     );
     assert!(fixture.sessions.checkpoint_report().is_empty());
+}
+
+/// A spawner whose line runs while the system drops file events of the root (KNSH-080).
+struct DroppingSpawner {
+    inner: FakeSpawner,
+    file_events: ScriptedFileEvents,
+}
+
+impl Spawner for DroppingSpawner {
+    fn spawn(&self, plan: SpawnPlan, events: &dyn LineEvents) -> SpawnReport {
+        self.file_events.emit(&[FileEvent::new(
+            ROOT,
+            FileEventFlags::MUST_SCAN_SUB_DIRS.union(FileEventFlags::USER_DROPPED),
+        )]);
+        self.inner.spawn(plan, events)
+    }
+}
+
+// KNSH-080 (FR-CKP-04): events dropped while a line runs in a protected root make its checkpoints uncertain:
+// `checkpoint.uncertain` names the line's record, after its `command.finished`.
+#[test]
+fn line_during_dropped_events_publishes_checkpoint_uncertain() {
+    let tree = Arc::new(FakeTree::new());
+    let rig = Rig::with_spawner(&tree, true, false, |journal, file_events| {
+        Arc::new(DroppingSpawner {
+            inner: FakeSpawner::new(journal),
+            file_events,
+        })
+    });
+    assert_eq!(
+        crate::shadows::tests::settled_in(&rig.fixture.sessions, rig.session_id, &Rig::root()),
+        knsh_checkpoint::RootReadiness::Ready
+    );
+    let subscriber = crate::events::Subscriber::new();
+    subscriber
+        .subscribe(&rig.fixture.hub, knsh_core::EventScope::Session(rig.session_id), None)
+        .unwrap();
+    let finished = rig.lifecycle.run(rig.line("echo hi", true), &StillWaiting).unwrap();
+    let record_id = finished.record_id.unwrap();
+    let names: Vec<(String, Option<EventData>)> = subscriber
+        .take(100)
+        .into_iter()
+        .filter_map(|(_, delivery)| match delivery {
+            knsh_core::Delivery::Event(event) => Some((event.name().to_owned(), Some(event.data.clone()))),
+            _ => None,
+        })
+        .collect();
+    let finished_at = names.iter().position(|(name, _)| name == "command.finished").unwrap();
+    let uncertain_at = names
+        .iter()
+        .position(|(name, _)| name == "checkpoint.uncertain")
+        .unwrap();
+    assert!(finished_at < uncertain_at);
+    let Some(EventData::CheckpointUncertain {
+        root,
+        record_id: uncertain_record,
+        reason,
+    }) = &names[uncertain_at].1
+    else {
+        panic!("not a checkpoint.uncertain payload");
+    };
+    assert_eq!(root, &Rig::root());
+    assert_eq!(*uncertain_record, Some(record_id));
+    assert_eq!(*reason, knsh_core::UncertainReason::EventsDropped);
+}
+
+// KNSH-080: a line in a protected root without drops publishes no `checkpoint.uncertain`.
+#[test]
+fn line_without_drops_is_certain() {
+    let tree = Arc::new(FakeTree::new());
+    let rig = Rig::new(&tree, true, false);
+    assert_eq!(
+        crate::shadows::tests::settled_in(&rig.fixture.sessions, rig.session_id, &Rig::root()),
+        knsh_checkpoint::RootReadiness::Ready
+    );
+    let subscriber = crate::events::Subscriber::new();
+    subscriber
+        .subscribe(&rig.fixture.hub, knsh_core::EventScope::Session(rig.session_id), None)
+        .unwrap();
+    rig.lifecycle.run(rig.line("echo hi", true), &StillWaiting).unwrap();
+    let uncertain = subscriber
+        .take(100)
+        .into_iter()
+        .filter(|(_, delivery)| {
+            matches!(delivery, knsh_core::Delivery::Event(event) if event.name() == "checkpoint.uncertain")
+        })
+        .count();
+    assert_eq!(uncertain, 0);
 }

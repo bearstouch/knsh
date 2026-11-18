@@ -35,12 +35,16 @@
 //! - [`FakeVolumes`]: volumes and files in memory for checkpoints: clones within or across volumes and file
 //!   systems, injected clone failures, identity changes (write in place, replace, touch) and digests (KNSH-078).
 //!
+//! - [`ScriptedFileEvents`]: file-event streams whose events the test emits, with what a flush delivers scripted
+//!   (a marker file's event) and failing starts (KNSH-080).
+//!
 //! Locks in the fakes are independent (one per fake) and never held across calls into another fake.
 
 mod ancestry;
 mod clock;
 mod control;
 mod denials;
+mod file_events;
 mod fs;
 mod keychain;
 mod launchd;
@@ -56,6 +60,7 @@ pub use ancestry::FakeProcessTree;
 pub use clock::FakeClock;
 pub use control::FakeCodeSigning;
 pub use denials::{ScriptedDenialLog, kernel_entry};
+pub use file_events::{FlushHook, ScriptedFileEvents, watch_failure};
 pub use fs::{DEFAULT_UID, MemFs};
 pub use keychain::{MemKeyStore, MemTrustStore};
 pub use launchd::{FakeSocketActivation, FixedPeerCredentials, RecordingServiceManager, ServiceCall};

@@ -452,6 +452,19 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
             ),
         // KNSH-065 (FR-POL-42): a profile name is `[A-Za-z0-9._-]`, so it needs no redaction.
         EventData::PolicyInvalid { profile } => Object::new().with("profile", profile.as_str()),
+        // KNSH-080 (FR-EVT-08): paths are shown like `cwd`, with U+FFFD for bytes that are not UTF-8.
+        EventData::FileChanged { root, path: changed } => {
+            Object::new().with("root", path(root))?.with("path", path(changed))
+        }
+        // KNSH-080 (FR-CKP-04, NFR-REL-04).
+        EventData::CheckpointUncertain {
+            root,
+            record_id,
+            reason,
+        } => Object::new()
+            .with("root", path(root))?
+            .with("record_id", record_id.map(|id| id.to_string()).to_json()?)?
+            .with("reason", reason.as_str()),
     }
 }
 
@@ -808,6 +821,46 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    // KNSH-080 (FR-EVT-08, FR-CKP-04, NFR-REL-04): `file.changed` and `checkpoint.uncertain`.
+    #[test]
+    fn checkpoint_payloads() {
+        let agent = || Actor::Agent(AgentId::new("claude-code").unwrap());
+        let cwd = || CanonicalPath::new("/Users/me/app").unwrap();
+        let data =
+            |data: EventData| written(event_notification(SubscriptionId::new(1), &event(data, agent())).unwrap());
+        let record = RecordId::from_ulid(Ulid::from_u128(9));
+        let changed = data(EventData::FileChanged {
+            root: cwd(),
+            path: knsh_core::CanonicalPath::new("/Users/me/app/src/main.rs").unwrap(),
+        });
+        assert!(changed.contains(r#""event":"file.changed""#), "{changed}");
+        assert!(
+            changed.contains(r#""data":{"root":"/Users/me/app","path":"/Users/me/app/src/main.rs"}"#),
+            "{changed}"
+        );
+        let uncertain = data(EventData::CheckpointUncertain {
+            root: cwd(),
+            record_id: Some(record),
+            reason: knsh_core::UncertainReason::EventsDropped,
+        });
+        assert!(uncertain.contains(r#""event":"checkpoint.uncertain""#), "{uncertain}");
+        assert!(
+            uncertain.contains(&format!(
+                r#""data":{{"root":"/Users/me/app","record_id":"{record}","reason":"events_dropped"}}"#
+            )),
+            "{uncertain}"
+        );
+        let gap = data(EventData::CheckpointUncertain {
+            root: cwd(),
+            record_id: None,
+            reason: knsh_core::UncertainReason::RestartGap,
+        });
+        assert!(
+            gap.contains(r#""data":{"root":"/Users/me/app","record_id":null,"reason":"restart_gap"}"#),
+            "{gap}"
+        );
     }
 
     // KNSH-060 (FR-NET-09): `proxy.denied` names the record for a line's refusal and none for the envelope's.

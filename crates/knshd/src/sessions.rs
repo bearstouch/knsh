@@ -70,7 +70,7 @@ use knsh_checkpoint::RootReadiness;
 use knsh_core::{
     Actor, ActorKind, CanonicalPath, CoreError, EventData, ExecutionRecord, Profile, ProfileName, ProfileOrder,
     RecordDetails, RecordId, Redacted, SessionId, SessionRegistry, SessionSpec, SessionState, Timestamp, Transition,
-    Ulid, UnprotectedReason,
+    Ulid, UncertainReason, UnprotectedReason,
 };
 use knsh_json::{Object, Value};
 use knsh_platform::{
@@ -87,7 +87,7 @@ use crate::dispatch::{Answer, Call, Endpoint, Handler, Handlers, Reply, answer, 
 use crate::events::EventHub;
 use crate::holds::{GroupKind, Holds, Kept};
 use crate::lifetime::Activity;
-use crate::shadows::Shadows;
+use crate::shadows::{OpenLine, Shadows};
 
 /// The profile recorded for human sessions. Nothing in a human session is enforced (FR-SES-22); profiles are loaded
 /// from files in phase 2 (KNSH-039), and until then every session runs under this name.
@@ -310,6 +310,21 @@ impl Sessions {
             Some(shadows) => shadows.wait(session_id, root, slice),
             None => RootReadiness::Unavailable(UnprotectedReason::NoShadow),
         }
+    }
+
+    /// A line of `session_id` touching the protected `roots` starts (KNSH-080): marks its start in each root's
+    /// watcher. Never waits. Nothing without attached shadows.
+    pub(crate) fn open_checkpoint_lines(&self, session_id: SessionId, roots: &[CanonicalPath]) -> Vec<OpenLine> {
+        match self.shadows.get() {
+            Some(shadows) => shadows.open_lines(session_id, roots),
+            None => Vec::new(),
+        }
+    }
+
+    /// The line of `lines` has been reaped: the line-end flush of each root (decision 16). Returns the roots whose
+    /// checkpoints are uncertain, and why (FR-CKP-04).
+    pub(crate) fn close_checkpoint_lines(lines: Vec<OpenLine>) -> Vec<(CanonicalPath, UncertainReason)> {
+        crate::shadows::close_lines(lines)
     }
 
     /// `hello`'s `checkpoints` (KNSH-079): each root of a running agent session once its shadow settled. Empty

@@ -881,8 +881,13 @@ impl Supervision<'_> {
     /// profiles and clock.
     fn handlers(self) -> dispatch::Handlers {
         // Lines wait on, and envelopes start, the checkpoint shadows of their sessions (KNSH-079).
-        self.sessions
-            .attach_shadows(checkpoint_shadows(self.paths, self.uid, &self.clock, self.log));
+        self.sessions.attach_shadows(checkpoint_shadows(
+            self.paths,
+            self.uid,
+            &self.clock,
+            self.log,
+            self.events,
+        ));
         // One proxy issues every envelope's and line's credentials (KNSH-059).
         let proxy = start_proxy(self.clock.clone(), self.random.clone(), self.log, self.events);
         let mut handlers = self.start_agent_handlers(&proxy);
@@ -943,13 +948,15 @@ impl Supervision<'_> {
 }
 
 /// The checkpoint shadows of agent sessions (KNSH-079): stores placed on the real volumes, files cloned with APFS
-/// clones, one background build per root when an agent session starts, stopped when it ends.
+/// clones, one background build per root when an agent session starts, stopped when it ends; each kept in step by an
+/// `FSEvents` watcher (KNSH-080).
 #[cfg(target_os = "macos")]
 fn checkpoint_shadows(
     paths: &knsh_platform::EnginePaths,
     uid: u32,
     clock: &std::sync::Arc<knsh_platform::macos::SystemClock>,
     log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+    events: &std::sync::Arc<events::EventHub>,
 ) -> std::sync::Arc<shadows::Shadows> {
     use std::sync::Arc;
 
@@ -966,6 +973,9 @@ fn checkpoint_shadows(
         paths: paths.clone(),
         uid,
         log: Arc::clone(log),
+        // Shadows follow the live tree from FSEvents, and publish `file.changed` and `checkpoint.uncertain` (KNSH-080).
+        file_events: Arc::new(knsh_platform::macos::FsEventStreams::new()),
+        events: Arc::clone(events) as Arc<dyn shadows::CheckpointEvents>,
     })
 }
 

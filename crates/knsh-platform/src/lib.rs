@@ -110,7 +110,13 @@
 //! | --- | --- | --- | --- |
 //! | [`Volumes`] | Clone a file, name its volume, read its identity, hash its contents | `SystemVolumes` (`clonefile`, `statfs`, `CommonCrypto`) | `FakeVolumes` |
 //!
-//! Later stories add `FSEvents` to the same interface.
+//! The `file_events` module (KNSH-080) streams file events under checkpoint roots, so shadows stay in step with
+//! the live tree and `file.changed` is emitted for changes by any process. Flags are only hints (decision 16); what
+//! the engine does with them lives in `knsh-checkpoint`.
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`FileEvents`] | Watch folders, deliver events to a sink, flush | `FsEventStreams` (`FSEvents`, file events) | `ScriptedFileEvents` |
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
 //! in a fake. All failures use the single crate error, [`PlatformError`], whose messages never echo paths or other
@@ -164,6 +170,7 @@ mod clock;
 mod control;
 pub mod engine_dirs;
 mod error;
+mod file_events;
 mod fs;
 pub mod launchd;
 mod log;
@@ -200,6 +207,7 @@ pub use control::{
 };
 pub use engine_dirs::{EnginePaths, ensure_engine_dirs};
 pub use error::{Operation, PlatformError, SqliteCode};
+pub use file_events::{FileEvent, FileEventFlags, FileEventSink, FileEventStream, FileEvents};
 pub use fs::{FileKind, Fs, Metadata};
 pub use launchd::{LaunchAgent, PeerCredentials, ServiceManager, SocketActivation, install_agent, uninstall_agent};
 pub use log::{Field, Level, SystemLog, Value, render};

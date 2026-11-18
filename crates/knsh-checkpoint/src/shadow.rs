@@ -47,8 +47,8 @@ use std::thread;
 use std::time::Duration;
 
 use knsh_core::{CanonicalPath, UnprotectedReason};
-use knsh_platform::engine_dirs::DIR_MODE;
-use knsh_platform::{Clock, FileKind, Fs, Monotonic, PlatformError, Volumes};
+use knsh_platform::engine_dirs::{DIR_MODE, FILE_MODE};
+use knsh_platform::{Clock, FileIdentity, FileKind, Fs, Monotonic, PlatformError, Volumes};
 
 /// Threads cloning one root (decision 15): 4 reached 7.4 to 7.7 s for 100,000 files on macOS 26.6; 8 gained nothing.
 pub const SHADOW_THREADS: usize = 4;
@@ -99,6 +99,30 @@ pub trait ShadowFiles: Send + Sync {
     /// A [`PlatformError`]; nothing is left at `dst`.
     fn clone_file(&self, src: &Path, dst: &Path) -> Result<(), PlatformError>;
 
+    /// The identity of `path` itself, read with `lstat`. The watcher (KNSH-080) compares a live entry with its shadow
+    /// copy by kind, size and modification time, which a clone keeps (KNSH-077, claim C3); the inode differs by
+    /// design.
+    ///
+    /// # Errors
+    ///
+    /// A [`PlatformError`]; `ENOENT` (see [`PlatformError::is_not_found`]) if nothing is there.
+    fn identity(&self, path: &Path) -> Result<FileIdentity, PlatformError>;
+
+    /// Removes the file or symlink at `path` (`folder` false), or the empty folder at `path` (`folder` true). A final
+    /// symlink is never followed.
+    ///
+    /// # Errors
+    ///
+    /// A [`PlatformError`]; `ENOENT` if nothing is there, `ENOTEMPTY` for a folder with entries.
+    fn remove(&self, path: &Path, folder: bool) -> Result<(), PlatformError>;
+
+    /// Creates the new, empty, owner-only file `path`: the watcher's line-end marker (decision 16).
+    ///
+    /// # Errors
+    ///
+    /// A [`PlatformError`], `EEXIST` if anything is there already.
+    fn create_file(&self, path: &Path) -> Result<(), PlatformError>;
+
     /// Called once on each build thread before it does anything else: the real backend lowers the thread to the
     /// utility class (decision 15). Best effort.
     fn prepare_thread(&self) {}
@@ -133,6 +157,22 @@ impl ShadowFiles for PlatformShadowFiles {
 
     fn clone_file(&self, src: &Path, dst: &Path) -> Result<(), PlatformError> {
         self.volumes.clone_file(src, dst)
+    }
+
+    fn identity(&self, path: &Path) -> Result<FileIdentity, PlatformError> {
+        self.volumes.identity(path)
+    }
+
+    fn remove(&self, path: &Path, folder: bool) -> Result<(), PlatformError> {
+        if folder {
+            self.fs.remove_dir(path)
+        } else {
+            self.fs.remove_file(path)
+        }
+    }
+
+    fn create_file(&self, path: &Path) -> Result<(), PlatformError> {
+        self.fs.create_new(path, FILE_MODE)
     }
 
     fn prepare_thread(&self) {

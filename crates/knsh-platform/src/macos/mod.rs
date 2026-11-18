@@ -10,6 +10,7 @@ mod denials;
 mod descriptors;
 mod digest;
 mod fs;
+mod fsevents;
 mod keychain;
 mod kqueue;
 mod launchd;
@@ -30,6 +31,7 @@ pub use denials::UnifiedLogDenials;
 pub use descriptors::{MAX_PASSED_DESCRIPTORS, peer_closed, recv_with_descriptors, send_with_descriptors};
 pub use digest::{SHA256_LEN, hmac_sha256, sha256, sha256_reader};
 pub use fs::RealFs;
+pub use fsevents::{FsEventStreams, MAX_WATCHED_PATHS};
 pub use keychain::{
     KeychainSigningKey, KeychainTrustStore, SIGNING_KEY_ACCOUNT, SIGNING_KEY_SERVICE, TRUST_ACCOUNT, TRUST_SERVICE,
 };

@@ -163,6 +163,16 @@ pub trait Fs: Send + Sync {
     /// (`ENOENT` if nothing exists there, `EPERM` for a directory).
     fn remove_file(&self, path: &Path) -> Result<(), PlatformError>;
 
+    /// Removes the empty directory at `path` (`rmdir`). A final symlink is never followed: a symlink at `path` is
+    /// refused, not its target removed. Used to keep checkpoint shadows in step with the live tree (KNSH-080).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::InvalidPath`]; [`PlatformError::Os`] with
+    /// [`Operation::RemoveDirectory`](crate::Operation::RemoveDirectory) (`ENOENT` if nothing exists there,
+    /// `ENOTDIR` for anything but a directory, `ENOTEMPTY` if it has entries).
+    fn remove_dir(&self, path: &Path) -> Result<(), PlatformError>;
+
     /// Renames the entry at `from` to `to` in one step, and only if nothing exists at `to`: it never replaces an
     /// existing entry, a symlink included (`renamex_np` with `RENAME_EXCL` on macOS). Neither final component is
     /// followed: a symlink at `from` is moved itself, never its target. Both paths must be on one volume. Used to set

@@ -205,6 +205,64 @@ pub enum EventData {
         /// The profile whose file failed its check: the session's own profile or a parent it `extends`.
         profile: ProfileName,
     },
+    /// `file.changed`: a path under one of the session's checkpoint roots changed, by any process (FR-EVT-08,
+    /// KNSH-080). Published once the watcher has brought the root's shadow in step with it.
+    FileChanged {
+        /// The checkpoint root.
+        root: CanonicalPath,
+        /// The path that changed (created, written, removed or replaced), inside `root`.
+        path: CanonicalPath,
+    },
+    /// `checkpoint.uncertain`: file events of a root may have been lost, so the root was rescanned and the changes of
+    /// that window cannot be attributed with certainty (FR-CKP-04, NFR-REL-04, KNSH-080).
+    CheckpointUncertain {
+        /// The checkpoint root.
+        root: CanonicalPath,
+        /// The line whose window it was, or `None` for a window outside any line.
+        record_id: Option<RecordId>,
+        /// Why.
+        reason: UncertainReason,
+    },
+}
+
+/// Why the changes of a window in a checkpoint root are uncertain (`checkpoint.uncertain`, FR-CKP-04, KNSH-080).
+/// Ordered by declaration, so a set of reasons is reported in a stable order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UncertainReason {
+    /// The system reported dropped events (`MustScanSubDirs`, `UserDropped`, `KernelDropped`).
+    EventsDropped,
+    /// The system's event identifiers wrapped around (`EventIdsWrapped`).
+    EventIdsWrapped,
+    /// The root itself, or a folder above it, was moved, removed or recreated, or a volume below it unmounted.
+    RootChanged,
+    /// More paths changed at once than the watcher keeps one by one: it fell back to rescanning the whole root.
+    TooManyEvents,
+    /// The line-end procedure did not see its marker, or did not settle the shadow, before its deadline (decision 16).
+    FlushTimedOut,
+    /// `knshd` was not running for a while, so changes in that gap were not watched (NFR-REL-04).
+    RestartGap,
+    /// The root is not watched: its file-event stream could not be started or has stopped.
+    NotWatched,
+    /// The shadow could not be brought in step with a change (a file operation failed).
+    ShadowUpdateFailed,
+}
+
+impl UncertainReason {
+    /// The wire value: `events_dropped`, `event_ids_wrapped`, `root_changed`, `too_many_events`, `flush_timed_out`,
+    /// `restart_gap`, `not_watched` or `shadow_update_failed`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EventsDropped => "events_dropped",
+            Self::EventIdsWrapped => "event_ids_wrapped",
+            Self::RootChanged => "root_changed",
+            Self::TooManyEvents => "too_many_events",
+            Self::FlushTimedOut => "flush_timed_out",
+            Self::RestartGap => "restart_gap",
+            Self::NotWatched => "not_watched",
+            Self::ShadowUpdateFailed => "shadow_update_failed",
+        }
+    }
 }
 
 /// Why a pending decision was cancelled (`decision.cancelled`).
@@ -300,7 +358,9 @@ impl EventData {
             | Self::DecisionCancelled { .. }
             | Self::PolicyInvalid { .. }
             | Self::CommandStarted { .. }
-            | Self::CommandLongRunning { .. } => None,
+            | Self::CommandLongRunning { .. }
+            | Self::FileChanged { .. }
+            | Self::CheckpointUncertain { .. } => None,
         }
     }
 
@@ -324,6 +384,8 @@ impl EventData {
             Self::CommandLongRunning { .. } => "command.long_running",
             Self::CommandOutput { .. } => "command.output",
             Self::PolicyInvalid { .. } => "policy.invalid",
+            Self::FileChanged { .. } => "file.changed",
+            Self::CheckpointUncertain { .. } => "checkpoint.uncertain",
         }
     }
 
