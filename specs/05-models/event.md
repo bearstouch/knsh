@@ -57,6 +57,7 @@ A `cwd` that is not valid UTF-8 is shown with U+FFFD replacements, as in records
 | Event | `data` |
 | --- | --- |
 | `file.changed` | `root` (the checkpoint root), `path` (the path inside it that changed: created, written, removed or replaced). Published on every agent session protecting the root, once its shadow follows the change, whichever process made it; an event that changed nothing is not published (FR-EVT-08, KNSH-080) |
+| `agent.edit` | `root`, `paths` (the paths inside it that changed, sorted, at most 256), `omitted` (how many more changed than `paths` lists). Published on each envelope session protecting the root, once the watcher has applied a batch of changes made while no supervised line ran there; each path is also a `file.changed` (FR-CKP-06, KNSH-081) |
 | `checkpoint.uncertain` | `root`, `record_id` (the line whose checkpoints are uncertain, published after its `command.finished`; `null` for a window outside any line), `reason`: `events_dropped`, `event_ids_wrapped`, `root_changed`, `too_many_events`, `flush_timed_out`, `restart_gap`, `not_watched` or `shadow_update_failed`. The root is rescanned (FR-CKP-04, NFR-REL-04, KNSH-080) |
 
 Paths that are not valid UTF-8 are shown with U+FFFD replacements, as in records.

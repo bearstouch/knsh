@@ -8,6 +8,8 @@ use knsh_core::{ProfileName, SessionId, Ulid};
 use knsh_platform::testing::{FakeClock, FakeVolumes, MemFs, RecordingLog, ScriptedFileEvents};
 use knsh_platform::{FileEvent, FileEventFlags, FileSystemKind, ensure_engine_dirs};
 
+use knsh_checkpoint::Edge;
+
 use super::*;
 
 pub(crate) const HOME: &str = "/Users/u";
@@ -21,6 +23,7 @@ pub(crate) const SETTLE: Duration = Duration::from_secs(20);
 pub(crate) struct RecordedEvents {
     pub(crate) changed: Mutex<Vec<(SessionId, PathBuf)>>,
     pub(crate) uncertain: Mutex<Vec<(SessionId, Option<RecordId>, UncertainReason)>>,
+    pub(crate) agent_edits: Mutex<Vec<(SessionId, Vec<PathBuf>, u32)>>,
 }
 
 impl CheckpointEvents for RecordedEvents {
@@ -39,6 +42,21 @@ impl CheckpointEvents for RecordedEvents {
         reason: UncertainReason,
     ) {
         self.uncertain.lock().unwrap().push((session_id, record_id, reason));
+    }
+
+    fn agent_edit(&self, session_id: SessionId, _root: &CanonicalPath, paths: &[CanonicalPath], omitted: u32) {
+        let paths = paths.iter().map(|path| path.as_path().to_path_buf()).collect();
+        self.agent_edits.lock().unwrap().push((session_id, paths, omitted));
+    }
+}
+
+/// Every edge closed, in order (KNSH-081).
+#[derive(Default)]
+pub(crate) struct RecordedEdges(pub(crate) Mutex<Vec<Edge>>);
+
+impl EdgeSink for RecordedEdges {
+    fn closed(&self, edges: Vec<Edge>) {
+        self.0.lock().unwrap().extend(edges);
     }
 }
 
@@ -72,6 +90,16 @@ pub(crate) fn shadows_with(
     file_events: ScriptedFileEvents,
     events: Arc<dyn CheckpointEvents>,
 ) -> Arc<Shadows> {
+    shadows_with_edges(tree, file_events, events, Arc::new(UncapturedEdges))
+}
+
+/// [`shadows_with`], with closed edges going to `edges` (KNSH-081).
+pub(crate) fn shadows_with_edges(
+    tree: &Arc<FakeTree>,
+    file_events: ScriptedFileEvents,
+    events: Arc<dyn CheckpointEvents>,
+    edges: Arc<dyn EdgeSink>,
+) -> Arc<Shadows> {
     let fs = MemFs::new();
     for dir in [HOME, ROOT, "/Volumes/Stick/code"] {
         fs.add_dir_all(Path::new(dir)).unwrap();
@@ -98,6 +126,7 @@ pub(crate) fn shadows_with(
         log: Arc::new(RecordingLog::new()),
         file_events: Arc::new(file_events),
         events,
+        edges,
     })
 }
 
@@ -135,6 +164,10 @@ fn session(n: u128) -> SessionId {
     SessionId::from_ulid(Ulid::from_u128(n))
 }
 
+fn record(n: u128) -> RecordId {
+    RecordId::from_ulid(Ulid::from_u128(n))
+}
+
 fn root(path: &str) -> CanonicalPath {
     CanonicalPath::new(path).unwrap()
 }
@@ -161,7 +194,7 @@ fn starting_a_session_starts_one_background_build_per_root() {
     let shadows = shadows(&tree);
     tree.hold();
     // Returns while every clone is held: nothing in `start` waits for a build.
-    shadows.start(session(1), &profile(&[ROOT, "/Users/u/lib"], true));
+    shadows.start(session(1), &profile(&[ROOT, "/Users/u/lib"], true), true);
     for path in [ROOT, "/Users/u/lib"] {
         assert!(
             matches!(shadows.readiness(session(1), &root(path)), RootReadiness::Building(_)),
@@ -195,7 +228,7 @@ fn a_failed_build_reports_none() {
     let tree = Arc::new(FakeTree::new());
     let shadows = shadows(&tree);
     tree.fail_clone(Path::new(ROOT).join("README"), 5);
-    shadows.start(session(1), &profile(&[ROOT], true));
+    shadows.start(session(1), &profile(&[ROOT], true), true);
     assert_eq!(
         settled(&shadows, session(1), &root(ROOT)),
         RootReadiness::Unavailable(UnprotectedReason::ShadowFailed)
@@ -208,7 +241,7 @@ fn a_failed_build_reports_none() {
 fn a_root_without_clones_has_no_shadow_and_reports_none() {
     let tree = Arc::new(FakeTree::new());
     let shadows = shadows(&tree);
-    shadows.start(session(1), &profile(&["/Volumes/Stick/code"], false));
+    shadows.start(session(1), &profile(&["/Volumes/Stick/code"], false), true);
     assert_eq!(
         shadows.readiness(session(1), &root("/Volumes/Stick/code")),
         RootReadiness::Unavailable(UnprotectedReason::NoShadow)
@@ -234,7 +267,7 @@ fn ending_a_session_stops_its_builds() {
     let tree = Arc::new(FakeTree::new());
     let shadows = shadows(&tree);
     tree.hold();
-    shadows.start(session(1), &profile(&[ROOT], true));
+    shadows.start(session(1), &profile(&[ROOT], true), true);
     let shadow = shadows.shadow_of(session(1), &root(ROOT)).unwrap();
     shadows.end(session(1));
     tree.release();
@@ -251,10 +284,10 @@ fn ending_a_session_stops_its_builds() {
 fn a_shared_root_reports_the_weaker_state() {
     let tree = Arc::new(FakeTree::new());
     let shadows = shadows(&tree);
-    shadows.start(session(1), &profile(&[ROOT], true));
+    shadows.start(session(1), &profile(&[ROOT], true), true);
     assert_eq!(settled(&shadows, session(1), &root(ROOT)), RootReadiness::Ready);
     tree.fail_clone(Path::new(ROOT).join("README"), 5);
-    shadows.start(session(2), &profile(&[ROOT], true));
+    shadows.start(session(2), &profile(&[ROOT], true), true);
     let _ = settled(&shadows, session(2), &root(ROOT));
     assert_eq!(shadows.capability_report().get(ROOT), Some(&CheckpointBackend::None));
 }
@@ -264,7 +297,7 @@ fn a_shared_root_reports_the_weaker_state() {
 fn a_session_without_roots_starts_nothing() {
     let tree = Arc::new(FakeTree::new());
     let shadows = shadows(&tree);
-    shadows.start(session(1), &profile(&[], true));
+    shadows.start(session(1), &profile(&[], true), true);
     assert!(shadows.table().is_empty());
     assert_eq!(tree.clones(), 0);
 }
@@ -279,7 +312,7 @@ fn watched_session() -> (Arc<FakeTree>, ScriptedFileEvents, Arc<RecordedEvents>,
         file_events.clone(),
         Arc::clone(&events) as Arc<dyn CheckpointEvents>,
     );
-    shadows.start(session(1), &profile(&[ROOT], true));
+    shadows.start(session(1), &profile(&[ROOT], true), true);
     assert_eq!(settled(&shadows, session(1), &root(ROOT)), RootReadiness::Ready);
     (tree, file_events, events, shadows)
 }
@@ -298,8 +331,8 @@ fn a_change_under_a_root_is_published_as_file_changed() {
     let new = Path::new(ROOT).join("new.txt");
     tree.add_file(&new, b"by another process");
     file_events.emit(&[FileEvent::new(&new, FileEventFlags::ITEM_CREATED)]);
-    let lines = shadows.open_lines(session(1), &[root(ROOT)]);
-    assert_eq!(close_lines(lines), Vec::new());
+    let lines = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
+    assert_eq!(close_lines(lines).uncertain, Vec::new());
     assert_eq!(*events.changed.lock().unwrap(), [(session(1), new.clone())]);
     let shadow = store_dir()
         .join("shadows")
@@ -319,13 +352,16 @@ fn dropped_events_make_the_line_uncertain() {
             FileEventFlags::MUST_SCAN_SUB_DIRS.union(FileEventFlags::USER_DROPPED),
         )]);
     };
-    let lines = shadows.open_lines(session(1), &[root(ROOT)]);
+    let lines = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
     drop();
-    assert_eq!(close_lines(lines), [(root(ROOT), UncertainReason::EventsDropped)]);
+    assert_eq!(
+        close_lines(lines).uncertain,
+        [(root(ROOT), UncertainReason::EventsDropped)]
+    );
     assert_eq!(*events.uncertain.lock().unwrap(), Vec::new());
     drop();
-    let lines = shadows.open_lines(session(1), &[root(ROOT)]);
-    assert_eq!(close_lines(lines), Vec::new());
+    let lines = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
+    assert_eq!(close_lines(lines).uncertain, Vec::new());
     assert_eq!(
         *events.uncertain.lock().unwrap(),
         [(session(1), None, UncertainReason::EventsDropped)]
@@ -337,13 +373,26 @@ fn dropped_events_make_the_line_uncertain() {
 fn ending_the_session_stops_its_watchers() {
     let (_tree, file_events, _events, shadows) = watched_session();
     assert_eq!(file_events.live_streams(), 1);
-    assert!(shadows.open_lines(session(1), &[root("/Users/u/elsewhere")]).is_empty());
-    let lines = shadows.open_lines(session(1), &[root(ROOT)]);
+    assert!(
+        shadows
+            .open_lines(session(1), record(1), &[root("/Users/u/elsewhere")])
+            .roots
+            .is_empty()
+    );
+    let lines = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
     shadows.end(session(1));
     assert_eq!(file_events.live_streams(), 0);
     // A line that was running when its session ended: its root is no longer watched.
-    assert_eq!(close_lines(lines), [(root(ROOT), UncertainReason::NotWatched)]);
-    assert!(shadows.open_lines(session(1), &[root(ROOT)]).is_empty());
+    assert_eq!(
+        close_lines(lines).uncertain,
+        [(root(ROOT), UncertainReason::NotWatched)]
+    );
+    assert!(
+        shadows
+            .open_lines(session(1), record(1), &[root(ROOT)])
+            .roots
+            .is_empty()
+    );
 }
 
 // KNSH-080: a watcher that cannot start leaves the shadow built (the gate still lets lines run) but every line in the
@@ -354,9 +403,177 @@ fn a_watcher_that_cannot_start_makes_lines_uncertain() {
     let file_events = echoing_events(&tree);
     file_events.fail_next_watch(knsh_platform::testing::watch_failure());
     let shadows = shadows_with(&tree, file_events.clone(), Arc::new(RecordedEvents::default()));
-    shadows.start(session(1), &profile(&[ROOT], true));
+    shadows.start(session(1), &profile(&[ROOT], true), true);
     assert_eq!(settled(&shadows, session(1), &root(ROOT)), RootReadiness::Ready);
-    let lines = shadows.open_lines(session(1), &[root(ROOT)]);
-    assert_eq!(close_lines(lines), [(root(ROOT), UncertainReason::NotWatched)]);
+    let lines = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
+    assert_eq!(
+        close_lines(lines).uncertain,
+        [(root(ROOT), UncertainReason::NotWatched)]
+    );
     assert_eq!(file_events.live_streams(), 0);
+}
+
+/// [`watched_session`] for a session in an envelope or not, with closed edges recorded (KNSH-081).
+fn attributed_session(
+    envelope: bool,
+) -> (
+    Arc<FakeTree>,
+    ScriptedFileEvents,
+    Arc<RecordedEvents>,
+    Arc<RecordedEdges>,
+    Arc<Shadows>,
+) {
+    let tree = Arc::new(FakeTree::new());
+    let file_events = echoing_events(&tree);
+    let events = Arc::new(RecordedEvents::default());
+    let edges = Arc::new(RecordedEdges::default());
+    let shadows = shadows_with_edges(
+        &tree,
+        file_events.clone(),
+        Arc::clone(&events) as Arc<dyn CheckpointEvents>,
+        Arc::clone(&edges) as Arc<dyn EdgeSink>,
+    );
+    shadows.start(session(1), &profile(&[ROOT], true), envelope);
+    assert_eq!(settled(&shadows, session(1), &root(ROOT)), RootReadiness::Ready);
+    (tree, file_events, events, edges, shadows)
+}
+
+/// Writes `name` under `ROOT` and emits its event, as another process would.
+fn write(tree: &FakeTree, file_events: &ScriptedFileEvents, name: &str, contents: &[u8]) -> PathBuf {
+    let path = Path::new(ROOT).join(name);
+    tree.add_file(&path, contents);
+    file_events.emit(&[FileEvent::new(&path, FileEventFlags::ITEM_CREATED)]);
+    path
+}
+
+/// Waits until the watcher has applied `count` changes in all (published as `file.changed`). Opening a line never
+/// waits for the watcher, so a change not applied yet when a line starts is the line's (`attribution.rs`).
+fn applied(events: &RecordedEvents, count: usize) {
+    let deadline = std::time::Instant::now() + SETTLE;
+    while events.changed.lock().unwrap().len() < count {
+        assert!(std::time::Instant::now() < deadline, "the change was never applied");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Runs a line that changes nothing, after the watcher applied `count` changes, and returns its attribution.
+fn line_after(shadows: &Shadows, events: &RecordedEvents, count: usize, n: u128) -> Attribution {
+    applied(events, count);
+    let line = shadows.open_lines(session(1), record(n), &[root(ROOT)]);
+    close_lines(line).attribution
+}
+
+// KNSH-081 (FR-CKP-05): a change made while a line runs is attributed to it: the line is `command`, and its closed
+// edge holds the line's record and the change.
+#[test]
+fn change_during_line_is_attributed_to_it() {
+    let (tree, file_events, events, edges, shadows) = attributed_session(true);
+    let line = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
+    let written = write(&tree, &file_events, "built.txt", b"out");
+    let closed = close_lines(line);
+    assert_eq!(closed.attribution, Attribution::Command);
+    let edges = edges.0.lock().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].attribution, closed.attribution);
+    assert_eq!(edges[0].records, [record(1)].into());
+    let paths: Vec<PathBuf> = edges[0].paths[&root(ROOT)]
+        .iter()
+        .map(|path| path.as_path().to_path_buf())
+        .collect();
+    assert_eq!(paths, [written]);
+    assert!(events.agent_edits.lock().unwrap().is_empty());
+}
+
+// KNSH-081 (FR-CKP-06): a change in an envelope session's root while no line runs is an agent edit: published as
+// `agent.edit` on the session, and closed as an `agent_edit` edge when the next line starts.
+#[test]
+fn change_between_lines_in_envelope_is_published_as_agent_edit() {
+    let (tree, file_events, events, edges, shadows) = attributed_session(true);
+    let edited = write(&tree, &file_events, "edited.txt", b"by the agent's edit tool");
+    assert_eq!(line_after(&shadows, &events, 1, 1), Attribution::Command);
+    assert_eq!(
+        *events.agent_edits.lock().unwrap(),
+        [(session(1), vec![edited.clone()], 0)]
+    );
+    let edges = edges.0.lock().unwrap();
+    let kinds: Vec<Attribution> = edges.iter().map(|edge| edge.attribution).collect();
+    assert_eq!(kinds, [Attribution::AgentEdit, Attribution::Command]);
+    assert_eq!(edges[0].sessions, [session(1)].into());
+    assert!(edges[1].paths.is_empty(), "the line itself changed nothing");
+}
+
+// KNSH-081: in a root no envelope watches, a change outside lines is `external`: no `agent.edit`, and its edge is
+// never offered for agent undo.
+#[test]
+fn change_without_envelope_is_external() {
+    let (tree, file_events, events, edges, shadows) = attributed_session(false);
+    write(&tree, &file_events, "outside.txt", b"by someone else");
+    assert_eq!(line_after(&shadows, &events, 1, 1), Attribution::Command);
+    assert!(events.agent_edits.lock().unwrap().is_empty());
+    let edges = edges.0.lock().unwrap();
+    assert_eq!(edges[0].attribution, Attribution::External);
+    assert!(!edges[0].agent_may_undo());
+}
+
+// KNSH-081 (FR-CKP-07): two lines overlapping in the root form one concurrent set: both are `concurrent`, and one
+// edge holds both records and every change made while either ran.
+#[test]
+fn overlapping_lines_are_one_concurrent_set() {
+    let (tree, file_events, _events, edges, shadows) = attributed_session(true);
+    let first = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
+    write(&tree, &file_events, "a.txt", b"a");
+    let second = shadows.open_lines(session(1), record(2), &[root(ROOT)]);
+    write(&tree, &file_events, "b.txt", b"b");
+    let first = close_lines(first);
+    let second = close_lines(second);
+    assert_eq!(first.attribution, Attribution::Concurrent);
+    assert_eq!(second.attribution, Attribution::Concurrent);
+    let edges = edges.0.lock().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].attribution, Attribution::Concurrent);
+    assert_eq!(edges[0].records, [record(1), record(2)].into());
+    assert_eq!(edges[0].path_count(), 2);
+}
+
+// KNSH-081: ending an envelope session closes its open agent-edit run, so a later change in the root is not its edit.
+#[test]
+fn ending_the_session_closes_its_agent_edits() {
+    let (tree, file_events, events, edges, shadows) = attributed_session(true);
+    write(&tree, &file_events, "edited.txt", b"by the agent");
+    applied(&events, 1);
+    assert!(
+        edges.0.lock().unwrap().is_empty(),
+        "the run stays open while the envelope watches"
+    );
+    shadows.end(session(1));
+    let edges = edges.0.lock().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].attribution, Attribution::AgentEdit);
+    assert_eq!(edges[0].path_count(), 1);
+}
+
+// KNSH-081: two envelope sessions protecting the same root each have a watcher, and both report a line's change.
+// The line's end waits for the other session's watcher too, so its report never arrives after the line ended, where
+// it would be published as the other session's `agent.edit` and open an agent-edit run of a change the line made.
+#[test]
+fn a_line_in_a_shared_root_is_never_another_sessions_agent_edit() {
+    let (tree, file_events, events, edges, shadows) = attributed_session(true);
+    shadows.start(session(2), &profile(&[ROOT], true), true);
+    assert_eq!(settled(&shadows, session(2), &root(ROOT)), RootReadiness::Ready);
+    let line = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
+    write(&tree, &file_events, "built.txt", b"out");
+    let flushes = file_events.flushes();
+    let closed = close_lines(line);
+    assert_eq!(closed.attribution, Attribution::Command);
+    assert!(
+        file_events.flushes() >= flushes + 2,
+        "the line's own watcher and the other session's are both flushed"
+    );
+    // Both watchers applied it before the line ended.
+    assert_eq!(events.changed.lock().unwrap().len(), 2);
+    assert!(events.agent_edits.lock().unwrap().is_empty());
+    let edges = edges.0.lock().unwrap();
+    let kinds: Vec<Attribution> = edges.iter().map(|edge| edge.attribution).collect();
+    assert_eq!(kinds, [Attribution::Command]);
+    assert_eq!(edges[0].path_count(), 1);
 }

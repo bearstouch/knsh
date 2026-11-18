@@ -14,7 +14,8 @@ use super::tests::{FakeSpawner, Journal, filesystem, forwarded};
 use super::*;
 use crate::sessions::tests::{Fixture, fixture};
 use crate::shadows::CheckpointEvents;
-use crate::shadows::tests::{ROOT, SETTLE, echoing_events, profile_with, shadows, shadows_with};
+use crate::shadows::EdgeSink;
+use crate::shadows::tests::{ROOT, RecordedEdges, SETTLE, echoing_events, profile_with, shadows, shadows_with_edges};
 
 /// Lines the profile allows.
 const ALLOW: &str = "[exec]\nallow = [\"echo\", \"ls\"]\n";
@@ -25,6 +26,8 @@ struct Rig {
     session_id: SessionId,
     journal: Arc<Journal>,
     lifecycle: Arc<Lifecycle>,
+    /// Every edge closed (KNSH-081).
+    edges: Arc<RecordedEdges>,
 }
 
 impl Rig {
@@ -43,10 +46,12 @@ impl Rig {
     ) -> Self {
         let fixture = fixture();
         let file_events = echoing_events(tree);
-        fixture.sessions.attach_shadows(shadows_with(
+        let edges = Arc::new(RecordedEdges::default());
+        fixture.sessions.attach_shadows(shadows_with_edges(
             tree,
             file_events.clone(),
             Arc::clone(&fixture.hub) as Arc<dyn CheckpointEvents>,
+            Arc::clone(&edges) as Arc<dyn EdgeSink>,
         ));
         let opened = fixture
             .sessions
@@ -85,6 +90,7 @@ impl Rig {
             fixture,
             journal,
             lifecycle,
+            edges,
         }
     }
 
@@ -418,4 +424,64 @@ fn line_without_drops_is_certain() {
         })
         .count();
     assert_eq!(uncertain, 0);
+}
+
+/// A spawner whose line writes `ROOT/built.txt` while it runs, as a build would (KNSH-081).
+struct WritingSpawner {
+    inner: FakeSpawner,
+    tree: Arc<FakeTree>,
+    file_events: ScriptedFileEvents,
+}
+
+impl Spawner for WritingSpawner {
+    fn spawn(&self, plan: SpawnPlan, events: &dyn LineEvents) -> SpawnReport {
+        let built = std::path::Path::new(ROOT).join("built.txt");
+        self.tree.add_file(&built, b"output");
+        self.file_events
+            .emit(&[FileEvent::new(&built, FileEventFlags::ITEM_CREATED)]);
+        self.inner.spawn(plan, events)
+    }
+}
+
+// KNSH-081 (FR-CKP-05): a change a line makes in a protected root is attributed to it: its record says `command`, as
+// does the closed edge that holds the record and the change, so the record matches the history-tree edge.
+#[test]
+fn line_record_attribution_matches_its_edge() {
+    let tree = Arc::new(FakeTree::new());
+    let writer_tree = Arc::clone(&tree);
+    let rig = Rig::with_spawner(&tree, true, false, move |journal, file_events| {
+        Arc::new(WritingSpawner {
+            inner: FakeSpawner::new(journal),
+            tree: writer_tree,
+            file_events,
+        })
+    });
+    assert_eq!(
+        crate::shadows::tests::settled_in(&rig.fixture.sessions, rig.session_id, &Rig::root()),
+        knsh_checkpoint::RootReadiness::Ready
+    );
+    let finished = rig.lifecycle.run(rig.line("echo hi", true), &StillWaiting).unwrap();
+    let record_id = finished.record_id.unwrap();
+    let records = rig.records();
+    let record = records.iter().find(|record| record.record_id == record_id).unwrap();
+    assert_eq!(record.details.attribution, Some(knsh_core::Attribution::Command));
+    let edges = rig.edges.0.lock().unwrap();
+    let edge = edges
+        .iter()
+        .find(|edge| edge.records.contains(&record_id))
+        .expect("the line's edge closed");
+    assert_eq!(Some(edge.attribution), record.details.attribution);
+    let built = CanonicalPath::new(format!("{ROOT}/built.txt")).unwrap();
+    assert!(edge.paths[&Rig::root()].contains(&built));
+}
+
+// KNSH-081: a denied line never ran, so its record has no attribution.
+#[test]
+fn denied_line_has_no_attribution() {
+    let tree = Arc::new(FakeTree::new());
+    let rig = Rig::new(&tree, true, false);
+    let _ = rig.lifecycle.run(rig.line("rm -rf /", true), &StillWaiting);
+    let records = rig.records();
+    assert!(!records.is_empty());
+    assert!(records.iter().all(|record| record.details.attribution.is_none()));
 }

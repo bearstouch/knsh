@@ -456,6 +456,14 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
         EventData::FileChanged { root, path: changed } => {
             Object::new().with("root", path(root))?.with("path", path(changed))
         }
+        // KNSH-081 (FR-CKP-06): paths are shown like `cwd`; `omitted` counts the paths the event does not list.
+        EventData::AgentEdit { root, paths, omitted } => {
+            let listed = paths.iter().map(|changed| Value::String(path(changed))).collect();
+            Object::new()
+                .with("root", path(root))?
+                .with("paths", Value::Array(listed))?
+                .with("omitted", *omitted)
+        }
         // KNSH-080 (FR-CKP-04, NFR-REL-04).
         EventData::CheckpointUncertain {
             root,
@@ -860,6 +868,36 @@ mod tests {
         assert!(
             gap.contains(r#""data":{"root":"/Users/me/app","record_id":null,"reason":"restart_gap"}"#),
             "{gap}"
+        );
+    }
+
+    // KNSH-081 (FR-CKP-06): `agent.edit` lists its root, its paths and how many more it does not list.
+    #[test]
+    fn agent_edit_payload() {
+        let agent = || Actor::Agent(AgentId::new("claude-code").unwrap());
+        let edit = written(
+            event_notification(
+                SubscriptionId::new(1),
+                &event(
+                    EventData::AgentEdit {
+                        root: CanonicalPath::new("/Users/me/app").unwrap(),
+                        paths: vec![
+                            CanonicalPath::new("/Users/me/app/README").unwrap(),
+                            CanonicalPath::new("/Users/me/app/src/main.rs").unwrap(),
+                        ],
+                        omitted: 3,
+                    },
+                    agent(),
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(edit.contains(r#""event":"agent.edit""#), "{edit}");
+        assert!(
+            edit.contains(
+                r#""data":{"root":"/Users/me/app","paths":["/Users/me/app/README","/Users/me/app/src/main.rs"],"omitted":3}"#
+            ),
+            "{edit}"
         );
     }
 

@@ -15,6 +15,13 @@
 //! `file.changed` for changes by any process, rescans when events are lost and marks those windows uncertain, and
 //! closes each line with the marker procedure of decision 16.
 //!
+//! KNSH-081 adds [`attribution`]: each change in a root is attributed to the supervised line running there
+//! (`command`), to the lines overlapping there as one set (`concurrent`), to the envelope's agent between lines
+//! (`agent_edit`), or to nobody supervised (`external`), grouped into the edges the history tree will store. File
+//! events carry no process ID, so a human editing at the same moment is attributed to the agent; the specification
+//! accepts this because undo checks each path's post-image identity first (FR-CKP-20), so a wrong attribution can
+//! refuse an undo but never overwrite work.
+//!
 //! # Boundaries
 //!
 //! Checkpoints live on the same APFS volume as the files they protect. Depends on `knsh-core` and `knsh-platform`:
@@ -23,7 +30,7 @@
 //!
 //! # Specification
 //!
-//! - `specs/03-functional-requirements/checkpoints.md`: FR-CKP-01 to FR-CKP-04, FR-CKP-09, FR-CKP-31, FR-CKP-35
+//! - `specs/03-functional-requirements/checkpoints.md`: FR-CKP-01 to FR-CKP-07, FR-CKP-09, FR-CKP-31, FR-CKP-35
 //! - FR-EVT-08 (`file.changed`), NFR-REL-04 (rescan after a restart) and decision 16 (closing a line, dropped events)
 //! - NFR-PERF-06 and decision 15 (`specs/09-reference/decisions.md`): how the initial shadow is built and timed
 //! - `specs/05-models/checkpoint.md` (storage), `specs/05-models/capabilities.md` (`checkpoints` per root)
@@ -34,6 +41,7 @@
 #![warn(clippy::pedantic)]
 #![forbid(unsafe_code)]
 
+pub mod attribution;
 mod error;
 pub mod identity;
 pub mod shadow;
@@ -44,6 +52,7 @@ pub mod watcher;
 #[cfg(any(test, doc, feature = "testing"))]
 pub mod testing;
 
+pub use attribution::{AgentEdits, Edge, EdgeId, Ledger, LineAttribution, MAX_EDGE_PATHS};
 pub use error::CheckpointError;
 pub use identity::{HASH_LIMIT, PostImageIdentity, post_image_identity};
 pub use shadow::{

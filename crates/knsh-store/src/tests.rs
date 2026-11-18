@@ -167,6 +167,7 @@ fn full_details() -> RecordDetails {
             root: CanonicalPath::new("/code/app").unwrap(),
             reason: UnprotectedReason::ShadowBuilding,
         }],
+        attribution: Some(knsh_core::Attribution::Concurrent),
     }
 }
 
@@ -310,6 +311,8 @@ fn human_record_drops_non_telemetry_fields() {
     );
     // KNSH-079: the roots whose changes were not protected read back as written.
     assert_eq!(details.unprotected, full_details().unprotected);
+    // KNSH-081: the attribution reads back as written.
+    assert_eq!(details.attribution, Some(knsh_core::Attribution::Concurrent));
     assert_eq!(stored.stdout.map(|info| info.stored), Some(3));
     assert_eq!(stored.stderr.map(|info| info.stored), Some(0));
 }
@@ -927,6 +930,28 @@ fn corrupt_argv_is_reported_not_repaired() {
         let read = store.query(Scope::All, RecordQuery::default());
         assert!(matches!(read, Err(StoreError::Corrupt)), "{bad}");
     }
+}
+
+// KNSH-081: a stored `attribution` the engine could not have written is reported as corrupt, never guessed at.
+#[test]
+fn corrupt_attribution_is_reported_not_repaired() {
+    let dir = TempDir::new("corrupt-attribution");
+    let store = open(&dir);
+    let agent_record = ExecutionRecord {
+        details: full_details(),
+        ..record(1, session_id(1), agent(), "npm test")
+    };
+    store.write_record(agent_record, RecordedOutput::default()).unwrap();
+    {
+        let raw = Connection::open(&RealFs::new(), &dir.db(), DEFAULT_BUSY_TIMEOUT).unwrap();
+        raw.execute(
+            "UPDATE records SET attribution = 'human' WHERE record_id = ?1",
+            &[Value::Text(&record_id(1).to_string())],
+        )
+        .unwrap();
+    }
+    let read = store.query(Scope::All, RecordQuery::default());
+    assert!(matches!(read, Err(StoreError::Corrupt)));
 }
 
 // FR-REC-07, configurability: each record is kept for the period of its own session's profile; profiles without an

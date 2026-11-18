@@ -119,6 +119,12 @@ pub trait WatchReport: Send + Sync {
     /// (`checkpoint.uncertain` with no record, FR-CKP-04, NFR-REL-04). Lines learn of theirs from
     /// [`Watcher::close_line`].
     fn uncertain(&self, root: &CanonicalPath, reason: UncertainReason);
+
+    /// The worker has applied one batch of events to the shadow of `root`: every [`WatchReport::changed`] of it has
+    /// been called. Where agent edits are reported, one `agent.edit` per batch (KNSH-081). Nothing by default.
+    fn settled(&self, root: &CanonicalPath) {
+        let _ = root;
+    }
 }
 
 /// What to watch.
@@ -367,6 +373,18 @@ impl Watcher {
         let mut state = lock(&self.inner.state);
         state.lines_open = state.lines_open.saturating_sub(1);
         outcome
+    }
+
+    /// Waits, at most the plan's flush deadline, until every event that happened before this call has been applied
+    /// (the procedure of [`Watcher::close_line`] for no line of this watcher). Returns whether it was in time and
+    /// no event was lost meanwhile.
+    ///
+    /// For attribution (KNSH-081): when sessions share a root, each has its own watcher, and a line of one must not
+    /// end before the others have reported its changes, or they would be attributed after it. Unlike a line it opens
+    /// no window of its own, so an uncertain window it meets is still reported to the watcher's session as usual.
+    pub fn flush(&self) -> bool {
+        let epoch = lock(&self.inner.state).epoch;
+        matches!(self.settle(epoch), LineClose::Certain)
     }
 
     /// Waits for the marker and then for the worker; see [`Watcher::close_line`].
@@ -659,6 +677,8 @@ impl Worker {
                 self.report.uncertain(&self.inner.plan.root, *reason);
             }
             let failed = self.apply(&batch);
+            // Before the batch counts as applied, so a line end waiting for it sees what this reports (KNSH-081).
+            self.report.settled(&self.inner.plan.root);
             let mut state = lock(&self.inner.state);
             if failed {
                 // The shadow may not follow the live tree: a later event retries the paths; the window is uncertain.

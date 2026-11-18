@@ -47,6 +47,10 @@ use crate::session::{Actor, ProfileName, Session, SessionState, StateChanged};
 use crate::time::Timestamp;
 use crate::violation::SandboxViolation;
 
+/// The most paths one `agent.edit` event lists (KNSH-081); further paths of the same batch are only counted, so one
+/// burst of edits cannot make an event of unbounded size.
+pub const AGENT_EDIT_PATHS: usize = 256;
+
 /// Events kept per session for `since_seq` resumes (FR-EVT-03), and the bound of each subscription's queue.
 pub const EVENT_BUFFER_LEN: usize = 10_000;
 
@@ -213,6 +217,17 @@ pub enum EventData {
         /// The path that changed (created, written, removed or replaced), inside `root`.
         path: CanonicalPath,
     },
+    /// `agent.edit`: paths under a checkpoint root changed inside an envelope while no supervised line ran there
+    /// (FR-CKP-06, KNSH-081). Published once the watcher has brought the root's shadow in step with them, at most
+    /// [`AGENT_EDIT_PATHS`] paths per event.
+    AgentEdit {
+        /// The checkpoint root.
+        root: CanonicalPath,
+        /// The paths that changed, inside `root`, sorted; at most [`AGENT_EDIT_PATHS`].
+        paths: Vec<CanonicalPath>,
+        /// How many more paths changed than `paths` lists (each was still published as `file.changed`), saturating.
+        omitted: u32,
+    },
     /// `checkpoint.uncertain`: file events of a root may have been lost, so the root was rescanned and the changes of
     /// that window cannot be attributed with certainty (FR-CKP-04, NFR-REL-04, KNSH-080).
     CheckpointUncertain {
@@ -360,6 +375,7 @@ impl EventData {
             | Self::CommandStarted { .. }
             | Self::CommandLongRunning { .. }
             | Self::FileChanged { .. }
+            | Self::AgentEdit { .. }
             | Self::CheckpointUncertain { .. } => None,
         }
     }
@@ -385,6 +401,7 @@ impl EventData {
             Self::CommandOutput { .. } => "command.output",
             Self::PolicyInvalid { .. } => "policy.invalid",
             Self::FileChanged { .. } => "file.changed",
+            Self::AgentEdit { .. } => "agent.edit",
             Self::CheckpointUncertain { .. } => "checkpoint.uncertain",
         }
     }

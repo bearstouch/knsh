@@ -976,6 +976,8 @@ fn checkpoint_shadows(
         // Shadows follow the live tree from FSEvents, and publish `file.changed` and `checkpoint.uncertain` (KNSH-080).
         file_events: Arc::new(knsh_platform::macos::FsEventStreams::new()),
         events: Arc::clone(events) as Arc<dyn shadows::CheckpointEvents>,
+        // KNSH-081: closed edges are dropped until capture (KNSH-082) and the history tree (KNSH-083) take them.
+        edges: Arc::new(shadows::UncapturedEdges),
     })
 }
 
