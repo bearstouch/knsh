@@ -63,6 +63,9 @@ pub enum SandboxViolations {
 pub enum CheckpointBackend {
     /// APFS clones on the root's own volume.
     ApfsClone,
+    /// Plain copies in the home store, limited to 50 MiB per change: the root's volume is not APFS, or no store
+    /// can be used on it (FR-CKP-35, KNSH-078).
+    PlainCopy,
     /// The root cannot be checkpointed.
     None,
 }
@@ -128,6 +131,7 @@ impl CheckpointBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ApfsClone => "apfs-clone",
+            Self::PlainCopy => "plain-copy",
             Self::None => NONE,
         }
     }
@@ -363,10 +367,13 @@ mod tests {
         assert!(!caps.has(Backend::Checkpoints));
         caps.checkpoints.insert("/b".to_owned(), CheckpointBackend::ApfsClone);
         assert!(caps.has(Backend::Checkpoints));
+        // FR-CKP-35: plain copies are a backend too, reported as such (KNSH-078).
+        caps.checkpoints.insert("/c".to_owned(), CheckpointBackend::PlainCopy);
         let object = caps.to_object().unwrap();
         let roots = object.get("checkpoints").and_then(Value::as_object).unwrap();
         assert_eq!(roots.get("/a").and_then(Value::as_str), Some("none"));
         assert_eq!(roots.get("/b").and_then(Value::as_str), Some("apfs-clone"));
+        assert_eq!(roots.get("/c").and_then(Value::as_str), Some("plain-copy"));
         assert_eq!(object.get("sandbox").and_then(Value::as_str), Some("seatbelt"));
     }
 }

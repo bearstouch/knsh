@@ -76,10 +76,27 @@ fn last_os_error(operation: Operation) -> PlatformError {
 }
 
 /// An absolute path as a C string for the `libc` calls the standard library does not wrap. A path with an inner NUL
-/// byte cannot be passed to the system and is refused.
-fn c_path(path: &Path) -> Result<CString, PlatformError> {
+/// byte cannot be passed to the system and is refused. Shared with `SystemVolumes`.
+pub(super) fn c_path(path: &Path) -> Result<CString, PlatformError> {
     require_absolute(path)?;
     CString::new(path.as_os_str().as_bytes()).map_err(|_| PlatformError::InvalidPath)
+}
+
+/// The kind of entry `file_type` (from `lstat`) names. Shared with `SystemVolumes`.
+pub(super) fn kind_of(file_type: fs::FileType) -> FileKind {
+    if file_type.is_symlink() {
+        FileKind::Symlink
+    } else if file_type.is_dir() {
+        FileKind::Directory
+    } else if file_type.is_file() {
+        FileKind::File
+    } else {
+        // Sockets, FIFOs and devices are all "other" to the engine.
+        debug_assert!(
+            file_type.is_socket() || file_type.is_fifo() || file_type.is_block_device() || file_type.is_char_device()
+        );
+        FileKind::Other
+    }
 }
 
 /// An extended attribute name as a C string; an inner NUL byte is refused like one in a path.
@@ -170,25 +187,8 @@ impl Fs for RealFs {
     fn metadata(&self, path: &Path) -> Result<Metadata, PlatformError> {
         require_absolute(path)?;
         let meta = fs::symlink_metadata(path).map_err(os(Operation::Metadata))?;
-        let file_type = meta.file_type();
-        let kind = if file_type.is_symlink() {
-            FileKind::Symlink
-        } else if file_type.is_dir() {
-            FileKind::Directory
-        } else if file_type.is_file() {
-            FileKind::File
-        } else {
-            // Sockets, FIFOs and devices are all "other" to the engine.
-            debug_assert!(
-                file_type.is_socket()
-                    || file_type.is_fifo()
-                    || file_type.is_block_device()
-                    || file_type.is_char_device()
-            );
-            FileKind::Other
-        };
         Ok(Metadata {
-            kind,
+            kind: kind_of(meta.file_type()),
             len: meta.len(),
             mode: meta.permissions().mode() & 0o7777,
             uid: meta.uid(),

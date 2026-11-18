@@ -53,6 +53,7 @@ mod tests;
 pub use check::{LineCheck, LineResolver, check_line};
 pub use fixed::{
     AGENT_SOCKET, CONTROL_SERVICE, ENGINE_CONFIG_DIR, ENGINE_DATA_DIR, ENGINE_RUN_DIR, FixedDenies, USER_SOCKET,
+    VOLUME_CHECKPOINT_DIR,
 };
 pub use grant::{Grant, GrantScope, GrantSet, MAX_GRANTS, line_grant_rule};
 use layer::{Layer, LayerKind, ReadTemplate};

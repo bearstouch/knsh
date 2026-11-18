@@ -19,7 +19,10 @@
 //! default on macOS, so `~/library/application support/KNSH` names the same directory. On a case-sensitive volume this
 //! can refuse a path that only differs in case, which fails closed.
 //!
-//! Out of scope (phase 3): `.knsh-checkpoints/` folders on other volumes.
+//! Checkpoint stores on other volumes (KNSH-078) are folders named [`VOLUME_CHECKPOINT_DIR`] at the volume's root,
+//! wherever it is mounted, so they cannot be listed per home: the name itself is reserved. [`FixedDenies::covers`]
+//! refuses any path with a `.knsh-checkpoints` component (ignoring ASCII case), and the sandbox compiler denies it
+//! with a regex in every profile.
 
 use std::path::{Component, Path};
 
@@ -40,6 +43,10 @@ pub const AGENT_SOCKET: &str = "agent.sock";
 
 /// The user endpoint socket, inside [`ENGINE_RUN_DIR`]: denied to every envelope and command (FR-SBX-05).
 pub const USER_SOCKET: &str = "user.sock";
+
+/// The checkpoint store on an APFS volume other than the home volume, at that volume's root (FR-CKP-35,
+/// `specs/09-reference/file-locations.md`). Any path component with this name is a fixed deny.
+pub const VOLUME_CHECKPOINT_DIR: &str = ".knsh-checkpoints";
 
 /// The XPC Mach service of the control endpoint (`specs/09-reference/file-locations.md`; the final name is tied to
 /// the signing identity).
@@ -96,13 +103,20 @@ impl FixedDenies {
         &FIXED_SERVICES
     }
 
-    /// Whether `path` is a fixed-deny path or lies below one (ignoring ASCII case, module documentation), so that
-    /// allowing it would allow engine files.
+    /// Whether `path` is a fixed-deny path or lies below one, or is (or lies in) a checkpoint store on another volume
+    /// (any [`VOLUME_CHECKPOINT_DIR`] component), ignoring ASCII case (module documentation), so that allowing it
+    /// would allow engine files.
     #[must_use]
     pub fn covers(&self, path: &CanonicalPath) -> bool {
         self.paths
             .iter()
             .any(|denied| starts_with_ignoring_case(path.as_path(), denied.as_path()))
+            || path.as_path().components().any(|component| {
+                component
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .eq_ignore_ascii_case(VOLUME_CHECKPOINT_DIR.as_bytes())
+            })
     }
 }
 
@@ -167,6 +181,10 @@ mod tests {
             // The home volume is case-insensitive by default.
             "/Users/u/library/application support/KNSH/records.db",
             "/users/U/.CONFIG/knsh",
+            // Checkpoint stores on other volumes, wherever they are mounted (KNSH-078).
+            "/Volumes/External/.knsh-checkpoints",
+            "/Volumes/External/.knsh-checkpoints/format",
+            "/Volumes/External/.KNSH-Checkpoints/x",
         ] {
             assert!(denies.covers(&canonical(covered)), "{covered}");
         }
@@ -178,6 +196,9 @@ mod tests {
             "/Users/u/.config",
             "/Users/u/.config/knshx",
             "/Users/v/.config/knsh",
+            "/Volumes/External",
+            "/Volumes/External/.knsh-checkpoints2",
+            "/Volumes/External/knsh-checkpoints",
         ] {
             assert!(!denies.covers(&canonical(open)), "{open}");
         }

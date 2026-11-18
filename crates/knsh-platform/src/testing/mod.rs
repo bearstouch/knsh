@@ -32,6 +32,9 @@
 //! - [`FakeCodeSigning`]: the code-signing facts of a control-service peer, scripted and changeable mid-test (a
 //!   peer that exec'd), every inspection counted (KNSH-067).
 //!
+//! - [`FakeVolumes`]: volumes and files in memory for checkpoints: clones within or across volumes and file
+//!   systems, injected clone failures, identity changes (write in place, replace, touch) and digests (KNSH-078).
+//!
 //! Locks in the fakes are independent (one per fake) and never held across calls into another fake.
 
 mod ancestry;
@@ -47,6 +50,7 @@ mod probe;
 mod process;
 mod random;
 mod resolver;
+mod volumes;
 
 pub use ancestry::FakeProcessTree;
 pub use clock::FakeClock;
@@ -61,6 +65,7 @@ pub use probe::FakeSystemProbe;
 pub use process::{Script, ScriptedProcesses};
 pub use random::SeededRandom;
 pub use resolver::FakeResolver;
+pub use volumes::FakeVolumes;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 

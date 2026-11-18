@@ -20,13 +20,14 @@ mod process;
 mod random;
 mod resolver;
 mod shell_host;
+mod volumes;
 mod xpc;
 
 pub use ancestry::SystemProcessTree;
 pub use clock::SystemClock;
 pub use denials::UnifiedLogDenials;
 pub use descriptors::{MAX_PASSED_DESCRIPTORS, peer_closed, recv_with_descriptors, send_with_descriptors};
-pub use digest::{SHA256_LEN, hmac_sha256, sha256};
+pub use digest::{SHA256_LEN, hmac_sha256, sha256, sha256_reader};
 pub use fs::RealFs;
 pub use keychain::{
     KeychainSigningKey, KeychainTrustStore, SIGNING_KEY_ACCOUNT, SIGNING_KEY_SERVICE, TRUST_ACCOUNT, TRUST_SERVICE,
@@ -40,6 +41,7 @@ pub use process::SystemProcesses;
 pub use random::SystemRandom;
 pub use resolver::SystemResolver;
 pub use shell_host::{JobSignalsIgnored, TelemetryPipe, reraise_default};
+pub use volumes::SystemVolumes;
 pub use xpc::{SecCodeSigning, XpcControlService, XpcMessage};
 
 /// The effective user id of this process: the only owner whose engine paths are used (KNSH-011, NFR-SEC-08).

@@ -46,6 +46,13 @@ Undo moves back along an edge and keeps the branch it left, so redo stays possib
 | Home volume (APFS) | `~/Library/Application Support/knsh/checkpoints/` | Copy-on-write clones |
 | Other APFS volumes | `.knsh-checkpoints/` on that volume, when writable | Copy-on-write clones |
 | Non-APFS volumes | Home store | Plain copies, limited to 50 MB per change |
+| Read-only APFS volumes, ones mounted with ownership ignored (the default for external disks: `0700` would protect nothing), or one whose store cannot be used | Home store | Plain copies, limited to 50 MB per change |
+
+MB here means MiB (50 × 2²⁰ bytes; the post-image hash limit is 64 × 2²⁰). A plain-copy change over the limit is
+recorded as not protected, never truncated. Every store is owner-only, excluded from Spotlight and Time Machine, a
+fixed deny, and versioned by a `format` file; a newer or corrupt store is left as found and its roots fall back
+(volume store to plain copies in the home store; home store to `none`). See
+[file locations](../09-reference/file-locations.md) (KNSH-078).
 
 ## Retention
 

@@ -146,8 +146,11 @@ the sockets in `run/`), the configuration directory `~/.config/knsh/`, and the M
 `fs.write`, `exec.trusted_folders`, `exec.bash`, `checkpoints.roots`) names an engine path or a path below one, after
 canonicalisation (so a symlink into an engine directory is caught) and ignoring ASCII case (the home volume is
 case-insensitive by default). A path above an engine path (`fs.write = ["~"]`) is accepted, because the fixed denies
-are carved out of it; `fs.deny` may name engine paths. No profile key names a socket or a Mach service. `.knsh-checkpoints/`
-folders on other volumes join the set in phase 3.
+are carved out of it; `fs.deny` may name engine paths. No profile key names a socket or a Mach service. Checkpoint stores on other volumes
+(`.knsh-checkpoints/` at a volume's root, KNSH-078) cannot be listed per home, so the name itself is reserved: every
+path with a `.knsh-checkpoints` component (ignoring ASCII case) is a fixed deny, refused by the loader like an engine
+path and denied in every profile by the regex `/\.knsh-checkpoints(/|$)` (reading, listing, writing, renaming and
+executing it observed denied on macOS 26.6.2).
 
 ## The `unattended` profile
 
