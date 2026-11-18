@@ -182,6 +182,10 @@ mod violations;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod threat_model;
+// Phase 2 qualification (KNSH-076): performance targets and the developer-tool list, over the same miniature `knshd`.
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod qualification;
 
 use std::fmt;
 use std::process::ExitCode;
