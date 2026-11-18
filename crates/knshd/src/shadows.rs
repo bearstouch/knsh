@@ -24,10 +24,21 @@
 //! - **Lines (KNSH-080).** [`Shadows::open_lines`] marks a line's start in each protected root it touches, and
 //!   [`close_lines`] runs the line-end procedure of decision 16 once the line has been reaped: the one place
 //!   the decision path waits for a watcher, at most [`knsh_checkpoint::FLUSH_DEADLINE`] per root.
+//! - **Attribution (KNSH-081).** One [`Attributor`] for the daemon keeps the [`Ledger`] of every root, keyed by root
+//!   so lines of one session are never another session's agent edits. Each session's roots are registered with it
+//!   (with whether the session runs in an envelope), every `file.changed` a watcher reports goes to it, and each
+//!   line is started in it by [`Shadows::open_lines`] and ended by [`close_lines`] **after** its line-end flush, so
+//!   every change of the line has been attributed before the line's attribution is read for its record
+//!   (FR-CKP-05, FR-CKP-07). The watchers other sessions keep on the line's roots are flushed too: they report the
+//!   line's changes as well, and must not do so after it ended. Agent edits are published as `agent.edit` on each envelope session watching the root,
+//!   one per batch the watcher applied (FR-CKP-06). Closed edges go to an [`EdgeSink`]: capture (KNSH-082) and the
+//!   history tree (KNSH-083) will take them; until then they are dropped.
 //!
 //! # Locks
 //!
-//! The session table is a leaf: no other lock is taken, and nothing waits, while it is held. A caller waiting on a
+//! The session table is a leaf: no other lock is taken, and nothing waits, while it is held. The attributor's ledger
+//! lock is taken only without the table lock; the [`EdgeSink`] is called under it (so edges arrive in the order they
+//! closed) and must not block or call back. Events are published after it is released. A caller waiting on a
 //! shadow ([`Shadows::wait`]) holds only that shadow's own lock, inside `knsh-checkpoint`. Watchers are looked up
 //! under the table lock and used after it is released; their reports publish events (the hub's lock), never under
 //! the table lock.
@@ -39,11 +50,13 @@ use std::thread;
 use std::time::Duration;
 
 use knsh_checkpoint::{
-    CheckpointError, FLUSH_DEADLINE, LineClose, LineMark, Method, RootReadiness, SHADOW_THREADS, STREAM_LATENCY,
-    Shadow, ShadowFailure, ShadowFiles, ShadowPlan, ShadowStatus, WatchPlan, WatchReport, Watcher, marker_dir,
-    place_roots, shadow_dir, start_shadow, start_watch,
+    CheckpointError, Edge, FLUSH_DEADLINE, Ledger, LineClose, LineMark, Method, RootReadiness, SHADOW_THREADS,
+    STREAM_LATENCY, Shadow, ShadowFailure, ShadowFiles, ShadowPlan, ShadowStatus, WatchPlan, WatchReport, Watcher,
+    marker_dir, place_roots, shadow_dir, start_shadow, start_watch,
 };
-use knsh_core::{CanonicalPath, EventData, Profile, RecordId, SessionId, UncertainReason, UnprotectedReason};
+use knsh_core::{
+    Attribution, CanonicalPath, EventData, Profile, RecordId, SessionId, UncertainReason, UnprotectedReason,
+};
 use knsh_platform::{Clock, EnginePaths, Field, FileEvents, Fs, Level, PlatformError, SystemLog, Value, Volumes};
 use knsh_proto::CheckpointBackend;
 
@@ -64,6 +77,10 @@ pub(crate) trait CheckpointEvents: Send + Sync {
         record_id: Option<RecordId>,
         reason: UncertainReason,
     );
+
+    /// `agent.edit`: `paths` under `root` changed inside the envelope of `session_id` while no line ran there, and
+    /// `omitted` more were not listed (FR-CKP-06, KNSH-081).
+    fn agent_edit(&self, session_id: SessionId, root: &CanonicalPath, paths: &[CanonicalPath], omitted: u32);
 }
 
 impl CheckpointEvents for EventHub {
@@ -90,29 +107,142 @@ impl CheckpointEvents for EventHub {
         };
         let _ = self.publish_for_session(session_id, data);
     }
+
+    fn agent_edit(&self, session_id: SessionId, root: &CanonicalPath, paths: &[CanonicalPath], omitted: u32) {
+        let data = EventData::AgentEdit {
+            root: root.clone(),
+            paths: paths.to_vec(),
+            omitted,
+        };
+        let _ = self.publish_for_session(session_id, data);
+    }
+}
+
+/// Where closed edges go (KNSH-081): the units capture (KNSH-082) and the history tree (KNSH-083) will store. Called
+/// under the attributor's lock, in the order the edges closed; must not block or call back into the attributor.
+pub(crate) trait EdgeSink: Send + Sync {
+    /// `edges` closed, oldest first.
+    fn closed(&self, edges: Vec<Edge>);
+}
+
+/// The edge sink until capture and the history tree exist (KNSH-082, KNSH-083): closed edges are dropped. Records
+/// still carry their attribution.
+pub(crate) struct UncapturedEdges;
+
+impl EdgeSink for UncapturedEdges {
+    fn closed(&self, edges: Vec<Edge>) {
+        drop(edges);
+    }
+}
+
+/// The daemon's attribution of changes in checkpoint roots (KNSH-081): the [`Ledger`] behind its lock, and where
+/// what it decides goes.
+pub(crate) struct Attributor {
+    ledger: Mutex<Ledger>,
+    events: Arc<dyn CheckpointEvents>,
+    edges: Arc<dyn EdgeSink>,
+}
+
+impl Attributor {
+    fn new(events: Arc<dyn CheckpointEvents>, edges: Arc<dyn EdgeSink>) -> Arc<Self> {
+        Arc::new(Self {
+            ledger: Mutex::new(Ledger::new()),
+            events,
+            edges,
+        })
+    }
+
+    /// Runs `change` on the ledger, then hands the edges it closed to the sink, under the same lock (module
+    /// documentation, "Locks").
+    fn with<R>(&self, change: impl FnOnce(&mut Ledger) -> R) -> R {
+        // The ledger stays consistent at each step of every operation, so a panic elsewhere cannot corrupt it.
+        let mut ledger = self.ledger.lock().unwrap_or_else(PoisonError::into_inner);
+        let result = change(&mut ledger);
+        let closed = ledger.take_closed();
+        if !closed.is_empty() {
+            self.edges.closed(closed);
+        }
+        result
+    }
+
+    /// Publishes the agent edits of `root` not reported yet, as one `agent.edit` on each envelope session watching
+    /// it (FR-CKP-06).
+    fn publish_agent_edits(&self, root: &CanonicalPath) {
+        let Some(edits) = self.with(|ledger| ledger.take_agent_edits(root)) else {
+            return;
+        };
+        for session_id in &edits.sessions {
+            self.events
+                .agent_edit(*session_id, &edits.root, &edits.paths, edits.omitted);
+        }
+    }
 }
 
 /// A watcher's reports, for one session.
 struct SessionReport {
     session_id: SessionId,
     events: Arc<dyn CheckpointEvents>,
+    attributor: Arc<Attributor>,
 }
 
 impl WatchReport for SessionReport {
     fn changed(&self, root: &CanonicalPath, path: &CanonicalPath) {
+        // Attributed first, so anyone who saw `file.changed` sees the change already attributed (KNSH-081).
+        self.attributor.with(|ledger| ledger.changed(root, path));
         self.events.file_changed(self.session_id, root, path);
     }
 
     fn uncertain(&self, root: &CanonicalPath, reason: UncertainReason) {
         self.events.uncertain(self.session_id, root, None, reason);
     }
+
+    fn settled(&self, root: &CanonicalPath) {
+        self.attributor.publish_agent_edits(root);
+    }
 }
 
 /// A line's start in one protected root ([`Shadows::open_lines`]).
-pub(crate) struct OpenLine {
+struct OpenLine {
     root: CanonicalPath,
     /// The root's watcher and the line's mark in it; `None` when the root has a shadow but no watcher.
     watched: Option<(Arc<Watcher>, LineMark)>,
+}
+
+/// A line's start in every protected root it touches, and in the attribution ledger ([`Shadows::open_lines`]).
+/// Give it to [`close_lines`] once the line has been reaped.
+#[must_use = "a checkpoint line must be closed with `close_lines`"]
+pub(crate) struct CheckpointLine {
+    record_id: RecordId,
+    roots: Vec<OpenLine>,
+    /// Where the line was started; `None` when it touches no protected root, or there are no shadows.
+    attributor: Option<Arc<Attributor>>,
+    /// The session table, to find at close time the watchers other sessions keep on the line's roots
+    /// ([`close_lines`]); `None` exactly when `attributor` is.
+    table: Option<Arc<Table>>,
+}
+
+impl CheckpointLine {
+    /// A line touching no protected root: nothing to flush, attributed `command`.
+    pub(crate) fn unprotected(record_id: RecordId) -> Self {
+        Self {
+            record_id,
+            roots: Vec::new(),
+            attributor: None,
+            table: None,
+        }
+    }
+}
+
+/// The shadows of every live agent session, by session.
+type Table = Mutex<BTreeMap<SessionId, Vec<RootShadow>>>;
+
+/// What closing a line found ([`close_lines`]).
+#[derive(Debug)]
+pub(crate) struct ClosedLine {
+    /// The roots whose checkpoints are uncertain, and why (FR-CKP-04).
+    pub(crate) uncertain: Vec<(CanonicalPath, UncertainReason)>,
+    /// The record's `attribution` (FR-CKP-05, FR-CKP-07).
+    pub(crate) attribution: Attribution,
 }
 
 /// The effects shadows need.
@@ -133,8 +263,10 @@ pub(crate) struct ShadowParts {
     pub(crate) log: Arc<dyn SystemLog>,
     /// File-event streams for the watchers (KNSH-080).
     pub(crate) file_events: Arc<dyn FileEvents>,
-    /// Where `file.changed` and `checkpoint.uncertain` are published.
+    /// Where `file.changed`, `checkpoint.uncertain` and `agent.edit` are published.
     pub(crate) events: Arc<dyn CheckpointEvents>,
+    /// Where closed edges go (KNSH-081): [`UncapturedEdges`] until capture and the history tree exist.
+    pub(crate) edges: Arc<dyn EdgeSink>,
 }
 
 /// One root of one session.
@@ -145,20 +277,25 @@ struct RootShadow {
     shadow: Option<Arc<Shadow>>,
     /// Its file-event watcher; `None` without a shadow, or when the watcher could not start.
     watcher: Option<Arc<Watcher>>,
+    /// Whether its session runs in an envelope, as registered with the attributor (KNSH-081).
+    envelope: bool,
 }
 
 /// The shadows of every live agent session. One per `knshd`.
 pub(crate) struct Shadows {
     parts: ShadowParts,
-    sessions: Mutex<BTreeMap<SessionId, Vec<RootShadow>>>,
+    sessions: Arc<Table>,
+    attributor: Arc<Attributor>,
 }
 
 impl Shadows {
     /// No session yet.
     pub(crate) fn new(parts: ShadowParts) -> Arc<Self> {
+        let attributor = Attributor::new(Arc::clone(&parts.events), Arc::clone(&parts.edges));
         Arc::new(Self {
             parts,
-            sessions: Mutex::new(BTreeMap::new()),
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            attributor,
         })
     }
 
@@ -167,8 +304,9 @@ impl Shadows {
     }
 
     /// Starts the shadows of `session_id`'s roots, from `profile` as the session runs it (FR-CKP-01). Returns once
-    /// each build has started, without waiting for any. A session with no roots gets nothing.
-    pub(crate) fn start(&self, session_id: SessionId, profile: &Profile) {
+    /// each build has started, without waiting for any. A session with no roots gets nothing. `envelope` tells
+    /// whether the session runs in an envelope: changes between its lines are then its agent edits (KNSH-081).
+    pub(crate) fn start(&self, session_id: SessionId, profile: &Profile, envelope: bool) {
         let roots = &profile.checkpoints.roots;
         if roots.is_empty() {
             return;
@@ -192,6 +330,10 @@ impl Shadows {
                         // Never shadowed: the root's store (a root may contain it) and the engine folders.
                         let mut skip: Vec<PathBuf> = parts.paths.fixed_denies().into();
                         skip.push(store.clone());
+                        // Registered before the watcher can report anything, so its first change is attributed with
+                        // the session's envelope known (KNSH-081).
+                        self.attributor
+                            .with(|ledger| ledger.watch(&placed.root, session_id, envelope));
                         // The watcher first, so a change made while the build runs is not missed (KNSH-080).
                         let watcher = self.start_watcher(session_id, index, store, &placed.root, &dir, profile, &skip);
                         let plan = ShadowPlan {
@@ -218,6 +360,7 @@ impl Shadows {
                     method: placed.method,
                     shadow,
                     watcher,
+                    envelope,
                 }
             })
             .collect();
@@ -225,7 +368,7 @@ impl Shadows {
         // the table lock is released, which stays a leaf.
         let previous = self.table().insert(session_id, shadows);
         if let Some(previous) = previous {
-            cancel_all(&previous);
+            self.cancel_all(session_id, &previous);
         }
     }
 
@@ -233,8 +376,19 @@ impl Shadows {
     pub(crate) fn end(&self, session_id: SessionId) {
         let removed = self.table().remove(&session_id);
         if let Some(shadows) = removed {
-            cancel_all(&shadows);
+            self.cancel_all(session_id, &shadows);
         }
+    }
+
+    /// Stops the builds and the watchers of `session_id`, which ended, then takes its roots out of the attribution
+    /// ledger: stopped first, so no change of its watchers arrives after it no longer watches (KNSH-081).
+    fn cancel_all(&self, session_id: SessionId, shadows: &[RootShadow]) {
+        cancel_all(shadows);
+        self.attributor.with(|ledger| {
+            for entry in shadows.iter().filter(|entry| entry.shadow.is_some()) {
+                ledger.unwatch(&entry.root, session_id, entry.envelope);
+            }
+        });
     }
 
     /// Starts the watcher of root number `index` of `session_id` (KNSH-080). `None`, logged, if it cannot start.
@@ -264,6 +418,7 @@ impl Shadows {
         let report = Arc::new(SessionReport {
             session_id,
             events: Arc::clone(&parts.events),
+            attributor: Arc::clone(&self.attributor),
         });
         match start_watch(
             parts.file_events.as_ref(),
@@ -280,15 +435,21 @@ impl Shadows {
         }
     }
 
-    /// A line of `session_id` touching `roots` starts (KNSH-080): marks its start in each root that has a shadow, so
-    /// [`close_lines`] can tell whether events were lost while it ran. Never waits.
-    pub(crate) fn open_lines(&self, session_id: SessionId, roots: &[CanonicalPath]) -> Vec<OpenLine> {
+    /// Line `record_id` of `session_id` touching `roots` starts (KNSH-080, KNSH-081): marks its start in each root
+    /// that has a shadow, so [`close_lines`] can tell whether events were lost while it ran, and starts it in the
+    /// attribution ledger, so changes in those roots are its own from now on. Never waits.
+    pub(crate) fn open_lines(
+        &self,
+        session_id: SessionId,
+        record_id: RecordId,
+        roots: &[CanonicalPath],
+    ) -> CheckpointLine {
         // Collected under the table lock and marked after it is released: the table is a leaf lock (module
         // documentation), and marking takes each watcher's own.
         let watched: Vec<(CanonicalPath, Option<Arc<Watcher>>)> = {
             let table = self.table();
             let Some(entries) = table.get(&session_id) else {
-                return Vec::new();
+                return CheckpointLine::unprotected(record_id);
             };
             roots
                 .iter()
@@ -300,7 +461,13 @@ impl Shadows {
                 })
                 .collect()
         };
-        watched
+        if watched.is_empty() {
+            return CheckpointLine::unprotected(record_id);
+        }
+        let shadowed: Vec<CanonicalPath> = watched.iter().map(|(root, _)| root.clone()).collect();
+        self.attributor
+            .with(|ledger| ledger.line_started(record_id, session_id, &shadowed));
+        let roots = watched
             .into_iter()
             .map(|(root, watcher)| OpenLine {
                 root,
@@ -309,7 +476,13 @@ impl Shadows {
                     (watcher, mark)
                 }),
             })
-            .collect()
+            .collect();
+        CheckpointLine {
+            record_id,
+            roots,
+            attributor: Some(Arc::clone(&self.attributor)),
+            table: Some(Arc::clone(&self.sessions)),
+        }
     }
 
     /// How far the shadow of `root` is for `session_id` (FR-CKP-02). A root the session has no shadow for (it was not
@@ -377,10 +550,61 @@ impl Shadows {
     }
 }
 
-/// The line of `lines` has ended and been reaped: closes it in each root (decision 16), one after the other, and
-/// returns the roots whose checkpoints are uncertain, and why (FR-CKP-04). A root without a watcher is uncertain
-/// (`not_watched`).
-pub(crate) fn close_lines(lines: Vec<OpenLine>) -> Vec<(CanonicalPath, UncertainReason)> {
+/// The line of `line` has ended and been reaped: closes it in each root (decision 16), one after the other, then
+/// ends it in the attribution ledger. Returns the roots whose checkpoints are uncertain, and why (FR-CKP-04; a root
+/// without a watcher is `not_watched`), and the line's attribution (FR-CKP-05, FR-CKP-07).
+///
+/// The ledger is told last: by then each watcher has applied every event of the line, so all of its changes are
+/// attributed before its attribution is read. That includes the watchers other sessions keep on the same roots
+/// (flushed, not closed: their uncertainty is their own session's): each reports the line's changes too, and one
+/// reported after the line ended would be attributed to whatever follows it, an agent edit of another session
+/// for instance (KNSH-081).
+pub(crate) fn close_lines(line: CheckpointLine) -> ClosedLine {
+    let CheckpointLine {
+        record_id,
+        roots,
+        attributor,
+        table,
+    } = line;
+    let peers = table.map(|table| peer_watchers(&table, &roots)).unwrap_or_default();
+    let uncertain = close_roots(roots);
+    for peer in peers {
+        // Best effort, bounded by the flush deadline: a peer that is late only risks attributing a late event of
+        // the line to the next run, which undo's post-image check makes safe (FR-CKP-20).
+        let _ = peer.flush();
+    }
+    let attribution = attributor
+        .and_then(|attributor| attributor.with(|ledger| ledger.line_ended(record_id)))
+        .map_or(Attribution::Command, |ended| ended.attribution);
+    ClosedLine { uncertain, attribution }
+}
+
+/// The running watchers on the roots of `lines` other than the line's own: those of other sessions sharing a root.
+/// Looked up when the line ends, not when it starts, so a session that started meanwhile is included. Collected
+/// under the table lock and used after it is released (module documentation, "Locks").
+fn peer_watchers(table: &Table, lines: &[OpenLine]) -> Vec<Arc<Watcher>> {
+    let table = table.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut peers: Vec<Arc<Watcher>> = Vec::new();
+    for line in lines {
+        let own = line.watched.as_ref().map(|(watcher, _)| watcher);
+        for entry in table.values().flatten() {
+            let Some(watcher) = &entry.watcher else {
+                continue;
+            };
+            if entry.root != line.root
+                || own.is_some_and(|own| Arc::ptr_eq(own, watcher))
+                || peers.iter().any(|kept| Arc::ptr_eq(kept, watcher))
+            {
+                continue;
+            }
+            peers.push(Arc::clone(watcher));
+        }
+    }
+    peers
+}
+
+/// Runs the line-end procedure in each root of a line, and returns the roots whose checkpoints are uncertain.
+fn close_roots(lines: Vec<OpenLine>) -> Vec<(CanonicalPath, UncertainReason)> {
     lines
         .into_iter()
         .filter_map(|line| {

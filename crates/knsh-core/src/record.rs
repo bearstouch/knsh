@@ -791,6 +791,59 @@ pub fn decode_unprotected(text: &str) -> Result<Vec<UnprotectedRoot>, CoreError>
         .map_err(|_| CoreError::InvalidUnprotected)
 }
 
+/// How a record's file changes were attributed (FR-CKP-05 to FR-CKP-07, KNSH-081): the record's `attribution`, and
+/// the kind of the history-tree edge its changes belong to (`specs/05-models/checkpoint.md`).
+///
+/// File events carry no process ID, so attribution goes by time and place: a change in a checkpoint root while a
+/// supervised line runs there belongs to that line, one between lines to the envelope's agent, and one in a root no
+/// envelope watches to nobody the engine supervises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Attribution {
+    /// Made while one supervised line ran alone in the root (FR-CKP-05).
+    Command,
+    /// Made inside an envelope while no supervised line ran in the root (FR-CKP-06).
+    AgentEdit,
+    /// Made while no envelope watched the root: not the agent's, so never offered for agent undo.
+    External,
+    /// Made while two or more supervised lines overlapped in time in one root; undone together (FR-CKP-07).
+    Concurrent,
+}
+
+impl Attribution {
+    /// The wire value: `command`, `agent_edit`, `external` or `concurrent`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::AgentEdit => "agent_edit",
+            Self::External => "external",
+            Self::Concurrent => "concurrent",
+        }
+    }
+
+    /// Reads a wire value written by [`Attribution::as_str`]; `None` for anything else.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "command" => Some(Self::Command),
+            "agent_edit" => Some(Self::AgentEdit),
+            "external" => Some(Self::External),
+            "concurrent" => Some(Self::Concurrent),
+            _ => None,
+        }
+    }
+
+    /// Whether an agent may be offered undo of changes attributed this way: never for `external` changes, which no
+    /// agent session made.
+    #[must_use]
+    pub const fn agent_may_undo(self) -> bool {
+        match self {
+            Self::Command | Self::AgentEdit | Self::Concurrent => true,
+            Self::External => false,
+        }
+    }
+}
+
 /// The fields of an execution record that only agent records carry.
 ///
 /// A human telemetry record keeps none of them (FR-REC-09): the store replaces them with
@@ -824,6 +877,9 @@ pub struct RecordDetails {
     /// `checkpoints.required = false`, a line runs at once even if a root's shadow is not ready. Empty when every
     /// root it touched was protected, or it touched none.
     pub unprotected: Vec<UnprotectedRoot>,
+    /// How the line's file changes were attributed (KNSH-081): `command`, or `concurrent` when another line overlapped
+    /// it in one of its checkpoint roots. `None` for a line that never ran (denied) and for records written before.
+    pub attribution: Option<Attribution>,
 }
 
 impl RecordDetails {
@@ -842,6 +898,7 @@ impl RecordDetails {
             argv,
             network,
             unprotected,
+            attribution,
         } = self;
         rewritten_from.is_none()
             && pipestatus.is_empty()
@@ -854,6 +911,7 @@ impl RecordDetails {
             && argv.is_empty()
             && network.is_empty()
             && unprotected.is_empty()
+            && attribution.is_none()
     }
 }
 
@@ -912,6 +970,23 @@ mod tests {
 
     fn entry(host: &str, port: u16, result: NetworkResult) -> NetworkEntry {
         NetworkEntry::new(Redacted::new(host.to_owned()), port, result)
+    }
+
+    // KNSH-081: every attribution round-trips its wire value; anything else is refused. Only `external` changes are
+    // kept from agent undo.
+    #[test]
+    fn attribution_round_trips_its_wire_value() {
+        for attribution in [
+            Attribution::Command,
+            Attribution::AgentEdit,
+            Attribution::External,
+            Attribution::Concurrent,
+        ] {
+            assert_eq!(Attribution::parse(attribution.as_str()), Some(attribution));
+            assert_eq!(attribution.agent_may_undo(), attribution != Attribution::External);
+        }
+        assert_eq!(Attribution::parse("Command"), None);
+        assert_eq!(Attribution::parse(""), None);
     }
 
     // KNSH-060 (FR-NET-09): a record's `network` list round-trips its stored form, and repeats merge with counts.

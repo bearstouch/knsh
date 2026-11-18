@@ -78,6 +78,30 @@ against it and publishes the gap as `checkpoint.uncertain` (`restart_gap`). **Pe
 `knshd` restart yet, so `knshd` has no shadow to take over after one; the takeover is wired when agent sessions are
 re-adopted after a restart.
 
+**Attribution (KNSH-081, FR-CKP-05 to FR-CKP-07).** `knshd` keeps one attribution ledger for all sessions, keyed by
+root, so a line of one session in a root another session also protects is never the other's agent edit. Each change
+the watcher applies is attributed by when it was applied and which root it is in:
+
+| While | Attribution | Edge |
+| --- | --- | --- |
+| One supervised line runs in the root | `command` | That line's; closes when it ends |
+| Two or more lines overlap in time in the root | `concurrent` | One set holding every overlapping line, transitively and across roots through a line touching several; closes when the last of them ends, and is undone as one |
+| No line runs, and an envelope session protects the root | `agent_edit` | One run of agent edits; closes when the next line in the root starts or the last envelope session ends. Each batch the watcher applies is published as `agent.edit {root, paths, omitted}` on each envelope session protecting the root, at most 256 paths per event |
+| No line runs, and no envelope session protects the root (only `session.create` sessions) | `external` | One run; closes when an envelope session or a line arrives, or the last session protecting the root ends; never offered for agent undo |
+
+A change reported once no session protects the root and no line runs there (the last batch of a watcher stopped with
+its session) belongs to nobody and is dropped. When sessions share a root, each has its own watcher and each reports a
+line's changes: the line-end procedure therefore also flushes the other sessions' watchers of the line's roots (within
+the flush deadline each, their uncertainty staying their own), so none reports a change of the line after it ended.
+
+A line's record gets its `attribution` (`command` or `concurrent`) only after the line-end procedure has applied every
+event of the line, so it is final and always equals the attribution of the closed edge that holds the line. A denied
+line has none. An edge lists at most 65,536 paths and is then marked overflowed. Closed edges are what capture
+(KNSH-082) and the history tree (KNSH-083) store; until those exist they are dropped, and only records carry the
+attribution.
+**Known limit:** opening a line never waits for the watcher (decision 16), so a change made just before the line whose
+event had not been applied yet is attributed to the line.
+
 File events carry no process ID, so a human edit made at the same moment can be attributed to the agent; the post-image check below keeps that from causing damage.
 
 ## Restore rules

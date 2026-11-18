@@ -12,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use knsh_core::{
-    Actor, ActorKind, AgentId, ArgvEntry, CanonicalPath, CappedOutput, CheckpointId, ExecutionRecord,
+    Actor, ActorKind, AgentId, ArgvEntry, Attribution, CanonicalPath, CappedOutput, CheckpointId, ExecutionRecord,
     MAX_NETWORK_ENTRIES, NetworkEntry, OutputInfo, OutputStream, RecordDecision, RecordDetails, RecordId, Redacted,
     SandboxViolation, Session, SessionId, Timestamp, UnprotectedRoot, decode_argv, decode_decision, decode_network,
     decode_unprotected, decode_violations, encode_argv, encode_decision, encode_network, encode_unprotected,
@@ -58,7 +58,7 @@ impl RecordedOutput {
 /// The columns [`read_record`] expects, in order.
 const RECORD_COLUMNS: &str = "record_id, session_id, actor_kind, agent_id, command, rewritten_from, cwd, started_at, \
      ended_at, exit_code, pipestatus, signal, sandbox_profile, secrets_injected, checkpoint_id, sandbox_violations, \
-     decision, argv, network, unprotected";
+     decision, argv, network, unprotected, attribution";
 
 /// The most distinct sandbox violations one record keeps (FR-SBX-08). Repeats of a kept one only add to its count;
 /// further distinct ones are dropped, so one noisy command cannot grow its record without bound.
@@ -146,7 +146,7 @@ impl Database {
         transaction.execute(
             &format!(
                 "INSERT INTO records ({RECORD_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"
             ),
             &encoded.values(&record),
         )?;
@@ -562,7 +562,7 @@ impl Encoded {
     }
 
     /// The bound values, in [`RECORD_COLUMNS`] order.
-    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 20] {
+    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 21] {
         let details = &record.details;
         [
             Value::Text(&self.record_id),
@@ -587,6 +587,8 @@ impl Encoded {
             optional_text(self.argv.as_deref()),
             optional_text(self.network.as_deref()),
             optional_text(self.unprotected.as_deref()),
+            // KNSH-081: the column has been in the schema since version 1, always NULL before.
+            optional_text(details.attribution.map(Attribution::as_str)),
         ]
     }
 }
@@ -646,6 +648,7 @@ fn read_record(statement: &Statement<'_>) -> Result<ExecutionRecord, StoreError>
             argv: stored_argv(statement.column_text(17)?.as_deref())?,
             network: stored_network(statement.column_text(18)?.as_deref())?,
             unprotected: stored_unprotected(statement.column_text(19)?.as_deref())?,
+            attribution: stored_attribution(statement.column_text(20)?.as_deref())?,
         },
     })
 }
@@ -731,4 +734,11 @@ fn stored_unprotected(text: Option<&str>) -> Result<Vec<UnprotectedRoot>, StoreE
         .transpose()
         .map_err(|_| StoreError::Corrupt)
         .map(Option::unwrap_or_default)
+}
+
+/// A record's stored `attribution` column (KNSH-081): `NULL` is none (a line that never ran, a human record, or one
+/// written before KNSH-081), and text the engine could not have written is [`StoreError::Corrupt`].
+fn stored_attribution(text: Option<&str>) -> Result<Option<Attribution>, StoreError> {
+    text.map(|text| Attribution::parse(text).ok_or(StoreError::Corrupt))
+        .transpose()
 }

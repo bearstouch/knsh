@@ -292,6 +292,12 @@ impl ToJson for RecordEntry<'_> {
             object.insert("network", details.network.to_json()?)?;
             // Checkpoint roots the line touched whose changes were not protected, and why (KNSH-079, FR-CKP-02).
             object.insert("unprotected", details.unprotected.to_json()?)?;
+            // How the line's file changes were attributed (KNSH-081, FR-CKP-05, FR-CKP-07), or null for a line that
+            // never ran or a record written before attribution.
+            let attribution = details
+                .attribution
+                .map_or(Value::Null, |attribution| Value::from(attribution.as_str()));
+            object.insert("attribution", attribution)?;
         }
         object.insert("stdout", self.stdout.as_ref().map(output_info).transpose()?.to_json()?)?;
         object.insert("stderr", self.stderr.as_ref().map(output_info).transpose()?.to_json()?)?;
@@ -529,6 +535,24 @@ mod tests {
 
     fn json(value: &impl ToJson) -> String {
         knsh_json::write(&value.to_json().unwrap()).unwrap()
+    }
+
+    // KNSH-081: an agent record's `attribution` is null without one, and its wire value otherwise.
+    #[test]
+    fn record_json_attribution() {
+        let entry = |record: &ExecutionRecord| {
+            json(&RecordEntry {
+                record,
+                stdout: None,
+                stderr: None,
+            })
+        };
+        let mut agent = record(Actor::Agent(AgentId::new("codex").unwrap()));
+        let text = entry(&agent);
+        assert!(text.contains(r#""attribution":null"#), "{text}");
+        agent.details.attribution = Some(knsh_core::Attribution::Concurrent);
+        let text = entry(&agent);
+        assert!(text.contains(r#""attribution":"concurrent""#), "{text}");
     }
 
     // FR-REC-09: the human form carries only the telemetry fields; byte counts are strings.

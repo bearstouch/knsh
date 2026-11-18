@@ -60,10 +60,10 @@ use std::time::Duration;
 
 use knsh_checkpoint::{Gate, ShadowProgress, gate, line_touches_root};
 use knsh_core::{
-    Actor, Allowed, Authority, BinaryLookup, Caller, CancelReason, CanonicalPath, Counted, Decision, DecisionSource,
-    DenialLimiter, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR, LineInput, LineKey, LocalApprovals,
-    NetworkEntry, Observer, Outcome, OutputRedaction, OutputStream, Profile, Proposal, RateLimits, RecordDetails,
-    RecordId, Redacted, Refusal, RefusalKind, RequestId, SessionId, Timestamp, Ulid, UnprotectedReason,
+    Actor, Allowed, Attribution, Authority, BinaryLookup, Caller, CancelReason, CanonicalPath, Counted, Decision,
+    DecisionSource, DenialLimiter, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR, LineInput, LineKey,
+    LocalApprovals, NetworkEntry, Observer, Outcome, OutputRedaction, OutputStream, Profile, Proposal, RateLimits,
+    RecordDetails, RecordId, Redacted, Refusal, RefusalKind, RequestId, SessionId, Timestamp, Ulid, UnprotectedReason,
     UnprotectedRoot, argv_of, decide, redact,
 };
 use knsh_json::{Object, ToJson, Value};
@@ -703,7 +703,8 @@ impl Lifecycle {
     /// (FR-REC-06), then `command.finished`. Returns whether the record was written, and when the line ended; the
     /// caller answers only after this returns, so the reply never precedes the commit (FR-REC-02, NFR-REL-05). A line
     /// that did not run to its end is recorded too, with neither exit code nor signal (NFR-REL-08). File changes
-    /// (checkpoints) are not recorded yet; roots whose changes were not protected are (`unprotected`, KNSH-079).
+    /// (checkpoints) are not recorded yet; roots whose changes were not protected are (`unprotected`, KNSH-079), and
+    /// so is how its changes were attributed (`attribution`, KNSH-081).
     #[allow(clippy::too_many_arguments)]
     fn finished(
         &self,
@@ -717,6 +718,7 @@ impl Lifecycle {
         report: &SpawnReport,
         record_output: bool,
         unprotected: Vec<UnprotectedRoot>,
+        attribution: Attribution,
     ) -> (bool, Timestamp) {
         let ended_at = self.parts.clock.now().unwrap_or(started_at);
         let ran = report.outcome.as_ref().ok();
@@ -753,6 +755,8 @@ impl Lifecycle {
                 network: report.network.clone(),
                 // FR-CKP-02 with `required = false`: the roots this line changed unprotected (KNSH-079).
                 unprotected,
+                // FR-CKP-05, FR-CKP-07: the line's own changes (`command`), or a set it overlapped (`concurrent`).
+                attribution: Some(attribution),
                 // `pipestatus` stays empty: the line runs in a separate bash whose `PIPESTATUS` is not reported back
                 // yet (KNSH-100). `secrets_injected` stays empty: no secret is injected in phase 2 (FR-REC-11).
                 ..RecordDetails::default()
@@ -860,12 +864,17 @@ impl Supervisor for Lifecycle {
             profile: *profile,
             capture,
         };
-        // KNSH-080: the start of the line's window in each protected root it touches. Never waits.
-        let checkpoint_lines = self.parts.sessions.open_checkpoint_lines(session_id, &protected);
+        // KNSH-080, KNSH-081: the start of the line's window in each protected root it touches; changes there are the
+        // line's from now on. Never waits.
+        let checkpoint_line = self
+            .parts
+            .sessions
+            .open_checkpoint_lines(session_id, record_id, &protected);
         let report = self.parts.spawner.spawn(plan, &events);
         // Decision 16: the line has been reaped; its file events are flushed with a marker before it is recorded, the
-        // one place the decision path waits for the watcher (bounded per root).
-        let uncertain = Sessions::close_checkpoint_lines(checkpoint_lines);
+        // one place the decision path waits for the watcher (bounded per root). Only then is its attribution read,
+        // so every change it made has been attributed (KNSH-081).
+        let closed = Sessions::close_checkpoint_lines(checkpoint_line);
         let (written, ended_at) = self.finished(
             session_id,
             &actor,
@@ -877,10 +886,11 @@ impl Supervisor for Lifecycle {
             &report,
             record_output,
             unprotected,
+            closed.attribution,
         );
         let record_id = written.then_some(record_id);
         // FR-CKP-04: the line's checkpoints in these roots are uncertain (the roots were rescanned).
-        for (root, reason) in uncertain {
+        for (root, reason) in closed.uncertain {
             let data = EventData::CheckpointUncertain {
                 root,
                 record_id,

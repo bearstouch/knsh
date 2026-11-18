@@ -166,9 +166,9 @@ mod violation;
 pub use authority::{BundleVersion, MAX_TRUST_RECORD_LEN, SigningIdentifier, TeamId, TrustError, TrustedAuthority};
 pub use error::{CoreError, MAX_KEY_DISPLAY_LEN, ProfileError, ProfileErrorKind, ProfileOrigin};
 pub use event::{
-    BusLimits, CancelReason, Delivery, EVENT_BUFFER_LEN, EngineEvent, EngineEventData, EngineLost, Event, EventBus,
-    EventData, EventScope, Lost, MAX_ENDED_BUFFERS, Published, PublishedEngine, Subscribed, SubscriptionId,
-    UncertainReason,
+    AGENT_EDIT_PATHS, BusLimits, CancelReason, Delivery, EVENT_BUFFER_LEN, EngineEvent, EngineEventData, EngineLost,
+    Event, EventBus, EventData, EventScope, Lost, MAX_ENDED_BUFFERS, Published, PublishedEngine, Subscribed,
+    SubscriptionId, UncertainReason,
 };
 pub use hook::{
     ConfigProblem, Ended, Execution, HOOK_EVENT, HOOKS_KEY, HookConfig, HookEntry, HookExecutor, HookExit, HookId,
@@ -206,10 +206,10 @@ pub use ratelimit::{
     MAX_TRACKED_SESSIONS,
 };
 pub use record::{
-    ArgvClass, ArgvEntry, DecisionVerdict, ExecutionRecord, HookResult, HookRun, MAX_HOOK_RUNS, MAX_NETWORK_ENTRIES,
-    NetworkEntry, NetworkResult, OutputInfo, OutputStream, RecordDecision, RecordDetails, UnprotectedReason,
-    UnprotectedRoot, argv_of, decode_argv, decode_decision, decode_network, decode_unprotected, encode_argv,
-    encode_decision, encode_network, encode_unprotected, merge_network,
+    ArgvClass, ArgvEntry, Attribution, DecisionVerdict, ExecutionRecord, HookResult, HookRun, MAX_HOOK_RUNS,
+    MAX_NETWORK_ENTRIES, NetworkEntry, NetworkResult, OutputInfo, OutputStream, RecordDecision, RecordDetails,
+    UnprotectedReason, UnprotectedRoot, argv_of, decode_argv, decode_decision, decode_network, decode_unprotected,
+    encode_argv, encode_decision, encode_network, encode_unprotected, merge_network,
 };
 pub use redacted::{REDACTED_MARKER, Redacted};
 pub use registry::{EqualProfileOnly, ProfileOrder, SessionRegistry};
