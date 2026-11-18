@@ -28,7 +28,8 @@
 //! 10. **Ancestors**: the directory entries above every fixed, engine and `fs.deny` path, so none of them can be
 //!     renamed away (with the protected path inside it), edited there and renamed back.
 //! 11. **Engine sockets and paths** ([`FixedDenies`]): binding a socket in an engine directory, connecting to
-//!     `user.sock`, and last, reading, writing or executing any engine path (FR-SBX-05, FR-SBX-10).
+//!     `user.sock`, and last, reading, writing or executing any engine path, including every `.knsh-checkpoints`
+//!     store on another volume (FR-SBX-05, FR-SBX-10, KNSH-078).
 //!
 //! Seatbelt applies the last rule that matches an operation, so each deny written after the allows wins over them:
 //! a write root that contains `~/.ssh`, an engine directory or a `.git/hooks` folder still cannot reach it, a
@@ -106,6 +107,11 @@ const GIT_REGEXES: [&str; 4] = [
     r#"(regex #"/\.git/(.+/)?(config|config\.worktree|commondir)$")"#,
     r#"(regex #"/\.git/(.+/)?(modules|worktrees)(/[^/]+)?$")"#,
 ];
+
+/// Every checkpoint store on another volume ([`knsh_core::VOLUME_CHECKPOINT_DIR`] at a volume root, KNSH-078) and
+/// everything in it, wherever the volume is mounted: a regex because mount points are not known when the profile is
+/// compiled. Seatbelt matches it without regard to case on a case-insensitive volume, like the git rules.
+const VOLUME_CHECKPOINT_REGEX: &str = r#"(regex #"/\.knsh-checkpoints(/|$)")"#;
 
 /// Shell startup files in the home directory, which bash and zsh run outside any sandbox: the spec's list, plus the
 /// zsh and bash files it leaves out that run as often (`.zshenv` runs for every zsh, even non-interactive ones).
@@ -338,6 +344,7 @@ pub fn compile(input: &ProfileInput<'_>) -> SbplText {
     for path in engine.paths() {
         out.subpath(path);
     }
+    out.raw(" ").raw(VOLUME_CHECKPOINT_REGEX);
     out.end_tagged(&tag, "fixed.engine");
 
     out.finish()

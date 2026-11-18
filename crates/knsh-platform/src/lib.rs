@@ -102,7 +102,15 @@
 //! | [`CodeSigning`] | Signature facts of a message's sender | `SecCodeSigning` (`SecCodeCreateWithXPCMessage`) | `FakeCodeSigning` |
 //! | [`TrustStore`] | Read, create or replace the trust record (KNSH-068) | `KeychainTrustStore` (legacy login keychain) | `MemTrustStore` |
 //!
-//! Later stories add `FSEvents` and APFS clones to the same interface.
+//! The `volume` module (KNSH-078) holds the services behind checkpoints: copy-on-write clones, the volume and file
+//! system of a path, file identity and streamed content hashes. Policy about when to clone and where checkpoints
+//! live stays in `knsh-checkpoint`.
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`Volumes`] | Clone a file, name its volume, read its identity, hash its contents | `SystemVolumes` (`clonefile`, `statfs`, `CommonCrypto`) | `FakeVolumes` |
+//!
+//! Later stories add `FSEvents` to the same interface.
 //!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
 //! in a fake. All failures use the single crate error, [`PlatformError`], whose messages never echo paths or other
@@ -144,6 +152,7 @@
 //! - FR-POL-40, FR-POL-41, FR-POL-42, decision 11 (policy file signatures, Keychain signing key, KNSH-065)
 //! - FR-AUTH-12 – FR-AUTH-14, NFR-SEC-01, decision 13, `specs/06-api/control-service.md`,
 //!   `specs/06-api/wire-format.md#control-service-xpc` (XPC control service with peer verification, KNSH-067)
+//! - FR-CKP-01, FR-CKP-09, FR-CKP-35, decision 17 (clones, volumes, file identity and streamed hashes, KNSH-078)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
@@ -167,6 +176,7 @@ mod random;
 mod resolver;
 mod signing;
 pub mod violation;
+mod volume;
 
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
@@ -204,3 +214,6 @@ pub use signing::{
     SigningKeyStore, constant_time_eq, split_signed, strip_signature,
 };
 pub use violation::{CanaryNonce, DenialLog, DenialStream, LogEntry, StreamStopper};
+pub use volume::{
+    CONTENT_HASH_LEN, ContentHash, FileIdentity, FileSystemKind, HASH_CHUNK, ModifiedTime, Volume, VolumeId, Volumes,
+};

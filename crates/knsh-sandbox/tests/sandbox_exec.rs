@@ -72,6 +72,46 @@ impl Drop for TempDir {
 }
 
 /// Runs `script` under `profile` with `/bin/sh`, its operands as `$1`, `$2`, …; whether it succeeded.
+/// KNSH-078 (checked from `compiled_file_rules_hold_under_sandbox_exec`): `.knsh-checkpoints` stores are denied by
+/// name under `profile_file`, whose write root is `base`.
+fn volume_checkpoint_stores_are_denied(profile_file: &Path, base: &Path, project: &Path) {
+    // A checkpoint store on another volume (`.knsh-checkpoints`, matched by name wherever it is mounted)
+    // cannot be read, written, planted, or renamed away, in any case on this case-insensitive volume.
+    let store = base.join(knsh_core::VOLUME_CHECKPOINT_DIR);
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("format"), "knsh-checkpoints 1\n").unwrap();
+    for path in [store.join("format"), store.join("new")] {
+        assert!(
+            !run(profile_file, "echo x > \"$1\"", &[&path]),
+            "{} writable",
+            path.display()
+        );
+    }
+    assert!(!run(profile_file, "cat \"$1\"", &[&store.join("format")]));
+    assert!(!run(
+        profile_file,
+        "mv \"$1\" \"$2\"",
+        &[&store, &base.join("moved-store")]
+    ));
+    let elsewhere = project.join("sub");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    assert!(!run(
+        profile_file,
+        "mkdir \"$1\"",
+        &[&elsewhere.join(knsh_core::VOLUME_CHECKPOINT_DIR)]
+    ));
+    assert!(!run(
+        profile_file,
+        "mkdir \"$1\"",
+        &[&elsewhere.join(".KNSH-Checkpoints")]
+    ));
+    assert!(run(
+        profile_file,
+        "mkdir \"$1\"",
+        &[&elsewhere.join("knsh-checkpoints")]
+    ));
+}
+
 fn run(profile: &Path, script: &str, operands: &[&Path]) -> bool {
     Command::new("/usr/bin/sandbox-exec")
         .arg("-f")
@@ -144,6 +184,8 @@ fn compiled_file_rules_hold_under_sandbox_exec() {
     refused(home.join("Library/LaunchAgents/evil.plist"));
     refused(engine_config.join("policy.toml"));
     refused(engine_data.join("records.db"));
+
+    volume_checkpoint_stores_are_denied(&profile_file, &dir.0, &project);
 
     // A planted git directory cannot be renamed into place, and the real one cannot be moved away.
     let plant = "mkdir -p \"$1/hooks\" && echo x > \"$1/hooks/pre-commit\" && mkdir -p \"$2\" && mv \"$1\" \"$2/.git\"";

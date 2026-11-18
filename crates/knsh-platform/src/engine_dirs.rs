@@ -30,7 +30,8 @@
 //! `0700` (the umask can only narrow that), so no other user can ever reach it, even between the create and the
 //! check.
 //!
-//! Out of scope (phase 3): `.knsh-checkpoints/` on other volumes.
+//! Checkpoint stores on other volumes (`.knsh-checkpoints/`, KNSH-078) are prepared by `knsh-checkpoint` with the
+//! same two steps, [`ensure_private_dir`] and [`exclude_from_index_and_backup`].
 
 use std::path::{Path, PathBuf};
 
@@ -284,14 +285,29 @@ fn create_missing_ancestors(fs: &dyn Fs, home: &Path, dir: &Path) -> Result<(), 
     Ok(())
 }
 
-/// Creates `dir` as an owner-only directory, or adopts an existing one after checking it.
-fn ensure_private_dir(fs: &dyn Fs, dir: &Path, uid: u32) -> Result<(), PlatformError> {
+/// Creates the single directory `dir` (its parent must exist) owner-only ([`DIR_MODE`]), or adopts an existing one
+/// after checking that it is a directory owned by `uid`, resetting its mode to exactly [`DIR_MODE`]. Also used for
+/// checkpoint stores outside the engine directories (`.knsh-checkpoints/` on other volumes, KNSH-078).
+///
+/// # Errors
+///
+/// [`PlatformError::ForeignOwner`], [`PlatformError::UnexpectedKind`] (a symlink or file in its place, never
+/// followed), or [`PlatformError::Os`] from creating it or setting its mode (`EROFS`, `EACCES` on a volume the user
+/// cannot write).
+pub fn ensure_private_dir(fs: &dyn Fs, dir: &Path, uid: u32) -> Result<(), PlatformError> {
     create_tolerating_existing(fs.create_dir(dir, DIR_MODE))?;
     adopt(fs, dir, FileKind::Directory, DIR_MODE, uid)
 }
 
-/// Adds the Spotlight marker to `dir` and sets its Time Machine exclusion, then verifies both.
-fn exclude_from_index_and_backup(fs: &dyn Fs, dir: &Path, uid: u32) -> Result<(), PlatformError> {
+/// Adds the owner-only Spotlight marker to `dir` and sets its Time Machine exclusion, then verifies both
+/// (NFR-PRIV-04). `dir` must already be a private directory ([`ensure_private_dir`]).
+///
+/// # Errors
+///
+/// [`PlatformError::ForeignOwner`] or [`PlatformError::UnexpectedKind`] for a marker that is not this user's regular
+/// file; [`PlatformError::ExclusionNotVerified`] if the attribute does not read back as written;
+/// [`PlatformError::Os`] from any call (`ENOTSUP` from a file system without extended attributes).
+pub fn exclude_from_index_and_backup(fs: &dyn Fs, dir: &Path, uid: u32) -> Result<(), PlatformError> {
     let marker = dir.join(SPOTLIGHT_MARKER);
     create_tolerating_existing(fs.create_new(&marker, FILE_MODE))?;
     adopt(fs, &marker, FileKind::File, FILE_MODE, uid)?;

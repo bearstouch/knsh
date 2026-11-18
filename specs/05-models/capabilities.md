@@ -14,7 +14,7 @@ Returned by `hello`. The capability probe in `knshd` detects which backends work
 | `network_filter` | `proxy`, `none` | `proxy` | — |
 | `file_events` | `fsevents`, `none` | `inotify`, `fanotify` | — |
 | `secrets` | `keychain`, `none` | Secret Service, authority-only | — |
-| `checkpoints` | Per root: `apfs-clone`, plain copies, or `none` | Reflinks, plain copies | Per root; with `required = true`, lines touching the root cannot run |
+| `checkpoints` | Per root: `apfs-clone`, `plain-copy` (non-APFS or read-only volume, one mounted with ownership ignored, or no usable store on it: copies in the home store, 50 MiB per change, FR-CKP-35), or `none` (the root's volume cannot be read, or the home store cannot be used) | Reflinks, `plain-copy` | Per root; with `required = true`, lines touching the root cannot run |
 | `sandbox_violations` | `unified_log`, `none` | journald (KNSH-117) | Denials the system reports are not emitted or attached (FR-SBX-08); nothing is blocked |
 | `methods` | List of available methods | | A method is available only if listed |
 | `deprecated` | Deprecated methods among `methods`: `{"<method>": {"since": "0.3", "earliest_removal": "0.6"}}` | | — |
@@ -35,6 +35,6 @@ check, run in sequence; at most 8 s in all, including reaping a hung `knsh-exec`
 | `platform` | The OS major version from `sysctl kern.osproductversion` |
 | `network_filter`, `secrets` | Always `none` for now: the proxy enforces host rules, address checks (KNSH-060) and the TLS server-name check (FR-NET-06, KNSH-061), but the probe does not claim `network_filter` yet; secrets have no backend yet |
 | `sandbox_violations` | Not part of the probe: the one field `hello` reads live (KNSH-047). `unified_log` from the moment a canary denial the reader caused came back through its own `log stream` (run as the user, without admin rights) until that stream ends or a recheck fails; `none` before, after, and while the reader restarts. The reader causes a canary every 250 ms until one comes back (at most 40 per round), then rechecks every 5 minutes; a stream that ends or cannot start is reopened after 1 s, doubling to 60 s. No method depends on it |
-| `checkpoints` | No root configured yet: always `{}` |
+| `checkpoints` | Not a probe: each root's method comes from preparing its store (KNSH-078, [checkpoint storage](checkpoint.md#storage)). `hello` lists the roots of running agent sessions once shadows are built (KNSH-079); until then always `{}` |
 
-Later phases extend the probe as backends arrive. Exact value strings for the plain-copy and Endpoint Security cases are to be fixed before phase 2.
+Later phases extend the probe as backends arrive. The plain-copy value is `plain-copy` (KNSH-078). The exact value string for the Endpoint Security case is still to be fixed.

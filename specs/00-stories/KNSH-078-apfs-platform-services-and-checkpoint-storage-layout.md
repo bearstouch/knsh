@@ -23,24 +23,26 @@ Out of scope: what goes into a checkpoint (KNSH-082).
 **Acceptance criteria**
 *APFS clone, volume and hashing platform services*
 
-- [ ] `clone_file(src, dst)` succeeds within one APFS volume and returns a typed error (not a panic) across volumes
+- [x] `clone_file(src, dst)` succeeds within one APFS volume and returns a typed error (not a panic) across volumes
       or on non-APFS file systems.
-- [ ] `volume_of(path)` returns a stable volume ID and reports whether the volume supports clones.
-- [ ] `identity(path)` returns inode, size and mtime; `hash(path)` streams the file and never loads it whole.
-- [ ] Hashing is skipped for files of 64 MB or more, and the identity records that no hash was taken (FR-CKP-09).
-- [ ] All `unsafe` FFI blocks carry `// SAFETY:` comments; every public item has `///` docs with `# Errors`.
-- [ ] Fakes allow tests to simulate clone failure, volume boundaries and identity changes deterministically.
+- [x] `volume_of(path)` returns a stable volume ID and reports whether the volume supports clones.
+- [x] `identity(path)` returns inode, size and mtime; `hash(path)` streams the file and never loads it whole.
+- [x] Hashing is skipped for files of 64 MB or more, and the identity records that no hash was taken (FR-CKP-09).
+- [x] All `unsafe` FFI blocks carry `// SAFETY:` comments; every public item has `///` docs with `# Errors`.
+- [x] Fakes allow tests to simulate clone failure, volume boundaries and identity changes deterministically.
 
 *Checkpoint storage layout per volume*
 
-- [ ] A root on the home volume uses the home store; a root on another APFS volume uses `.knsh-checkpoints/` on that
+- [x] A root on the home volume uses the home store; a root on another APFS volume uses `.knsh-checkpoints/` on that
       volume when it is writable; otherwise plain copies are stored in the home store.
-- [ ] Plain-copy checkpoints are limited to 50 MB per change; a change over the limit is recorded as not protected,
+- [x] Plain-copy checkpoints are limited to 50 MB per change; a change over the limit is recorded as not protected,
       not silently truncated (FR-CKP-35).
 - [ ] The capability report (`hello`) lists each root with its method (`apfs-clone`, plain copies, or `none`).
-- [ ] Store directories are 0700 and files 0600, excluded from Spotlight and Time Machine, and denied to envelopes
+      *Partially met:* the per-root report (`knsh_checkpoint::capability_report`) and the wire value `plain-copy` exist
+      and are tested; `knshd` fills `hello` from live session roots with the shadow builder (KNSH-079).
+- [x] Store directories are 0700 and files 0600, excluded from Spotlight and Time Machine, and denied to envelopes
       and commands (engine paths).
-- [ ] The store has a format version; a newer or corrupt store triggers recovery and is never overwritten.
+- [x] The store has a format version; a newer or corrupt store triggers recovery and is never overwritten.
 
 **Unit tests**
 *APFS clone, volume and hashing platform services*
@@ -68,4 +70,12 @@ Out of scope: what goes into a checkpoint (KNSH-082).
 **Notes**
 *Checkpoint storage layout per volume*
 
-- The exact capability value string for plain copies is still open in [../05-models/capabilities.md](../05-models/capabilities.md); fix it in that page as part of this story.
+- The capability value string for plain copies is fixed as `plain-copy` in [../05-models/capabilities.md](../05-models/capabilities.md).
+
+**Results (2026-11-18, macOS 26.6.2).** `knsh_platform::Volumes` (`SystemVolumes`, `FakeVolumes`),
+`knsh_checkpoint::{post_image_identity, place_roots, capability_report}`. Observed on the home APFS volume: clones have
+identical contents and a new inode; cloning to `/dev` returns `EXDEV` (`CrossVolume`); FIFOs are refused without
+blocking. The `.knsh-checkpoints` deny holds under real `sandbox-exec` (read, list, write, create, rename, case
+variants). Review addition: volumes mounted with `MNT_IGNORE_OWNERSHIP` (the default for external disks) never get a
+store, since owner-only modes mean nothing there; their roots use plain copies. **Pending:** a real second APFS volume
+and a non-APFS volume (only fakes and devfs were exercised), macOS 14 and 15, and `hello` wiring (KNSH-079).

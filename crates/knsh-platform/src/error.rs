@@ -102,6 +102,10 @@ pub enum Operation {
     CodeSigning,
     /// Compiling a code requirement (`SecRequirementCreateWithString`; KNSH-067).
     CodeRequirement,
+    /// Cloning a file copy-on-write (`clonefile`; checkpoint shadows and pre-images, KNSH-078).
+    Clone,
+    /// Reading the volume a path is on (`statfs`; checkpoint storage layout, KNSH-078).
+    VolumeInfo,
 }
 
 impl Operation {
@@ -150,6 +154,8 @@ impl Operation {
             Self::KeychainUpdate => "update keychain item",
             Self::CodeSigning => "read code signature",
             Self::CodeRequirement => "compile code requirement",
+            Self::Clone => "clone file",
+            Self::VolumeInfo => "read volume information",
         }
     }
 }
@@ -344,6 +350,12 @@ pub enum PlatformError {
     /// An XPC call failed or an XPC object was not what it had to be (KNSH-067). XPC reports no status for most
     /// failures, so only the operation is kept.
     Xpc,
+    /// A copy-on-write clone was asked across two volumes (`EXDEV`). Clones exist only within one volume, so the
+    /// checkpoint store must sit on the volume of the files it protects (FR-CKP-35, KNSH-078).
+    CrossVolume,
+    /// The file system cannot clone files copy-on-write (`ENOTSUP`; anything but APFS on macOS). The root falls back
+    /// to plain copies (FR-CKP-35, KNSH-078).
+    ClonesUnsupported,
 }
 
 impl PlatformError {
@@ -375,7 +387,9 @@ impl PlatformError {
             | Self::Keychain { .. }
             | Self::KeychainValueInvalid
             | Self::Security { .. }
-            | Self::Xpc => None,
+            | Self::Xpc
+            | Self::CrossVolume
+            | Self::ClonesUnsupported => None,
         }
     }
 
@@ -399,7 +413,9 @@ impl PlatformError {
             | Self::Keychain { .. }
             | Self::KeychainValueInvalid
             | Self::Security { .. }
-            | Self::Xpc => None,
+            | Self::Xpc
+            | Self::CrossVolume
+            | Self::ClonesUnsupported => None,
         }
     }
 
@@ -452,6 +468,8 @@ impl fmt::Display for PlatformError {
             }
             Self::KeychainValueInvalid => f.write_str("keychain item does not hold a value the engine wrote"),
             Self::Xpc => f.write_str("xpc call failed"),
+            Self::CrossVolume => f.write_str("clone source and destination are on different volumes"),
+            Self::ClonesUnsupported => f.write_str("file system does not support copy-on-write clones"),
         }
     }
 }
@@ -475,7 +493,9 @@ impl std::error::Error for PlatformError {
             | Self::Keychain { .. }
             | Self::KeychainValueInvalid
             | Self::Security { .. }
-            | Self::Xpc => None,
+            | Self::Xpc
+            | Self::CrossVolume
+            | Self::ClonesUnsupported => None,
         }
     }
 }

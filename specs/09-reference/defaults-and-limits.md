@@ -57,10 +57,10 @@
 | Bash quote and substitution nesting (lexer) | 32 levels; a here-document body counts as one level, and backtick bodies count when they are parsed. Over it the line is dynamic (`nesting_too_deep`) | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md) (KNSH-028, KNSH-031, KNSH-032) |
 | Bash command-list nesting (parser) | 32 levels, the same constant, reached by compound commands, function bodies and substitutions; bounds the parser's recursion. Over it the line is dynamic (`nesting_too_deep`) | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md) (KNSH-029, KNSH-030, KNSH-031, KNSH-032) |
 | Function definitions analysed for call marking (parser) | 64 per line; past it no call is marked as a function call, so every call is resolved as a program | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md) (KNSH-030) |
-| Content hash in post-image identity | Files under 64 MB | — | [checkpoints](../03-functional-requirements/checkpoints.md) |
+| Content hash in post-image identity | Files under 64 MB (64 MiB, 67,108,864 bytes) | — | [checkpoints](../03-functional-requirements/checkpoints.md) |
 | Checkpoint retention | 5 GB per volume, 200 per root, or 7 days | — | [checkpoints](../03-functional-requirements/checkpoints.md) |
 | Sensitive-file pre-images | 24 hours at most | — | [checkpoints](../03-functional-requirements/checkpoints.md) |
-| Plain-copy checkpoints (non-APFS) | 50 MB per change | — | [checkpoints](../03-functional-requirements/checkpoints.md) |
+| Plain-copy checkpoints (non-APFS) | 50 MB per change (50 MiB, 52,428,800 bytes; larger changes recorded as not protected) | — | [checkpoints](../03-functional-requirements/checkpoints.md) |
 | Checkpoint excludes | `node_modules`, `target`, `.venv`, `dist`, `build` | `checkpoints.exclude` | [checkpoints](../03-functional-requirements/checkpoints.md) |
 | Rewrites per line | 1, by a hook or the authority alike; a second is a deny | — | [authority](../03-functional-requirements/authority.md) |
 | Caller check while an ask waits | Every 100 ms, so a disconnected caller cancels its line at once (FR-LC-41) | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md#the-decision-pipeline-knsh-050) |
