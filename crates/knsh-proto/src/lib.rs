@@ -135,7 +135,10 @@ pub use hello::{
     PROTOCOL_CAPABILITY, SUPPORTED_PROTOCOLS, negotiate,
 };
 
-pub use checkpoint::undo_conflict;
+pub use checkpoint::{
+    CheckpointDiffParams, CheckpointRestoreParams, CheckpointRestoreResult, DIFF_CONTENT_TYPE, DiffAnswer,
+    MAX_BASE64_DIFF, MAX_DIFF_PAGE, MAX_LISTED_RESTORED, RestoredChange, diff_answer, undo_conflict,
+};
 pub use envelope::{
     ErrorResponse, MAX_ID_LEN, Message, Notification, Rejection, Request, RequestId, RpcError, SuccessResponse, decode,
     encode,

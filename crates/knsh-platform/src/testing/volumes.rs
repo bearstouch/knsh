@@ -296,6 +296,16 @@ impl Volumes for FakeVolumes {
         Ok(digest)
     }
 
+    fn read_regular(&self, path: &Path, limit: u64) -> Result<Vec<u8>, PlatformError> {
+        require_absolute(path)?;
+        let state = lock(&self.state);
+        let file = state.files.get(path).ok_or(not_found(Operation::Open))?;
+        if file.contents.len() as u64 > limit {
+            return Err(PlatformError::TooLarge { limit });
+        }
+        Ok(file.contents.clone())
+    }
+
     fn write_in_place(&self, src: &Path, dst: &Path, expect: Option<&FileIdentity>) -> Result<(), PlatformError> {
         require_absolute(src)?;
         require_absolute(dst)?;

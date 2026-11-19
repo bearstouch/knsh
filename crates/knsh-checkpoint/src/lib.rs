@@ -27,6 +27,10 @@
 //! `force` is only for the user and the authority (FR-CKP-21); excluded folders are listed as not restored
 //! (FR-CKP-31); `checkpoint.restored` is published (FR-CKP-25).
 //!
+//! KNSH-086 adds [`History::restore_state`] (`checkpoint.restore`: every root back to any state of the history at
+//! once, checked whole before the first write, `-32004` and nothing changed on any conflict) and [`diff`]
+//! (`checkpoint.diff`: the paths that differ between two states, with a unified diff of each text file).
+//!
 //! KNSH-085 adds [`torn`]: files held open for writing or mapped writable by the line's processes when it ends
 //! ([`held_in_roots`], through `knsh_platform::WriteHolders`), and SQLite databases with journal files beside them,
 //! are marked possibly torn in their checkpoint ([`Checkpoint::possibly_torn`]); undo and redo skip them and list
@@ -48,7 +52,8 @@
 //! # Specification
 //!
 //! - `specs/03-functional-requirements/checkpoints.md`: FR-CKP-01 to FR-CKP-11, FR-CKP-20 to FR-CKP-23, FR-CKP-25,
-//!   FR-CKP-24, FR-CKP-30, FR-CKP-31, FR-CKP-35, FR-CKP-36
+//!   FR-CKP-24, FR-CKP-30, FR-CKP-31, FR-CKP-35, FR-CKP-36; history tree operations (`checkpoint.restore`,
+//!   `checkpoint.diff`, KNSH-086)
 //! - FR-EVT-08 (`file.changed`), NFR-REL-04 (rescan after a restart) and decision 16 (closing a line, dropped events)
 //! - Decision 17: memory-mapped writes, possibly torn files
 //! - NFR-PERF-06 and decision 15 (`specs/09-reference/decisions.md`): how the initial shadow is built and timed
@@ -62,6 +67,7 @@
 
 pub mod attribution;
 pub mod capture;
+pub mod diff;
 mod error;
 pub mod identity;
 pub mod restore;
@@ -80,6 +86,7 @@ pub use capture::{
     CHECKPOINTS_DIR, CapturedPath, Captures, Change, Checkpoint, CheckpointSummary, MAX_CHECKPOINT_PATHS, MAX_EXCLUDED,
     PostImage, PreImage, RECENT_CHECKPOINTS, StoredPreImage, Ticket,
 };
+pub use diff::{DiffPage, DiffRequest, MAX_DIFF_PAGE, MAX_DIFF_PAGE_BYTES};
 pub use error::CheckpointError;
 pub use identity::{HASH_LIMIT, PostImageIdentity, post_image_identity};
 pub use restore::{JOURNAL_FORMAT, RESTORES_DIR, RestoreOutcome, RestoreRequest, recover_restores, restore};
@@ -92,7 +99,7 @@ pub use store::{
     capability_report, place_roots,
 };
 pub use torn::{HeldScan, LineProcesses, MAX_TORN_PATHS, SQLITE_SIDECARS, held_in_roots, sqlite_marks};
-pub use undo::{Caller, History, Request, RestoreEvents, Restored, Target};
+pub use undo::{Caller, History, Request, RestoreEvents, Restored, StateRequest, StateRestored, Target};
 pub use watcher::{
     FLUSH_DEADLINE, FLUSH_INTERVAL, HELD_DIR, LineClose, LineMark, MARKERS_DIR, MAX_PENDING_PATHS, STREAM_LATENCY,
     WatchPlan, WatchReport, Watcher, held_dir, marker_dir, start_watch,

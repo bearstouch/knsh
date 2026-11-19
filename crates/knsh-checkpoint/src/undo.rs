@@ -6,7 +6,7 @@
 //!
 //! 1. refuse `force` from any caller but the user or the authority (FR-CKP-21), and an agent's request for a change
 //!    that is not its own session's, or for external edits, which are never offered for agent undo;
-//! 2. ask the tree for a [`Plan`](knsh_core::Plan) (step back, step forward, or revert an older change, FR-CKP-30),
+//! 2. ask the tree for a [`Plan`] (step back, step forward, or revert an older change, FR-CKP-30),
 //!    which changes nothing;
 //! 3. [`restore`] the plan's checkpoint, with the identity check of every path, saving the current versions first
 //!    (FR-CKP-20, FR-CKP-22, FR-CKP-23; any conflict changes nothing);
@@ -25,6 +25,25 @@
 //! Every method takes `&mut self`, so the tree cannot change between a plan and its commit; the caller holds the
 //! history behind one lock and keeps the time it is held to one restore.
 //!
+//! # Restoring a state (KNSH-086)
+//!
+//! [`History::restore_state`] (`checkpoint.restore`, user and authority only) returns every root to any state of the
+//! tree at once. The tree gives the way there ([`Route`]): back over each later change to the last state shared with
+//! the target, then forward over the changes of the target's branch. Each step is an ordinary step back or step
+//! forward, with its own identity checks, saved versions and journal, so redo and later restores keep working.
+//!
+//! - **Nothing changes on a conflict.** Before the first step, every path on the way is checked at once against one
+//!   checkpoint standing for the whole way: its post-image from the first step that restores it (what must be there
+//!   now) and its pre-image from the last (what will be there). Any conflict is `-32004` with the paths, before
+//!   anything is written (FR-CKP-20).
+//! - **Possibly-torn paths** of any change on the way are skipped by every step without `force` (FR-CKP-24).
+//! - **Identities follow the steps.** Each step rewrites files (new times); the checkpoints the next steps check
+//!   those paths against get the new identities, same contents only, like the post-image refresh of undo and redo.
+//! - **A failure part-way** (a file changed between the check and its step, a write error) takes back the steps
+//!   already taken, newest first, by the opposite steps, and returns the error: files and history are as before,
+//!   with new times. If taking back fails too, [`CheckpointError::RestoreStopped`] names the state reached; each
+//!   step is whole, so the files match it. `checkpoint.restored` is published per step only once every step is done.
+//!
 //! **Pending:** the history lives in memory: it is written to disk with retention (KNSH-087), and fed with finished
 //! checkpoints and called by the API endpoints in `knshd` (KNSH-088).
 
@@ -33,14 +52,15 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use knsh_core::{
-    Attribution, CanonicalPath, Change, CheckpointId, EdgeKind, EventData, HistoryError, HistoryTree, RecordId,
-    RestoreOperation, SessionId, StateId, TornPath,
+    Action, Attribution, CanonicalPath, Change, CheckpointId, EdgeKind, EventData, HistoryError, HistoryTree, Plan,
+    RecordId, RestoreOperation, Route, SessionId, StateId, TornPath, TornReason,
 };
 use knsh_platform::{Clock, FileKind, Random};
 
 use crate::capture::{Checkpoint, PostImage, new_checkpoint_id};
 use crate::error::CheckpointError;
-use crate::restore::{RestoreRequest, remove_checkpoint_files, restore};
+use crate::identity::post_image;
+use crate::restore::{RestoreRequest, check_only, remove_checkpoint_files, restore};
 use crate::shadow::ShadowFiles;
 
 /// Who asks for an undo or redo: what decides whether `force` is allowed (FR-CKP-21) and which changes are visible.
@@ -118,6 +138,108 @@ pub struct Restored {
     pub forced_torn: Vec<TornPath>,
 }
 
+/// A request to return every root to a state (`checkpoint.restore`, KNSH-086).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateRequest {
+    /// The state to return to: any state of the tree, on the head's branch or another.
+    pub state: StateId,
+    /// Who asks: only the user or the authority may.
+    pub caller: Caller,
+    /// Restore paths whose identity no longer matches, and possibly-torn paths, losing what is there now.
+    pub force: bool,
+}
+
+/// What a restore to a state did: one undo or redo per change on the way, in the order taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateRestored {
+    /// The state the history was in before.
+    pub from: StateId,
+    /// The state it is in now: the one asked for.
+    pub head: StateId,
+    /// Each step: an undo of each later change (newest first), then a redo of each change of the other branch
+    /// (oldest first). Empty when the history was already in that state.
+    pub steps: Vec<Restored>,
+}
+
+impl StateRestored {
+    /// Every path restored by any step, sorted, each once.
+    #[must_use]
+    pub fn restored(&self) -> Vec<CanonicalPath> {
+        let paths: BTreeSet<&CanonicalPath> = self.steps.iter().flat_map(|step| &step.restored).collect();
+        paths.into_iter().cloned().collect()
+    }
+
+    /// Whether `force` overrode an identity check or restored a possibly-torn file in any step.
+    #[must_use]
+    pub fn forced(&self) -> bool {
+        self.steps.iter().any(|step| step.forced)
+    }
+
+    /// Excluded folders the changes on the way changed: not restored (FR-CKP-31). Sorted, each once.
+    #[must_use]
+    pub fn not_restored(&self) -> Vec<CanonicalPath> {
+        let paths: BTreeSet<&CanonicalPath> = self.steps.iter().flat_map(|step| &step.not_restored).collect();
+        paths.into_iter().cloned().collect()
+    }
+
+    /// Whether more excluded folders were changed than [`StateRestored::not_restored`] lists.
+    #[must_use]
+    pub fn not_restored_incomplete(&self) -> bool {
+        self.steps.iter().any(|step| step.not_restored_incomplete)
+    }
+
+    /// What the changes on the way did that no restore can undo (FR-CKP-36). Sorted, each once.
+    #[must_use]
+    pub fn irreversible(&self) -> Vec<String> {
+        let reasons: BTreeSet<&String> = self.steps.iter().flat_map(|step| &step.irreversible).collect();
+        reasons.into_iter().cloned().collect()
+    }
+
+    /// Possibly-torn files skipped by any step (FR-CKP-24). Sorted, each once.
+    #[must_use]
+    pub fn skipped_torn(&self) -> Vec<TornPath> {
+        let torn: BTreeSet<&TornPath> = self.steps.iter().flat_map(|step| &step.skipped_torn).collect();
+        torn.into_iter().cloned().collect()
+    }
+
+    /// Possibly-torn files restored under `force` by any step (FR-CKP-24). Sorted, each once.
+    #[must_use]
+    pub fn forced_torn(&self) -> Vec<TornPath> {
+        let torn: BTreeSet<&TornPath> = self.steps.iter().flat_map(|step| &step.forced_torn).collect();
+        torn.into_iter().cloned().collect()
+    }
+}
+
+/// Which way a step of a restore to a state goes over its edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// Back to the edge's parent state, restoring its checkpoint.
+    Back,
+    /// Forward to the edge's child state, restoring the versions its undo saved.
+    Forward,
+}
+
+/// One step of a restore to a state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RouteStep {
+    edge: CheckpointId,
+    direction: Direction,
+    /// The checkpoint the step restores.
+    source: CheckpointId,
+    /// What the step is to the change: stepping back over a change undoes it, over a revert redoes its change.
+    operation: RestoreOperation,
+    /// The change reported.
+    origin: CheckpointId,
+}
+
+/// How one restore is reported and whether it may override checks.
+#[derive(Debug, Clone, Copy)]
+struct Step {
+    operation: RestoreOperation,
+    origin: CheckpointId,
+    force: bool,
+}
+
 /// Where `checkpoint.restored` goes (FR-CKP-25).
 pub trait RestoreEvents {
     /// Publishes `data` (a [`EventData::CheckpointRestored`]) on session `session_id`.
@@ -157,6 +279,11 @@ impl History {
     #[must_use]
     pub const fn tree(&self) -> &HistoryTree {
         &self.tree
+    }
+
+    /// How files are read and restored.
+    pub(crate) fn files(&self) -> &dyn ShadowFiles {
+        self.files.as_ref()
     }
 
     /// The checkpoint `id`: an edge's, or a set of saved versions.
@@ -232,19 +359,344 @@ impl History {
             RestoreOperation::Undo => self.tree.plan_undo(target)?,
             RestoreOperation::Redo => self.tree.plan_redo(target)?,
         };
-        let source = self
+        let restored = self.perform(
+            &plan,
+            Step {
+                operation,
+                origin,
+                force: request.force,
+            },
+            &BTreeMap::new(),
+            &[],
+        )?;
+        publish(events, &restored);
+        Ok(restored)
+    }
+
+    /// Returns every root to state `request.state` at once, undoing all later changes (and redoing the changes of
+    /// another branch, when the state is on one): `checkpoint.restore` (KNSH-086, module documentation of
+    /// [`crate::undo`], "Restoring a state").
+    ///
+    /// # Errors
+    ///
+    /// [`CheckpointError::RestoreNotAllowed`] for an agent; [`CheckpointError::History`] for an unknown state (or a
+    /// change on the way whose saved versions are gone); [`CheckpointError::Conflicts`] (`-32004`) if any path on the
+    /// way cannot be restored, and nothing changed; any error of [`restore`] for a step, after the steps already taken
+    /// were undone; [`CheckpointError::RestoreStopped`] if undoing them failed too.
+    pub fn restore_state(
+        &mut self,
+        request: &StateRequest,
+        events: &dyn RestoreEvents,
+    ) -> Result<StateRestored, CheckpointError> {
+        match request.caller {
+            Caller::User | Caller::Authority => {}
+            Caller::Agent(_) => return Err(CheckpointError::RestoreNotAllowed),
+        }
+        let from = self.tree.head();
+        let route = self.tree.route(from, request.state)?;
+        let steps = self.route_steps(&route)?;
+        if steps.is_empty() {
+            return Ok(StateRestored {
+                from,
+                head: from,
+                steps: Vec::new(),
+            });
+        }
+        // Every path on the way checked at once, before the first step writes anything (FR-CKP-20).
+        let whole = self.composite(&steps)?;
+        check_only(self.files.as_ref(), &whole, request.force)?;
+        // Without `force`, a path possibly torn in any change on the way is skipped by every step, so the steps
+        // stay consistent with each other and with the check above (FR-CKP-24).
+        let skip = if request.force {
+            BTreeMap::new()
+        } else {
+            whole.possibly_torn
+        };
+        let mut done: Vec<(RouteStep, Restored)> = Vec::new();
+        for (index, step) in steps.iter().enumerate() {
+            let ahead: Vec<CheckpointId> = steps[index + 1..].iter().map(|step| step.source).collect();
+            match self.take_step(step, request.force, &skip, &ahead) {
+                Ok(restored) => done.push((*step, restored)),
+                Err(error) => return Err(self.unwind(&done, step.source, request.force, &skip, error)),
+            }
+        }
+        for (_, restored) in &done {
+            publish(events, restored);
+        }
+        Ok(StateRestored {
+            from,
+            head: self.tree.head(),
+            steps: done.into_iter().map(|(_, restored)| restored).collect(),
+        })
+    }
+
+    /// The steps of `route`: back over each edge (restoring its own checkpoint), then forward over each edge
+    /// (restoring the versions its undo saved).
+    fn route_steps(&self, route: &Route) -> Result<Vec<RouteStep>, CheckpointError> {
+        let unknown = CheckpointError::History(HistoryError::UnknownChange);
+        let mut steps = Vec::with_capacity(route.back.len() + route.forward.len());
+        for &edge in &route.back {
+            let reverts = matches!(self.tree.edge(edge).ok_or(unknown.clone())?.kind, EdgeKind::Undo { .. });
+            steps.push(RouteStep {
+                edge,
+                direction: Direction::Back,
+                source: edge,
+                // Stepping back over a revert redoes the change it reverted.
+                operation: if reverts {
+                    RestoreOperation::Redo
+                } else {
+                    RestoreOperation::Undo
+                },
+                origin: self.origin(edge)?,
+            });
+        }
+        for &edge in &route.forward {
+            let edge_of = self.tree.edge(edge).ok_or(unknown.clone())?;
+            // Every edge off the head's path was left by stepping back over it, which saved the versions it
+            // replaced; one without them cannot be returned to.
+            let source = edge_of.saved.ok_or(CheckpointError::History(HistoryError::NotUndone))?;
+            let reverts = matches!(edge_of.kind, EdgeKind::Undo { .. });
+            steps.push(RouteStep {
+                edge,
+                direction: Direction::Forward,
+                source,
+                operation: if reverts {
+                    RestoreOperation::Undo
+                } else {
+                    RestoreOperation::Redo
+                },
+                origin: self.origin(edge)?,
+            });
+        }
+        Ok(steps)
+    }
+
+    /// One checkpoint standing for the whole way of `steps`, for the check before the first step: each path's
+    /// post-image is from the first step that restores it (what it must be now), its pre-image from the last (what
+    /// it will be at the end). Possibly-torn marks and stores are those of every step.
+    fn composite(&self, steps: &[RouteStep]) -> Result<Checkpoint, CheckpointError> {
+        let mut whole: Option<Checkpoint> = None;
+        let mut root_of: BTreeMap<CanonicalPath, CanonicalPath> = BTreeMap::new();
+        for step in steps {
+            let source = self
+                .checkpoints
+                .get(&step.source)
+                .ok_or(CheckpointError::History(HistoryError::UnknownChange))?;
+            let whole = whole.get_or_insert_with(|| Checkpoint {
+                id: source.id,
+                edge: source.edge,
+                attribution: source.attribution,
+                records: BTreeSet::new(),
+                sessions: BTreeSet::new(),
+                paths: BTreeMap::new(),
+                uncertain: BTreeSet::new(),
+                stores: BTreeMap::new(),
+                excluded: BTreeMap::new(),
+                excluded_overflowed: false,
+                possibly_torn: BTreeMap::new(),
+            });
+            for (root, listed) in &source.paths {
+                for (path, captured) in listed {
+                    if let Some(first_root) = root_of.get(path) {
+                        // A later step: the path ends at this step's version.
+                        if let Some(entry) = whole.paths.get_mut(first_root).and_then(|paths| paths.get_mut(path)) {
+                            entry.pre = captured.pre.clone();
+                        }
+                    } else {
+                        root_of.insert(path.clone(), root.clone());
+                        whole
+                            .paths
+                            .entry(root.clone())
+                            .or_default()
+                            .insert(path.clone(), captured.clone());
+                    }
+                }
+            }
+            for (path, reason) in &source.possibly_torn {
+                whole.possibly_torn.entry(path.clone()).or_insert(*reason);
+            }
+            for (root, store) in &source.stores {
+                whole.stores.entry(root.clone()).or_insert_with(|| store.clone());
+            }
+        }
+        whole.ok_or(CheckpointError::History(HistoryError::UnknownChange))
+    }
+
+    /// Takes one step of a restore to a state: plans it with the tree (which must agree it is the step expected)
+    /// and performs it.
+    fn take_step(
+        &mut self,
+        step: &RouteStep,
+        force: bool,
+        skip: &BTreeMap<CanonicalPath, TornReason>,
+        ahead: &[CheckpointId],
+    ) -> Result<Restored, CheckpointError> {
+        let plan = match step.direction {
+            Direction::Back => self.tree.plan_undo(step.edge)?,
+            Direction::Forward => self.tree.plan_redo(step.edge)?,
+        };
+        let expected = match (step.direction, plan.action()) {
+            (Direction::Back, Action::StepBack { edge, .. })
+            | (Direction::Forward, Action::StepForward { edge, .. }) => {
+                edge == step.edge && plan.restore_from() == step.source
+            }
+            (
+                Direction::Back | Direction::Forward,
+                Action::StepBack { .. } | Action::StepForward { .. } | Action::Revert { .. },
+            ) => false,
+        };
+        if !expected {
+            // The tree and the route disagree; never restore something other than the step checked.
+            return Err(CheckpointError::History(HistoryError::Stale));
+        }
+        self.perform(
+            &plan,
+            Step {
+                operation: step.operation,
+                origin: step.origin,
+                force,
+            },
+            skip,
+            ahead,
+        )
+    }
+
+    /// After a step of a restore to a state failed with `failed` (its own restore rolled back, so the paths of its
+    /// checkpoint `failed_source` were rewritten): takes back each step of `done`, newest first, by the opposite
+    /// step. Returns `failed` if every one was taken back (the files and the history are as before the restore, with
+    /// new modification times), or [`CheckpointError::RestoreStopped`] at the state reached otherwise. Nothing is
+    /// taken back when the failed step could not roll itself back ([`CheckpointError::RollbackFailed`]): its journal
+    /// must first put its paths back at the next start. `skip` is the possibly-torn set the steps skipped: taking a
+    /// step back skips the same paths, so it never writes a path the step itself left alone.
+    fn unwind(
+        &mut self,
+        done: &[(RouteStep, Restored)],
+        failed_source: CheckpointId,
+        force: bool,
+        skip: &BTreeMap<CanonicalPath, TornReason>,
+        failed: CheckpointError,
+    ) -> CheckpointError {
+        if matches!(failed, CheckpointError::RollbackFailed(_)) {
+            return CheckpointError::RestoreStopped(self.tree.head());
+        }
+        // The failed step's rollback rewrote its paths: the steps taking back must find their new identities.
+        let sources: Vec<CheckpointId> = done
+            .iter()
+            .rev()
+            .filter_map(|(step, _)| self.reverse_source(step))
+            .collect();
+        self.refresh_from_live(failed_source, &sources);
+        for (index, (step, _)) in done.iter().enumerate().rev() {
+            // The sources of the steps still to take back, so each finds the identities the previous one left.
+            let ahead: Vec<CheckpointId> = done[..index]
+                .iter()
+                .rev()
+                .filter_map(|(earlier, _)| self.reverse_source(earlier))
+                .collect();
+            let reverse = RouteStep {
+                edge: step.edge,
+                direction: match step.direction {
+                    Direction::Back => Direction::Forward,
+                    Direction::Forward => Direction::Back,
+                },
+                source: match self.reverse_source(step) {
+                    Some(source) => source,
+                    None => return CheckpointError::RestoreStopped(self.tree.head()),
+                },
+                operation: match step.operation {
+                    RestoreOperation::Undo => RestoreOperation::Redo,
+                    RestoreOperation::Redo => RestoreOperation::Undo,
+                },
+                origin: step.origin,
+            };
+            if self.take_step(&reverse, force, skip, &ahead).is_err() {
+                return CheckpointError::RestoreStopped(self.tree.head());
+            }
+        }
+        failed
+    }
+
+    /// Reads the live identity of each path checkpoint `of` lists and gives it, in the first checkpoint of `ahead`
+    /// listing the path, as its post-image where it records the same contents ([`same_contents`]) **and the same
+    /// inode**. The engine did not write what it reads here (a rollback writes in place, but a step-1 conflict wrote
+    /// nothing): only a new time is accepted. A new inode with the same contents (a symlink retargeted to a name of
+    /// the same length, which has no hash; a file swapped for a hard link elsewhere) stays a conflict (FR-CKP-20).
+    fn refresh_from_live(&mut self, of: CheckpointId, ahead: &[CheckpointId]) {
+        let Some(paths) = self.checkpoints.get(&of).map(|checkpoint| {
+            checkpoint
+                .paths
+                .values()
+                .flat_map(BTreeMap::keys)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        }) else {
+            return;
+        };
+        let now: BTreeMap<CanonicalPath, PostImage> = paths
+            .into_iter()
+            .map(|path| {
+                let post = post_image(self.files.as_ref(), path.as_path());
+                (path, post)
+            })
+            .collect();
+        self.refresh_ahead(&now, ahead, true);
+    }
+
+    /// The checkpoint taking back `step` restores: the versions saved when it stepped back, or the edge's own
+    /// pre-images when it stepped forward.
+    fn reverse_source(&self, step: &RouteStep) -> Option<CheckpointId> {
+        match step.direction {
+            Direction::Back => self.tree.edge(step.edge).and_then(|edge| edge.saved),
+            Direction::Forward => Some(step.edge),
+        }
+    }
+
+    /// Carries out `plan` (steps 3 and 4 of the module documentation) and reports it, publishing nothing. Paths in
+    /// `skip` are skipped as possibly torn, on top of those the restored checkpoint marks. After the restore, the
+    /// first checkpoint of `ahead` listing each restored path gets its new identity too (same contents only): the
+    /// next steps of a restore to a state check against them.
+    fn perform(
+        &mut self,
+        plan: &Plan,
+        step: Step,
+        skip: &BTreeMap<CanonicalPath, TornReason>,
+        ahead: &[CheckpointId],
+    ) -> Result<Restored, CheckpointError> {
+        let stored = self
             .checkpoints
             .get(&plan.restore_from())
             .ok_or(CheckpointError::History(HistoryError::UnknownChange))?;
+        let widened;
+        let source = if skip.is_empty() {
+            stored
+        } else {
+            let mut copy = stored.clone();
+            for (path, reason) in skip {
+                copy.possibly_torn.entry(path.clone()).or_insert(*reason);
+            }
+            widened = copy;
+            &widened
+        };
         let saved_id = self.fresh_id();
-        let outcome = restore(
+        let result = restore(
             self.files.as_ref(),
             &RestoreRequest {
                 from: source,
                 saved: saved_id,
-                force: request.force,
+                force: step.force,
             },
-        )?;
+        );
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error @ (CheckpointError::RolledBack(_) | CheckpointError::Conflicts(_))) => {
+                // A rollback wrote the old versions back (new times): a retry must find them as recorded, not as
+                // changed by someone else. Same contents only, so nothing unrecorded is taken for recorded.
+                let from = plan.restore_from();
+                self.refresh_from_live(from, &[from]);
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         let mut saved = Checkpoint {
             id: saved_id,
             edge: source.edge,
@@ -258,7 +710,7 @@ impl History {
             excluded_overflowed: false,
             possibly_torn: BTreeMap::new(),
         };
-        let committed = match self.tree.commit(&plan, plan.saves_current().then_some(saved_id)) {
+        let committed = match self.tree.commit(plan, plan.saves_current().then_some(saved_id)) {
             Ok(committed) => committed,
             Err(error) => {
                 // Unreachable with `&mut self` and a fresh identifier; if it ever happens, the files go back to what
@@ -283,16 +735,50 @@ impl History {
         // them against must describe them. Done once the saved versions are in place, since a revert's new `undo`
         // edge is then the newest edge of its paths.
         self.refresh_post_images(&saved);
+        let now: BTreeMap<CanonicalPath, PostImage> = saved
+            .paths
+            .values()
+            .flat_map(BTreeMap::iter)
+            .map(|(path, captured)| (path.clone(), captured.post))
+            .collect();
+        self.refresh_ahead(&now, ahead, false);
         if let Some(released) = committed.released
             && let Some(checkpoint) = self.checkpoints.remove(&released)
         {
             remove_checkpoint_files(self.files.as_ref(), released, &checkpoint.paths, &checkpoint.stores);
         }
-        let mut restored = self.report(operation, origin, committed.head, outcome.restored, outcome.forced);
+        let mut restored = self.report(
+            step.operation,
+            step.origin,
+            committed.head,
+            outcome.restored,
+            outcome.forced,
+        );
         restored.skipped_torn = outcome.skipped;
         restored.forced_torn = outcome.forced_torn;
-        publish(events, &restored);
         Ok(restored)
+    }
+
+    /// Sets the post-image of each path of `now`, in the first checkpoint of `ahead` that lists it, to its post-image
+    /// in `now` (what is there now), where it records the same contents ([`same_contents`]). With `same_inode` (`now`
+    /// was read from live files the engine did not just write), only where it records the same inode too
+    /// ([`same_inode`]).
+    fn refresh_ahead(&mut self, now: &BTreeMap<CanonicalPath, PostImage>, ahead: &[CheckpointId], same_inode: bool) {
+        for (path, now) in now {
+            let next = ahead.iter().copied().find(|id| {
+                self.checkpoints
+                    .get(id)
+                    .is_some_and(|checkpoint| checkpoint.paths.values().any(|listed| listed.contains_key(path)))
+            });
+            let Some(checkpoint) = next.and_then(|id| self.checkpoints.get_mut(&id)) else {
+                continue;
+            };
+            for captured in checkpoint.paths.values_mut().filter_map(|listed| listed.get_mut(path)) {
+                if same_contents(&captured.post, now) && (!same_inode || self::same_inode(&captured.post, now)) {
+                    captured.post = *now;
+                }
+            }
+        }
     }
 
     /// After a committed restore, sets the post-image of each path `restored` restored, in each checkpoint that a
@@ -352,7 +838,7 @@ impl History {
     }
 
     /// The change behind edge `edge`: itself, or the change an `undo` edge reverted.
-    fn origin(&self, edge: CheckpointId) -> Result<CheckpointId, CheckpointError> {
+    pub(crate) fn origin(&self, edge: CheckpointId) -> Result<CheckpointId, CheckpointError> {
         let edge_of = self
             .tree
             .edge(edge)
@@ -364,7 +850,7 @@ impl History {
     }
 
     /// Whether `caller` may undo or redo the change `origin`: an agent only its own session's, never external edits.
-    fn authorize(&self, caller: Caller, origin: CheckpointId) -> Result<(), CheckpointError> {
+    pub(crate) fn authorize(&self, caller: Caller, origin: CheckpointId) -> Result<(), CheckpointError> {
         let Caller::Agent(session) = caller else {
             return Ok(());
         };
@@ -470,6 +956,19 @@ fn same_contents(recorded: &PostImage, now: &PostImage) -> bool {
                         recorded.identity.size == now.identity.size && recorded.hash == now.hash
                     }
                 }
+        }
+        (PostImage::Deleted | PostImage::Present(_) | PostImage::Unknown, _) => false,
+    }
+}
+
+/// Whether `recorded` and `now` are the same entry: both absent, or present with the same kind and inode. What a
+/// refresh from live files needs on top of [`same_contents`]: a symlink has no content hash, and a new inode may be a
+/// hard link to a file outside the root, which a write in place would then change.
+fn same_inode(recorded: &PostImage, now: &PostImage) -> bool {
+    match (recorded, now) {
+        (PostImage::Deleted, PostImage::Deleted) => true,
+        (PostImage::Present(recorded), PostImage::Present(now)) => {
+            recorded.identity.kind == now.identity.kind && recorded.identity.inode == now.identity.inode
         }
         (PostImage::Deleted | PostImage::Present(_) | PostImage::Unknown, _) => false,
     }

@@ -272,4 +272,69 @@ States form a tree, like commits. Each line, agent edit or concurrent set is an 
   change of the tree is refused, so the tree never records a restore that did not happen.
 - The tree is stored as one JSON object with a `format` version; a corrupt or newer file is refused and left as found.
 
+**Restoring a state (KNSH-086).** `checkpoint.restore {state_id, force?}` returns every root to any state of the
+tree, on the head's branch or another (the case redo refuses as `RedoBlocked`). User and authority only; an agent
+caller is refused before anything is checked.
+
+- The tree gives the way there: back over each later edge to the last state shared with the target, then forward
+  over the edges of the target's branch. Each step is an ordinary step back (restoring the edge's checkpoint) or step
+  forward (restoring the versions its undo saved), with the restore rules above, so redo and later restores keep
+  working. Stepping back over an undo edge redoes the change it reverted.
+- **Nothing changes on a conflict.** Before the first step, every path on the way is checked at once, against its
+  post-image from the first step that restores it (what must be there now) with its pre-image from the last (what
+  will be there). Any conflict is `-32004` with the paths, before anything is written (FR-CKP-20).
+- A path possibly torn in any change on the way is skipped by every step without `force`, and listed (FR-CKP-24).
+- Each step rewrites files (new times): the checkpoints the next steps check them against get the new identities,
+  only where they record the same contents, as for undo and redo.
+- **A failure part-way** (a file changed between the check and its step, a write error) rolls that step back, then
+  takes back the steps already taken, newest first, by the opposite steps, and returns the error: files and history
+  are as before (with new modification times). If a step's own rollback failed, or taking back fails, the result is
+  an internal error naming the state reached (`RestoreStopped`); every step is whole, so the files match that state
+  (or the step's journal puts them back at the next start). `checkpoint.restored` is published per change undone or
+  redone, only once every step is done.
+- After a restore that was rolled back, the restored checkpoint takes the rewritten files' new times (same contents
+  and same inode only: a rollback writes in place), so the same undo, redo or restore can be tried again (also for
+  KNSH-084's undo and redo). A path with a new inode (one the rollback re-created, or a symlink an agent retargeted)
+  still conflicts: the engine never takes an entry it did not write for the recorded one.
+
+Result: `{"from", "state_id", "changes": [{"checkpoint_id", "operation", "record_ids", "files_restored"}],
+"files_restored", "restored", "restored_incomplete", "not_restored", "not_restored_incomplete", "irreversible",
+"forced", "skipped_torn", "forced_torn"}`. States are JSON integers. `restored` lists at most 1,000 paths;
+`files_restored` counts them all.
+
+**Diffs (KNSH-086).** `checkpoint.diff {record_id | state_id, cursor?, limit?}` lists the paths that differ between
+two states: a line's change (the state before it and the state after it, also once it was undone), or a state and the
+current one (what `checkpoint.restore` to it would change). Exactly one of `record_id` and `state_id`; otherwise
+`-32602`.
+
+- The paths compared are those the edges on the way between the two states changed. A path's version at a state
+  comes from the last edge on the way from the current state to it that restores the path (a pre-image, or versions
+  an undo saved), or the live file if none does; a version the history does not hold (never captured, its copy
+  gone, or skipped as possibly torn by an undo) is `unknown`. A path whose two versions have the same contents (a
+  change and its revert) is not listed.
+- Each file: `{"path", "change": "created" | "modified" | "deleted", "before", "after"` (kinds: `absent`, `file`,
+  `folder`, `symlink`, `other`, `unknown`), and its unified diff (three lines of context; at most 1,000 differing
+  lines are matched up, beyond that the differing middle is shown removed and added whole) or `null` with a
+  `reason`: `binary` (a NUL byte or not UTF-8: reported as changed without a text diff), `too_large` (a version over
+  1 MiB), `unavailable`, `sensitive` (named `.env*`, `*.pem`, `*.key` or `id_*`, FR-CKP-33: contents never read nor
+  sent; redaction of other contents waits for KNSH-090), or `not_a_file`.
+- **Bytes on the wire.** Each diff is a binary stream (content type `text/x-diff`) named in the file's
+  `"diff": {"stream_id", "size", "content_type"}`, numbered from 1 in path order, sent right after the JSON answer as
+  chunks and closed by an end-of-stream frame. A client that opted out of binary frames gets `diff_base64` instead,
+  at most 384 KiB of diffs per answer: the answer ends before the diff that would pass it, and a single diff larger
+  than that is `too_large` for it.
+- **Pages.** At most `limit` paths per answer (1 to 256, the most streams a client may have open; default 256) and
+  8 MiB of diffs; `next_cursor` names the last path listed when more follow, `null` otherwise.
+- **Reading.** `knshd` is not sandboxed and live files sit in roots agents write: a live file is read only if every
+  folder from its root down is a real folder, and through a descriptor that refuses a final symlink and anything not
+  a regular file (`Volumes::read_regular`). A file swapped for a symlink is listed as `symlink`, never followed.
+- An agent sees only diffs made of its own session's changes (otherwise refused like an unknown change); a state
+  diff across another session's change is refused.
+
+**Limits (restore and diff).** The live version is read when the diff is made, so an edit not yet recorded shows as
+part of the current state. Symlink targets are not compared. A folder swapped for a symlink between the check and the
+read is still followed (the `openat` walk of the restore limits closes this). Files of 64 MiB or more have no content
+hash, so their post-images are not refreshed between steps and a restore across two changes of one such file
+conflicts. **Pending:** the endpoints, agent-socket scoping and CLI (KNSH-088).
+
 Undoing an `npm install`, for example, leaves `node_modules` out of step with the lockfile until install runs again. A file the agent deleted, including one holding secrets such as `.env`, stays in its checkpoint until retention removes it.

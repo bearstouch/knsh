@@ -629,3 +629,368 @@ fn folder_holding_a_skipped_torn_file_is_not_removed() {
     );
     assert_eq!(fixture.contents("data/app.db").as_deref(), Some(&b"v1"[..]));
 }
+
+// --- Restoring a state (KNSH-086) ---
+
+fn to_state(state: StateId) -> StateRequest {
+    StateRequest {
+        state,
+        caller: Caller::User,
+        force: false,
+    }
+}
+
+/// Three lines from the root state: (1) `a.txt` a0 to a1 and `e.txt` e0 to e1, (2) `b.txt` created, (3) `a.txt` a1
+/// to a2 and `c.txt` created. Returns the states after each.
+fn three_changes() -> (Fixture, History, [StateId; 3]) {
+    let fixture = Fixture::new();
+    fixture.tree.add_file(live("a.txt"), b"a0");
+    fixture.tree.add_file(live("e.txt"), b"e0");
+    let mut history = history(&fixture);
+    let s1 = history
+        .record(fixture.command(1, &["a.txt", "e.txt"], |tree| {
+            tree.add_file(live("a.txt"), b"a1");
+            tree.add_file(live("e.txt"), b"e1");
+        }))
+        .unwrap();
+    let s2 = history
+        .record(fixture.command(2, &["b.txt"], |tree| tree.add_file(live("b.txt"), b"b1")))
+        .unwrap();
+    let s3 = history
+        .record(fixture.command(3, &["a.txt", "c.txt"], |tree| {
+            tree.add_file(live("a.txt"), b"a2");
+            tree.add_file(live("c.txt"), b"c1");
+        }))
+        .unwrap();
+    (fixture, history, [s1, s2, s3])
+}
+
+fn files_of(fixture: &Fixture) -> Vec<(&'static str, Option<Vec<u8>>)> {
+    ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"]
+        .into_iter()
+        .map(|name| (name, fixture.contents(name)))
+        .collect()
+}
+
+fn expect(pairs: [(&'static str, Option<&[u8]>); 5]) -> Vec<(&'static str, Option<Vec<u8>>)> {
+    pairs
+        .into_iter()
+        .map(|(name, contents)| (name, contents.map(<[u8]>::to_vec)))
+        .collect()
+}
+
+// KNSH-086, FR-CKP-20: restoring an earlier state undoes every later change at once, newest first, each with its
+// identity checks; each is published, and the result lists every path restored.
+#[test]
+fn restore_to_state_undoes_all_later_changes() {
+    let (fixture, mut history, [s1, _, s3]) = three_changes();
+    let events = Events::default();
+
+    let restored = history.restore_state(&to_state(s1), &events).unwrap();
+
+    assert_eq!(
+        files_of(&fixture),
+        expect([
+            ("a.txt", Some(b"a1")),
+            ("b.txt", None),
+            ("c.txt", None),
+            ("d.txt", None),
+            ("e.txt", Some(b"e1")),
+        ])
+    );
+    assert_eq!((restored.from, restored.head), (s3, s1));
+    assert_eq!(history.tree().head(), s1);
+    let undone: Vec<(RestoreOperation, Vec<RecordId>)> = restored
+        .steps
+        .iter()
+        .map(|step| (step.operation, step.records.clone()))
+        .collect();
+    assert_eq!(
+        undone,
+        vec![
+            (RestoreOperation::Undo, vec![record(3)]),
+            (RestoreOperation::Undo, vec![record(2)]),
+        ]
+    );
+    assert_eq!(
+        restored.restored(),
+        ["a.txt", "b.txt", "c.txt"].map(|name| canonical(live(name))).to_vec()
+    );
+    assert_eq!(events.take().len(), 2, "one checkpoint.restored per change undone");
+
+    // All the way back to the root, then forward again to where it started: redo of every change.
+    history
+        .restore_state(&to_state(history.tree().root()), &events)
+        .unwrap();
+    assert_eq!(
+        files_of(&fixture),
+        expect([
+            ("a.txt", Some(b"a0")),
+            ("b.txt", None),
+            ("c.txt", None),
+            ("d.txt", None),
+            ("e.txt", Some(b"e0")),
+        ])
+    );
+    let redone = history.restore_state(&to_state(s3), &events).unwrap();
+    assert!(redone.steps.iter().all(|step| step.operation == RestoreOperation::Redo));
+    assert_eq!(
+        files_of(&fixture),
+        expect([
+            ("a.txt", Some(b"a2")),
+            ("b.txt", Some(b"b1")),
+            ("c.txt", Some(b"c1")),
+            ("d.txt", None),
+            ("e.txt", Some(b"e1")),
+        ])
+    );
+    assert_eq!(history.tree().head(), s3);
+}
+
+// KNSH-086: a state on another branch (which redo cannot reach, `RedoBlocked`) is reached by going back to the
+// shared state and forward down the other branch. `a.txt` is changed on both branches, by steps that are not next to
+// each other, so each step must find the identities the previous ones left.
+#[test]
+fn restore_reaches_a_state_on_another_branch() {
+    let (fixture, mut history, [_, _, s3]) = three_changes();
+    let events = Events::default();
+    history
+        .restore_state(&to_state(history.tree().root()), &events)
+        .unwrap();
+    // A new branch from the root: (4) `d.txt` created, (5) `a.txt` a0 to a5.
+    history
+        .record(fixture.command(4, &["d.txt"], |tree| tree.add_file(live("d.txt"), b"d4")))
+        .unwrap();
+    history
+        .record(fixture.command(5, &["a.txt"], |tree| tree.add_file(live("a.txt"), b"a5")))
+        .unwrap();
+    assert_eq!(
+        history.redo(&user(1), &events).unwrap_err(),
+        CheckpointError::History(HistoryError::RedoBlocked)
+    );
+    events.take();
+
+    let restored = history.restore_state(&to_state(s3), &events).unwrap();
+
+    assert_eq!(
+        files_of(&fixture),
+        expect([
+            ("a.txt", Some(b"a2")),
+            ("b.txt", Some(b"b1")),
+            ("c.txt", Some(b"c1")),
+            ("d.txt", None),
+            ("e.txt", Some(b"e1")),
+        ])
+    );
+    assert_eq!(history.tree().head(), s3);
+    let steps: Vec<(RestoreOperation, Vec<RecordId>)> = restored
+        .steps
+        .iter()
+        .map(|step| (step.operation, step.records.clone()))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            (RestoreOperation::Undo, vec![record(5)]),
+            (RestoreOperation::Undo, vec![record(4)]),
+            (RestoreOperation::Redo, vec![record(1)]),
+            (RestoreOperation::Redo, vec![record(2)]),
+            (RestoreOperation::Redo, vec![record(3)]),
+        ]
+    );
+    assert_eq!(events.take().len(), 5);
+    // And back to the other branch's end: undo and redo keep working after a restore.
+    let other = history.tree().edge_for_record(record(5)).unwrap().to;
+    history.restore_state(&to_state(other), &events).unwrap();
+    assert_eq!(fixture.contents("a.txt").as_deref(), Some(&b"a5"[..]));
+    assert_eq!(fixture.contents("d.txt").as_deref(), Some(&b"d4"[..]));
+    history.undo(&user(5), &events).unwrap();
+    assert_eq!(fixture.contents("a.txt").as_deref(), Some(&b"a0"[..]));
+}
+
+// KNSH-086, FR-CKP-20: a conflict anywhere on the way, even in the oldest change (whose step would come last), is
+// `-32004` with the paths before anything is written: no file, saved copy or journal, and the history stays.
+#[test]
+fn restore_conflict_changes_nothing() {
+    let (fixture, mut history, [_, _, s3]) = three_changes();
+    let events = Events::default();
+    // Only change 1 touched `e.txt`; changes 3 and 2 alone would restore fine.
+    fixture.tree.add_file(live("e.txt"), b"human edit");
+    fixture.tree.remove_all(live("c.txt"));
+    let before = fixture.tree.snapshot("/");
+
+    let error = history
+        .restore_state(&to_state(history.tree().root()), &events)
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        CheckpointError::Conflicts(vec![
+            RestoreConflict {
+                path: canonical(live("c.txt")),
+                reason: ConflictReason::Missing,
+            },
+            RestoreConflict {
+                path: canonical(live("e.txt")),
+                reason: ConflictReason::Changed,
+            },
+        ])
+    );
+    assert_eq!(fixture.tree.snapshot("/"), before, "not a byte changed, nothing saved");
+    assert_eq!(fixture.tree.writes(), Vec::new());
+    assert_eq!(history.tree().head(), s3);
+    assert!(events.take().is_empty());
+}
+
+// KNSH-086: only the user and the authority may restore a state; an agent is refused before anything is checked.
+#[test]
+fn restore_is_only_for_user_and_authority() {
+    let (fixture, mut history, [s1, _, s3]) = three_changes();
+    let events = Events::default();
+    let request = StateRequest {
+        caller: Caller::Agent(session(1)),
+        ..to_state(s1)
+    };
+    assert_eq!(
+        history.restore_state(&request, &events),
+        Err(CheckpointError::RestoreNotAllowed)
+    );
+    assert_eq!(history.tree().head(), s3);
+    assert_eq!(fixture.contents("a.txt").as_deref(), Some(&b"a2"[..]));
+    let request = StateRequest {
+        caller: Caller::Authority,
+        ..to_state(s1)
+    };
+    assert_eq!(history.restore_state(&request, &events).unwrap().head, s1);
+}
+
+// KNSH-086: the current state is a no-op; an unknown state is refused.
+#[test]
+fn restore_to_current_or_unknown_state() {
+    let (fixture, mut history, [_, _, s3]) = three_changes();
+    let events = Events::default();
+    let same = history.restore_state(&to_state(s3), &events).unwrap();
+    assert_eq!((same.from, same.head, same.steps.len()), (s3, s3, 0));
+    assert_eq!(fixture.tree.writes(), Vec::new());
+    assert_eq!(
+        history.restore_state(&to_state(StateId::new(99).unwrap()), &events),
+        Err(CheckpointError::History(HistoryError::UnknownState))
+    );
+}
+
+// KNSH-086, never mixed: a step that fails part-way is rolled back, then the steps already taken are taken back,
+// newest first: files and history are as before. A later try succeeds.
+#[test]
+fn restore_failure_part_way_takes_back_earlier_steps() {
+    let (fixture, mut history, [_, _, s3]) = three_changes();
+    let events = Events::default();
+    // `e.txt` is written only by the last step (undo of change 1).
+    fixture
+        .tree
+        .fail_write_once(live("e.txt"), crate::restore::tests::ENOSPC);
+    let before = files_of(&fixture);
+
+    let error = history
+        .restore_state(&to_state(history.tree().root()), &events)
+        .unwrap_err();
+
+    assert!(matches!(error, CheckpointError::RolledBack(_)), "{error:?}");
+    assert_eq!(files_of(&fixture), before);
+    assert_eq!(history.tree().head(), s3);
+    assert!(
+        events.take().is_empty(),
+        "nothing is published for a restore that did not happen"
+    );
+    assert!(fixture.journals().is_empty(), "no journal left");
+
+    history
+        .restore_state(&to_state(history.tree().root()), &events)
+        .unwrap();
+    assert_eq!(fixture.contents("e.txt").as_deref(), Some(&b"e0"[..]));
+    assert_eq!(fixture.contents("a.txt").as_deref(), Some(&b"a0"[..]));
+}
+
+// KNSH-086, FR-CKP-24: a path possibly torn in any change on the way is skipped by every step without `force`, and
+// listed; with `force` it is restored and reported forced.
+#[test]
+fn restore_skips_possibly_torn_paths_without_force() {
+    let fixture = Fixture::new();
+    fixture.tree.add_file(live("app.db"), b"v0");
+    let mut history = history(&fixture);
+    let mut first = fixture.command(1, &["app.db"], |tree| tree.add_file(live("app.db"), b"v1"));
+    first
+        .possibly_torn
+        .insert(canonical(live("app.db")), TornReason::SqliteJournal);
+    history.record(first).unwrap();
+    history
+        .record(fixture.command(2, &["app.db", "a.txt"], |tree| {
+            tree.add_file(live("app.db"), b"v2");
+            tree.add_file(live("a.txt"), b"new");
+        }))
+        .unwrap();
+    let events = Events::default();
+    let root = history.tree().root();
+
+    let restored = history.restore_state(&to_state(root), &events).unwrap();
+
+    assert_eq!(
+        fixture.contents("app.db").as_deref(),
+        Some(&b"v2"[..]),
+        "skipped by both steps"
+    );
+    assert_eq!(fixture.contents("a.txt"), None);
+    assert_eq!(
+        restored.skipped_torn(),
+        vec![TornPath {
+            path: canonical(live("app.db")),
+            reason: TornReason::SqliteJournal,
+        }]
+    );
+    assert!(!restored.forced());
+
+    // Forward again, then back with `force`: the file is restored and reported.
+    let end = restored.from;
+    history.restore_state(&to_state(end), &events).unwrap();
+    let forced = history
+        .restore_state(
+            &StateRequest {
+                force: true,
+                ..to_state(root)
+            },
+            &events,
+        )
+        .unwrap();
+    assert_eq!(fixture.contents("app.db").as_deref(), Some(&b"v0"[..]));
+    assert!(forced.forced());
+    assert_eq!(forced.forced_torn().len(), 1);
+}
+
+// FR-CKP-20, KNSH-086: a conflict refreshes nothing it did not write. A file replaced by another entry with the same
+// contents (a new inode: possibly a hard link to a file outside the root, which a write in place would change) still
+// conflicts on the next try, and only `force` restores it.
+#[test]
+fn conflict_on_a_new_inode_with_the_same_contents_is_not_refreshed() {
+    let (fixture, mut history, [_, s2, s3]) = three_changes();
+    let events = Events::default();
+    fixture.tree.remove_all(live("c.txt"));
+    fixture.tree.add_file(live("c.txt"), b"c1");
+    let conflict = CheckpointError::Conflicts(vec![RestoreConflict {
+        path: canonical(live("c.txt")),
+        reason: ConflictReason::Changed,
+    }]);
+
+    assert_eq!(history.undo(&user(3), &events).unwrap_err(), conflict);
+    assert_eq!(
+        history.undo(&user(3), &events).unwrap_err(),
+        conflict,
+        "still a conflict"
+    );
+    assert_eq!(history.restore_state(&to_state(s2), &events).unwrap_err(), conflict);
+    assert_eq!(
+        history.restore_state(&to_state(s2), &events).unwrap_err(),
+        conflict,
+        "still a conflict"
+    );
+    assert_eq!(history.tree().head(), s3);
+    assert_eq!(fixture.contents("a.txt").as_deref(), Some(&b"a2"[..]));
+}

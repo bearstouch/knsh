@@ -117,6 +117,35 @@ impl Volumes for SystemVolumes {
         Ok(digest.map(ContentHash::from_bytes))
     }
 
+    fn read_regular(&self, path: &Path, limit: u64) -> Result<Vec<u8>, PlatformError> {
+        require_absolute(path)?;
+        // `O_NOFOLLOW`: a symlink is never read as its target. `O_NONBLOCK`: a FIFO is refused below instead of
+        // waiting for a writer.
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|error| PlatformError::from_io(Operation::Open, &error))?;
+        let meta = file
+            .metadata()
+            .map_err(|error| PlatformError::from_io(Operation::Metadata, &error))?;
+        if !meta.file_type().is_file() {
+            return Err(PlatformError::UnexpectedKind);
+        }
+        if meta.len() > limit {
+            return Err(PlatformError::TooLarge { limit });
+        }
+        // The size can change between `fstat` and the read: the read is capped one byte past the limit, and reading
+        // that byte proves the file grew too large.
+        let mut data = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+        io::Read::read_to_end(&mut io::Read::take(file, limit.saturating_add(1)), &mut data)
+            .map_err(|error| PlatformError::from_io(Operation::Read, &error))?;
+        if data.len() as u64 > limit {
+            return Err(PlatformError::TooLarge { limit });
+        }
+        Ok(data)
+    }
+
     fn write_in_place(&self, src: &Path, dst: &Path, expect: Option<&FileIdentity>) -> Result<(), PlatformError> {
         require_absolute(src)?;
         require_absolute(dst)?;

@@ -29,7 +29,7 @@ pub enum ErrorCode {
     DecisionTimeout,
     /// `-32003`: caller not allowed on this endpoint or session. No `data`.
     NotAllowed,
-    /// `-32004`: undo or redo conflict (FR-CKP-20). `data`: `conflicts`.
+    /// `-32004`: undo, redo or restore conflict (FR-CKP-20, KNSH-086). `data`: `conflicts`.
     UndoConflict,
     /// `-32005`: capability not available on this machine. `data`: `capability`.
     CapabilityUnavailable,
@@ -111,7 +111,7 @@ impl ErrorCode {
             Self::Denied => "Denied by policy, hook, authority or rate limit",
             Self::DecisionTimeout => "No decision before the timeout",
             Self::NotAllowed => "Caller not allowed on this endpoint or session",
-            Self::UndoConflict => "Undo or redo conflict",
+            Self::UndoConflict => "Undo, redo or restore conflict",
             Self::CapabilityUnavailable => "Capability not available on this machine",
             Self::SessionNotFound => "Session not found or ended",
             Self::SessionHeld => "Session paused or under human control; the line is held",

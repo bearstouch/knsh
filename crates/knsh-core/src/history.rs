@@ -81,6 +81,13 @@ const MAX_STATE: u64 = MAX_SAFE_INTEGER.unsigned_abs();
 pub struct StateId(u64);
 
 impl StateId {
+    /// The state numbered `number`, as a caller names it (`checkpoint.restore`, `checkpoint.diff`, KNSH-086); `None`
+    /// above ±2^53, which no tree hands out. Whether the tree holds it is [`HistoryTree::has_state`].
+    #[must_use]
+    pub const fn new(number: u64) -> Option<Self> {
+        if number <= MAX_STATE { Some(Self(number)) } else { None }
+    }
+
     /// The number behind it.
     #[must_use]
     pub const fn get(self) -> u64 {
@@ -222,6 +229,28 @@ impl Plan {
     }
 }
 
+/// The way from one state of the tree to another ([`HistoryTree::route`], KNSH-086): back over `back`, from the
+/// start up to the last state both share, then forward over `forward` down to the end.
+///
+/// Walking it changes the files as stepping back over each edge of `back` (restoring its pre-images) and then
+/// forward over each edge of `forward` (restoring the versions its undo saved) would, which is how
+/// `checkpoint.restore` returns every root to a state and how `checkpoint.diff` finds each path's version at one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Route {
+    /// The edges to step back over, newest first: the first leads to the start state.
+    pub back: Vec<CheckpointId>,
+    /// The edges to step forward over, oldest first: the last leads to the end state.
+    pub forward: Vec<CheckpointId>,
+}
+
+impl Route {
+    /// Whether the two states are the same.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.back.is_empty() && self.forward.is_empty()
+    }
+}
+
 /// What a commit did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Committed {
@@ -239,6 +268,8 @@ pub struct Committed {
 pub enum HistoryError {
     /// No edge has this checkpoint: it never existed or retention removed it.
     UnknownChange,
+    /// No state of the tree has this number: it never existed or retention removed it (KNSH-086).
+    UnknownState,
     /// The change is not in effect: it was already undone, or lies on a branch the head left.
     NotInEffect,
     /// Redo of a change that is in effect, or was not undone by stepping back.
@@ -278,6 +309,7 @@ impl fmt::Display for HistoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownChange => f.write_str("no change in the history has this checkpoint"),
+            Self::UnknownState => f.write_str("no state in the history has this number"),
             Self::NotInEffect => f.write_str("the change is not in effect: already undone or on another branch"),
             Self::NotUndone => f.write_str("the change was not undone, so there is nothing to redo"),
             Self::RedoBlocked => f.write_str("later changes started another branch; restore the state instead"),
@@ -413,6 +445,52 @@ impl HistoryTree {
     /// Every edge, in no particular order.
     pub fn edges(&self) -> impl Iterator<Item = &HistoryEdge> {
         self.edges.values()
+    }
+
+    /// Whether `state` is a state of the tree: its root or the end of one of its edges.
+    #[must_use]
+    pub fn has_state(&self, state: StateId) -> bool {
+        state == self.root || self.parents.contains_key(&state)
+    }
+
+    /// The way from state `from` to state `to` ([`Route`]): the edges from `from` back to the last state both share,
+    /// then the edges from there down to `to`. Empty when they are the same state. Changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`HistoryError::UnknownState`] if either is not a state of the tree.
+    pub fn route(&self, from: StateId, to: StateId) -> Result<Route, HistoryError> {
+        if !self.has_state(from) || !self.has_state(to) {
+            return Err(HistoryError::UnknownState);
+        }
+        let up = self.ancestry(from);
+        let down = self.ancestry(to);
+        // Both lists end at the root; the shared tail is the way from their last shared state to the root.
+        let shared = up
+            .iter()
+            .rev()
+            .zip(down.iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let back = up[..up.len() - shared].to_vec();
+        let mut forward = down[..down.len() - shared].to_vec();
+        forward.reverse();
+        Ok(Route { back, forward })
+    }
+
+    /// The edges from `state` up to the root, newest first. `state` must be a state of the tree.
+    fn ancestry(&self, state: StateId) -> Vec<CheckpointId> {
+        let mut edges = Vec::new();
+        let mut state = state;
+        while let Some(&checkpoint) = self.parents.get(&state) {
+            edges.push(checkpoint);
+            // Parents always have lower numbers (`from < to`), so this ends at the root.
+            match self.edges.get(&checkpoint) {
+                Some(edge) => state = edge.from,
+                None => break,
+            }
+        }
+        edges
     }
 
     /// Whether the edge identified by `checkpoint` is in effect: part of the head state and not undone.
@@ -1054,6 +1132,51 @@ mod tests {
     fn undo(tree: &mut HistoryTree, edge: u8, saved: u8) -> Committed {
         let plan = tree.plan_undo(checkpoint(edge)).unwrap();
         tree.commit(&plan, Some(checkpoint(saved))).unwrap()
+    }
+
+    // KNSH-086: the way between two states goes back to the last state they share, then down the other branch.
+    #[test]
+    fn route_goes_back_to_the_shared_state_then_forward() {
+        let mut tree = HistoryTree::new();
+        let s1 = tree.record(line(1, &["/p/a"])).unwrap();
+        let s2 = tree.record(line(2, &["/p/b"])).unwrap();
+        let s3 = tree.record(line(3, &["/p/c"])).unwrap();
+        undo(&mut tree, 3, 30);
+        undo(&mut tree, 2, 20);
+        // A new change from s1 starts another branch: s1 -> s4 -> s5.
+        let s4 = tree.record(line(4, &["/p/d"])).unwrap();
+        let s5 = tree.record(line(5, &["/p/e"])).unwrap();
+        assert_eq!(tree.head(), s5);
+
+        assert_eq!(
+            tree.route(s5, s3).unwrap(),
+            Route {
+                back: vec![checkpoint(5), checkpoint(4)],
+                forward: vec![checkpoint(2), checkpoint(3)],
+            }
+        );
+        assert_eq!(
+            tree.route(s5, tree.root()).unwrap(),
+            Route {
+                back: vec![checkpoint(5), checkpoint(4), checkpoint(1)],
+                forward: vec![],
+            }
+        );
+        assert_eq!(
+            tree.route(s1, s2).unwrap(),
+            Route {
+                back: vec![],
+                forward: vec![checkpoint(2)],
+            }
+        );
+        assert!(tree.route(s4, s4).unwrap().is_empty());
+        assert!(tree.has_state(s3) && tree.has_state(tree.root()));
+        let unknown = StateId::new(99).unwrap();
+        assert!(!tree.has_state(unknown));
+        assert_eq!(tree.route(s5, unknown), Err(HistoryError::UnknownState));
+        assert_eq!(tree.route(unknown, s5), Err(HistoryError::UnknownState));
+        assert_eq!(StateId::new(MAX_STATE + 1), None);
+        assert_eq!(StateId::new(7).map(StateId::get), Some(7));
     }
 
     #[test]

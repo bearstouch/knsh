@@ -159,6 +159,7 @@
 #![forbid(unsafe_code)]
 
 mod authority;
+mod diff;
 mod error;
 mod event;
 mod history;
@@ -179,6 +180,10 @@ mod ulid;
 mod violation;
 
 pub use authority::{BundleVersion, MAX_TRUST_RECORD_LEN, SigningIdentifier, TeamId, TrustError, TrustedAuthority};
+pub use diff::{
+    Diff, DiffTarget, EntryKind, FileDiff, MAX_DIFF_FILE, MAX_EDIT_LINES, MAX_EDIT_WORK, NoTextDiff, TextDiff,
+    is_binary, is_sensitive, unified,
+};
 pub use error::{CoreError, MAX_KEY_DISPLAY_LEN, ProfileError, ProfileErrorKind, ProfileOrigin};
 pub use event::{
     AGENT_EDIT_PATHS, BusLimits, CancelReason, Delivery, EVENT_BUFFER_LEN, EngineEvent, EngineEventData, EngineLost,
@@ -187,7 +192,7 @@ pub use event::{
 };
 pub use history::{
     Action, Change, Committed, ConflictReason, EdgeKind, HISTORY_FORMAT, HistoryEdge, HistoryError, HistoryTree,
-    MAX_HISTORY_LEN, Plan, RestoreConflict, RestoreOperation, StateId, TornPath, TornReason,
+    MAX_HISTORY_LEN, Plan, RestoreConflict, RestoreOperation, Route, StateId, TornPath, TornReason,
 };
 pub use hook::{
     ConfigProblem, Ended, Execution, HOOK_EVENT, HOOKS_KEY, HookConfig, HookEntry, HookExecutor, HookExit, HookId,

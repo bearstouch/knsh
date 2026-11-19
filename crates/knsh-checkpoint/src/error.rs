@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use knsh_core::{HistoryError, RestoreConflict};
+use knsh_core::{HistoryError, RestoreConflict, StateId};
 use knsh_platform::PlatformError;
 
 /// Every way a checkpoint operation can fail.
@@ -29,6 +29,12 @@ pub enum CheckpointError {
     /// An agent asked to undo or redo a change that is not its own session's, or one no agent may undo (external
     /// edits). Answered as unknown on `agent.sock` (`-32003`, KNSH-088).
     NotOwnChange,
+    /// `checkpoint.restore` was asked by a caller that is neither the user nor the authority (KNSH-086).
+    RestoreNotAllowed,
+    /// Returning to a state failed part-way, and undoing the steps already taken failed too (KNSH-086): the history
+    /// is at this state, which the files match (each step is restored whole or not at all), except where a step's
+    /// own rollback failed: its journal then puts its paths back at the next start ([`crate::recover_restores`]).
+    RestoreStopped(StateId),
     /// The checkpoint has paths in a root whose store it does not know, so the current versions cannot be saved.
     NoStore,
     /// The restore journal could not be read: it is not in the form the engine writes, or is from a newer version. It
@@ -51,6 +57,8 @@ impl fmt::Display for CheckpointError {
             Self::Conflicts(conflicts) => write!(f, "{} paths conflict; nothing was restored", conflicts.len()),
             Self::ForceNotAllowed => f.write_str("force is only for the user and the authority"),
             Self::NotOwnChange => f.write_str("the change does not belong to the caller's session"),
+            Self::RestoreNotAllowed => f.write_str("restoring a state is only for the user and the authority"),
+            Self::RestoreStopped(state) => write!(f, "restoring a state stopped part-way, at state {state}"),
             Self::NoStore => f.write_str("a checkpoint root has no known store"),
             Self::Journal => f.write_str("the restore journal is not in the engine's format"),
             Self::RolledBack(error) => write!(f, "restore failed and every file was put back: {error}"),
@@ -74,6 +82,8 @@ impl std::error::Error for CheckpointError {
             | Self::Conflicts(_)
             | Self::ForceNotAllowed
             | Self::NotOwnChange
+            | Self::RestoreNotAllowed
+            | Self::RestoreStopped(_)
             | Self::NoStore
             | Self::Journal => None,
         }

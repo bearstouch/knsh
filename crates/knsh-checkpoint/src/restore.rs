@@ -203,6 +203,36 @@ pub fn restore(files: &dyn ShadowFiles, request: &RestoreRequest<'_>) -> Result<
     Ok(outcome)
 }
 
+/// Step 1 alone: whether `from` could be restored now, changing nothing (KNSH-086: `checkpoint.restore` checks the
+/// whole way to a state before its first step). Possibly-torn paths are skipped without `force`, as by [`restore`].
+///
+/// # Errors
+///
+/// [`CheckpointError::Conflicts`] with every path that cannot be restored; [`CheckpointError::Platform`] if a path
+/// could not be checked.
+pub(crate) fn check_only(files: &dyn ShadowFiles, from: &Checkpoint, force: bool) -> Result<(), CheckpointError> {
+    check(
+        files,
+        &RestoreRequest {
+            from,
+            // Unused by the check: nothing is saved.
+            saved: from.id,
+            force,
+        },
+    )
+    .map(|_| ())
+}
+
+/// Every folder from `root` down to the one holding `path` is a real folder now (not a symlink): what a read of a
+/// live path in a root needs before it trusts the path to stay inside the root (KNSH-086, `checkpoint.diff`).
+///
+/// # Errors
+///
+/// [`PlatformError::UnexpectedKind`] if one is not; another [`PlatformError`] if one could not be read.
+pub(crate) fn check_inside_root(files: &dyn ShadowFiles, root: &Path, path: &Path) -> Result<(), PlatformError> {
+    inside_root(files, root, path)
+}
+
 /// Puts back every restore a stopped `knshd` left part-way in `store` (module documentation, "Never mixed"): each
 /// journal's paths get their version from before the restore, then the journal and the saved copies are removed.
 /// Returns how many restores were put back. Call it before any session uses the store's roots.
