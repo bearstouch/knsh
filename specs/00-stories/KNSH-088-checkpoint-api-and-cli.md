@@ -10,6 +10,9 @@
 right scope, so that agents can undo their own changes but never force or restore. Scope: `checkpoint.list`,
 `diff`, `undo`, `redo` on `agent.sock` (own session, no `force`); all `checkpoint.*` including `restore` and `force`
 on `user.sock` and the control service; `knsh undo`, `knsh redo`, `knsh checkpoints` with `--json`.
+Also wires KNSH-087 into `knshd`: run `History::retain` at start and whenever its `next_due` comes (so sensitive
+pre-images never outlive 24 hours), and pass `records.forget`'s `with_checkpoints` to `History::forget` instead of
+answering `-32005`.
 
 **Acceptance criteria**
 - [ ] On `agent.sock`, checkpoint methods see only the caller's session; other sessions return `-32003`.

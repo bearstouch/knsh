@@ -36,6 +36,12 @@
 //! are marked possibly torn in their checkpoint ([`Checkpoint::possibly_torn`]); undo and redo skip them and list
 //! them with their reasons unless `force` is given, and then say they were forced (FR-CKP-24).
 //!
+//! KNSH-087 adds [`retention`]: checkpoints are kept until the first limit is reached (5 GB per volume, 200 per root,
+//! 7 days, FR-CKP-32), sensitive files' pre-images at most 24 hours (FR-CKP-33, NFR-PRIV-07), and
+//! [`History::forget`] removes a session's or a period's checkpoints at once (FR-CKP-34). A removed change is
+//! expired in the history tree, so its undo or redo is refused as expired. Excluded folders (`checkpoints.exclude`,
+//! FR-CKP-31) come from the profile (`knsh_core::DEFAULT_CHECKPOINT_EXCLUDES` unless a profile replaces the list).
+//!
 //! KNSH-081 adds [`attribution`]: each change in a root is attributed to the supervised line running there
 //! (`command`), to the lines overlapping there as one set (`concurrent`), to the envelope's agent between lines
 //! (`agent_edit`), or to nobody supervised (`external`), grouped into the edges the history tree will store. File
@@ -52,8 +58,9 @@
 //! # Specification
 //!
 //! - `specs/03-functional-requirements/checkpoints.md`: FR-CKP-01 to FR-CKP-11, FR-CKP-20 to FR-CKP-23, FR-CKP-25,
-//!   FR-CKP-24, FR-CKP-30, FR-CKP-31, FR-CKP-35, FR-CKP-36; history tree operations (`checkpoint.restore`,
+//!   FR-CKP-24, FR-CKP-30 to FR-CKP-36; history tree operations (`checkpoint.restore`,
 //!   `checkpoint.diff`, KNSH-086)
+//! - NFR-PRIV-07 (sensitive pre-images kept 24 hours at most), FR-REC-10 and NFR-PRIV-03 (forget with checkpoints)
 //! - FR-EVT-08 (`file.changed`), NFR-REL-04 (rescan after a restart) and decision 16 (closing a line, dropped events)
 //! - Decision 17: memory-mapped writes, possibly torn files
 //! - NFR-PERF-06 and decision 15 (`specs/09-reference/decisions.md`): how the initial shadow is built and timed
@@ -71,6 +78,7 @@ pub mod diff;
 mod error;
 pub mod identity;
 pub mod restore;
+pub mod retention;
 pub mod shadow;
 pub mod store;
 pub mod torn;
@@ -90,6 +98,9 @@ pub use diff::{DiffPage, DiffRequest, MAX_DIFF_PAGE, MAX_DIFF_PAGE_BYTES};
 pub use error::CheckpointError;
 pub use identity::{HASH_LIMIT, PostImageIdentity, post_image_identity};
 pub use restore::{JOURNAL_FORMAT, RESTORES_DIR, RestoreOutcome, RestoreRequest, recover_restores, restore};
+pub use retention::{
+    Forget, RETAINED_AGE, RETAINED_BYTES_PER_VOLUME, RETAINED_PER_ROOT, Retention, SENSITIVE_AGE, Swept,
+};
 pub use shadow::{
     Gate, PlatformShadowFiles, RootReadiness, SHADOW_BUDGET, SHADOW_THREADS, Shadow, ShadowFailure, ShadowFiles,
     ShadowPlan, ShadowProgress, ShadowStatus, ShadowSummary, gate, line_touches_root, shadow_dir, start_shadow,

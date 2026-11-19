@@ -112,7 +112,8 @@ impl History {
     /// # Errors
     ///
     /// [`CheckpointError::History`] for an unknown record or state ([`HistoryError::UnknownChange`],
-    /// [`HistoryError::UnknownState`]); [`CheckpointError::NotOwnChange`] when an agent asks for a diff that
+    /// [`HistoryError::UnknownState`]), or one whose way crosses a removed checkpoint ([`HistoryError::Expired`],
+    /// KNSH-087); [`CheckpointError::NotOwnChange`] when an agent asks for a diff that
     /// includes a change not its own session's. A file that cannot be read is not an error: it is reported
     /// `unavailable`.
     pub fn diff(&self, request: &DiffRequest) -> Result<DiffPage, CheckpointError> {
@@ -121,7 +122,12 @@ impl History {
             DiffTarget::Record(record) => {
                 let edge = tree
                     .edge_for_record(record)
-                    .ok_or(CheckpointError::History(HistoryError::UnknownChange))?;
+                    .ok_or_else(|| CheckpointError::History(self.missing_record(record)))?;
+                // KNSH-087: an expired edge still in the tree makes the route below fail as expired; authorize the
+                // line's own change first, so another session's agent learns nothing about it (as in undo).
+                if let Caller::Agent(_) = request.caller {
+                    self.authorize(request.caller, self.origin(edge.checkpoint)?)?;
+                }
                 (edge.from, edge.to)
             }
             DiffTarget::State(state) => (state, tree.head()),

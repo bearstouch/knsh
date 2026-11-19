@@ -682,3 +682,18 @@ fn reads_non_tls_hosts() {
     assert_eq!(profile.network.non_tls_hosts, ["git.corp"]);
     assert!(load_text("[network]\nnon_tls_hosts = [3]\n").is_err());
 }
+
+// FR-CKP-31 (KNSH-087): `checkpoints.exclude` replaces the default list rather than adding to it.
+#[test]
+fn checkpoint_exclude_replaces_the_defaults() {
+    let source = Source::default().with(
+        "own",
+        "name = \"own\"\n[checkpoints]\nexclude = [\"vendor\", \"node_modules\"]\n",
+    );
+    let profile = load(&source, "own").unwrap();
+    assert_eq!(profile.checkpoints.exclude, ["vendor", "node_modules"]);
+    assert!(!profile.checkpoints.exclude.iter().any(|name| name == "target"));
+
+    let source = Source::default().with("none", "name = \"none\"\n[checkpoints]\nexclude = []\n");
+    assert_eq!(load(&source, "none").unwrap().checkpoints.exclude, Vec::<String>::new());
+}

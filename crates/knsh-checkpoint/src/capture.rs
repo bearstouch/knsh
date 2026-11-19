@@ -41,8 +41,9 @@
 //! store), so two changes of one checkpoint never race to create it.
 //!
 //! **Pending:** checkpoints are not yet written to disk with an index of their paths (the history tree's persistence,
-//! KNSH-083), and their folders are not yet removed by retention (KNSH-087). Pre-images of changes no session claimed
-//! are removed at once.
+//! KNSH-083). Retention removes a checkpoint's folder once the checkpoint is in the history ([`crate::retention`],
+//! KNSH-087); until `knshd` feeds the history (KNSH-088), finished checkpoints are not removed. Pre-images of changes
+//! no session claimed are removed at once.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
