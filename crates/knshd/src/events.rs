@@ -398,6 +398,8 @@ fn subscribe_error(error: SubscribeError, session_id: Option<SessionId>) -> RpcE
             | CoreError::InvalidDecision
             | CoreError::InvalidAgentId
             | CoreError::InvalidProfileName
+            | CoreError::EmptySecretValue
+            | CoreError::RedactionTooLarge
             | CoreError::InvalidSecretName
             | CoreError::HumanRecording
             | CoreError::HumanProfile
