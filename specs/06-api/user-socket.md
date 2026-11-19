@@ -191,7 +191,37 @@ At least one of `session_id` and `since` is required (`-32602` otherwise); with 
 
 Result: `{"deleted": n}`, the number of records deleted.
 
-Until checkpoints exist (phase 3), `with_checkpoints: true` is refused with `-32005` and `data.capability` `"checkpoints"`, before anything is deleted: the flag is never silently ignored.
+With `with_checkpoints: true` the matching checkpoints are removed first, at once and whatever their age (FR-CKP-34, KNSH-088): every change of the session, or made (or stepped back over) at or after `since`, with both selectors combined like records ([forget](../03-functional-requirements/checkpoints.md#history-tree)). Their undo, redo, diff and restore are then refused as `expired`. Where checkpoints cannot be taken (`file_events` is `none`), `with_checkpoints: true` is refused with `-32005` and `data.capability` `"checkpoints"`, before anything is deleted: the flag is never silently ignored.
+
+## Checkpoints
+
+The `checkpoint.*` methods (KNSH-088) act on the daemon's history of changes ([history tree](../03-functional-requirements/checkpoints.md#history-tree)). On `user.sock` the caller is the user, on the control service the authority: both see every session's changes and may use `force` and `checkpoint.restore`. On `agent.sock` the caller is the connection's agent session: only its own changes (and reverts of them), never external edits, never `force`, never `checkpoint.restore` (FR-CKP-21). They are listed in `hello` only where checkpoints can be taken (`file_events` is not `none`); elsewhere every call is `-32005` with `capability: "checkpoints"`. The history is kept in memory: a restarted `knshd` starts with an empty one (pending).
+
+### `checkpoint.undo`, `checkpoint.redo`
+
+| Param | Type | Notes |
+| --- | --- | --- |
+| `record_id` | ULID | A line's change; for a line of a concurrent set, the whole set (FR-CKP-07) |
+| `checkpoint_id` | ULID | The change a checkpoint holds, such as a run of agent edits, which has no line |
+| `force` | bool, optional | Restore paths whose identity no longer matches, and possibly-torn files; default `false`. On `agent.sock` it is `-32003` before anything is looked up (FR-CKP-21) |
+
+Exactly one of `record_id` and `checkpoint_id` (`-32602` otherwise). Result: `{"operation", "checkpoint_id", "record_ids", "roots", "state_id", "files_restored", "restored", "restored_incomplete", "not_restored", "not_restored_incomplete", "irreversible", "forced", "skipped_torn", "forced_torn"}`: the change, the state the history is in now, every path restored (`restored` lists at most 1,000, `files_restored` counts them all), the excluded folders not restored (FR-CKP-31), what cannot be undone (FR-CKP-36), and the possibly-torn files skipped or forced (FR-CKP-24). `checkpoint.restored` is published on each session of the change (FR-CKP-25).
+
+Errors: `-32004` when a path conflicts (FR-CKP-20, reasons as in [errors](errors.md)), or when later changes touched the same paths as an older change (FR-CKP-30, reason `later_change`); nothing is restored either way. `-32602` with `data.reason`: `unknown` (no such change), `expired` (removed by retention or `knsh forget --with-checkpoints`), `not_in_effect` (already undone, or on a branch the history left), `not_undone` (nothing to redo), `redo_blocked` (a later change started another branch: `checkpoint.restore` returns to it). `-32003` on `agent.sock` for another session's change or an external edit.
+
+### `checkpoint.list`
+
+| Param | Type | Notes |
+| --- | --- | --- |
+| `session_id` | ULID, optional | Only changes belonging to this session. On `agent.sock` only the caller's own (`-32003` otherwise) |
+| `cursor` | ULID, optional | The previous answer's `next_cursor` |
+| `limit` | int, optional | 1 to 256; default 256 |
+
+Result: `{"head", "changes": [...], "next_cursor"}`: the current state, and the changes oldest first (by checkpoint ID). A page may hold fewer than `limit` changes with a non-null `next_cursor` when more would not fit in one frame. Each change: `{"checkpoint_id", "created_at", "kind": "change" | "revert", "attribution", "reverts", "record_ids", "session_ids", "roots", "files_changed", "uncertain", "from", "to", "status"}`: `attribution` (`command`, `agent_edit`, `external`, `concurrent`) is null for a revert, `reverts` (the change a revert undid) null for a change; `from` and `to` are its states; `status` is `in_effect`, `undone` (stepped back over with its versions saved: redo applies while its `from` is the head), `inactive` (reverted, or on a branch the history left), or `expired`. On `agent.sock`, `session_ids` lists only the caller's own session. **Known limit:** `head`, `from` and `to` are the daemon's state numbers, so an agent can infer how many changes other sessions made (never what they changed).
+
+### `checkpoint.diff`, `checkpoint.restore`
+
+As specified with the [history tree](../03-functional-requirements/checkpoints.md#history-tree) (KNSH-086). On the sockets, each text diff of a `checkpoint.diff` answer goes in its own binary stream, numbered from 1 in the answer and sent, one after the other, right after it. On the control service, whose messages carry at most one data value, an answer in binary values lists one path at a time (`next_cursor` names it); with base64 the page is as on the sockets. `checkpoint.restore` is `-32003` on `agent.sock`, and its errors are those of undo; `-32602` with `unknown` for a state the history does not have.
 
 ## Events
 

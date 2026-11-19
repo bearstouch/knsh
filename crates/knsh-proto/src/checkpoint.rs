@@ -8,13 +8,17 @@
 //!   `content_type`), closed by an end-of-stream frame, or inline base64 for a client that opted out of binary frames
 //!   (`specs/06-api/wire-format.md`).
 //!
+//! - KNSH-088: `checkpoint.undo` and `checkpoint.redo` (one change, by its line or its checkpoint), `checkpoint.list`
+//!   (the changes of the history, with where each stands), and how a refusal of the history becomes an API error
+//!   ([`history_error`]).
+//!
 //! Parameters come from untrusted clients: each is bounded and parsed strictly, and anything else is `-32602`.
 
 use std::io::Write;
 
 use knsh_core::{
-    CanonicalPath, CheckpointId, Diff, DiffTarget, FileDiff, RecordId, RestoreConflict, RestoreOperation, StateId,
-    TextDiff, TornPath,
+    Attribution, CanonicalPath, CheckpointId, Diff, DiffTarget, FileDiff, HistoryError, RecordId, RestoreConflict,
+    RestoreOperation, SessionId, StateId, TextDiff, Timestamp, TornPath,
 };
 use knsh_json::{Fields, FrameWriter, FromJson, JsonError, MAX_OPEN_STREAMS, Object, StreamId, ToJson, Value};
 
@@ -61,6 +65,360 @@ fn conflicts_data(conflicts: &[RestoreConflict]) -> Result<Object, JsonError> {
         list.push(Value::Object(entry));
     }
     Object::new().with("conflicts", Value::Array(list))
+}
+
+/// `-32004` for an older change that later changes overlap (FR-CKP-30): `data.conflicts` lists each path both
+/// touched with the reason `later_change`. A change whose path list was cut short or scrubbed overlaps every later
+/// change, so the list may be empty or partial: the refusal stands either way. Nothing was restored.
+#[must_use]
+pub fn overlap_conflict(paths: &[CanonicalPath]) -> RpcError {
+    let mut list = Vec::with_capacity(paths.len());
+    for path in paths {
+        match Object::new()
+            .with("path", path_text(path))
+            .and_then(|entry| entry.with("reason", LATER_CHANGE))
+        {
+            Ok(entry) => list.push(Value::Object(entry)),
+            // Fixed keys written once: cannot fail. The code alone still says what happened.
+            Err(_) => return RpcError::new(ErrorCode::UndoConflict),
+        }
+    }
+    match Object::new().with("conflicts", Value::Array(list)) {
+        Ok(data) => RpcError::new(ErrorCode::UndoConflict).with_data(Value::Object(data)),
+        Err(_) => RpcError::new(ErrorCode::UndoConflict),
+    }
+}
+
+/// The `-32004` conflict reason of a path a later change also touched (FR-CKP-30, KNSH-088).
+pub const LATER_CHANGE: &str = "later_change";
+
+/// The most conflicting paths one `-32004` answer lists, so the answer always fits a frame.
+pub const MAX_LISTED_CONFLICTS: usize = 1_000;
+
+/// The API error for a refusal of the history tree (KNSH-088, `specs/06-api/errors.md`):
+///
+/// - an older change overlapped by later ones (FR-CKP-30) is `-32004` with each shared path ([`overlap_conflict`],
+///   at most [`MAX_LISTED_CONFLICTS`]);
+/// - a change or state the history does not know, or can no longer act on, is `-32602` with `data.reason`:
+///   `unknown`, `expired` (removed by retention or `knsh forget --with-checkpoints`), `not_in_effect` (already
+///   undone, or on a branch the head left), `not_undone` (nothing to redo), or `redo_blocked` (a later change started
+///   another branch: `checkpoint.restore` returns to it);
+/// - anything else is the engine's own failure, `-32603` with no detail.
+#[must_use]
+pub fn history_error(error: &HistoryError) -> RpcError {
+    let reason = match error {
+        HistoryError::Conflict { paths, .. } => {
+            let listed: Vec<CanonicalPath> = paths.iter().take(MAX_LISTED_CONFLICTS).cloned().collect();
+            return overlap_conflict(&listed);
+        }
+        HistoryError::UnknownChange | HistoryError::UnknownState => "unknown",
+        HistoryError::Expired => "expired",
+        HistoryError::NotInEffect => "not_in_effect",
+        HistoryError::NotUndone => "not_undone",
+        HistoryError::RedoBlocked => "redo_blocked",
+        HistoryError::Stale
+        | HistoryError::SavedVersions
+        | HistoryError::DuplicateCheckpoint
+        | HistoryError::DuplicateRecord
+        | HistoryError::StatesExhausted
+        | HistoryError::UnencodablePath
+        | HistoryError::TooLarge
+        | HistoryError::NewerFormat(_)
+        | HistoryError::Corrupt => return RpcError::new(ErrorCode::InternalError),
+    };
+    match Object::new().with("reason", reason) {
+        Ok(data) => RpcError::new(ErrorCode::InvalidParams).with_data(Value::Object(data)),
+        Err(_) => RpcError::new(ErrorCode::InvalidParams),
+    }
+}
+
+/// Which change `checkpoint.undo` or `checkpoint.redo` acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeTarget {
+    /// A line's change (`record_id`): for a line of a concurrent set, the whole set (FR-CKP-07).
+    Record(RecordId),
+    /// The change a checkpoint holds (`checkpoint_id`), such as a run of agent edits, which has no line.
+    Checkpoint(CheckpointId),
+}
+
+/// The parameters of `checkpoint.undo` and `checkpoint.redo` (KNSH-088): exactly one of `record_id` and
+/// `checkpoint_id`, and `force`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointUndoParams {
+    /// The change.
+    pub target: ChangeTarget,
+    /// Restore paths whose identity no longer matches, and possibly-torn paths (user and authority only,
+    /// FR-CKP-21); `false` when absent. `knshd` refuses it on `agent.sock` before anything else.
+    pub force: bool,
+}
+
+impl FromJson for CheckpointUndoParams {
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let mut fields = Fields::new(value)?;
+        let record_id = fields.optional::<String>("record_id")?;
+        let checkpoint_id = fields.optional::<String>("checkpoint_id")?;
+        let force = fields.optional::<bool>("force")?.unwrap_or(false);
+        fields.finish()?;
+        let target = match (record_id, checkpoint_id) {
+            (Some(record), None) => ChangeTarget::Record(record.parse().map_err(|_| out_of_range("record_id"))?),
+            (None, Some(checkpoint)) => {
+                ChangeTarget::Checkpoint(checkpoint.parse().map_err(|_| out_of_range("checkpoint_id"))?)
+            }
+            // Neither or both: never guessed at.
+            (None, None) | (Some(_), Some(_)) => return Err(out_of_range("record_id")),
+        };
+        Ok(Self { target, force })
+    }
+}
+
+impl ToJson for CheckpointUndoParams {
+    /// `force` is written only when set.
+    fn to_json(&self) -> Result<Value, JsonError> {
+        let mut object = match self.target {
+            ChangeTarget::Record(record) => Object::new().with("record_id", record.to_string())?,
+            ChangeTarget::Checkpoint(checkpoint) => Object::new().with("checkpoint_id", checkpoint.to_string())?,
+        };
+        if self.force {
+            object.insert("force", Value::from(true))?;
+        }
+        Ok(Value::Object(object))
+    }
+}
+
+/// The result of `checkpoint.undo` and `checkpoint.redo` (KNSH-088).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointUndoResult {
+    /// Undo or redo.
+    pub operation: RestoreOperation,
+    /// The change undone or redone: its checkpoint.
+    pub checkpoint_id: CheckpointId,
+    /// Its lines; empty for agent and external edits.
+    pub record_ids: Vec<RecordId>,
+    /// The checkpoint roots it covers.
+    pub roots: Vec<CanonicalPath>,
+    /// The state the history is in now.
+    pub state_id: StateId,
+    /// Every path restored, sorted.
+    pub restored: Vec<CanonicalPath>,
+    /// Excluded folders the change touched: not restored (FR-CKP-31).
+    pub not_restored: Vec<CanonicalPath>,
+    /// More excluded folders were changed than `not_restored` lists.
+    pub not_restored_incomplete: bool,
+    /// What the change did that no restore can undo (FR-CKP-36); its files were still restored.
+    pub irreversible: Vec<String>,
+    /// Whether `force` overrode a check.
+    pub forced: bool,
+    /// Possibly-torn files skipped (FR-CKP-24).
+    pub skipped_torn: Vec<TornPath>,
+    /// Possibly-torn files restored under `force` (FR-CKP-24).
+    pub forced_torn: Vec<TornPath>,
+}
+
+impl ToJson for CheckpointUndoResult {
+    /// `{"operation", "checkpoint_id", "record_ids", "roots", "state_id", "files_restored", "restored",
+    /// "restored_incomplete", "not_restored", "not_restored_incomplete", "irreversible", "forced", "skipped_torn",
+    /// "forced_torn"}`. `files_restored` counts every path restored; `restored` lists at most
+    /// [`MAX_LISTED_RESTORED`] of them, so the answer always fits a frame.
+    fn to_json(&self) -> Result<Value, JsonError> {
+        let records: Vec<Value> = self.record_ids.iter().map(|id| Value::from(id.to_string())).collect();
+        Ok(Value::Object(
+            Object::new()
+                .with("operation", self.operation.as_str())?
+                .with("checkpoint_id", self.checkpoint_id.to_string())?
+                .with("record_ids", Value::Array(records))?
+                .with("roots", paths(&self.roots, usize::MAX))?
+                .with("state_id", self.state_id.get().to_json()?)?
+                .with("files_restored", (self.restored.len() as u64).to_json()?)?
+                .with("restored", paths(&self.restored, MAX_LISTED_RESTORED))?
+                .with("restored_incomplete", self.restored.len() > MAX_LISTED_RESTORED)?
+                .with("not_restored", paths(&self.not_restored, usize::MAX))?
+                .with("not_restored_incomplete", self.not_restored_incomplete)?
+                .with("irreversible", strings(&self.irreversible))?
+                .with("forced", self.forced)?
+                .with("skipped_torn", torn_list(&self.skipped_torn)?)?
+                .with("forced_torn", torn_list(&self.forced_torn)?)?,
+        ))
+    }
+}
+
+/// The most changes one `checkpoint.list` answer lists, and its default.
+pub const MAX_LIST_PAGE: u32 = 256;
+
+/// The parameters of `checkpoint.list` (KNSH-088).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointListParams {
+    /// Only changes belonging to this session. On `agent.sock` it may only name the caller's own session.
+    pub session_id: Option<SessionId>,
+    /// The previous answer's `next_cursor`: only changes after that checkpoint.
+    pub cursor: Option<CheckpointId>,
+    /// Changes per answer, 1 to [`MAX_LIST_PAGE`]; [`MAX_LIST_PAGE`] when absent.
+    pub limit: u32,
+}
+
+impl FromJson for CheckpointListParams {
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let mut fields = Fields::new(value)?;
+        let session_id = fields
+            .optional::<String>("session_id")?
+            .map(|id| id.parse().map_err(|_| out_of_range("session_id")))
+            .transpose()?;
+        let cursor = fields
+            .optional::<String>("cursor")?
+            .map(|id| id.parse().map_err(|_| out_of_range("cursor")))
+            .transpose()?;
+        let limit = fields.optional::<u32>("limit")?.unwrap_or(MAX_LIST_PAGE);
+        fields.finish()?;
+        if !(1..=MAX_LIST_PAGE).contains(&limit) {
+            return Err(out_of_range("limit"));
+        }
+        Ok(Self {
+            session_id,
+            cursor,
+            limit,
+        })
+    }
+}
+
+impl ToJson for CheckpointListParams {
+    /// Absent filters are left out; `limit` is written only when not the default.
+    fn to_json(&self) -> Result<Value, JsonError> {
+        let mut object = Object::new();
+        if let Some(session_id) = self.session_id {
+            object.insert("session_id", Value::from(session_id.to_string()))?;
+        }
+        if let Some(cursor) = self.cursor {
+            object.insert("cursor", Value::from(cursor.to_string()))?;
+        }
+        if self.limit != MAX_LIST_PAGE {
+            object.insert("limit", self.limit.to_json()?)?;
+        }
+        Ok(Value::Object(object))
+    }
+}
+
+/// What an edge of the history stands for, in `checkpoint.list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListedKind {
+    /// A captured change, with how it was attributed.
+    Change(Attribution),
+    /// The undo of an older change made on top of later ones (a revert, FR-CKP-30): the change it reverted.
+    Revert(CheckpointId),
+}
+
+/// Where a change stands relative to the current state, in `checkpoint.list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListedStatus {
+    /// Part of the current state and not undone: `checkpoint.undo` applies.
+    InEffect,
+    /// Stepped back over by an undo, with the versions it replaced saved: `checkpoint.redo` applies while its
+    /// parent state is the current one, `checkpoint.restore` otherwise.
+    Undone,
+    /// Reverted by a later undo, or on a branch the current state left without saved versions.
+    Inactive,
+    /// Removed by retention or `knsh forget --with-checkpoints`: nothing can be done with it any more.
+    Expired,
+}
+
+impl ListedStatus {
+    /// The wire value: `in_effect`, `undone`, `inactive` or `expired`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InEffect => "in_effect",
+            Self::Undone => "undone",
+            Self::Inactive => "inactive",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+/// One change of `checkpoint.list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedChange {
+    /// Its checkpoint: what identifies it for undo and redo.
+    pub checkpoint_id: CheckpointId,
+    /// A change or a revert.
+    pub kind: ListedKind,
+    /// Its lines; empty for agent and external edits and reverts.
+    pub record_ids: Vec<RecordId>,
+    /// The sessions it belongs to (on `agent.sock`, only the caller's own).
+    pub session_ids: Vec<SessionId>,
+    /// The checkpoint roots it covers.
+    pub roots: Vec<CanonicalPath>,
+    /// How many paths it changed.
+    pub files_changed: u64,
+    /// It may be incomplete (FR-CKP-04).
+    pub uncertain: bool,
+    /// The state it starts from.
+    pub from: StateId,
+    /// The state it leads to.
+    pub to: StateId,
+    /// Where it stands.
+    pub status: ListedStatus,
+}
+
+impl ToJson for ListedChange {
+    /// `{"checkpoint_id", "created_at", "kind": "change" | "revert", "attribution", "reverts", "record_ids",
+    /// "session_ids", "roots", "files_changed", "uncertain", "from", "to", "status"}`: `attribution` is null for a
+    /// revert, `reverts` null for a change. `created_at` is the time in the checkpoint's ID (its first captured
+    /// change, or the undo that made a revert).
+    fn to_json(&self) -> Result<Value, JsonError> {
+        let (kind, attribution, reverts) = match self.kind {
+            ListedKind::Change(attribution) => ("change", Value::from(attribution.as_str()), Value::Null),
+            ListedKind::Revert(of) => ("revert", Value::Null, Value::from(of.to_string())),
+        };
+        let created_at = self
+            .checkpoint_id
+            .ulid()
+            .millis()
+            .checked_mul(1_000)
+            .and_then(|micros| Timestamp::from_unix_micros(micros).ok())
+            .map_or(Value::Null, |time| Value::from(time.to_string()));
+        let records: Vec<Value> = self.record_ids.iter().map(|id| Value::from(id.to_string())).collect();
+        let sessions: Vec<Value> = self.session_ids.iter().map(|id| Value::from(id.to_string())).collect();
+        Ok(Value::Object(
+            Object::new()
+                .with("checkpoint_id", self.checkpoint_id.to_string())?
+                .with("created_at", created_at)?
+                .with("kind", kind)?
+                .with("attribution", attribution)?
+                .with("reverts", reverts)?
+                .with("record_ids", Value::Array(records))?
+                .with("session_ids", Value::Array(sessions))?
+                .with("roots", paths(&self.roots, usize::MAX))?
+                .with("files_changed", self.files_changed.to_json()?)?
+                .with("uncertain", self.uncertain)?
+                .with("from", self.from.get().to_json()?)?
+                .with("to", self.to.get().to_json()?)?
+                .with("status", self.status.as_str())?,
+        ))
+    }
+}
+
+/// The result of `checkpoint.list` (KNSH-088).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointListResult {
+    /// The current state.
+    pub head: StateId,
+    /// The changes of this page, oldest first (by checkpoint ID).
+    pub changes: Vec<ListedChange>,
+    /// The `cursor` of the next page; `None` on the last.
+    pub next_cursor: Option<CheckpointId>,
+}
+
+impl ToJson for CheckpointListResult {
+    fn to_json(&self) -> Result<Value, JsonError> {
+        Ok(Value::Object(
+            Object::new()
+                .with("head", self.head.get().to_json()?)?
+                .with("changes", self.changes.to_json()?)?
+                .with(
+                    "next_cursor",
+                    self.next_cursor
+                        .map_or(Value::Null, |cursor| Value::from(cursor.to_string())),
+                )?,
+        ))
+    }
 }
 
 /// The parameters of `checkpoint.restore` (`user.sock` and the authority only, KNSH-086).
@@ -326,6 +684,20 @@ fn torn_list(torn: &[TornPath]) -> Result<Value, JsonError> {
     Ok(Value::Array(list))
 }
 
+/// At most `limit` of `list` as JSON strings.
+fn paths(list: &[CanonicalPath], limit: usize) -> Value {
+    Value::Array(
+        list.iter()
+            .take(limit)
+            .map(|path| Value::from(path_text(path)))
+            .collect(),
+    )
+}
+
+fn strings(list: &[String]) -> Value {
+    Value::Array(list.iter().map(|text| Value::from(text.as_str())).collect())
+}
+
 /// Paths are shown like `cwd`: APFS names are UTF-8, anything else gets U+FFFD.
 fn path_text(path: &CanonicalPath) -> String {
     path.as_path().to_string_lossy().into_owned()
@@ -411,6 +783,190 @@ mod tests {
     }
 
     // KNSH-086: `state_id` is required and bounded; `force` defaults to false.
+    const CHECKPOINT: &str = "01JCZ0000000000000000000CK";
+    const SESSION: &str = "01JCZ0000000000000000000SS";
+
+    // KNSH-088: exactly one of record_id and checkpoint_id; force only as a boolean; nothing else.
+    #[test]
+    fn undo_params_take_exactly_one_target() {
+        let by_record: CheckpointUndoParams = params(&format!(r#"{{"record_id":"{RECORD}"}}"#)).unwrap();
+        assert_eq!(by_record.target, ChangeTarget::Record(RECORD.parse().unwrap()));
+        assert!(!by_record.force);
+        let by_checkpoint: CheckpointUndoParams =
+            params(&format!(r#"{{"checkpoint_id":"{CHECKPOINT}","force":true}}"#)).unwrap();
+        assert_eq!(
+            by_checkpoint.target,
+            ChangeTarget::Checkpoint(CHECKPOINT.parse().unwrap())
+        );
+        assert!(by_checkpoint.force);
+        for bad in [
+            "{}".to_owned(),
+            format!(r#"{{"record_id":"{RECORD}","checkpoint_id":"{CHECKPOINT}"}}"#),
+            r#"{"record_id":"nope"}"#.to_owned(),
+            format!(r#"{{"record_id":"{RECORD}","force":"yes"}}"#),
+        ] {
+            assert!(params::<CheckpointUndoParams>(&bad).is_err(), "{bad}");
+        }
+        // The CLI writes what knshd reads.
+        for parsed in [by_record, by_checkpoint] {
+            assert_eq!(
+                CheckpointUndoParams::from_json(&parsed.to_json().unwrap()).unwrap(),
+                parsed
+            );
+        }
+    }
+
+    #[test]
+    fn list_params_are_bounded() {
+        let all: CheckpointListParams = params("{}").unwrap();
+        assert_eq!((all.session_id, all.cursor, all.limit), (None, None, MAX_LIST_PAGE));
+        let some: CheckpointListParams = params(&format!(
+            r#"{{"session_id":"{SESSION}","cursor":"{CHECKPOINT}","limit":5}}"#
+        ))
+        .unwrap();
+        assert_eq!(some.session_id, Some(SESSION.parse().unwrap()));
+        assert_eq!(some.cursor, Some(CHECKPOINT.parse().unwrap()));
+        assert_eq!(some.limit, 5);
+        assert_eq!(CheckpointListParams::from_json(&some.to_json().unwrap()).unwrap(), some);
+        for bad in [
+            r#"{"limit":0}"#,
+            r#"{"limit":257}"#,
+            r#"{"session_id":"x"}"#,
+            r#"{"cursor":"x"}"#,
+        ] {
+            assert!(params::<CheckpointListParams>(bad).is_err(), "{bad}");
+        }
+    }
+
+    // KNSH-088: a refusal of the history tree becomes the API error the spec names, with a reason a client can act
+    // on and never a path in the message.
+    #[test]
+    fn history_refusals_map_to_api_errors() {
+        let reason = |error: &RpcError| {
+            error
+                .data
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|data| data.get("reason"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        for (error, expected) in [
+            (HistoryError::UnknownChange, "unknown"),
+            (HistoryError::UnknownState, "unknown"),
+            (HistoryError::Expired, "expired"),
+            (HistoryError::NotInEffect, "not_in_effect"),
+            (HistoryError::NotUndone, "not_undone"),
+            (HistoryError::RedoBlocked, "redo_blocked"),
+        ] {
+            let rpc = history_error(&error);
+            assert_eq!(rpc.code, ErrorCode::InvalidParams, "{error}");
+            assert_eq!(reason(&rpc).as_deref(), Some(expected), "{error}");
+        }
+        for error in [
+            HistoryError::Stale,
+            HistoryError::Corrupt,
+            HistoryError::StatesExhausted,
+        ] {
+            let rpc = history_error(&error);
+            assert_eq!(rpc.code, ErrorCode::InternalError, "{error}");
+            assert!(rpc.data.is_none());
+        }
+        // FR-CKP-30: the shared paths, as -32004 conflicts.
+        let overlap = history_error(&HistoryError::Conflict {
+            paths: [path("/r/a"), path("/r/b")].into_iter().collect(),
+            incomplete: false,
+        });
+        assert_eq!(overlap.code, ErrorCode::UndoConflict);
+        let conflicts = overlap
+            .data
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|data| data.get("conflicts"))
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(conflicts.len(), 2);
+        let first = conflicts[0].as_object().unwrap();
+        assert_eq!(first.get("path").and_then(Value::as_str), Some("/r/a"));
+        assert_eq!(first.get("reason").and_then(Value::as_str), Some(LATER_CHANGE));
+    }
+
+    #[test]
+    fn undo_result_lists_what_was_restored() {
+        let result = CheckpointUndoResult {
+            operation: RestoreOperation::Undo,
+            checkpoint_id: CHECKPOINT.parse().unwrap(),
+            record_ids: vec![RECORD.parse().unwrap()],
+            roots: vec![path("/r")],
+            state_id: StateId::new(3).unwrap(),
+            restored: vec![path("/r/a"), path("/r/b")],
+            not_restored: vec![path("/r/node_modules")],
+            not_restored_incomplete: false,
+            irreversible: vec![String::from("network")],
+            forced: false,
+            skipped_torn: vec![TornPath {
+                path: path("/r/db"),
+                reason: TornReason::SqliteJournal,
+            }],
+            forced_torn: Vec::new(),
+        };
+        let value = result.to_json().unwrap();
+        let object = object(&value);
+        assert_eq!(object.get("operation").and_then(Value::as_str), Some("undo"));
+        assert_eq!(object.get("checkpoint_id").and_then(Value::as_str), Some(CHECKPOINT));
+        assert_eq!(object.get("state_id").and_then(Value::as_i64), Some(3));
+        assert_eq!(object.get("files_restored").and_then(Value::as_i64), Some(2));
+        assert_eq!(object.get("restored_incomplete").and_then(Value::as_bool), Some(false));
+        let torn = object.get("skipped_torn").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            torn[0].as_object().unwrap().get("reason").and_then(Value::as_str),
+            Some("sqlite_journal")
+        );
+        assert_eq!(object.len(), 14);
+    }
+
+    #[test]
+    fn listed_change_says_where_it_stands() {
+        let change = ListedChange {
+            checkpoint_id: CHECKPOINT.parse().unwrap(),
+            kind: ListedKind::Change(Attribution::Command),
+            record_ids: vec![RECORD.parse().unwrap()],
+            session_ids: vec![SESSION.parse().unwrap()],
+            roots: vec![path("/r")],
+            files_changed: 2,
+            uncertain: false,
+            from: StateId::new(1).unwrap(),
+            to: StateId::new(2).unwrap(),
+            status: ListedStatus::Undone,
+        };
+        let revert = ListedChange {
+            kind: ListedKind::Revert(CHECKPOINT.parse().unwrap()),
+            record_ids: Vec::new(),
+            status: ListedStatus::InEffect,
+            ..change.clone()
+        };
+        let result = CheckpointListResult {
+            head: StateId::new(1).unwrap(),
+            changes: vec![change, revert],
+            next_cursor: None,
+        };
+        let value = result.to_json().unwrap();
+        let object = object(&value);
+        assert_eq!(object.get("head").and_then(Value::as_i64), Some(1));
+        assert_eq!(object.get("next_cursor"), Some(&Value::Null));
+        let changes = object.get("changes").and_then(Value::as_array).unwrap();
+        let first = changes[0].as_object().unwrap();
+        assert_eq!(first.get("kind").and_then(Value::as_str), Some("change"));
+        assert_eq!(first.get("attribution").and_then(Value::as_str), Some("command"));
+        assert_eq!(first.get("reverts"), Some(&Value::Null));
+        assert_eq!(first.get("status").and_then(Value::as_str), Some("undone"));
+        assert!(first.get("created_at").and_then(Value::as_str).is_some());
+        let second = changes[1].as_object().unwrap();
+        assert_eq!(second.get("kind").and_then(Value::as_str), Some("revert"));
+        assert_eq!(second.get("attribution"), Some(&Value::Null));
+        assert_eq!(second.get("reverts").and_then(Value::as_str), Some(CHECKPOINT));
+    }
+
     #[test]
     fn restore_params_parse_strictly() {
         let parsed: CheckpointRestoreParams = params(r#"{"state_id":3}"#).unwrap();

@@ -53,6 +53,9 @@ fn main() -> ExitCode {
             ["authority", "trust"] => authority_trust(&parsed),
             ["daemon", action @ ("install" | "uninstall")] => daemon(action, parsed.json()),
             ["forget"] => forget(&parsed),
+            ["undo"] => checkpoint_step(&parsed, knsh::cli::checkpoints::Step::Undo),
+            ["redo"] => checkpoint_step(&parsed, knsh::cli::checkpoints::Step::Redo),
+            ["checkpoints"] => checkpoints(&parsed),
             ["history"] => history(&parsed),
             ["policy", "edit"] => policy_edit(&parsed),
             ["policy", "grant"] => policy_grant(&parsed),
@@ -135,6 +138,73 @@ fn forget(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
         }
         Err(error) => {
             report(&forget::failure_message(&error));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs `knsh undo` or `knsh redo` (KNSH-088): a malformed ID is a usage error (exit 2) and sends nothing; otherwise
+/// it calls `checkpoint.undo` or `checkpoint.redo` on `user.sock` and reports what was restored. A refusal exits with
+/// 1 and says why on stderr, with each conflicting path.
+#[cfg(unix)]
+fn checkpoint_step(parsed: &knsh::cli::args::ParsedCommand, how: knsh::cli::checkpoints::Step) -> ExitCode {
+    use knsh::cli::{checkpoints, client};
+
+    let params = match checkpoints::step_params(parsed) {
+        Ok(params) => params,
+        Err(error) => return usage(&error, how.command()),
+    };
+    let socket = match user_socket() {
+        Ok(socket) => socket,
+        Err(code) => return code,
+    };
+    let outcome = client::connect_user(&socket)
+        .and_then(|mut client| checkpoints::step(&mut client, how, &params))
+        .map_err(|error| checkpoints::failure_message(how.command(), &error))
+        .and_then(|result| {
+            checkpoints::step_report(how, &result, parsed.json())
+                .map_err(|error| format!("knsh: {} failed: {error}\n", how.command()))
+        });
+    match outcome {
+        Ok(text) => {
+            let _ = std::io::stdout().write_all(text.as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            report(&message);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs `knsh checkpoints` (KNSH-088): reads every page of `checkpoint.list` on `user.sock` and prints each change,
+/// oldest first, then the current state. A failed call exits with 1 and the reason on stderr.
+#[cfg(unix)]
+fn checkpoints(parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    use knsh::cli::{checkpoints, client};
+
+    let session = match checkpoints::list_session(parsed) {
+        Ok(session) => session,
+        Err(error) => return usage(&error, "checkpoints"),
+    };
+    let socket = match user_socket() {
+        Ok(socket) => socket,
+        Err(code) => return code,
+    };
+    let listed = client::connect_user(&socket)
+        .and_then(|mut client| checkpoints::list(&mut client, session))
+        .map_err(|error| checkpoints::failure_message("checkpoints", &error))
+        .and_then(|(changes, head)| {
+            checkpoints::list_report(&changes, head, parsed.json())
+                .map_err(|error| format!("knsh: checkpoints failed: {error}\n"))
+        });
+    match listed {
+        Ok(text) => {
+            let _ = std::io::stdout().write_all(text.as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            report(&message);
             ExitCode::FAILURE
         }
     }
@@ -379,6 +449,18 @@ fn approvals(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
 #[cfg(not(unix))]
 fn answer_approval(_parsed: &knsh::cli::args::ParsedCommand, how: knsh::cli::approvals::Answer) -> ExitCode {
     not_implemented(&format!("'knsh {}' on this platform", how.command()))
+}
+
+/// `user.sock` is a Unix socket; no other platform has one.
+#[cfg(not(unix))]
+fn checkpoint_step(_parsed: &knsh::cli::args::ParsedCommand, how: knsh::cli::checkpoints::Step) -> ExitCode {
+    not_implemented(&format!("'knsh {}' on this platform", how.command()))
+}
+
+/// `user.sock` is a Unix socket; no other platform has one.
+#[cfg(not(unix))]
+fn checkpoints(_parsed: &knsh::cli::args::ParsedCommand) -> ExitCode {
+    not_implemented("'knsh checkpoints' on this platform")
 }
 
 /// `user.sock` is a Unix socket; no other platform has one.

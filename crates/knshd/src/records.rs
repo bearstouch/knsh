@@ -9,9 +9,11 @@
 //!
 //! `records.forget` exists on `user.sock` only: the catalogue keeps it off `agent.sock` (`-32003` there), and the
 //! handler checks the endpoint again, so an agent can never erase records. Records matching the selectors are
-//! deleted with their output in one transaction (FR-REC-10, NFR-PRIV-03). `with_checkpoints` is refused with
-//! `-32005` naming `checkpoints` until checkpoints exist (phase 3), before anything is deleted: the user asked for
-//! more than this build can do, so it does nothing rather than half of it.
+//! deleted with their output in one transaction (FR-REC-10, NFR-PRIV-03). With `with_checkpoints` the matching
+//! changes are first removed from the checkpoint history at once, whatever their age (FR-CKP-34, KNSH-088): a change
+//! of the session, or made (or stepped back over) since the instant. Where checkpoints cannot be taken (no
+//! [`ForgetCheckpoints`]), it is refused with `-32005` naming `checkpoints` before anything is deleted: the user asked
+//! for more than this machine can do, so it does nothing rather than half of it.
 //!
 //! # Scope
 //!
@@ -31,6 +33,7 @@
 
 use std::sync::Arc;
 
+use knsh_core::{SessionId, Timestamp};
 use knsh_json::ToJson;
 use knsh_proto::{
     Backend, ByteTransport, ErrorCode, MAX_BASE64_OUTPUT, OutputData, RecordEntry, RecordsForgetParams,
@@ -45,23 +48,56 @@ use crate::lifetime::{CommitFailed, PendingWrites};
 /// response envelope (`jsonrpc`, an `id` of at most 128 bytes even fully escaped, `next_cursor`).
 const QUERY_RESULT_BUDGET: usize = knsh_json::MAX_PAYLOAD - 4096;
 
+/// Where `records.forget` removes checkpoints (FR-CKP-34, KNSH-088): the daemon's history.
+pub(crate) trait ForgetCheckpoints: Send + Sync {
+    /// Removes at once every change of `session` (when given) made, or stepped back over, at or after `since` (when
+    /// given). At least one is given.
+    fn forget_checkpoints(&self, session: Option<SessionId>, since: Option<Timestamp>);
+}
+
 /// The record store as the handlers see it: absent when it could not be opened at start (for example a database
 /// from a newer engine, which is reported and left untouched).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Records {
     store: Option<RecordStore>,
+    /// The checkpoint history `with_checkpoints` forgets in; `None` where checkpoints cannot be taken.
+    checkpoints: Option<Arc<dyn ForgetCheckpoints>>,
+}
+
+impl std::fmt::Debug for Records {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Records")
+            .field("store", &self.store)
+            .field("checkpoints", &self.checkpoints.is_some())
+            .finish()
+    }
 }
 
 impl Records {
     /// Handlers over `store`.
     pub(crate) const fn new(store: Option<RecordStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            checkpoints: None,
+        }
+    }
+
+    /// The same handlers, with `records.forget` removing checkpoints from `checkpoints` when asked (KNSH-088).
+    #[must_use]
+    pub(crate) fn with_checkpoints(self, checkpoints: Arc<dyn ForgetCheckpoints>) -> Self {
+        Self {
+            checkpoints: Some(checkpoints),
+            ..self
+        }
     }
 
     /// No store: every call answers `-32603`.
     #[cfg(test)]
     pub(crate) const fn unavailable() -> Self {
-        Self { store: None }
+        Self {
+            store: None,
+            checkpoints: None,
+        }
     }
 
     fn store(&self) -> Result<&RecordStore, RpcError> {
@@ -95,15 +131,22 @@ impl Records {
             Endpoint::Agent | Endpoint::Control => return Err(RpcError::new(ErrorCode::NotAllowed)),
         }
         let params: RecordsForgetParams = call.request.params().map_err(|error| RpcError::from(&error))?;
-        if params.with_checkpoints {
-            // Honest capabilities: phase 1 has no checkpoints to delete. Refused before any record is touched.
-            return Err(capability_unavailable(Backend::Checkpoints.name()));
-        }
         // The protocol already requires a selector; a mismatch is still refused rather than widened to every record.
         let selector = ForgetSelector::new(params.session_id, params.since)
             .ok_or_else(|| RpcError::new(ErrorCode::InvalidParams))?;
-        let deleted = self
-            .store()?
+        // Without a store nothing can be deleted: refused before any checkpoint is removed.
+        let store = self.store()?;
+        if params.with_checkpoints {
+            // Honest capabilities: where checkpoints cannot be taken, refused before any record is touched.
+            let checkpoints = self
+                .checkpoints
+                .as_ref()
+                .ok_or_else(|| capability_unavailable(Backend::Checkpoints.name()))?;
+            // FR-CKP-34: removed at once, before the records. Were deleting the records to fail next, the user has
+            // still lost only what they asked to forget.
+            checkpoints.forget_checkpoints(params.session_id, params.since);
+        }
+        let deleted = store
             .forget(selector)
             .map_err(|error| store_error(Scope::All, &error))?;
         let result = RecordsForgetResult { deleted }
@@ -208,7 +251,11 @@ impl Records {
             ByteTransport::BinaryFrames => Some(range.data),
             ByteTransport::Base64 => None,
         };
-        Ok(Answer { result, bytes })
+        Ok(Answer {
+            result,
+            bytes,
+            streams: Vec::new(),
+        })
     }
 }
 
@@ -684,8 +731,8 @@ mod tests {
         assert_eq!(error.code, ErrorCode::InvalidParams);
     }
 
-    // Honest capabilities: phase 1 has no checkpoints, so --with-checkpoints is -32005 naming them, and nothing is
-    // deleted.
+    // Honest capabilities: where checkpoints cannot be taken, --with-checkpoints is -32005 naming them, and nothing
+    // is deleted.
     #[test]
     fn with_checkpoints_reports_capability_unavailable() {
         let dir = TempDir::new();
@@ -708,6 +755,43 @@ mod tests {
             .query(Scope::All, &call(&query, ByteTransport::BinaryFrames))
             .unwrap();
         assert_eq!(record_ids(&left).len(), 3, "nothing deleted");
+    }
+
+    /// Every `forget_checkpoints` call, in order.
+    #[derive(Default)]
+    struct ForgottenCheckpoints(std::sync::Mutex<Vec<(Option<SessionId>, Option<Timestamp>)>>);
+
+    impl ForgetCheckpoints for ForgottenCheckpoints {
+        fn forget_checkpoints(&self, session: Option<SessionId>, since: Option<Timestamp>) {
+            self.0.lock().unwrap().push((session, since));
+        }
+    }
+
+    // FR-CKP-34 (KNSH-088): with checkpoints wired in, --with-checkpoints removes the matching checkpoints with the
+    // same selectors, then the records; without the flag the history is not touched.
+    #[test]
+    fn with_checkpoints_forgets_the_matching_checkpoints_too() {
+        let dir = TempDir::new();
+        let forgotten = Arc::new(ForgottenCheckpoints::default());
+        let records = records(&dir).with_checkpoints(Arc::clone(&forgotten) as Arc<dyn ForgetCheckpoints>);
+        let plain = rpc("records.forget", &format!(r#"{{"session_id":"{}"}}"#, session(2)));
+        records.forget(&call(&plain, ByteTransport::BinaryFrames)).unwrap();
+        assert!(forgotten.0.lock().unwrap().is_empty());
+        let request = rpc(
+            "records.forget",
+            &format!(r#"{{"session_id":"{}","with_checkpoints":true}}"#, session(1)),
+        );
+        let answer = records.forget(&call(&request, ByteTransport::BinaryFrames)).unwrap();
+        assert_eq!(
+            answer
+                .result
+                .as_object()
+                .unwrap()
+                .get("deleted")
+                .and_then(Value::as_i64),
+            Some(2)
+        );
+        assert_eq!(*forgotten.0.lock().unwrap(), vec![(Some(session(1)), None)]);
     }
 
     // records.forget is not available on agent.sock: the real phase 1 dispatcher refuses it there with -32003, and

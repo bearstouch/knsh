@@ -99,8 +99,8 @@ the flush deadline each, their uncertainty staying their own), so none reports a
 A line's record gets its `attribution` (`command` or `concurrent`) only after the line-end procedure has applied every
 event of the line, so it is final and always equals the attribution of the closed edge that holds the line. A denied
 line has none. An edge lists at most 65,536 paths and is then marked overflowed. Each edge's changes are captured as
-its checkpoint (below); the history tree model exists (KNSH-083, below), but feeding closed edges into it is wired
-with undo (KNSH-084), and until then closed edges themselves are dropped.
+its checkpoint (below), and `knshd` records each finished checkpoint as a change of the history tree (KNSH-083,
+KNSH-088) before `checkpoint.created` is published.
 **Known limit:** opening a line never waits for the watcher (decision 16), so a change made just before the line whose
 event had not been applied yet is attributed to the line.
 
@@ -136,10 +136,18 @@ File events carry no process ID, so a human edit made at the same moment can be 
 - **Excluded folders (FR-CKP-31, KNSH-084).** The watcher reports the outermost excluded folder of each event path
   below one (or of an event on an excluded folder itself), and the checkpoint lists it, at most 256 per checkpoint
   (then marked incomplete), so an undo can name it as not restored. Excluded changes alone make no checkpoint.
+- **The engine's own restores (KNSH-088).** Undo, redo and `checkpoint.restore` write files in roots that live
+  sessions may watch, and those writes are nobody's change: recorded, they would become a new change from the state
+  just reached, and the redo that should follow would be refused. `knshd` therefore brackets each restore over the
+  roots it may write in: it flushes every watcher there (what changed before stays its own and is recorded before the
+  restore is planned), stops attributing changes there, restores, flushes the watchers again (the restore's writes
+  reach the shadows but no checkpoint), and resumes. A line running in such a root meanwhile loses the changes it
+  made in that window, so its checkpoint is marked uncertain (`capture_failed`). A flush is bounded by its deadline:
+  a restore write reported later still is attributed as an edit, which the post-image check keeps from doing harm.
 - **Pending:** `captures` keeps only a summary of the last 64 checkpoints, and their pre-images on disk; the full
-  checkpoints and the history tree (KNSH-084's `History`) live in memory (the tree has a stored form, the checkpoints
-  not yet), and are written to disk, fed, swept by retention and called by `knshd` with the endpoints (KNSH-088).
-  Plain-copy roots (which have no shadow yet) are not captured.
+  checkpoints and the history tree (KNSH-084's `History`) live in `knshd`'s memory (the tree has a stored form, the
+  checkpoints not yet), so a restarted `knshd` starts with an empty history. Plain-copy roots (which have no shadow
+  yet) are not captured.
 - **Known limit (sessions sharing a root):** each session's watcher reports every change in the root. If one of them
   applies a change after the next line has started (the KNSH-081 limit), that change can be captured in the line's
   checkpoint with that watcher's older shadow copy as its pre-image, so undoing the line could also undo the agent edit
@@ -201,8 +209,9 @@ ends with every file as it was before the undo or redo.
 
 **Limits.** Recovery writes the saved copies over whatever is at the listed paths, so a human edit made between a
 crash and the next start is overwritten there. A special file (socket, FIFO, device) is replaced only under `force`
-and cannot be put back by a rollback. **Pending:** calling `recover_restores` at `knshd` start and the endpoints are
-KNSH-088.
+and cannot be put back by a rollback. `knshd` calls `recover_restores` on the home store at start, before serving
+(KNSH-088). **Pending:** recovering stores on other volumes, whose places `knshd` learns only when a session protects
+a root there.
 
 **Possibly torn (KNSH-085, FR-CKP-24, decision 17).** A checkpoint lists its possibly-torn paths with a reason
 (`possibly_torn`):
@@ -234,8 +243,8 @@ region whose inheritance was changed with `minherit`, or a path the kernel names
 symlink, or after a rename) is not seen. Such writes still change contents, which the post-image hash catches for
 files under 64 MiB (FR-CKP-09). **Pending:** the restore-time refusal of decision 17 for files of 64 MiB or more
 while any process holds them for writing; attributing a held file's next event (when its writer closes it) as an
-agent edit rather than to a later line (decision 17); showing `possibly_torn` in the line's record and on the wire
-(KNSH-088).
+agent edit rather than to a later line (decision 17); showing `possibly_torn` in the line's record and in
+`checkpoint.list` (undo, redo and restore results list the paths they skipped or forced, KNSH-088).
 
 ## History tree
 
@@ -307,10 +316,14 @@ FR-CKP-33 in one sweep, and `History::forget` those of FR-CKP-34 at once:
   before expiry is checked, while the change's edge is still in the tree, so it learns nothing about the change, not
   even that it expired. Once the edge is gone, a remembered checkpoint or record is reported as expired to any caller.
 
+**In `knshd` (KNSH-088).** A retention thread sweeps at start, whenever the last sweep's next due time comes (at most
+an hour apart, a minute after a sweep that could not read the clock), and soon after new checkpoints are recorded
+(the count and size limits). `records.forget` with `with_checkpoints` removes the matching changes at once, before
+the records.
+
 **Limits (retention).** Shadows and the pre-images of a change still being captured are not checkpoints yet and do not
-count. **Pending:** running the sweep in `knshd` (at start and when due), feeding it the history, and passing
-`records.forget`'s `with_checkpoints` to it (KNSH-088; until then `knshd` still answers `-32005`); removing shadows
-and holding folders when their session ends; sweeping files left in a store by a failed removal.
+count. **Pending:** removing shadows and holding folders when their session ends; sweeping files left in a store by a
+failed removal.
 
 **Restoring a state (KNSH-086).** `checkpoint.restore {state_id, force?}` returns every root to any state of the
 tree, on the head's branch or another (the case redo refuses as `RedoBlocked`). User and authority only; an agent

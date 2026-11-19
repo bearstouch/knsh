@@ -49,9 +49,9 @@
 //! Retention and forget ([`crate::retention`]) remove checkpoints and expire their edges in the tree; undo, redo,
 //! restore and diff of a change removed, or across one, are refused as [`HistoryError::Expired`].
 //!
-//! **Pending:** the history lives in memory: writing it to disk (the tree's stored form exists, the checkpoints'
-//! does not yet), feeding it finished checkpoints, running retention and calling it from the API endpoints are
-//! `knshd`'s (KNSH-088).
+//! `knshd` keeps one history behind a lock, records each finished checkpoint, runs retention and serves the
+//! `checkpoint.*` methods from it (KNSH-088). **Pending:** the history lives in memory: writing it to disk (the
+//! tree's stored form exists, the checkpoints' does not yet), so a restarted `knshd` starts with an empty history.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -898,6 +898,76 @@ impl History {
         } else {
             Err(CheckpointError::NotOwnChange)
         }
+    }
+
+    /// Whether `caller` may see and act on `edge` (`checkpoint.list` on `agent.sock`, KNSH-088): the user and the
+    /// authority see every edge; an agent only its own session's changes, and the reverts of them, never external
+    /// edits (the same rule undo and redo apply).
+    #[must_use]
+    pub fn visible_to(&self, caller: Caller, edge: CheckpointId) -> bool {
+        match caller {
+            Caller::User | Caller::Authority => true,
+            Caller::Agent(_) => self
+                .origin(edge)
+                .is_ok_and(|origin| self.authorize(caller, origin).is_ok()),
+        }
+    }
+
+    /// The checkpoint roots an undo or redo of `target` may write in (KNSH-088): those of the change, of the
+    /// versions its undo saved, of the change it reverts, and of any revert of it. `knshd` stops attributing changes
+    /// there while it restores ([`crate::attribution::Ledger::restore_started`]). Empty for an unknown target; the
+    /// undo or redo itself then reports why.
+    #[must_use]
+    pub fn target_roots(&self, target: Target) -> Vec<CanonicalPath> {
+        let Ok(checkpoint) = self.resolve(target) else {
+            return Vec::new();
+        };
+        let mut related = vec![checkpoint];
+        for edge in self.tree.edges() {
+            let reverts_it = matches!(edge.kind, EdgeKind::Undo { of } if of == checkpoint);
+            if edge.checkpoint == checkpoint || reverts_it {
+                related.push(edge.checkpoint);
+                related.extend(edge.saved);
+                if let EdgeKind::Undo { of } = edge.kind {
+                    related.push(of);
+                }
+            }
+        }
+        self.roots_of(&related)
+    }
+
+    /// The checkpoint roots a restore to `state` may write in (KNSH-088): those of every change on the way from the
+    /// current state, and of the versions their undos saved. Empty for an unknown state or a way that crosses an
+    /// expired change; the restore itself then reports why.
+    #[must_use]
+    pub fn state_roots(&self, state: StateId) -> Vec<CanonicalPath> {
+        let Ok(route) = self.tree.route(self.tree.head(), state) else {
+            return Vec::new();
+        };
+        let mut related = Vec::new();
+        for checkpoint in route.back.iter().chain(&route.forward) {
+            related.push(*checkpoint);
+            if let Some(edge) = self.tree.edge(*checkpoint) {
+                related.extend(edge.saved);
+            }
+        }
+        self.roots_of(&related)
+    }
+
+    /// Every root the checkpoints `ids` hold paths, stores or excluded folders in, sorted, each once.
+    fn roots_of(&self, ids: &[CheckpointId]) -> Vec<CanonicalPath> {
+        let roots: BTreeSet<&CanonicalPath> = ids
+            .iter()
+            .filter_map(|id| self.checkpoints.get(id))
+            .flat_map(|checkpoint| {
+                checkpoint
+                    .paths
+                    .keys()
+                    .chain(checkpoint.stores.keys())
+                    .chain(checkpoint.excluded.keys())
+            })
+            .collect();
+        roots.into_iter().cloned().collect()
     }
 
     /// What the caller is told, about the change `origin`.

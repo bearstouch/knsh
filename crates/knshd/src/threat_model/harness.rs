@@ -295,6 +295,7 @@ impl Stack {
         handlers.extend(crate::authority::tests::idle_handlers());
         handlers.extend(ExecRun::new(Arc::clone(&lifecycle) as _, paths.shim_dir()).handlers());
         handlers.extend(starter.handlers());
+        handlers.extend(crate::checkpoints::tests::idle_handlers());
         let server = serve(&paths, &fixture, handlers, log);
 
         Self {

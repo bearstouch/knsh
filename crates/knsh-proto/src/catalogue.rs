@@ -311,8 +311,8 @@ pub struct Catalogue {
 /// telemetry methods with `session.info` (KNSH-021). Phase 2 adds `policy.check` (KNSH-043), `exec.*` (KNSH-051,
 /// KNSH-053), `session.start_agent` (KNSH-056), `policy.read` and `policy.edit` (KNSH-065), `approval.*` (KNSH-066),
 /// `authority.trust` and `authority.register` (KNSH-068), `decision.respond` (KNSH-069), the control service's
-/// `session.*`, `policy.*` and `recording.set` methods (KNSH-071), and `profile.use` (KNSH-072); the rest arrive with
-/// their stories.
+/// `session.*`, `policy.*` and `recording.set` methods (KNSH-071), and `profile.use` (KNSH-072). Phase 3 adds the
+/// `checkpoint.*` methods (KNSH-088); the rest arrive with their stories.
 const ENGINE_METHODS: &[MethodSpec] = &[
     // Handshake (specs/06-api/handshake.md).
     MethodSpec::planned("hello", Endpoints::ALL).available(),
@@ -340,12 +340,25 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     // Events (KNSH-018): agent.sock sees its own session, user.sock and the control service every session.
     MethodSpec::planned("events.subscribe", Endpoints::ALL).available(),
     MethodSpec::planned("events.unsubscribe", Endpoints::ALL).available(),
-    MethodSpec::planned("checkpoint.list", Endpoints::ALL),
-    MethodSpec::planned("checkpoint.diff", Endpoints::ALL),
-    MethodSpec::planned("checkpoint.undo", Endpoints::ALL),
-    MethodSpec::planned("checkpoint.redo", Endpoints::ALL),
-    // user.sock (specs/06-api/user-socket.md).
-    MethodSpec::planned("checkpoint.restore", Endpoints::USER_CONTROL),
+    // Checkpoints (KNSH-088): on agent.sock the session's own changes, never `force` (FR-CKP-21); everywhere else
+    // every session's. Listed only where checkpoints can be taken at all (`Backend::Checkpoints`), else -32005.
+    MethodSpec::planned("checkpoint.list", Endpoints::ALL)
+        .requires(Backend::Checkpoints)
+        .available(),
+    MethodSpec::planned("checkpoint.diff", Endpoints::ALL)
+        .requires(Backend::Checkpoints)
+        .available(),
+    MethodSpec::planned("checkpoint.undo", Endpoints::ALL)
+        .requires(Backend::Checkpoints)
+        .available(),
+    MethodSpec::planned("checkpoint.redo", Endpoints::ALL)
+        .requires(Backend::Checkpoints)
+        .available(),
+    // user.sock (specs/06-api/user-socket.md). Never on agent.sock: an agent cannot return every root to a state
+    // (FR-CKP-21).
+    MethodSpec::planned("checkpoint.restore", Endpoints::USER_CONTROL)
+        .requires(Backend::Checkpoints)
+        .available(),
     // Agent sessions refuse to start without the sandbox (FR-AGT-06, KNSH-046). Served since KNSH-056: unlisted and
     // answered -32005 naming `sandbox` whenever the probe reports `none`.
     MethodSpec::planned("session.start_agent", Endpoints::USER)
@@ -744,6 +757,47 @@ mod tests {
                 "{method}"
             );
         }
+    }
+
+    // KNSH-088: the checkpoint methods are listed only where checkpoints can be taken (file events work), and are
+    // `-32005` naming `checkpoints` otherwise. On agent.sock there is no `checkpoint.restore` (FR-CKP-21).
+    #[test]
+    fn checkpoint_methods_follow_the_checkpoint_capability() {
+        const SHARED: [&str; 4] = [
+            "checkpoint.list",
+            "checkpoint.diff",
+            "checkpoint.undo",
+            "checkpoint.redo",
+        ];
+        let without = capabilities(Sandbox::Seatbelt);
+        let mut with = capabilities(Sandbox::Seatbelt);
+        with.file_events = FileEvents::FsEvents;
+        for endpoint in Endpoint::ALL {
+            let listed = names(Catalogue::ENGINE, endpoint, &with);
+            for method in SHARED {
+                assert!(listed.contains(&method), "{method} on {}", endpoint.name());
+                assert_eq!(
+                    Catalogue::ENGINE.lookup(endpoint, method, &without),
+                    Lookup::Unavailable(Backend::Checkpoints),
+                    "{method} on {}",
+                    endpoint.name()
+                );
+            }
+            assert!(
+                !names(Catalogue::ENGINE, endpoint, &without)
+                    .iter()
+                    .any(|name| name.starts_with("checkpoint.")),
+                "{}",
+                endpoint.name()
+            );
+        }
+        for endpoint in [Endpoint::User, Endpoint::Control] {
+            assert!(names(Catalogue::ENGINE, endpoint, &with).contains(&"checkpoint.restore"));
+        }
+        assert_eq!(
+            Catalogue::ENGINE.lookup(Endpoint::Agent, "checkpoint.restore", &with),
+            Lookup::NotOnEndpoint
+        );
     }
 
     const TEST_METHODS: &[MethodSpec] = &[

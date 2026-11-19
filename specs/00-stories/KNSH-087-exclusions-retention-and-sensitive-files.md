@@ -17,9 +17,8 @@ reached, sensitive-pattern expiry, `forget --with-checkpoints`. Out of scope: re
       the 5 GB limit with scaled-down bytes); running the sweep in `knshd` is pending (KNSH-088).
 - [x] Pre-images matching `.env*`, `*.pem`, `*.key` or `id_*` are deleted after at most 24 hours (FR-CKP-33).
       Observed in unit tests; each sweep returns when the next is due, which `knshd` must honour (pending, KNSH-088).
-- [ ] `knsh forget --with-checkpoints` removes the matching checkpoints at once (FR-CKP-34). **Partly:** the removal
-      (`History::forget`) is implemented and tested; `records.forget` still answers `-32005` for `with_checkpoints`
-      until `knshd` holds the history (KNSH-088).
+- [x] `knsh forget --with-checkpoints` removes the matching checkpoints at once (FR-CKP-34). The removal
+      (`History::forget`) is implemented and tested; `records.forget` calls it since KNSH-088.
 - [x] Removing a checkpoint updates the history tree so redo or undo of removed edges reports "expired", not a crash.
 
 **Implementation notes.** `knsh_core::HistoryTree::expire` and `HistoryError::Expired`; `knsh_checkpoint::retention`

@@ -149,7 +149,10 @@ pub enum Backend {
     FileEvents,
     /// [`Capabilities::secrets`].
     Secrets,
-    /// At least one root in [`Capabilities::checkpoints`] with a backend.
+    /// Checkpoints can be taken on this machine: its file events work ([`Capabilities::file_events`]), which every
+    /// root's watcher needs (KNSH-080). How each root is protected is [`Capabilities::checkpoints`], read live and
+    /// never deciding which methods exist (`specs/05-models/capabilities.md`); the history the `checkpoint.*`
+    /// methods act on outlives the sessions whose roots it covers (KNSH-088).
     Checkpoints,
 }
 
@@ -191,15 +194,16 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// Whether `backend` works here. Checkpoints count as present when at least one root has a backend.
+    /// Whether `backend` works here. Checkpoints count as present when file events do ([`Backend::Checkpoints`]):
+    /// the per-root report is live and changes as sessions start and end, while the methods a client may call are
+    /// settled once per `knshd` (KNSH-088).
     #[must_use]
     pub fn has(&self, backend: Backend) -> bool {
         match backend {
             Backend::Sandbox => self.sandbox != Sandbox::None,
             Backend::NetworkFilter => self.network_filter != NetworkFilter::None,
-            Backend::FileEvents => self.file_events != FileEvents::None,
+            Backend::FileEvents | Backend::Checkpoints => self.file_events != FileEvents::None,
             Backend::Secrets => self.secrets != Secrets::None,
-            Backend::Checkpoints => self.checkpoints.values().any(|root| *root != CheckpointBackend::None),
         }
     }
 
@@ -358,15 +362,24 @@ mod tests {
         ] {
             assert!(!caps.has(backend), "{}", backend.name());
         }
+        // KNSH-088: the per-root report never decides whether the checkpoint methods exist; file events do.
+        caps.checkpoints.insert("/b".to_owned(), CheckpointBackend::ApfsClone);
+        assert!(
+            !caps.has(Backend::Checkpoints),
+            "no file events: nothing can be captured"
+        );
         caps.sandbox = Sandbox::Seatbelt;
         caps.file_events = FileEvents::FsEvents;
         assert!(caps.has(Backend::Sandbox) && caps.has(Backend::FileEvents));
-
-        // A root that cannot be checkpointed does not make checkpoints available.
         caps.checkpoints.insert("/a".to_owned(), CheckpointBackend::None);
-        assert!(!caps.has(Backend::Checkpoints));
+        assert!(
+            caps.has(Backend::Checkpoints),
+            "a root without protection does not hide the history"
+        );
+        caps.checkpoints.clear();
+        assert!(caps.has(Backend::Checkpoints), "nor does having no running session");
+        caps.checkpoints.insert("/a".to_owned(), CheckpointBackend::None);
         caps.checkpoints.insert("/b".to_owned(), CheckpointBackend::ApfsClone);
-        assert!(caps.has(Backend::Checkpoints));
         // FR-CKP-35: plain copies are a backend too, reported as such (KNSH-078).
         caps.checkpoints.insert("/c".to_owned(), CheckpointBackend::PlainCopy);
         let object = caps.to_object().unwrap();

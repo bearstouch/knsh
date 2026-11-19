@@ -178,6 +178,9 @@ mod sessions;
 // Checkpoint shadows of agent sessions (KNSH-079); built with the sessions that start them.
 #[cfg(target_os = "macos")]
 mod shadows;
+// The checkpoint history and the `checkpoint.*` methods (KNSH-088); fed by the shadows.
+#[cfg(target_os = "macos")]
+mod checkpoints;
 // The reader is platform-neutral; its record sink is built where the record store is.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod violations;
@@ -281,7 +284,6 @@ fn start() -> Result<(), StartError> {
 
     use crate::events::EventHub;
     use crate::policy::PolicyCheck;
-    use crate::records::Records;
     use crate::server::{Config, Exit, Server, Services};
     use crate::sessions::Sessions;
     use crate::violations::{Reader, ReaderStatus};
@@ -307,10 +309,12 @@ fn start() -> Result<(), StartError> {
         let listeners = endpoints::activate(&LaunchdSockets::new()).map_err(StartError::NoLaunchdSockets)?;
         let clock = Arc::new(SystemClock::new());
         let store = open_store(&paths, uid, &clock, log.as_ref());
-        let records = Records::new(store.clone());
         // The event bus with the specified limits (10,000 events per session).
         let random = Arc::new(SystemRandom::new());
         let events = EventHub::new(knsh_core::EventBus::default(), clock.clone(), random.clone());
+        // Probed once before serving: every hello reports the same result; a restarted knshd probes again (KNSH-014).
+        let probed = probe_this_machine(&paths, clock.clone(), Arc::clone(&log));
+        let (records, history) = record_services(&paths, &clock, &random, &log, &events, store.clone(), &probed);
         // Sandbox denials the system reports, attributed by tag to sessions and records (KNSH-047). Best effort: a
         // reader that cannot start is reported as `sandbox_violations: none` and never blocks anything.
         let reader = start_violation_reader(&paths, clock.clone(), random.clone(), &log, store.clone(), &events);
@@ -345,10 +349,9 @@ fn start() -> Result<(), StartError> {
             random,
             approvals,
             decisions: Arc::clone(&decisions),
+            history: &history,
         };
         handlers.extend(supervision.handlers());
-        // Probed once before serving: every hello reports the same result; a restarted knshd probes again (KNSH-014).
-        let probed = probe_this_machine(&paths, clock.clone(), Arc::clone(&log));
         let violation_status = reader.as_ref().map_or_else(ReaderStatus::stopped, Reader::status);
         let dispatcher = hello::dispatcher_with_violations(probed, handlers, violation_status, Arc::clone(&sessions));
         let dispatcher = Arc::new(dispatcher.map_err(StartError::Dispatch)?);
@@ -762,6 +765,9 @@ struct Supervision<'a> {
     /// The authority, asked whenever one is registered (KNSH-069), shared with `decision.respond`; also holds the
     /// live grants every line is evaluated with.
     decisions: std::sync::Arc<decisions::Decisions>,
+    /// The checkpoint history the shadows feed and whose restores they bracket, with its `checkpoint.*` handlers
+    /// (KNSH-088).
+    history: &'a std::sync::Arc<checkpoints::HistoryService>,
 }
 
 /// Starts the network proxy (KNSH-059) on a loopback port with the host rules, the system resolver and address
@@ -880,18 +886,24 @@ impl Supervision<'_> {
     /// `session.start_agent` (KNSH-056) and `exec.*` (KNSH-050 to KNSH-053), over the same paths, sessions,
     /// profiles and clock.
     fn handlers(self) -> dispatch::Handlers {
-        // Lines wait on, and envelopes start, the checkpoint shadows of their sessions (KNSH-079).
-        self.sessions.attach_shadows(checkpoint_shadows(
+        // Lines wait on, and envelopes start, the checkpoint shadows of their sessions (KNSH-079). Their finished
+        // checkpoints go to the history, and the history's restores are bracketed by them (KNSH-088).
+        let shadows = checkpoint_shadows(
             self.paths,
             self.uid,
             &self.clock,
             &self.random,
             self.log,
             self.events,
-        ));
+            self.history,
+        );
+        self.history
+            .attach_windows(std::sync::Arc::clone(&shadows) as std::sync::Arc<dyn shadows::RestoreWindows>);
+        self.sessions.attach_shadows(shadows);
         // One proxy issues every envelope's and line's credentials (KNSH-059).
         let proxy = start_proxy(self.clock.clone(), self.random.clone(), self.log, self.events);
-        let mut handlers = self.start_agent_handlers(&proxy);
+        let mut handlers = self.history.handlers();
+        handlers.extend(self.start_agent_handlers(&proxy));
         handlers.extend(self.exec_run_handlers(proxy));
         handlers
     }
@@ -959,6 +971,7 @@ fn checkpoint_shadows(
     random: &std::sync::Arc<knsh_platform::macos::SystemRandom>,
     log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
     events: &std::sync::Arc<events::EventHub>,
+    history: &std::sync::Arc<checkpoints::HistoryService>,
 ) -> std::sync::Arc<shadows::Shadows> {
     use std::sync::Arc;
 
@@ -979,14 +992,79 @@ fn checkpoint_shadows(
         // and `checkpoint.created` (KNSH-082).
         file_events: Arc::new(knsh_platform::macos::FsEventStreams::new()),
         events: Arc::clone(events) as Arc<dyn shadows::CheckpointEvents>,
-        // KNSH-081: closed edges are dropped until the history tree (KNSH-083) takes them; their checkpoints are
-        // taken (KNSH-082).
+        // KNSH-081: closed edges are dropped; the history records their checkpoints instead (KNSH-082, KNSH-088).
         edges: Arc::new(shadows::UncapturedEdges),
+        history: Arc::clone(history) as Arc<dyn shadows::CheckpointSink>,
         // KNSH-082: checkpoint identifiers.
         random: random.clone(),
         // KNSH-085: files the line's processes still hold for writing at its end (decision 17).
         holders: Arc::new(knsh_platform::macos::SystemWriteHolders::new()),
     })
+}
+
+/// The record handlers and the checkpoint history (KNSH-088), fed by the shadows, swept by retention and forgotten with
+/// records: `records.forget` removes checkpoints only where checkpoints can be taken (`probed`), and answers `-32005`
+/// for them elsewhere.
+#[cfg(target_os = "macos")]
+fn record_services(
+    paths: &knsh_platform::EnginePaths,
+    clock: &std::sync::Arc<knsh_platform::macos::SystemClock>,
+    random: &std::sync::Arc<knsh_platform::macos::SystemRandom>,
+    log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+    events: &std::sync::Arc<events::EventHub>,
+    store: Option<knsh_store::RecordStore>,
+    probed: &probe::Probed,
+) -> (records::Records, std::sync::Arc<checkpoints::HistoryService>) {
+    let history = checkpoint_history(paths, clock, random, log, events);
+    let records = records::Records::new(store);
+    let records = if probed.capabilities.has(knsh_proto::Backend::Checkpoints) {
+        records.with_checkpoints(std::sync::Arc::clone(&history) as std::sync::Arc<dyn records::ForgetCheckpoints>)
+    } else {
+        records
+    };
+    (records, history)
+}
+
+/// The checkpoint history (KNSH-088): files restored with APFS clones on the real volumes, `checkpoint.restored`
+/// published on `events`, retention at the specified limits. Restores an earlier run left part-way in the home store
+/// are put back first, before any session uses its roots; then the retention thread starts (a sweep now, then
+/// whenever one is due). Either failing is logged: the history still serves.
+#[cfg(target_os = "macos")]
+fn checkpoint_history(
+    paths: &knsh_platform::EnginePaths,
+    clock: &std::sync::Arc<knsh_platform::macos::SystemClock>,
+    random: &std::sync::Arc<knsh_platform::macos::SystemRandom>,
+    log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+    events: &std::sync::Arc<events::EventHub>,
+) -> std::sync::Arc<checkpoints::HistoryService> {
+    use std::sync::Arc;
+
+    use knsh_platform::{Field, Level, Value};
+
+    let fs: Arc<dyn knsh_platform::Fs> = Arc::new(knsh_platform::macos::RealFs::new());
+    let volumes: Arc<dyn knsh_platform::Volumes> = Arc::new(knsh_platform::macos::SystemVolumes::new());
+    let files: Arc<dyn knsh_checkpoint::ShadowFiles> = Arc::new(knsh_checkpoint::PlatformShadowFiles::new(fs, volumes));
+    match knsh_checkpoint::recover_restores(files.as_ref(), &paths.checkpoints_dir()) {
+        Ok(0) => {}
+        Ok(recovered) => log.log(
+            Level::Notice,
+            "interrupted restores put back",
+            &[Field::new("restores", Value::U64(recovered as u64))],
+        ),
+        Err(_) => log.log(Level::Error, "interrupted restores not recovered", &[]),
+    }
+    let history = knsh_checkpoint::History::new(files, clock.clone(), random.clone());
+    let service = checkpoints::HistoryService::new(
+        history,
+        Arc::clone(events) as Arc<dyn knsh_checkpoint::RestoreEvents + Send + Sync>,
+        clock.clone(),
+        Arc::clone(log),
+        knsh_checkpoint::Retention::default(),
+    );
+    if service.start_retention().is_err() {
+        log.log(Level::Error, "checkpoint retention thread not started", &[]);
+    }
+    service
 }
 
 /// Removes the compiled profile files an earlier run left behind: no line runs yet, so none is in use (FR-SBX-07). A
