@@ -36,8 +36,9 @@ entered), a folder is entered only if it is one, folders named in `checkpoints.e
 of that name are not), special files (sockets, FIFOs, devices) are skipped and listed, and the store and the engine
 directories are never entered (a root may contain them). An entry removed during the build is skipped; any other error
 fails the build, and the root becomes `none`. Each build's file count and duration are logged, and one over 10 s is
-logged as an error (NFR-PERF-06). Roots whose store is `plain-copy` get no shadow yet (`none`). Shadows are not removed
-when their session ends yet (retention, KNSH-087).
+logged as an error (NFR-PERF-06). Roots whose store is `plain-copy` get no shadow yet (`none`). **Pending:** shadows, and
+the session's holding and marker folders, are not removed when their session ends yet; retention (KNSH-087) covers
+the checkpoints in the history only.
 **Known limit (pending):** the walk goes by path, so a folder swapped for a symlink between its `lstat` and its
 listing (by a writer racing the build, such as the envelope) is still followed for that folder; an `openat`-relative
 walk with `O_NOFOLLOW` closes this. Restore (KNSH-084) writes pre-images only to their own paths inside the root, so
@@ -136,9 +137,9 @@ File events carry no process ID, so a human edit made at the same moment can be 
   below one (or of an event on an excluded folder itself), and the checkpoint lists it, at most 256 per checkpoint
   (then marked incomplete), so an undo can name it as not restored. Excluded changes alone make no checkpoint.
 - **Pending:** `captures` keeps only a summary of the last 64 checkpoints, and their pre-images on disk; the full
-  checkpoints and the history tree (KNSH-084's `History`) live in memory, are written to disk with retention
-  (KNSH-087), and are fed and called by `knshd` with the endpoints (KNSH-088). Plain-copy roots (which have no shadow
-  yet) are not captured.
+  checkpoints and the history tree (KNSH-084's `History`) live in memory (the tree has a stored form, the checkpoints
+  not yet), and are written to disk, fed, swept by retention and called by `knshd` with the endpoints (KNSH-088).
+  Plain-copy roots (which have no shadow yet) are not captured.
 - **Known limit (sessions sharing a root):** each session's watcher reports every change in the root. If one of them
   applies a change after the next line has started (the KNSH-081 limit), that change can be captured in the line's
   checkpoint with that watcher's older shadow copy as its pre-image, so undoing the line could also undo the agent edit
@@ -270,7 +271,46 @@ States form a tree, like commits. Each line, agent edit or concurrent set is an 
   `checkpoint.restore`. Redo of a change undone by an undo edge is the undo of that edge, under the same rule.
 - Each undo or redo is planned without changes, carried out on the files, then committed; a plan made before any later
   change of the tree is refused, so the tree never records a restore that did not happen.
-- The tree is stored as one JSON object with a `format` version; a corrupt or newer file is refused and left as found.
+- The tree is stored as one JSON object with a `format` version (2 since KNSH-087; format 1 was never written to
+  disk and is refused); a corrupt or newer file is refused and left as found.
+
+**Retention, sensitive files and forget (KNSH-087).** `History::retain` applies the limits of FR-CKP-32 and
+FR-CKP-33 in one sweep, and `History::forget` those of FR-CKP-34 at once:
+
+- **Sensitive pre-images first.** In each checkpoint created 24 hours ago or more, the kept copy of every path named
+  `.env*`, `*.pem`, `*.key` or `id_*` is deleted and the path's pre-image becomes lost; the rest of the checkpoint
+  stays. Its undo then reports the path as `pre_image_lost` (a conflict `force` does not override), so a change
+  that touched a secret file can no longer be undone after 24 hours. Versions saved by an undo count from the undo.
+- **Then whole changes,** oldest first, until no limit is passed: each change created 7 days ago or more; while a
+  root has more than 200 changes, its oldest (a change in two roots counts in both); while the kept copies in one
+  store (one per volume) pass 5 GB (5 × 2³⁰ bytes, logical sizes, so clones count in full), the oldest change with
+  bytes there. "Oldest" is the order changes entered the history; ages come from the time in each checkpoint's ULID
+  (its first captured change, or the undo that saved the versions), so nothing is kept longer than its limit.
+- **Removing a change** deletes its checkpoint and the versions its undo saved, and **expires** its edge in the tree:
+  it can no longer be crossed either way, nor can an `undo` edge that reverted it. Every edge only reachable over an
+  expired one is removed too (with its checkpoints), as are expired edges at the root; an expired edge between kept
+  ones stays with its path list so FR-CKP-30 still holds. Undo, redo, `checkpoint.restore` and `checkpoint.diff` of a
+  removed change, or across one, are refused as **expired** (`HistoryError::Expired`), never attempted; a state that
+  was removed is unknown. The tree remembers up to 65,536 removed checkpoints and records to say so.
+- **Forget** (`knsh forget --with-checkpoints`) selects changes like records (a session's, made since an instant, or
+  both; a change made earlier but stepped back over since the instant counts as made then, since the versions that step
+  saved hold the files as they were after it), removes them at once whatever their age, and scrubs their path lists from
+  the tree; a scrubbed edge counts as touching every path, so an older change kept is never reverted over it unchecked
+  (FR-CKP-30, fail closed). A revert belongs to the sessions of the change it reverted (not to the session that ran it),
+  so forgetting a session forgets the reverts of its changes too. A revert whose reverted change is already gone from
+  the tree still lists that change's paths, and its sessions are no longer known, so any forget scrubs it.
+- Each sweep returns when the next is due (the earliest time a kept checkpoint reaches an age limit), so the 24-hour
+  bound is kept exactly rather than late by a period. A sensitive copy that cannot be deleted stays listed and is due
+  again at once; when a whole checkpoint's files cannot be deleted, the checkpoint still leaves the history and its
+  files stay in the store (pending below). A clock that cannot be read removes nothing.
+- An agent asking to undo, redo or diff (by line) another session's change is refused as not its own (`NotOwnChange`)
+  before expiry is checked, while the change's edge is still in the tree, so it learns nothing about the change, not
+  even that it expired. Once the edge is gone, a remembered checkpoint or record is reported as expired to any caller.
+
+**Limits (retention).** Shadows and the pre-images of a change still being captured are not checkpoints yet and do not
+count. **Pending:** running the sweep in `knshd` (at start and when due), feeding it the history, and passing
+`records.forget`'s `with_checkpoints` to it (KNSH-088; until then `knshd` still answers `-32005`); removing shadows
+and holding folders when their session ends; sweeping files left in a store by a failed removal.
 
 **Restoring a state (KNSH-086).** `checkpoint.restore {state_id, force?}` returns every root to any state of the
 tree, on the head's branch or another (the case redo refuses as `RedoBlocked`). User and authority only; an agent
@@ -337,4 +377,4 @@ read is still followed (the `openat` walk of the restore limits closes this). Fi
 hash, so their post-images are not refreshed between steps and a restore across two changes of one such file
 conflicts. **Pending:** the endpoints, agent-socket scoping and CLI (KNSH-088).
 
-Undoing an `npm install`, for example, leaves `node_modules` out of step with the lockfile until install runs again. A file the agent deleted, including one holding secrets such as `.env`, stays in its checkpoint until retention removes it.
+Undoing an `npm install`, for example, leaves `node_modules` out of step with the lockfile until install runs again. A file the agent deleted, including one holding secrets such as `.env`, stays in its checkpoint until retention removes it: 24 hours at most for a sensitive name such as `.env` (FR-CKP-33).

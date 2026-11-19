@@ -163,8 +163,8 @@ installs and removes it without talking to `knshd`.
 - At least one of `--session <id>` and `--since <date>` is required; with both, a record must match both. Without
   one, or with a malformed value, it is a usage error (status 2) and nothing is sent.
 - `--since` takes a UTC date `YYYY-MM-DD` (from midnight UTC) or an engine timestamp `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`.
-- `--with-checkpoints` is passed on. Until checkpoints exist (phase 3) `knshd` answers `-32005`: `knsh forget` says so,
-  deletes nothing and exits with 1.
+- `--with-checkpoints` is passed on. Until the history is wired into `knshd` (KNSH-088; the removal itself is
+  `History::forget`, KNSH-087) `knshd` answers `-32005`: `knsh forget` says so, deletes nothing and exits with 1.
 
 ## History
 

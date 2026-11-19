@@ -192,7 +192,7 @@ pub use event::{
 };
 pub use history::{
     Action, Change, Committed, ConflictReason, EdgeKind, HISTORY_FORMAT, HistoryEdge, HistoryError, HistoryTree,
-    MAX_HISTORY_LEN, Plan, RestoreConflict, RestoreOperation, Route, StateId, TornPath, TornReason,
+    MAX_FORGOTTEN, MAX_HISTORY_LEN, Plan, RestoreConflict, RestoreOperation, Route, StateId, TornPath, TornReason,
 };
 pub use hook::{
     ConfigProblem, Ended, Execution, HOOK_EVENT, HOOKS_KEY, HookConfig, HookEntry, HookExecutor, HookExit, HookId,

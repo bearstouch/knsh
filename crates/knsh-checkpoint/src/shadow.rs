@@ -36,7 +36,8 @@
 //!
 //! Every effect goes through [`ShadowFiles`]: [`PlatformShadowFiles`] over `knsh_platform::Fs` and
 //! `knsh_platform::Volumes` in `knshd`, and an in-memory fake in tests. Keeping the shadow current is KNSH-080;
-//! removing a shadow when its session ends is not done yet (retention, KNSH-087).
+//! removing a shadow when its session ends is not done yet (pending: retention, KNSH-087, covers the checkpoints in
+//! the history only).
 
 use std::collections::VecDeque;
 use std::ffi::OsString;

@@ -44,8 +44,14 @@
 //!   with new times. If taking back fails too, [`CheckpointError::RestoreStopped`] names the state reached; each
 //!   step is whole, so the files match it. `checkpoint.restored` is published per step only once every step is done.
 //!
-//! **Pending:** the history lives in memory: it is written to disk with retention (KNSH-087), and fed with finished
-//! checkpoints and called by the API endpoints in `knshd` (KNSH-088).
+//! # Expired changes (KNSH-087)
+//!
+//! Retention and forget ([`crate::retention`]) remove checkpoints and expire their edges in the tree; undo, redo,
+//! restore and diff of a change removed, or across one, are refused as [`HistoryError::Expired`].
+//!
+//! **Pending:** the history lives in memory: writing it to disk (the tree's stored form exists, the checkpoints'
+//! does not yet), feeding it finished checkpoints, running retention and calling it from the API endpoints are
+//! `knshd`'s (KNSH-088).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -248,15 +254,18 @@ pub trait RestoreEvents {
 
 /// The history of checkpoints, and undo and redo over it (module documentation). One per `knshd`.
 pub struct History {
-    files: Arc<dyn ShadowFiles>,
-    clock: Arc<dyn Clock>,
+    pub(crate) files: Arc<dyn ShadowFiles>,
+    pub(crate) clock: Arc<dyn Clock>,
     random: Arc<dyn Random>,
     fallback: AtomicU64,
-    tree: HistoryTree,
+    pub(crate) tree: HistoryTree,
     /// Every checkpoint the tree refers to: each edge's, and each set of saved versions.
-    checkpoints: BTreeMap<CheckpointId, Checkpoint>,
+    pub(crate) checkpoints: BTreeMap<CheckpointId, Checkpoint>,
     /// What each change did that cannot be undone (FR-CKP-36), by its checkpoint.
-    irreversible: BTreeMap<CheckpointId, BTreeSet<String>>,
+    pub(crate) irreversible: BTreeMap<CheckpointId, BTreeSet<String>>,
+    /// The bytes of each checkpoint's kept pre-images by store, as retention last measured them (KNSH-087,
+    /// [`crate::retention`]); dropped when the checkpoint changes or goes.
+    pub(crate) sizes: BTreeMap<CheckpointId, BTreeMap<std::path::PathBuf, u64>>,
 }
 
 impl History {
@@ -272,6 +281,7 @@ impl History {
             tree: HistoryTree::new(),
             checkpoints: BTreeMap::new(),
             irreversible: BTreeMap::new(),
+            sizes: BTreeMap::new(),
         }
     }
 
@@ -353,8 +363,21 @@ impl History {
             return Err(CheckpointError::ForceNotAllowed);
         }
         let target = self.resolve(request.target)?;
-        let origin = self.origin(target)?;
-        self.authorize(request.caller, origin)?;
+        // While the edge is still in the tree its sessions are known: authorize first, so an agent learns nothing
+        // about another session's change, not even that it expired.
+        let origin = match self.tree.edge(target) {
+            Some(_) => {
+                let origin = self.origin(target)?;
+                self.authorize(request.caller, origin)?;
+                Some(origin)
+            }
+            None => None,
+        };
+        // KNSH-087: a change retention or forget removed is refused as expired before anything else is looked at.
+        if self.tree.is_expired(target) {
+            return Err(CheckpointError::History(HistoryError::Expired));
+        }
+        let origin = origin.ok_or(CheckpointError::History(HistoryError::UnknownChange))?;
         let plan = match operation {
             RestoreOperation::Undo => self.tree.plan_undo(target)?,
             RestoreOperation::Redo => self.tree.plan_redo(target)?,
@@ -745,6 +768,7 @@ impl History {
         if let Some(released) = committed.released
             && let Some(checkpoint) = self.checkpoints.remove(&released)
         {
+            self.sizes.remove(&released);
             remove_checkpoint_files(self.files.as_ref(), released, &checkpoint.paths, &checkpoint.stores);
         }
         let mut restored = self.report(
@@ -832,8 +856,17 @@ impl History {
                 .tree
                 .edge_for_record(record)
                 .map(|edge| edge.checkpoint)
-                .ok_or(CheckpointError::History(HistoryError::UnknownChange)),
+                .ok_or_else(|| CheckpointError::History(self.missing_record(record))),
             Target::Checkpoint(checkpoint) => Ok(checkpoint),
+        }
+    }
+
+    /// Why line `record` has no change in the history: it expired (KNSH-087), or it is unknown.
+    pub(crate) fn missing_record(&self, record: RecordId) -> HistoryError {
+        if self.tree.is_record_expired(record) {
+            HistoryError::Expired
+        } else {
+            HistoryError::UnknownChange
         }
     }
 

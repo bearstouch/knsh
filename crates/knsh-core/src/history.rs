@@ -41,6 +41,24 @@
 //! An edge is **in effect** when it lies on the path from the root to the head and no `undo` edge in effect after it
 //! undid it. Only edges in effect can be undone.
 //!
+//! # Expiry (KNSH-087)
+//!
+//! Retention (FR-CKP-32) and `knsh forget --with-checkpoints` (FR-CKP-34) remove checkpoints; [`HistoryTree::expire`]
+//! records that in the tree, so the undo or redo of a removed change is refused as [`HistoryError::Expired`], never
+//! attempted. Expiring an edge:
+//!
+//! - marks it **expired**: it can no longer be crossed either way (its pre-images and the versions its undo saved are
+//!   gone), and so is every `undo` edge that reverted it (redoing the change would be its undo);
+//! - removes every edge that can only be reached by crossing an expired edge (branches hanging off states before an
+//!   expired edge on the head's path, and everything beyond an expired edge off it), since no undo, redo or restore
+//!   could reach them; and the expired edges at the root, which nothing later needs;
+//! - keeps an expired edge on the head's path between edges still kept, with its path list, so the undo of an older
+//!   change is still refused when it overlapped (FR-CKP-30).
+//!
+//! Every checkpoint the tree stops referencing is returned for the caller to remove. The checkpoints and records of
+//! removed edges are remembered (at most [`MAX_FORGOTTEN`] of each, oldest dropped first) so asking for them still
+//! says `Expired` rather than unknown.
+//!
 //! # Persistence
 //!
 //! [`HistoryTree::encode`] writes one strict JSON object with a `format` version ([`HISTORY_FORMAT`]);
@@ -59,7 +77,10 @@ use crate::path::CanonicalPath;
 use crate::record::Attribution;
 
 /// The version of the stored history tree that [`HistoryTree::encode`] writes and [`HistoryTree::decode`] reads.
-pub const HISTORY_FORMAT: u64 = 1;
+///
+/// 2 since KNSH-087 (expired edges, `forgotten` and `forgotten_records`). Format 1 (KNSH-083) was never written to
+/// disk, so it is not read: any other version than this one is refused.
+pub const HISTORY_FORMAT: u64 = 2;
 
 /// The largest stored history tree [`HistoryTree::decode`] reads, in bytes (256 MiB).
 ///
@@ -69,6 +90,10 @@ pub const MAX_HISTORY_LEN: usize = 256 << 20;
 
 /// The highest state number: the integers JSON carries exactly (±2^53).
 const MAX_STATE: u64 = MAX_SAFE_INTEGER.unsigned_abs();
+
+/// The most removed checkpoints, and the most removed records, a tree remembers as expired ([`HistoryTree::expire`]);
+/// beyond that the oldest (lowest identifier, so earliest created) are forgotten and reported as unknown.
+pub const MAX_FORGOTTEN: usize = 65_536;
 
 /// Identifies a state of the history tree, the contents of every checkpoint root at one point in time (the API's
 /// `state_id`).
@@ -158,8 +183,11 @@ pub struct HistoryEdge {
     /// `paths` is incomplete.
     pub overflowed: bool,
     /// The versions saved when the head last stepped back over it, which redo restores. `None` while it is not
-    /// undone that way.
+    /// undone that way, and once it expired.
     pub saved: Option<CheckpointId>,
+    /// Its checkpoint was removed by retention or forget ([`HistoryTree::expire`]): it can no longer be undone,
+    /// redone or crossed by a restore.
+    pub expired: bool,
 }
 
 /// What an undo or redo does ([`Plan::action`]).
@@ -295,6 +323,9 @@ pub enum HistoryError {
     DuplicateRecord,
     /// Every state number has been used.
     StatesExhausted,
+    /// The change's checkpoint was removed by retention or `knsh forget --with-checkpoints` (FR-CKP-32 to
+    /// FR-CKP-34), or the way to a state crosses such a change: it can no longer be undone, redone or restored.
+    Expired,
     /// A path is not valid UTF-8, which the stored form cannot hold.
     UnencodablePath,
     /// The stored tree is larger than [`MAX_HISTORY_LEN`].
@@ -325,6 +356,7 @@ impl fmt::Display for HistoryError {
             Self::DuplicateCheckpoint => f.write_str("the checkpoint is already in the history"),
             Self::DuplicateRecord => f.write_str("the record already belongs to a change in the history"),
             Self::StatesExhausted => f.write_str("the history has used every state number"),
+            Self::Expired => f.write_str("the change's checkpoint has expired and was removed"),
             Self::UnencodablePath => f.write_str("a path is not valid UTF-8"),
             Self::TooLarge => f.write_str("the stored history is too large"),
             Self::NewerFormat(format) => write!(f, "the stored history has newer format {format}"),
@@ -347,6 +379,10 @@ pub struct HistoryTree {
     parents: BTreeMap<StateId, CheckpointId>,
     /// The edge holding each record's change.
     records: BTreeMap<RecordId, CheckpointId>,
+    /// Checkpoints of edges removed by [`HistoryTree::expire`], at most [`MAX_FORGOTTEN`].
+    forgotten: BTreeSet<CheckpointId>,
+    /// Records of edges removed by [`HistoryTree::expire`], at most [`MAX_FORGOTTEN`].
+    forgotten_records: BTreeSet<RecordId>,
     /// Counts changes of the tree, so a plan made before one is stale. Not stored: plans do not outlive the process.
     generation: u64,
 }
@@ -384,6 +420,8 @@ impl HistoryTree {
             edges: BTreeMap::new(),
             parents: BTreeMap::new(),
             records: BTreeMap::new(),
+            forgotten: BTreeSet::new(),
+            forgotten_records: BTreeSet::new(),
             generation: 0,
         }
     }
@@ -447,6 +485,32 @@ impl HistoryTree {
         self.edges.values()
     }
 
+    /// Whether the change identified by `checkpoint` expired ([`HistoryTree::expire`]): its edge is marked expired,
+    /// or was removed and is still remembered.
+    #[must_use]
+    pub fn is_expired(&self, checkpoint: CheckpointId) -> bool {
+        self.edges
+            .get(&checkpoint)
+            .map_or_else(|| self.forgotten.contains(&checkpoint), |edge| edge.expired)
+    }
+
+    /// Whether line `record`'s change expired ([`HistoryTree::is_expired`]).
+    #[must_use]
+    pub fn is_record_expired(&self, record: RecordId) -> bool {
+        self.edge_for_record(record)
+            .map_or_else(|| self.forgotten_records.contains(&record), |edge| edge.expired)
+    }
+
+    /// The edge identified by `checkpoint`, refusing an expired one.
+    fn live_edge(&self, checkpoint: CheckpointId) -> Result<&HistoryEdge, HistoryError> {
+        match self.edges.get(&checkpoint) {
+            Some(edge) if edge.expired => Err(HistoryError::Expired),
+            Some(edge) => Ok(edge),
+            None if self.forgotten.contains(&checkpoint) => Err(HistoryError::Expired),
+            None => Err(HistoryError::UnknownChange),
+        }
+    }
+
     /// Whether `state` is a state of the tree: its root or the end of one of its edges.
     #[must_use]
     pub fn has_state(&self, state: StateId) -> bool {
@@ -458,7 +522,8 @@ impl HistoryTree {
     ///
     /// # Errors
     ///
-    /// [`HistoryError::UnknownState`] if either is not a state of the tree.
+    /// [`HistoryError::UnknownState`] if either is not a state of the tree; [`HistoryError::Expired`] if the way
+    /// crosses an expired edge, whose versions are gone.
     pub fn route(&self, from: StateId, to: StateId) -> Result<Route, HistoryError> {
         if !self.has_state(from) || !self.has_state(to) {
             return Err(HistoryError::UnknownState);
@@ -475,6 +540,9 @@ impl HistoryTree {
         let back = up[..up.len() - shared].to_vec();
         let mut forward = down[..down.len() - shared].to_vec();
         forward.reverse();
+        if back.iter().chain(&forward).any(|edge| self.is_expired(*edge)) {
+            return Err(HistoryError::Expired);
+        }
         Ok(Route { back, forward })
     }
 
@@ -529,6 +597,7 @@ impl HistoryTree {
             paths: change.paths,
             overflowed: change.overflowed,
             saved: None,
+            expired: false,
         });
         self.head = to;
         self.generation += 1;
@@ -540,10 +609,10 @@ impl HistoryTree {
     ///
     /// # Errors
     ///
-    /// [`HistoryError::UnknownChange`], [`HistoryError::NotInEffect`], or [`HistoryError::Conflict`] with the paths a
-    /// later edge also touched.
+    /// [`HistoryError::UnknownChange`], [`HistoryError::Expired`], [`HistoryError::NotInEffect`], or
+    /// [`HistoryError::Conflict`] with the paths a later edge also touched.
     pub fn plan_undo(&self, checkpoint: CheckpointId) -> Result<Plan, HistoryError> {
-        let edge = self.edges.get(&checkpoint).ok_or(HistoryError::UnknownChange)?;
+        let edge = self.live_edge(checkpoint)?;
         let path = self.head_path();
         if !path.in_effect(checkpoint) {
             return Err(HistoryError::NotInEffect);
@@ -564,11 +633,12 @@ impl HistoryTree {
     ///
     /// # Errors
     ///
-    /// [`HistoryError::UnknownChange`]; [`HistoryError::NotUndone`] if it is in effect or has no saved versions;
+    /// [`HistoryError::UnknownChange`]; [`HistoryError::Expired`] if it, or the `undo` edge that reverted it,
+    /// expired; [`HistoryError::NotUndone`] if it is in effect or has no saved versions;
     /// [`HistoryError::RedoBlocked`] if the head is not its parent state; or any error of undoing the `undo` edge
     /// ([`HistoryTree::plan_undo`]).
     pub fn plan_redo(&self, checkpoint: CheckpointId) -> Result<Plan, HistoryError> {
-        let edge = self.edges.get(&checkpoint).ok_or(HistoryError::UnknownChange)?;
+        let edge = self.live_edge(checkpoint)?;
         let path = self.head_path();
         if path.contains(checkpoint) {
             // On the head's path, the edge can only be undone by a revert; redoing it undoes that revert.
@@ -632,6 +702,7 @@ impl HistoryTree {
                     paths,
                     overflowed,
                     saved: None,
+                    expired: false,
                 });
                 self.head = to;
                 None
@@ -646,6 +717,132 @@ impl HistoryTree {
             head: self.head,
             released,
         })
+    }
+
+    /// Expires the change identified by `checkpoint`, whose checkpoint retention or forget removes (module
+    /// documentation, "Expiry"), and returns every checkpoint the tree no longer references, sorted: the edge's own,
+    /// the versions its undo saved, and those of each edge expired or removed with it. The caller removes their files.
+    ///
+    /// With `scrub` (forget, FR-CKP-34), the expired edges also drop their path lists and count as overflowed, so
+    /// nothing of what the user asked to forget stays in the tree, and an older change kept is still never undone
+    /// over them unchecked (FR-CKP-30, fail closed). Expiring an edge already expired changes nothing but `scrub`.
+    ///
+    /// # Errors
+    ///
+    /// [`HistoryError::UnknownChange`] if no edge has this checkpoint (one already removed is not an error: nothing is
+    /// left to expire).
+    pub fn expire(&mut self, checkpoint: CheckpointId, scrub: bool) -> Result<Vec<CheckpointId>, HistoryError> {
+        if !self.edges.contains_key(&checkpoint) {
+            return if self.forgotten.contains(&checkpoint) {
+                Ok(Vec::new())
+            } else {
+                Err(HistoryError::UnknownChange)
+            };
+        }
+        let mut released = BTreeSet::new();
+        let mut queue = vec![checkpoint];
+        let mut seen = BTreeSet::new();
+        while let Some(id) = queue.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(edge) = self.edges.get_mut(&id) else {
+                continue;
+            };
+            if !edge.expired {
+                edge.expired = true;
+                released.insert(id);
+            }
+            released.extend(edge.saved.take());
+            if scrub {
+                edge.paths.clear();
+                edge.overflowed = true;
+            }
+            // Redoing a change reverted by an `undo` edge is that edge's undo: it goes with the change.
+            queue.extend(
+                self.edges
+                    .values()
+                    .filter(|other| matches!(other.kind, EdgeKind::Undo { of } if of == id))
+                    .map(|other| other.checkpoint),
+            );
+        }
+        self.remove_unreachable(&mut released);
+        self.generation += 1;
+        Ok(released.into_iter().collect())
+    }
+
+    /// Removes every edge no undo, redo or restore can use any more, adding the checkpoints they referenced to
+    /// `released`: those that can only be reached by crossing an expired edge, then the expired edges at the root.
+    /// The edges on the way from the root to the head are kept (expired or not), so later changes are still checked
+    /// against them (FR-CKP-30).
+    fn remove_unreachable(&mut self, released: &mut BTreeSet<CheckpointId>) {
+        let trunk: BTreeSet<CheckpointId> = self.ancestors(self.head).into_iter().collect();
+        // The states reachable from the head over edges not expired, either way.
+        let mut reachable = BTreeSet::from([self.head]);
+        let mut frontier = vec![self.head];
+        while let Some(state) = frontier.pop() {
+            let near = self.edges.values().filter(|edge| !edge.expired).filter_map(|edge| {
+                if edge.from == state {
+                    Some(edge.to)
+                } else if edge.to == state {
+                    Some(edge.from)
+                } else {
+                    None
+                }
+            });
+            let near: Vec<StateId> = near.collect();
+            for next in near {
+                if reachable.insert(next) {
+                    frontier.push(next);
+                }
+            }
+        }
+        let unreachable: Vec<CheckpointId> = self
+            .edges
+            .values()
+            .filter(|edge| {
+                let kept = trunk.contains(&edge.checkpoint)
+                    || (reachable.contains(&edge.from) && reachable.contains(&edge.to));
+                !kept
+            })
+            .map(|edge| edge.checkpoint)
+            .collect();
+        for checkpoint in unreachable {
+            self.remove_edge(checkpoint, released);
+        }
+        // The expired edges at the root are needed by nothing: no kept edge is older than them.
+        while self.root != self.head {
+            let Some(first) = self.edges.values().find(|edge| edge.from == self.root) else {
+                break;
+            };
+            if !first.expired {
+                break;
+            }
+            let (checkpoint, to) = (first.checkpoint, first.to);
+            self.remove_edge(checkpoint, released);
+            self.root = to;
+        }
+    }
+
+    /// Removes edge `checkpoint` from the tree, remembering it (and its records) as expired and adding the
+    /// checkpoints it referenced to `released`.
+    fn remove_edge(&mut self, checkpoint: CheckpointId, released: &mut BTreeSet<CheckpointId>) {
+        let Some(edge) = self.edges.remove(&checkpoint) else {
+            return;
+        };
+        self.parents.remove(&edge.to);
+        // An expired edge's checkpoint and saved versions were released when it expired.
+        if !edge.expired {
+            released.insert(edge.checkpoint);
+            released.extend(edge.saved);
+        }
+        if let EdgeKind::Change { records, .. } = &edge.kind {
+            for record in records {
+                self.records.remove(record);
+                remember(&mut self.forgotten_records, *record);
+            }
+        }
+        remember(&mut self.forgotten, edge.checkpoint);
     }
 
     /// The stored form: one JSON object with `format` [`HISTORY_FORMAT`], read back by [`HistoryTree::decode`].
@@ -663,6 +860,8 @@ impl HistoryTree {
         let object = put(object, "head", state_number(self.head.0)?)?;
         let object = put(object, "next_state", state_number(self.next_state)?)?;
         let object = put(object, "edges", Value::Array(edges))?;
+        let object = put(object, "forgotten", id_list(&self.forgotten))?;
+        let object = put(object, "forgotten_records", id_list(&self.forgotten_records))?;
         knsh_json::write(&Value::Object(object)).map_err(|_| HistoryError::Corrupt)
     }
 
@@ -692,7 +891,18 @@ impl HistoryTree {
         let head = StateId(read_number(&mut fields, "head")?);
         let next_state = read_number(&mut fields, "next_state")?;
         let edges: Vec<Value> = fields.required("edges").map_err(|_| HistoryError::Corrupt)?;
+        let forgotten: Vec<String> = fields.required("forgotten").map_err(|_| HistoryError::Corrupt)?;
+        let forgotten_records: Vec<String> = fields
+            .required("forgotten_records")
+            .map_err(|_| HistoryError::Corrupt)?;
         fields.finish_closed().map_err(|_| HistoryError::Corrupt)?;
+        if forgotten.len() > MAX_FORGOTTEN || forgotten_records.len() > MAX_FORGOTTEN {
+            return Err(HistoryError::Corrupt);
+        }
+        let forgotten =
+            read_set(&forgotten, "forgotten", |text| text.parse().ok()).map_err(|_| HistoryError::Corrupt)?;
+        let forgotten_records = read_set(&forgotten_records, "forgotten_records", |text| text.parse().ok())
+            .map_err(|_| HistoryError::Corrupt)?;
         if root.0 >= next_state {
             return Err(HistoryError::Corrupt);
         }
@@ -700,6 +910,8 @@ impl HistoryTree {
             root,
             head: root,
             next_state,
+            forgotten,
+            forgotten_records,
             ..Self::new()
         };
         for value in &edges {
@@ -711,7 +923,20 @@ impl HistoryTree {
         // Saved versions are checkpoints of their own: each held by one edge, and never an edge's checkpoint.
         let saved: Vec<CheckpointId> = tree.edges.values().filter_map(|edge| edge.saved).collect();
         let distinct: BTreeSet<CheckpointId> = saved.iter().copied().collect();
-        if distinct.len() != saved.len() || distinct.iter().any(|id| tree.edges.contains_key(id)) {
+        if distinct.len() != saved.len()
+            || distinct
+                .iter()
+                .any(|id| tree.edges.contains_key(id) || tree.forgotten.contains(id))
+        {
+            return Err(HistoryError::Corrupt);
+        }
+        // A removed edge is never also in the tree.
+        if tree.edges.keys().any(|id| tree.forgotten.contains(id))
+            || tree
+                .records
+                .keys()
+                .any(|record| tree.forgotten_records.contains(record))
+        {
             return Err(HistoryError::Corrupt);
         }
         tree.head = head;
@@ -727,7 +952,8 @@ impl HistoryTree {
         if !from_known || !to_new || edge.from >= edge.to || edge.to.0 >= self.next_state {
             return Err(HistoryError::Corrupt);
         }
-        if self.edges.contains_key(&edge.checkpoint) {
+        // An expired edge's saved versions were released with it.
+        if self.edges.contains_key(&edge.checkpoint) || (edge.expired && edge.saved.is_some()) {
             return Err(HistoryError::Corrupt);
         }
         match &edge.kind {
@@ -739,16 +965,16 @@ impl HistoryTree {
                 }
             }
             // An undo edge undoes an edge in effect at its start state (the only kind `plan_undo` allows), and
-            // touches exactly that edge's paths: a shorter list would hide conflicts from FR-CKP-30.
-            EdgeKind::Undo { of } => {
-                if !self.path_to(edge.from).in_effect(*of) {
-                    return Err(HistoryError::Corrupt);
-                }
-                match self.edges.get(of) {
-                    Some(target) if target.paths == edge.paths && target.overflowed == edge.overflowed => {}
-                    Some(_) | None => return Err(HistoryError::Corrupt),
-                }
-            }
+            // touches exactly that edge's paths: a shorter list would hide conflicts from FR-CKP-30. An expired
+            // change takes its undo edges with it, which may outlive it in the tree (`expire`, scrubbed or not).
+            EdgeKind::Undo { of } => match self.edges.get(of) {
+                None if edge.expired => {}
+                Some(target) if target.expired && !edge.expired => return Err(HistoryError::Corrupt),
+                Some(target)
+                    if self.path_to(edge.from).in_effect(*of)
+                        && (edge.expired || (target.paths == edge.paths && target.overflowed == edge.overflowed)) => {}
+                Some(_) | None => return Err(HistoryError::Corrupt),
+            },
         }
         self.insert_edge(edge);
         Ok(())
@@ -829,7 +1055,9 @@ impl HistoryTree {
 
     /// Whether `checkpoint` already identifies an edge or the saved versions of one.
     fn is_used(&self, checkpoint: CheckpointId) -> bool {
-        self.edges.contains_key(&checkpoint) || self.edges.values().any(|edge| edge.saved == Some(checkpoint))
+        self.edges.contains_key(&checkpoint)
+            || self.forgotten.contains(&checkpoint)
+            || self.edges.values().any(|edge| edge.saved == Some(checkpoint))
     }
 
     /// Hands out the next state number, refusing past the integers JSON carries exactly.
@@ -846,6 +1074,14 @@ impl HistoryTree {
     fn insert_edge(&mut self, edge: HistoryEdge) {
         self.parents.insert(edge.to, edge.checkpoint);
         self.edges.insert(edge.checkpoint, edge);
+    }
+}
+
+/// Adds `id` to `set`, dropping the lowest identifiers (the oldest) beyond [`MAX_FORGOTTEN`].
+fn remember<T: Ord + Copy>(set: &mut BTreeSet<T>, id: T) {
+    set.insert(id);
+    while set.len() > MAX_FORGOTTEN {
+        set.pop_first();
     }
 }
 
@@ -904,6 +1140,7 @@ fn edge_to_json(edge: &HistoryEdge) -> Result<Value, HistoryError> {
     let object = put(object, "paths", Value::Array(paths))?;
     let object = put(object, "overflowed", edge.overflowed)?;
     let object = put(object, "saved", saved)?;
+    let object = put(object, "expired", edge.expired)?;
     Ok(Value::Object(object))
 }
 
@@ -946,6 +1183,7 @@ fn edge_from_json(value: &Value) -> Result<HistoryEdge, JsonError> {
     })?;
     let overflowed: bool = fields.required("overflowed")?;
     let saved: Option<String> = fields.required("saved")?;
+    let expired: bool = fields.required("expired")?;
     fields.finish_closed()?;
     let state = |value: &Value, field| non_negative(value).map(StateId).ok_or(out_of_range(field));
     Ok(HistoryEdge {
@@ -958,6 +1196,7 @@ fn edge_from_json(value: &Value) -> Result<HistoryEdge, JsonError> {
         saved: saved
             .map(|saved| saved.parse().map_err(|_| out_of_range("saved")))
             .transpose()?,
+        expired,
     })
 }
 
@@ -1449,7 +1688,7 @@ mod tests {
         assert_eq!(tree.children(tree.parent_edge(branch_point).unwrap().from).len(), 2);
 
         let text = tree.encode().unwrap();
-        assert!(text.starts_with(r#"{"format":1,"#));
+        assert!(text.starts_with(r#"{"format":2,"#));
         let read = HistoryTree::decode(text.as_bytes()).unwrap();
         // Equal except the in-memory generation, which is not stored.
         assert_eq!(read.encode().unwrap(), text);
@@ -1470,8 +1709,8 @@ mod tests {
 
     #[test]
     fn newer_format_is_reported_as_newer() {
-        let text = r#"{"format":2,"anything":true}"#;
-        assert_eq!(HistoryTree::decode(text.as_bytes()), Err(HistoryError::NewerFormat(2)));
+        let text = r#"{"format":3,"anything":true}"#;
+        assert_eq!(HistoryTree::decode(text.as_bytes()), Err(HistoryError::NewerFormat(3)));
     }
 
     #[test]
@@ -1487,10 +1726,12 @@ mod tests {
             String::new(),
             "[]".to_owned(),
             r#"{"format":0,"root":0,"head":0,"next_state":1,"edges":[]}"#.to_owned(),
-            r#"{"format":1,"root":0,"head":0,"next_state":1,"edges":[],"extra":1}"#.to_owned(),
+            // Format 1 (KNSH-083) lacks the KNSH-087 fields and was never written: refused, not guessed at.
+            r#"{"format":1,"root":0,"head":0,"next_state":1,"edges":[]}"#.to_owned(),
+            r#"{"format":2,"root":0,"head":0,"next_state":1,"edges":[],"extra":1}"#.to_owned(),
             // Head is not a state; root not below next_state.
-            r#"{"format":1,"root":0,"head":5,"next_state":1,"edges":[]}"#.to_owned(),
-            r#"{"format":1,"root":3,"head":3,"next_state":3,"edges":[]}"#.to_owned(),
+            r#"{"format":2,"root":0,"head":5,"next_state":1,"edges":[]}"#.to_owned(),
+            r#"{"format":2,"root":3,"head":3,"next_state":3,"edges":[]}"#.to_owned(),
             // An edge from an unknown state, a state with two parents, and an edge pointing backwards.
             good.replace(r#""from":1"#, r#""from":7"#),
             good.replace(r#""from":1,"to":2"#, r#""from":0,"to":1"#),
@@ -1585,5 +1826,171 @@ mod tests {
         );
         // A mapping outranks a descriptor when both hold a file (`knsh_checkpoint::held_in_roots`).
         assert!(TornReason::MappedWritable > TornReason::OpenForWriting);
+    }
+
+    // KNSH-087: a stored tree whose saved versions reuse a forgotten checkpoint id is corrupt.
+    #[test]
+    fn refuses_stored_saved_versions_that_were_forgotten() {
+        let mut tree = HistoryTree::new();
+        tree.record(line(1, &["/p/a"])).unwrap();
+        tree.record(line(2, &["/p/b"])).unwrap();
+        undo(&mut tree, 2, 20);
+        // The oldest change is removed at the root: its checkpoint id is forgotten.
+        assert_eq!(tree.expire(checkpoint(1), false), Ok(vec![checkpoint(1)]));
+        assert!(tree.edge(checkpoint(1)).is_none());
+        let good = tree.encode().unwrap();
+        assert!(HistoryTree::decode(good.as_bytes()).is_ok());
+        let saved = format!(r#""saved":"{}""#, checkpoint(20));
+        assert!(good.contains(&saved));
+        // Saved versions that claim a forgotten checkpoint id would refer to files already removed.
+        let corrupt = good.replace(&saved, &format!(r#""saved":"{}""#, checkpoint(1)));
+        assert_ne!(corrupt, good);
+        assert_eq!(HistoryTree::decode(corrupt.as_bytes()), Err(HistoryError::Corrupt));
+    }
+
+    // KNSH-087: undo and redo of a change whose checkpoint was removed say so, and the tree drops what nothing needs.
+    #[test]
+    fn expired_changes_report_expired_and_leave_the_root() {
+        let mut tree = HistoryTree::new();
+        tree.record(line(1, &["/p/a"])).unwrap();
+        let s2 = tree.record(line(2, &["/p/b"])).unwrap();
+        tree.record(line(3, &["/p/c"])).unwrap();
+
+        // The middle change: kept as expired (an older change is still there), its checkpoint released.
+        assert_eq!(tree.expire(checkpoint(2), false), Ok(vec![checkpoint(2)]));
+        assert!(tree.is_expired(checkpoint(2)) && tree.is_record_expired(record_id(2)));
+        assert_eq!(tree.plan_undo(checkpoint(2)), Err(HistoryError::Expired));
+        assert_eq!(tree.plan_redo(checkpoint(2)), Err(HistoryError::Expired));
+        assert_eq!(tree.route(tree.head(), tree.root()), Err(HistoryError::Expired));
+        // The older change can still be reverted: the expired one kept its paths, which do not overlap.
+        assert!(tree.plan_undo(checkpoint(1)).is_ok());
+        // The latest one can still be undone.
+        undo(&mut tree, 3, 30);
+        assert_eq!(tree.head(), s2);
+
+        // Expiring the oldest leaves both expired edges at the root: removed, and still reported as expired.
+        assert_eq!(tree.expire(checkpoint(1), false), Ok(vec![checkpoint(1)]));
+        assert_eq!(tree.root(), s2);
+        assert!(tree.edge(checkpoint(1)).is_none() && tree.edge(checkpoint(2)).is_none());
+        assert_eq!(tree.plan_undo(checkpoint(1)), Err(HistoryError::Expired));
+        assert!(tree.is_record_expired(record_id(1)) && tree.edge_for_record(record_id(1)).is_none());
+        assert_eq!(
+            tree.expire(checkpoint(1), false),
+            Ok(vec![]),
+            "already gone: nothing to do"
+        );
+        assert_eq!(tree.expire(checkpoint(99), false), Err(HistoryError::UnknownChange));
+        assert_eq!(tree.plan_undo(checkpoint(99)), Err(HistoryError::UnknownChange));
+        // The undone change is still redoable.
+        assert!(tree.plan_redo(checkpoint(3)).is_ok());
+    }
+
+    // KNSH-087: branches only reachable over an expired change go, with their saved versions.
+    #[test]
+    fn expiring_releases_branches_only_reachable_over_it() {
+        let mut tree = HistoryTree::new();
+        let s1 = tree.record(line(1, &["/p/a"])).unwrap();
+        tree.record(line(2, &["/p/b"])).unwrap();
+        tree.record(line(3, &["/p/c"])).unwrap();
+        undo(&mut tree, 3, 30);
+        undo(&mut tree, 2, 20);
+        assert_eq!(tree.head(), s1);
+
+        // Off the head's path: the change, what lies beyond it, and their saved versions.
+        let released = tree.expire(checkpoint(2), false).unwrap();
+        assert_eq!(
+            released,
+            vec![checkpoint(2), checkpoint(3), checkpoint(20), checkpoint(30)]
+        );
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree.plan_redo(checkpoint(2)), Err(HistoryError::Expired));
+        assert_eq!(tree.plan_redo(checkpoint(3)), Err(HistoryError::Expired));
+        assert!(tree.plan_undo(checkpoint(1)).is_ok());
+
+        // On the head's path: the branches off the states before it can no longer be reached.
+        let mut tree = HistoryTree::new();
+        tree.record(line(1, &["/p/a"])).unwrap();
+        undo(&mut tree, 1, 10);
+        let s2 = tree.record(line(2, &["/p/b"])).unwrap();
+        let released = tree.expire(checkpoint(2), false).unwrap();
+        assert_eq!(released, vec![checkpoint(1), checkpoint(2), checkpoint(10)]);
+        assert!(tree.is_empty());
+        assert_eq!((tree.root(), tree.head()), (s2, s2));
+        assert_eq!(tree.plan_redo(checkpoint(1)), Err(HistoryError::Expired));
+    }
+
+    // KNSH-087: a change reverted by an undo edge takes it along: redoing the change would be undoing that edge.
+    #[test]
+    fn expiring_a_reverted_change_expires_its_undo_edge() {
+        let mut tree = HistoryTree::new();
+        tree.record(line(1, &["/p/a"])).unwrap();
+        tree.record(line(2, &["/p/b"])).unwrap();
+        undo(&mut tree, 1, 10);
+        assert_eq!(
+            tree.expire(checkpoint(1), false),
+            Ok(vec![checkpoint(1), checkpoint(10)])
+        );
+        assert_eq!(tree.plan_redo(checkpoint(1)), Err(HistoryError::Expired));
+        assert_eq!(tree.plan_undo(checkpoint(10)), Err(HistoryError::Expired));
+        // A revert of the later change over the expired undo edge: disjoint paths, so still allowed (FR-CKP-30).
+        assert!(tree.plan_undo(checkpoint(2)).is_ok());
+
+        // The stored form keeps expired edges and what was removed.
+        let text = tree.encode().unwrap();
+        let read = HistoryTree::decode(text.as_bytes()).unwrap();
+        assert_eq!(read.encode().unwrap(), text);
+        assert!(read.is_expired(checkpoint(1)) && read.is_expired(checkpoint(10)));
+        assert_eq!(read.plan_redo(checkpoint(1)), Err(HistoryError::Expired));
+    }
+
+    // FR-CKP-34 with FR-CKP-30: a forgotten change keeps no paths, and counts as touching every path.
+    #[test]
+    fn scrubbed_expiry_drops_paths_and_fails_closed() {
+        let mut tree = HistoryTree::new();
+        tree.record(line(1, &["/p/a"])).unwrap();
+        tree.record(line(2, &["/p/b"])).unwrap();
+        tree.record(line(3, &["/p/c"])).unwrap();
+        assert!(tree.plan_undo(checkpoint(1)).is_ok());
+
+        tree.expire(checkpoint(2), true).unwrap();
+        let edge = tree.edge(checkpoint(2)).unwrap();
+        assert!(edge.expired && edge.paths.is_empty() && edge.overflowed);
+        assert_eq!(
+            tree.plan_undo(checkpoint(1)),
+            Err(HistoryError::Conflict {
+                paths: BTreeSet::new(),
+                incomplete: true,
+            })
+        );
+        let text = tree.encode().unwrap();
+        assert!(!text.contains("/p/b"));
+        assert!(HistoryTree::decode(text.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn refuses_stored_expiry_that_breaks_invariants() {
+        let mut tree = HistoryTree::new();
+        tree.record(line(1, &["/p/a"])).unwrap();
+        tree.record(line(2, &["/p/b"])).unwrap();
+        tree.record(line(3, &["/p/c"])).unwrap();
+        tree.expire(checkpoint(2), false).unwrap();
+        tree.expire(checkpoint(1), false).unwrap();
+        let good = tree.encode().unwrap();
+        assert!(HistoryTree::decode(good.as_bytes()).is_ok());
+        let third = checkpoint(3).to_string();
+        let corrupt = [
+            // A removed checkpoint still in the tree; an expired edge keeping saved versions.
+            good.replacen(&checkpoint(1).to_string(), &third, 1),
+            good.replace(r#""saved":null,"expired":false"#, r#""saved":null,"expired":true"#)
+                .replacen(r#""saved":null"#, &format!(r#""saved":"{}""#, checkpoint(40)), 1),
+        ];
+        for text in &corrupt {
+            assert_ne!(text, &good);
+            assert_eq!(
+                HistoryTree::decode(text.as_bytes()),
+                Err(HistoryError::Corrupt),
+                "{text}"
+            );
+        }
     }
 }

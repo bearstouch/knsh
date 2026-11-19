@@ -57,3 +57,9 @@ fixed deny, and versioned by a `format` file; a newer or corrupt store is left a
 ## Retention
 
 First limit reached: 5 GB per volume, 200 checkpoints per root, or 7 days. Sensitive patterns (`.env*`, `*.pem`, `*.key`, `id_*`): 24 hours at most.
+
+GB here means GiB (5 × 2³⁰ bytes of kept copies per store, logical sizes). A sensitive pre-image past 24 hours is
+deleted from its checkpoint, which stays; a change past a limit is removed whole with the versions its undo saved,
+and its edge is marked `expired` in the history tree (stored as `"expired"` on each edge, with the removed
+checkpoints and records listed in `"forgotten"` and `"forgotten_records"`). See
+[checkpoints](../03-functional-requirements/checkpoints.md) (KNSH-087).

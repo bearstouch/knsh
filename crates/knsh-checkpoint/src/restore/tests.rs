@@ -37,6 +37,9 @@ pub(crate) fn record(n: u128) -> RecordId {
 pub(crate) struct Fixture {
     pub(crate) tree: Arc<FakeTree>,
     kept: Cell<u64>,
+    /// When the next changes are taken, in Unix milliseconds: the time in their checkpoint identifiers (retention,
+    /// KNSH-087). 0 by default.
+    pub(crate) at: Cell<u64>,
 }
 
 /// One change to take with [`Fixture::change`].
@@ -57,6 +60,7 @@ impl Fixture {
         Self {
             tree,
             kept: Cell::new(0),
+            at: Cell::new(0),
         }
     }
 
@@ -74,7 +78,8 @@ impl Fixture {
     /// A command line's change of `paths`, made by `edit`: each path's pre-image is set aside first (a clone into the
     /// checkpoint's folder, or a marker), its post-image identity read after, as capture does.
     pub(crate) fn change(&self, taken: &Taken<'_>, edit: impl FnOnce(&FakeTree)) -> Checkpoint {
-        let id = CheckpointId::from_ulid(Ulid::from_u128(1000 + taken.n));
+        // A ULID's time is its top 48 bits.
+        let id = CheckpointId::from_ulid(Ulid::from_u128((u128::from(self.at.get()) << 80) | (1000 + taken.n)));
         let folder = Path::new(STORE).join(CHECKPOINTS_DIR).join(id.to_string());
         self.tree.add_dir(&folder);
         let mut pres = Vec::new();

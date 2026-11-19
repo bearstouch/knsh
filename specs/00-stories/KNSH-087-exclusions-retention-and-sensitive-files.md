@@ -11,12 +11,20 @@ checkpoints do not fill the disk or keep secrets around. Scope: configurable exc
 reached, sensitive-pattern expiry, `forget --with-checkpoints`. Out of scope: record retention (phase 1).
 
 **Acceptance criteria**
-- [ ] Defaults exclude `node_modules`, `target`, `.venv`, `dist`, `build`; `checkpoints.exclude` overrides them.
-- [ ] Retention removes the oldest checkpoints when the first limit is reached: 5 GB of checkpoint data per volume,
-      200 checkpoints per root, or 7 days (FR-CKP-32).
-- [ ] Pre-images matching `.env*`, `*.pem`, `*.key` or `id_*` are deleted after at most 24 hours (FR-CKP-33).
-- [ ] `knsh forget --with-checkpoints` removes the matching checkpoints at once (FR-CKP-34).
-- [ ] Removing a checkpoint updates the history tree so redo or undo of removed edges reports "expired", not a crash.
+- [x] Defaults exclude `node_modules`, `target`, `.venv`, `dist`, `build`; `checkpoints.exclude` overrides them.
+- [x] Retention removes the oldest checkpoints when the first limit is reached: 5 GB of checkpoint data per volume,
+      200 checkpoints per root, or 7 days (FR-CKP-32). Observed in `knsh-checkpoint` unit tests (`History::retain`;
+      the 5 GB limit with scaled-down bytes); running the sweep in `knshd` is pending (KNSH-088).
+- [x] Pre-images matching `.env*`, `*.pem`, `*.key` or `id_*` are deleted after at most 24 hours (FR-CKP-33).
+      Observed in unit tests; each sweep returns when the next is due, which `knshd` must honour (pending, KNSH-088).
+- [ ] `knsh forget --with-checkpoints` removes the matching checkpoints at once (FR-CKP-34). **Partly:** the removal
+      (`History::forget`) is implemented and tested; `records.forget` still answers `-32005` for `with_checkpoints`
+      until `knshd` holds the history (KNSH-088).
+- [x] Removing a checkpoint updates the history tree so redo or undo of removed edges reports "expired", not a crash.
+
+**Implementation notes.** `knsh_core::HistoryTree::expire` and `HistoryError::Expired`; `knsh_checkpoint::retention`
+(`Retention`, `Forget`, `Swept`, `History::retain`, `History::forget`). Pending beyond KNSH-088: removing shadows,
+holding and marker folders when their session ends, and sweeping files left in a store by a failed removal.
 
 **Unit tests**
 - `retention_removes_oldest_after_200_checkpoints_per_root` (FR-CKP-32)
@@ -25,3 +33,6 @@ reached, sensitive-pattern expiry, `forget --with-checkpoints`. Out of scope: re
 - `sensitive_pre_image_deleted_after_24_hours` (FR-CKP-33)
 - `forget_with_checkpoints_removes_immediately` (FR-CKP-34)
 - `undo_of_expired_edge_reports_expired`
+- `forget_scrubs_a_revert_whose_change_is_gone` (FR-CKP-34, from the independent review)
+- `forget_since_selects_a_change_stepped_back_over_after_the_instant` (FR-CKP-34)
+- `agent_of_another_session_is_refused_before_expiry_is_reported` (agent scope, KNSH-084)

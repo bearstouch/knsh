@@ -277,7 +277,8 @@ pub fn recover_restores(files: &dyn ShadowFiles, store: &Path) -> Result<usize, 
 }
 
 /// Removes the saved copies of checkpoint `id` (its files in `paths`) and its folder in each of `stores`, best effort:
-/// a leftover is only a file in the owner-only store, which retention removes (KNSH-087).
+/// a leftover is only a file in the owner-only store (sweeping such leftovers is pending: retention, KNSH-087, removes
+/// the checkpoints the history holds).
 pub(crate) fn remove_checkpoint_files(
     files: &dyn ShadowFiles,
     id: CheckpointId,
