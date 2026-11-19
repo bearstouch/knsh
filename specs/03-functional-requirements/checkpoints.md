@@ -97,8 +97,8 @@ the flush deadline each, their uncertainty staying their own), so none reports a
 A line's record gets its `attribution` (`command` or `concurrent`) only after the line-end procedure has applied every
 event of the line, so it is final and always equals the attribution of the closed edge that holds the line. A denied
 line has none. An edge lists at most 65,536 paths and is then marked overflowed. Each edge's changes are captured as
-its checkpoint (below); storing edges in the history tree is KNSH-083, and until then closed edges themselves are
-dropped.
+its checkpoint (below); the history tree model exists (KNSH-083, below), but feeding closed edges into it is wired
+with undo (KNSH-084), and until then closed edges themselves are dropped.
 **Known limit:** opening a line never waits for the watcher (decision 16), so a change made just before the line whose
 event had not been applied yet is attributed to the line.
 
@@ -131,8 +131,8 @@ File events carry no process ID, so a human edit made at the same moment can be 
   `files_changed` 0 (`[]` in the record) and no checkpoint, unless one of its roots was uncertain (it then gets an
   empty, uncertain checkpoint, so its record says changes may be missing); one that touched none has `null`. A line of a concurrent
   set that ends before the set closes gets the set's changes so far.
-- **Pending:** only a summary of the last 64 checkpoints is kept in memory, and their pre-images on disk; an index written to disk
-  with the history tree is KNSH-083, removal by retention KNSH-087, and plain-copy roots (which have no shadow yet)
+- **Pending:** only a summary of the last 64 checkpoints is kept in memory, and their pre-images on disk; writing the history tree
+  (KNSH-083) to disk is wired with undo (KNSH-084), removal by retention KNSH-087, and plain-copy roots (which have no shadow yet)
   are not captured.
 - **Known limit (sessions sharing a root):** each session's watcher reports every change in the root. If one of them
   applies a change after the next line has started (the KNSH-081 limit), that change can be captured in the line's
@@ -170,5 +170,20 @@ States form a tree, like commits. Each line, agent edit or concurrent set is an 
 | FR-CKP-34 | `knsh forget --with-checkpoints` must remove checkpoints at once. |
 | FR-CKP-35 | **Other volumes:** checkpoints must sit on the same volume as the files they protect. Roots on non-APFS volumes must fall back to plain copies, limited to 50 MB per change, and the capability report must say so. |
 | FR-CKP-36 | Undo of a flagged irreversible change must still restore its files, and its result must list what cannot be undone. |
+
+**Model (KNSH-083).** The tree is a pure model in `knsh-core` (`HistoryTree`):
+
+- An edge is a closed change of the attribution ledger (identified by its checkpoint), or an **undo edge**. A new change
+  is an edge from the current state (the head); after an undo, it starts a new branch and the old branch stays.
+- **Undo of the latest change** in effect moves the head back to its parent state; the versions saved first stay on
+  the edge for redo. **Undo of an older change** (FR-CKP-30) cannot move back without undoing the later changes, so it
+  becomes an undo edge from the head to a new state (like `git revert`), whose checkpoint holds the saved versions. A
+  change whose path list overflowed conflicts with any later change, since its list cannot prove the paths disjoint.
+- **Redo** moves forward over an edge the head stepped back from, restoring the versions its undo saved, and only from
+  that edge's parent state: once a new change started another branch, returning to the old one is
+  `checkpoint.restore`. Redo of a change undone by an undo edge is the undo of that edge, under the same rule.
+- Each undo or redo is planned without changes, carried out on the files, then committed; a plan made before any later
+  change of the tree is refused, so the tree never records a restore that did not happen.
+- The tree is stored as one JSON object with a `format` version; a corrupt or newer file is refused and left as found.
 
 Undoing an `npm install`, for example, leaves `node_modules` out of step with the lockfile until install runs again. A file the agent deleted, including one holding secrets such as `.env`, stays in its checkpoint until retention removes it.

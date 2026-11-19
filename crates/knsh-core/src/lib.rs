@@ -15,6 +15,7 @@
 //! - `specs/05-models/grant.md`
 //! - `specs/05-models/execution-record.md`
 //! - `specs/05-models/event.md`, `specs/03-functional-requirements/events.md`
+//! - `specs/05-models/checkpoint.md`, `specs/03-functional-requirements/checkpoints.md#history-tree` (FR-CKP-30)
 //! - `specs/03-functional-requirements/command-lifecycle.md` (FR-LC-03: resolve each command to a canonical path;
 //!   FR-LC-09: decide the whole line before anything runs)
 //! - `specs/03-functional-requirements/agent-integration.md` (FR-AGT-21: the `unattended` profile)
@@ -137,6 +138,16 @@
 //! each answer with [`judge`], and returns the chain's [`HookOutcome`] with every hook's run time ([`HookRun`],
 //! FR-HOOK-05), which the pipeline puts in the record's `decision.hooks`. Human sessions run no hooks (FR-HOOK-01).
 //!
+//! # History tree (KNSH-083)
+//!
+//! [`HistoryTree`] is the pure model of checkpoint states and edges, like commits (`specs/05-models/checkpoint.md`).
+//! [`HistoryTree::record`] adds each captured [`Change`] (a line, concurrent set or run of edits) as an edge from the
+//! head, starting a new branch after an undo. [`HistoryTree::plan_undo`] and [`HistoryTree::plan_redo`] compute a
+//! [`Plan`] without changing anything: step back over the latest edge (keeping the branch for redo), step forward
+//! again with the versions the undo saved, or revert an older edge only if no later edge touched its paths
+//! (FR-CKP-30, else [`HistoryError::Conflict`] lists them). [`HistoryTree::commit`] records a plan once its files
+//! were restored. The tree is stored as versioned JSON ([`HISTORY_FORMAT`]); history errors are [`HistoryError`].
+//!
 //! Failures are reported through [`CoreError`], except the profile loader's, which are [`ProfileError`] because they
 //! must name the key at fault.
 
@@ -147,6 +158,7 @@
 mod authority;
 mod error;
 mod event;
+mod history;
 mod hook;
 mod id;
 mod lifecycle;
@@ -169,6 +181,10 @@ pub use event::{
     AGENT_EDIT_PATHS, BusLimits, CancelReason, Delivery, EVENT_BUFFER_LEN, EngineEvent, EngineEventData, EngineLost,
     Event, EventBus, EventData, EventScope, Lost, MAX_ENDED_BUFFERS, Published, PublishedEngine, Subscribed,
     SubscriptionId, UncertainReason,
+};
+pub use history::{
+    Action, Change, Committed, EdgeKind, HISTORY_FORMAT, HistoryEdge, HistoryError, HistoryTree, MAX_HISTORY_LEN, Plan,
+    StateId,
 };
 pub use hook::{
     ConfigProblem, Ended, Execution, HOOK_EVENT, HOOKS_KEY, HookConfig, HookEntry, HookExecutor, HookExit, HookId,
