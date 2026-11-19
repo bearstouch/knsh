@@ -31,17 +31,25 @@
 //!   every change of the line has been attributed before the line's attribution is read for its record
 //!   (FR-CKP-05, FR-CKP-07). The watchers other sessions keep on the line's roots are flushed too: they report the
 //!   line's changes as well, and must not do so after it ended. Agent edits are published as `agent.edit` on each envelope session watching the root,
-//!   one per batch the watcher applied (FR-CKP-06). Closed edges go to an [`EdgeSink`]: capture (KNSH-082) and the
-//!   history tree (KNSH-083) will take them; until then they are dropped.
+//!   one per batch the watcher applied (FR-CKP-06). Closed edges go to an [`EdgeSink`]: the history tree (KNSH-083)
+//!   will take them; until then they are dropped.
+//! - **Capture (KNSH-082).** Each change a watcher reports carries its pre-image (the shadow copy the watcher moved
+//!   into the root's holding folder) and its post-image identity. The attributor attributes it and begins its capture
+//!   in one critical section, then [`Captures::add`] keeps it in the checkpoint of its edge, in the root's store
+//!   (FR-CKP-08, FR-CKP-09). When an edge closes and its checkpoint is final, `checkpoint.created` is published on
+//!   each of its sessions (FR-CKP-11). A line's uncertain roots mark its checkpoint uncertain before it ends, and so
+//!   does an uncertain window outside lines for the run of edits it opens (FR-CKP-04). [`close_lines`] returns the
+//!   line's checkpoint for its record (`checkpoint_id`, `files_changed`).
 //!
 //! # Locks
 //!
 //! The session table is a leaf: no other lock is taken, and nothing waits, while it is held. The attributor's ledger
 //! lock is taken only without the table lock; the [`EdgeSink`] is called under it (so edges arrive in the order they
-//! closed) and must not block or call back. Events are published after it is released. A caller waiting on a
-//! shadow ([`Shadows::wait`]) holds only that shadow's own lock, inside `knsh-checkpoint`. Watchers are looked up
-//! under the table lock and used after it is released; their reports publish events (the hub's lock), never under
-//! the table lock.
+//! closed) and must not block or call back. The captures' lock is taken under it (lock order: ledger, then
+//! captures), never the other way round; a capture's renames happen after both are released. Events are published
+//! after it is released. A caller waiting on a shadow ([`Shadows::wait`]) holds only that shadow's own lock, inside
+//! `knsh-checkpoint`. Watchers are looked up under the table lock and used after it is released; their reports
+//! publish events (the hub's lock), never under the table lock.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -50,14 +58,17 @@ use std::thread;
 use std::time::Duration;
 
 use knsh_checkpoint::{
-    CheckpointError, Edge, FLUSH_DEADLINE, Ledger, LineClose, LineMark, Method, RootReadiness, SHADOW_THREADS,
-    STREAM_LATENCY, Shadow, ShadowFailure, ShadowFiles, ShadowPlan, ShadowStatus, WatchPlan, WatchReport, Watcher,
-    marker_dir, place_roots, shadow_dir, start_shadow, start_watch,
+    Captures, Change, Checkpoint, CheckpointError, CheckpointSummary, Edge, FLUSH_DEADLINE, Ledger, LineClose,
+    LineMark, Method, RootReadiness, SHADOW_THREADS, STREAM_LATENCY, Shadow, ShadowFailure, ShadowFiles, ShadowPlan,
+    ShadowStatus, WatchPlan, WatchReport, Watcher, held_dir, marker_dir, place_roots, shadow_dir, start_shadow,
+    start_watch,
 };
 use knsh_core::{
     Attribution, CanonicalPath, EventData, Profile, RecordId, SessionId, UncertainReason, UnprotectedReason,
 };
-use knsh_platform::{Clock, EnginePaths, Field, FileEvents, Fs, Level, PlatformError, SystemLog, Value, Volumes};
+use knsh_platform::{
+    Clock, EnginePaths, Field, FileEvents, Fs, Level, PlatformError, Random, SystemLog, Value, Volumes,
+};
 use knsh_proto::CheckpointBackend;
 
 use crate::events::EventHub;
@@ -81,6 +92,9 @@ pub(crate) trait CheckpointEvents: Send + Sync {
     /// `agent.edit`: `paths` under `root` changed inside the envelope of `session_id` while no line ran there, and
     /// `omitted` more were not listed (FR-CKP-06, KNSH-081).
     fn agent_edit(&self, session_id: SessionId, root: &CanonicalPath, paths: &[CanonicalPath], omitted: u32);
+
+    /// `checkpoint.created`: `checkpoint` was taken, and belongs to `session_id` (FR-CKP-11, KNSH-082).
+    fn checkpoint_created(&self, session_id: SessionId, checkpoint: &Checkpoint);
 }
 
 impl CheckpointEvents for EventHub {
@@ -116,17 +130,30 @@ impl CheckpointEvents for EventHub {
         };
         let _ = self.publish_for_session(session_id, data);
     }
+
+    fn checkpoint_created(&self, session_id: SessionId, checkpoint: &Checkpoint) {
+        let data = EventData::CheckpointCreated {
+            checkpoint_id: checkpoint.id,
+            attribution: checkpoint.attribution,
+            record_ids: checkpoint.records.iter().copied().collect(),
+            roots: checkpoint.paths.keys().cloned().collect(),
+            files_changed: checkpoint.path_count() as u64,
+            uncertain: checkpoint.is_uncertain(),
+        };
+        let _ = self.publish_for_session(session_id, data);
+    }
 }
 
-/// Where closed edges go (KNSH-081): the units capture (KNSH-082) and the history tree (KNSH-083) will store. Called
-/// under the attributor's lock, in the order the edges closed; must not block or call back into the attributor.
+/// Where closed edges go (KNSH-081): the units the history tree (KNSH-083) will store (their checkpoints are taken by
+/// [`Captures`], KNSH-082). Called under the attributor's lock, in the order the edges closed; must not block or call
+/// back into the attributor.
 pub(crate) trait EdgeSink: Send + Sync {
     /// `edges` closed, oldest first.
     fn closed(&self, edges: Vec<Edge>);
 }
 
-/// The edge sink until capture and the history tree exist (KNSH-082, KNSH-083): closed edges are dropped. Records
-/// still carry their attribution.
+/// The edge sink until the history tree exists (KNSH-083): closed edges are dropped. Their checkpoints are still
+/// taken, and records still carry their attribution.
 pub(crate) struct UncapturedEdges;
 
 impl EdgeSink for UncapturedEdges {
@@ -135,40 +162,74 @@ impl EdgeSink for UncapturedEdges {
     }
 }
 
-/// The daemon's attribution of changes in checkpoint roots (KNSH-081): the [`Ledger`] behind its lock, and where
-/// what it decides goes.
+/// The daemon's attribution of changes in checkpoint roots (KNSH-081), and their capture (KNSH-082): the [`Ledger`]
+/// behind its lock, the [`Captures`], and where what they decide goes.
 pub(crate) struct Attributor {
     ledger: Mutex<Ledger>,
+    captures: Captures,
     events: Arc<dyn CheckpointEvents>,
     edges: Arc<dyn EdgeSink>,
 }
 
 impl Attributor {
-    fn new(events: Arc<dyn CheckpointEvents>, edges: Arc<dyn EdgeSink>) -> Arc<Self> {
+    fn new(events: Arc<dyn CheckpointEvents>, edges: Arc<dyn EdgeSink>, captures: Captures) -> Arc<Self> {
         Arc::new(Self {
             ledger: Mutex::new(Ledger::new()),
+            captures,
             events,
             edges,
         })
     }
 
-    /// Runs `change` on the ledger, then hands the edges it closed to the sink, under the same lock (module
-    /// documentation, "Locks").
-    fn with<R>(&self, change: impl FnOnce(&mut Ledger) -> R) -> R {
-        // The ledger stays consistent at each step of every operation, so a panic elsewhere cannot corrupt it.
-        let mut ledger = self.ledger.lock().unwrap_or_else(PoisonError::into_inner);
-        let result = change(&mut ledger);
-        let closed = ledger.take_closed();
-        if !closed.is_empty() {
-            self.edges.closed(closed);
-        }
+    /// Runs `change` on the ledger and the captures, then hands the edges it closed to the captures and the sink,
+    /// under the same lock (module documentation, "Locks"). The checkpoints that finished are published once the lock
+    /// is released.
+    fn with<R>(&self, change: impl FnOnce(&mut Ledger, &Captures) -> R) -> R {
+        let (result, finished) = {
+            // The ledger stays consistent at each step of every operation, so a panic elsewhere cannot corrupt it.
+            let mut ledger = self.ledger.lock().unwrap_or_else(PoisonError::into_inner);
+            let result = change(&mut ledger, &self.captures);
+            let closed = ledger.take_closed();
+            let finished = if closed.is_empty() {
+                Vec::new()
+            } else {
+                let finished = self.captures.closed(&closed);
+                self.edges.closed(closed);
+                finished
+            };
+            (result, finished)
+        };
+        self.publish_created(&finished);
         result
+    }
+
+    /// Attributes `change` of `root`, reported by `session_id`'s watcher, and captures it in its edge's checkpoint in
+    /// `store` (KNSH-082). A change no session claims keeps nothing.
+    fn capture(&self, session_id: SessionId, store: &Path, root: &CanonicalPath, change: Change) {
+        // Attributed and begun in one critical section, so the edge cannot close before the change is added.
+        let ticket = self.with(|ledger, captures| ledger.changed(root, &change.path).map(|edge| captures.begin(edge)));
+        match ticket {
+            Some(ticket) => {
+                let finished = self.captures.add(ticket, session_id, store, root, change);
+                self.publish_created(&finished);
+            }
+            None => self.captures.discard(change),
+        }
+    }
+
+    /// `checkpoint.created` for each of `finished`, on each session it belongs to (FR-CKP-11).
+    fn publish_created(&self, finished: &[Checkpoint]) {
+        for checkpoint in finished {
+            for session_id in &checkpoint.sessions {
+                self.events.checkpoint_created(*session_id, checkpoint);
+            }
+        }
     }
 
     /// Publishes the agent edits of `root` not reported yet, as one `agent.edit` on each envelope session watching
     /// it (FR-CKP-06).
     fn publish_agent_edits(&self, root: &CanonicalPath) {
-        let Some(edits) = self.with(|ledger| ledger.take_agent_edits(root)) else {
+        let Some(edits) = self.with(|ledger, _| ledger.take_agent_edits(root)) else {
             return;
         };
         for session_id in &edits.sessions {
@@ -181,18 +242,28 @@ impl Attributor {
 /// A watcher's reports, for one session.
 struct SessionReport {
     session_id: SessionId,
+    /// The root's store, where its checkpoints are kept (KNSH-082).
+    store: PathBuf,
     events: Arc<dyn CheckpointEvents>,
     attributor: Arc<Attributor>,
 }
 
 impl WatchReport for SessionReport {
-    fn changed(&self, root: &CanonicalPath, path: &CanonicalPath) {
-        // Attributed first, so anyone who saw `file.changed` sees the change already attributed (KNSH-081).
-        self.attributor.with(|ledger| ledger.changed(root, path));
-        self.events.file_changed(self.session_id, root, path);
+    fn changed(&self, root: &CanonicalPath, change: Change) {
+        let path = change.path.clone();
+        // Attributed and captured first, so anyone who saw `file.changed` sees the change already attributed
+        // (KNSH-081) and its pre-image kept (KNSH-082).
+        self.attributor.capture(self.session_id, &self.store, root, change);
+        self.events.file_changed(self.session_id, root, &path);
     }
 
     fn uncertain(&self, root: &CanonicalPath, reason: UncertainReason) {
+        // FR-CKP-04: the checkpoint of the edits this window opens may miss changes.
+        self.attributor.with(|ledger, captures| {
+            if let Some(edge) = ledger.edge_of(root) {
+                captures.mark_uncertain(edge, reason);
+            }
+        });
         self.events.uncertain(self.session_id, root, None, reason);
     }
 
@@ -243,6 +314,11 @@ pub(crate) struct ClosedLine {
     pub(crate) uncertain: Vec<(CanonicalPath, UncertainReason)>,
     /// The record's `attribution` (FR-CKP-05, FR-CKP-07).
     pub(crate) attribution: Attribution,
+    /// Whether the line touched a protected root: its record then has `files_changed` (KNSH-082).
+    pub(crate) protected: bool,
+    /// The line's checkpoint, for the record's `checkpoint_id` and `files_changed` (KNSH-082); `None` when it
+    /// changed nothing in a protected root.
+    pub(crate) checkpoint: Option<CheckpointSummary>,
 }
 
 /// The effects shadows need.
@@ -265,8 +341,10 @@ pub(crate) struct ShadowParts {
     pub(crate) file_events: Arc<dyn FileEvents>,
     /// Where `file.changed`, `checkpoint.uncertain` and `agent.edit` are published.
     pub(crate) events: Arc<dyn CheckpointEvents>,
-    /// Where closed edges go (KNSH-081): [`UncapturedEdges`] until capture and the history tree exist.
+    /// Where closed edges go (KNSH-081): [`UncapturedEdges`] until the history tree exists.
     pub(crate) edges: Arc<dyn EdgeSink>,
+    /// Checkpoint identifiers (KNSH-082).
+    pub(crate) random: Arc<dyn Random>,
 }
 
 /// One root of one session.
@@ -291,7 +369,12 @@ pub(crate) struct Shadows {
 impl Shadows {
     /// No session yet.
     pub(crate) fn new(parts: ShadowParts) -> Arc<Self> {
-        let attributor = Attributor::new(Arc::clone(&parts.events), Arc::clone(&parts.edges));
+        let captures = Captures::new(
+            Arc::clone(&parts.files),
+            Arc::clone(&parts.clock),
+            Arc::clone(&parts.random),
+        );
+        let attributor = Attributor::new(Arc::clone(&parts.events), Arc::clone(&parts.edges), captures);
         Arc::new(Self {
             parts,
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -333,7 +416,7 @@ impl Shadows {
                         // Registered before the watcher can report anything, so its first change is attributed with
                         // the session's envelope known (KNSH-081).
                         self.attributor
-                            .with(|ledger| ledger.watch(&placed.root, session_id, envelope));
+                            .with(|ledger, _| ledger.watch(&placed.root, session_id, envelope));
                         // The watcher first, so a change made while the build runs is not missed (KNSH-080).
                         let watcher = self.start_watcher(session_id, index, store, &placed.root, &dir, profile, &skip);
                         let plan = ShadowPlan {
@@ -384,7 +467,7 @@ impl Shadows {
     /// ledger: stopped first, so no change of its watchers arrives after it no longer watches (KNSH-081).
     fn cancel_all(&self, session_id: SessionId, shadows: &[RootShadow]) {
         cancel_all(shadows);
-        self.attributor.with(|ledger| {
+        self.attributor.with(|ledger, _| {
             for entry in shadows.iter().filter(|entry| entry.shadow.is_some()) {
                 ledger.unwatch(&entry.root, session_id, entry.envelope);
             }
@@ -405,11 +488,14 @@ impl Shadows {
     ) -> Option<Arc<Watcher>> {
         let parts = &self.parts;
         let (markers, marker_parents) = marker_dir(store, &session_id.to_string(), index);
+        let (held, held_parents) = held_dir(store, &session_id.to_string(), index);
         let plan = WatchPlan {
             root: root.clone(),
             shadow: shadow.to_path_buf(),
             markers,
             marker_parents,
+            held,
+            held_parents,
             exclude: profile.checkpoints.exclude.clone(),
             skip: skip.to_vec(),
             latency: STREAM_LATENCY,
@@ -417,6 +503,7 @@ impl Shadows {
         };
         let report = Arc::new(SessionReport {
             session_id,
+            store: store.to_path_buf(),
             events: Arc::clone(&parts.events),
             attributor: Arc::clone(&self.attributor),
         });
@@ -466,7 +553,7 @@ impl Shadows {
         }
         let shadowed: Vec<CanonicalPath> = watched.iter().map(|(root, _)| root.clone()).collect();
         self.attributor
-            .with(|ledger| ledger.line_started(record_id, session_id, &shadowed));
+            .with(|ledger, _| ledger.line_started(record_id, session_id, &shadowed));
         let roots = watched
             .into_iter()
             .map(|(root, watcher)| OpenLine {
@@ -552,7 +639,8 @@ impl Shadows {
 
 /// The line of `line` has ended and been reaped: closes it in each root (decision 16), one after the other, then
 /// ends it in the attribution ledger. Returns the roots whose checkpoints are uncertain, and why (FR-CKP-04; a root
-/// without a watcher is `not_watched`), and the line's attribution (FR-CKP-05, FR-CKP-07).
+/// without a watcher is `not_watched`), the line's attribution (FR-CKP-05, FR-CKP-07), and its checkpoint (KNSH-082):
+/// final when its edge closed with it, the changes so far while a concurrent line still runs.
 ///
 /// The ledger is told last: by then each watcher has applied every event of the line, so all of its changes are
 /// attributed before its attribution is read. That includes the watchers other sessions keep on the same roots
@@ -573,10 +661,29 @@ pub(crate) fn close_lines(line: CheckpointLine) -> ClosedLine {
         // the line to the next run, which undo's post-image check makes safe (FR-CKP-20).
         let _ = peer.flush();
     }
-    let attribution = attributor
-        .and_then(|attributor| attributor.with(|ledger| ledger.line_ended(record_id)))
-        .map_or(Attribution::Command, |ended| ended.attribution);
-    ClosedLine { uncertain, attribution }
+    let protected = attributor.is_some();
+    let ended = attributor.and_then(|attributor| {
+        let ended = attributor.with(|ledger, captures| {
+            // FR-CKP-04: marked before the line ends, so its checkpoint is uncertain when it is finished.
+            if let Some(edge) = ledger.running_edge(record_id) {
+                for (_, reason) in &uncertain {
+                    captures.mark_uncertain(edge.id, *reason);
+                }
+            }
+            ledger.line_ended(record_id)
+        })?;
+        Some((ended, attributor.captures.summary(ended.edge)))
+    });
+    let (attribution, checkpoint) = match ended {
+        Some((ended, checkpoint)) => (ended.attribution, checkpoint),
+        None => (Attribution::Command, None),
+    };
+    ClosedLine {
+        uncertain,
+        attribution,
+        protected,
+        checkpoint,
+    }
 }
 
 /// The running watchers on the roots of `lines` other than the line's own: those of other sessions sharing a root.

@@ -24,6 +24,7 @@ pub(crate) struct RecordedEvents {
     pub(crate) changed: Mutex<Vec<(SessionId, PathBuf)>>,
     pub(crate) uncertain: Mutex<Vec<(SessionId, Option<RecordId>, UncertainReason)>>,
     pub(crate) agent_edits: Mutex<Vec<(SessionId, Vec<PathBuf>, u32)>>,
+    pub(crate) created: Mutex<Vec<(SessionId, Checkpoint)>>,
 }
 
 impl CheckpointEvents for RecordedEvents {
@@ -47,6 +48,10 @@ impl CheckpointEvents for RecordedEvents {
     fn agent_edit(&self, session_id: SessionId, _root: &CanonicalPath, paths: &[CanonicalPath], omitted: u32) {
         let paths = paths.iter().map(|path| path.as_path().to_path_buf()).collect();
         self.agent_edits.lock().unwrap().push((session_id, paths, omitted));
+    }
+
+    fn checkpoint_created(&self, session_id: SessionId, checkpoint: &Checkpoint) {
+        self.created.lock().unwrap().push((session_id, checkpoint.clone()));
     }
 }
 
@@ -127,6 +132,7 @@ pub(crate) fn shadows_with_edges(
         file_events: Arc::new(file_events),
         events,
         edges,
+        random: Arc::new(knsh_platform::testing::SeededRandom::new(3)),
     })
 }
 

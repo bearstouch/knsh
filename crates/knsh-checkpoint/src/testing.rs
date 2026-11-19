@@ -1,4 +1,4 @@
-//! Deterministic fakes for checkpoint tests (KNSH-079, KNSH-080). Built only for tests and with the `testing` feature,
+//! Deterministic fakes for checkpoint tests (KNSH-079, KNSH-080, KNSH-082). Built only for tests and with the `testing` feature,
 //! which other crates enable in their `[dev-dependencies]` alone, so no fake reaches a shipped binary.
 
 use std::collections::BTreeMap;
@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
-use knsh_platform::{FileIdentity, FileKind, ModifiedTime, Operation, PlatformError};
+use knsh_platform::{ContentHash, FileIdentity, FileKind, ModifiedTime, Operation, PlatformError};
 
 use crate::shadow::ShadowFiles;
 
@@ -56,6 +56,14 @@ struct State {
     /// Every folder listed, in order.
     listed: Vec<PathBuf>,
     clones: usize,
+    /// `errno` a [`ShadowFiles::rename_new`] from a path fails with.
+    rename_failures: BTreeMap<PathBuf, i32>,
+    /// Every successful [`ShadowFiles::rename_new`], in order.
+    renames: Vec<(PathBuf, PathBuf)>,
+    /// Every path hashed, in order.
+    hashed: Vec<PathBuf>,
+    /// `errno` a hash of a path fails with.
+    hash_failures: BTreeMap<PathBuf, i32>,
     /// While set, clones wait until [`FakeTree::release`].
     held: bool,
 }
@@ -225,6 +233,49 @@ impl FakeTree {
         lock(&self.state).clones
     }
 
+    /// Makes a [`ShadowFiles::rename_new`] from `from` fail with `errno` (KNSH-082: a pre-image that cannot be moved).
+    pub fn fail_rename(&self, from: impl AsRef<Path>, errno: i32) {
+        lock(&self.state)
+            .rename_failures
+            .insert(from.as_ref().to_path_buf(), errno);
+    }
+
+    /// Makes a hash of `path` fail with `errno` (KNSH-082: a post-image identity that cannot be read).
+    pub fn fail_hash(&self, path: impl AsRef<Path>, errno: i32) {
+        lock(&self.state)
+            .hash_failures
+            .insert(path.as_ref().to_path_buf(), errno);
+    }
+
+    /// Every successful [`ShadowFiles::rename_new`] so far, `(from, to)`, in order.
+    #[must_use]
+    pub fn renames(&self) -> Vec<(PathBuf, PathBuf)> {
+        lock(&self.state).renames.clone()
+    }
+
+    /// Every path hashed so far, in order.
+    #[must_use]
+    pub fn hashed(&self) -> Vec<PathBuf> {
+        lock(&self.state).hashed.clone()
+    }
+
+    /// The digest [`ShadowFiles::hash`] gives `contents`: not SHA-256, but distinct for distinct test contents.
+    #[must_use]
+    pub fn digest_of(contents: &[u8]) -> ContentHash {
+        // FNV-1a over the contents, spread over the 32 bytes with the length mixed in.
+        let mut state: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in contents {
+            state = (state ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+        let mut digest = [0u8; 32];
+        let len = contents.len() as u64;
+        for (index, chunk) in digest.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            let word = state.rotate_left(u32::try_from(index * 13).unwrap_or(0)) ^ len.wrapping_mul(index as u64 + 1);
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        ContentHash::from_bytes(digest)
+    }
+
     /// Makes later clones wait until [`FakeTree::release`].
     pub fn hold(&self) {
         lock(&self.state).held = true;
@@ -367,5 +418,43 @@ impl ShadowFiles for FakeTree {
         }
         state.put(path, FakeNode::File(Vec::new()));
         Ok(())
+    }
+
+    fn rename_new(&self, from: &Path, to: &Path) -> Result<(), PlatformError> {
+        {
+            let state = lock(&self.state);
+            if let Some(errno) = state.rename_failures.get(from) {
+                return Err(os(Operation::Rename, *errno));
+            }
+            if !state.nodes.contains_key(from) {
+                return Err(os(Operation::Rename, ENOENT));
+            }
+            if state.nodes.contains_key(to) {
+                return Err(os(Operation::Rename, EEXIST));
+            }
+            let parent_is_dir = to
+                .parent()
+                .is_some_and(|parent| state.nodes.get(parent) == Some(&FakeNode::Dir));
+            if !parent_is_dir {
+                return Err(os(Operation::Rename, ENOENT));
+            }
+        }
+        self.rename(from, to);
+        lock(&self.state).renames.push((from.to_path_buf(), to.to_path_buf()));
+        Ok(())
+    }
+
+    fn hash(&self, path: &Path, limit: u64) -> Result<Option<ContentHash>, PlatformError> {
+        let mut state = lock(&self.state);
+        state.hashed.push(path.to_path_buf());
+        if let Some(errno) = state.hash_failures.get(path) {
+            return Err(os(Operation::Read, *errno));
+        }
+        match state.nodes.get(path) {
+            Some(FakeNode::File(contents)) if contents.len() as u64 > limit => Ok(None),
+            Some(FakeNode::File(contents)) => Ok(Some(Self::digest_of(contents))),
+            Some(_) => Err(PlatformError::UnexpectedKind),
+            None => Err(os(Operation::Open, ENOENT)),
+        }
     }
 }

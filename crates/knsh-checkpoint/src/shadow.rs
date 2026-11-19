@@ -48,7 +48,7 @@ use std::time::Duration;
 
 use knsh_core::{CanonicalPath, UnprotectedReason};
 use knsh_platform::engine_dirs::{DIR_MODE, FILE_MODE};
-use knsh_platform::{Clock, FileIdentity, FileKind, Fs, Monotonic, PlatformError, Volumes};
+use knsh_platform::{Clock, ContentHash, FileIdentity, FileKind, Fs, Monotonic, PlatformError, Volumes};
 
 /// Threads cloning one root (decision 15): 4 reached 7.4 to 7.7 s for 100,000 files on macOS 26.6; 8 gained nothing.
 pub const SHADOW_THREADS: usize = 4;
@@ -123,6 +123,23 @@ pub trait ShadowFiles: Send + Sync {
     /// A [`PlatformError`], `EEXIST` if anything is there already.
     fn create_file(&self, path: &Path) -> Result<(), PlatformError>;
 
+    /// Moves the file, symlink or folder `from` to the new path `to` in one step, without following either final
+    /// component and never replacing anything at `to` (KNSH-082: a shadow copy becomes a pre-image). Both paths are on
+    /// one volume.
+    ///
+    /// # Errors
+    ///
+    /// A [`PlatformError`], `EEXIST` if anything is at `to`; nothing has moved then.
+    fn rename_new(&self, from: &Path, to: &Path) -> Result<(), PlatformError>;
+
+    /// The SHA-256 of the regular file `path`, or `None` if it is larger than `limit` bytes (a post-image identity
+    /// hashes files under 64 MiB only, FR-CKP-09). A final symlink is never followed.
+    ///
+    /// # Errors
+    ///
+    /// A [`PlatformError`]; `ENOENT` if nothing is there.
+    fn hash(&self, path: &Path, limit: u64) -> Result<Option<ContentHash>, PlatformError>;
+
     /// Called once on each build thread before it does anything else: the real backend lowers the thread to the
     /// utility class (decision 15). Best effort.
     fn prepare_thread(&self) {}
@@ -173,6 +190,14 @@ impl ShadowFiles for PlatformShadowFiles {
 
     fn create_file(&self, path: &Path) -> Result<(), PlatformError> {
         self.fs.create_new(path, FILE_MODE)
+    }
+
+    fn rename_new(&self, from: &Path, to: &Path) -> Result<(), PlatformError> {
+        self.fs.rename_new(from, to)
+    }
+
+    fn hash(&self, path: &Path, limit: u64) -> Result<Option<ContentHash>, PlatformError> {
+        self.volumes.hash(path, limit)
     }
 
     fn prepare_thread(&self) {

@@ -885,6 +885,7 @@ impl Supervision<'_> {
             self.paths,
             self.uid,
             &self.clock,
+            &self.random,
             self.log,
             self.events,
         ));
@@ -949,12 +950,13 @@ impl Supervision<'_> {
 
 /// The checkpoint shadows of agent sessions (KNSH-079): stores placed on the real volumes, files cloned with APFS
 /// clones, one background build per root when an agent session starts, stopped when it ends; each kept in step by an
-/// `FSEvents` watcher (KNSH-080).
+/// `FSEvents` watcher (KNSH-080), whose changes are captured as checkpoints (KNSH-082).
 #[cfg(target_os = "macos")]
 fn checkpoint_shadows(
     paths: &knsh_platform::EnginePaths,
     uid: u32,
     clock: &std::sync::Arc<knsh_platform::macos::SystemClock>,
+    random: &std::sync::Arc<knsh_platform::macos::SystemRandom>,
     log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
     events: &std::sync::Arc<events::EventHub>,
 ) -> std::sync::Arc<shadows::Shadows> {
@@ -973,11 +975,15 @@ fn checkpoint_shadows(
         paths: paths.clone(),
         uid,
         log: Arc::clone(log),
-        // Shadows follow the live tree from FSEvents, and publish `file.changed` and `checkpoint.uncertain` (KNSH-080).
+        // Shadows follow the live tree from FSEvents, and publish `file.changed` and `checkpoint.uncertain` (KNSH-080),
+        // and `checkpoint.created` (KNSH-082).
         file_events: Arc::new(knsh_platform::macos::FsEventStreams::new()),
         events: Arc::clone(events) as Arc<dyn shadows::CheckpointEvents>,
-        // KNSH-081: closed edges are dropped until capture (KNSH-082) and the history tree (KNSH-083) take them.
+        // KNSH-081: closed edges are dropped until the history tree (KNSH-083) takes them; their checkpoints are
+        // taken (KNSH-082).
         edges: Arc::new(shadows::UncapturedEdges),
+        // KNSH-082: checkpoint identifiers.
+        random: random.clone(),
     })
 }
 

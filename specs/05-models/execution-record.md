@@ -21,10 +21,10 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 | `signal` | string or null | e.g. `SIGKILL` |
 | `stdout`, `stderr` | blob reference | Only when output recording is on; capped at 1 MB each by default, then head and tail kept |
 | `children` | array | Processes seen in the command's process groups, best effort |
-| `files_changed` | array | Paths created, modified or deleted under checkpoint roots, with post-image identity |
+| `files_changed` | array or null | Paths created, modified or deleted under checkpoint roots, with post-image identity: `{path, change, post_image}`, `change` one of `created`, `modified`, `deleted`; `post_image` is `{inode, size, mtime_seconds, mtime_nanoseconds, sha256}` (`inode` and `size` decimal strings, `sha256` lower-case hex for regular files under 64 MiB, else null), or null for a deleted path or one whose identity could not be read (its checkpoint is then uncertain). Sorted, at most 256 (the checkpoint lists them all). For a `concurrent` line, the set's. Empty when the line changed nothing in a protected root; null when it touched none or never ran (KNSH-082) |
 | `network` | array | Hosts contacted or refused, as reported by the proxy ([below](#network)) |
 | `unprotected` | array | Checkpoint roots the line touched whose changes were not protected: `{root, reason}`, `reason` one of `shadow_building` (the root's shadow was not complete yet, with `checkpoints.required = false`), `shadow_failed`, `no_shadow`. Empty when every root it touched was protected (KNSH-079, FR-CKP-02). Stored from record schema version 2 |
-| `checkpoint_id` | ID or null | Checkpoint holding the pre-images |
+| `checkpoint_id` | ID or null | Checkpoint holding the pre-images; null when the line changed nothing in a protected root and none of them was uncertain (KNSH-082) |
 | `irreversible` | bool + reasons | From classification and observed behaviour |
 | `sandbox_violations` | array | Denials the system reported for this command, best effort |
 

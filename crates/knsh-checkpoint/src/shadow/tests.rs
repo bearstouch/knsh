@@ -293,6 +293,12 @@ fn a_slow_build_is_marked_over_budget() {
         fn create_file(&self, path: &Path) -> Result<(), PlatformError> {
             self.tree.create_file(path)
         }
+        fn rename_new(&self, from: &Path, to: &Path) -> Result<(), PlatformError> {
+            self.tree.rename_new(from, to)
+        }
+        fn hash(&self, path: &Path, limit: u64) -> Result<Option<knsh_platform::ContentHash>, PlatformError> {
+            self.tree.hash(path, limit)
+        }
     }
     let tree = tree();
     tree.add_file(Path::new(ROOT).join("a"), b"a");

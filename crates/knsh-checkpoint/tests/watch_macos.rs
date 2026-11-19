@@ -15,9 +15,10 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use knsh_checkpoint::capture::Change;
 use knsh_checkpoint::{
     FLUSH_DEADLINE, LineClose, PlatformShadowFiles, SHADOW_THREADS, STREAM_LATENCY, ShadowFiles, ShadowPlan,
-    ShadowStatus, WatchPlan, WatchReport, marker_dir, shadow_dir, start_shadow, start_watch,
+    ShadowStatus, WatchPlan, WatchReport, held_dir, marker_dir, shadow_dir, start_shadow, start_watch,
 };
 use knsh_core::{CanonicalPath, UncertainReason};
 use knsh_platform::macos::{FsEventStreams, RealFs, SystemClock, SystemVolumes};
@@ -45,12 +46,14 @@ impl Drop for TempDir {
 #[derive(Default)]
 struct Reports {
     changed: Mutex<Vec<PathBuf>>,
+    changes: Mutex<Vec<Change>>,
     uncertain: Mutex<Vec<UncertainReason>>,
 }
 
 impl WatchReport for Reports {
-    fn changed(&self, _root: &CanonicalPath, path: &CanonicalPath) {
-        self.changed.lock().unwrap().push(path.as_path().to_path_buf());
+    fn changed(&self, _root: &CanonicalPath, change: Change) {
+        self.changed.lock().unwrap().push(change.path.as_path().to_path_buf());
+        self.changes.lock().unwrap().push(change);
     }
 
     fn uncertain(&self, _root: &CanonicalPath, reason: UncertainReason) {
@@ -130,6 +133,7 @@ fn shadow_equals_live_tree_after_each_line_with_concurrent_writers() {
     let reports = Arc::new(Reports::default());
     let (shadow, parents) = shadow_dir(&store, "S1", 0);
     let (markers, marker_parents) = marker_dir(&store, "S1", 0);
+    let (held, held_parents) = held_dir(&store, "S1", 0);
     let root_path = CanonicalPath::new(&root).unwrap();
     // Started before the build, as `knshd` does, so nothing written during the build is missed.
     let watcher = start_watch(
@@ -142,6 +146,8 @@ fn shadow_equals_live_tree_after_each_line_with_concurrent_writers() {
             shadow: shadow.clone(),
             markers,
             marker_parents,
+            held,
+            held_parents,
             exclude: vec!["node_modules".to_owned()],
             skip: vec![store.clone()],
             latency: STREAM_LATENCY,

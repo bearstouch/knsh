@@ -16,8 +16,8 @@
 //! which prints them and exits 126 (FR-LC-31).
 
 use knsh_core::{
-    CanonicalPath, Decision, Excerpt, HeadTail, MAX_HEAD_TAIL_LINES, MAX_TRUNCATE_BYTES, OutputMode, OutputRequest,
-    RecordId, Redacted, ShapedOutput,
+    CanonicalPath, CheckpointId, Decision, Excerpt, HeadTail, MAX_HEAD_TAIL_LINES, MAX_TRUNCATE_BYTES, OutputMode,
+    OutputRequest, RecordId, Redacted, ShapedOutput,
 };
 use knsh_json::{Fields, FromJson, JsonError, MAX_SAFE_INTEGER, Object, ToJson, Value};
 
@@ -421,6 +421,11 @@ pub struct ExecOutcome {
     pub duration_ms: u64,
     /// The decision that let it run.
     pub decision: Decision,
+    /// How many paths its change created, modified or deleted under its checkpoint roots (KNSH-082); `None` when it
+    /// touched no protected root.
+    pub files_changed: Option<u64>,
+    /// The checkpoint holding its pre-images; `None` when it changed nothing there or touched no protected root.
+    pub checkpoint_id: Option<CheckpointId>,
     /// The output mode applied: the caller's, or the profile's default (FR-OUT-02).
     pub mode: OutputMode,
     /// Standard output's totals.
@@ -461,7 +466,8 @@ impl ExecOutcome {
 
 impl ToJson for ExecOutcome {
     /// `record_id`, `executed_command`, `exit_code` and `signal` (one of them null), `duration_ms`, `decision`
-    /// (`verdict`, `source`, `rule_id`), `files_changed` and `checkpoint_id` (null until checkpoints exist), the
+    /// (`verdict`, `source`, `rule_id`), `files_changed` and `checkpoint_id` (null when the line touched no protected
+    /// checkpoint root, KNSH-082), the
     /// `output_mode`, both streams' `*_size` (decimal strings) and `*_lines`, `cut_to_fit`, and the mode's fields.
     fn to_json(&self) -> Result<Value, JsonError> {
         let (exit_code, signal) = self.status.fields();
@@ -476,9 +482,9 @@ impl ToJson for ExecOutcome {
             .with("signal", signal.to_json()?)?
             .with("duration_ms", safe(self.duration_ms)?)?
             .with("decision", Value::Object(decision))?
-            // Checkpoints arrive in phase 3: until then nothing is counted, and saying 0 would claim it was.
-            .with("files_changed", Value::Null)?
-            .with("checkpoint_id", Value::Null)?
+            // KNSH-082: null when no protected root was touched, so nothing was counted; 0 only when it was.
+            .with("files_changed", self.files_changed.to_json()?)?
+            .with("checkpoint_id", self.checkpoint_id.map(|id| id.to_string()).to_json()?)?
             .with("output_mode", self.mode.as_str())?
             .with("stdout_size", size(self.stdout.size))?
             .with("stdout_lines", safe(self.stdout.lines)?)?
@@ -832,6 +838,8 @@ mod tests {
                 decided_by: None,
                 hooks: Vec::new(),
             },
+            files_changed: None,
+            checkpoint_id: None,
             mode,
             stdout: StreamTotals { size: 3, lines: 1 },
             stderr: StreamTotals { size: 0, lines: 0 },
@@ -899,6 +907,18 @@ mod tests {
         assert_eq!(result.get("signal"), Some(&Value::Null));
         assert_eq!(result.get("files_changed"), Some(&Value::Null));
         assert_eq!(result.get("checkpoint_id"), Some(&Value::Null));
+
+        // KNSH-082: a line that touched a protected root counts its changes and names its checkpoint.
+        let mut protected = outcome(OutputMode::Ref, ShapedOutput::Ref);
+        protected.files_changed = Some(3);
+        protected.checkpoint_id = Some(CheckpointId::from_ulid(knsh_core::Ulid::from_u128(7)));
+        let value = protected.to_json().unwrap();
+        let protected = value.as_object().unwrap();
+        assert_eq!(protected.get("files_changed").and_then(Value::as_i64), Some(3));
+        assert_eq!(
+            protected.get("checkpoint_id").and_then(Value::as_str),
+            Some("00000000000000000000000007")
+        );
         let decision = result.get("decision").and_then(Value::as_object).unwrap();
         assert_eq!(decision.get("verdict").and_then(Value::as_str), Some("allow"));
         assert_eq!(decision.get("rule_id").and_then(Value::as_str), Some("exec.allow[0]"));
