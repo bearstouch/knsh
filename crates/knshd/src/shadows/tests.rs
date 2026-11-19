@@ -65,6 +65,16 @@ impl EdgeSink for RecordedEdges {
     }
 }
 
+/// Every checkpoint the history was given, in order (KNSH-088).
+#[derive(Default)]
+pub(crate) struct RecordedCheckpoints(pub(crate) Mutex<Vec<Checkpoint>>);
+
+impl CheckpointSink for RecordedCheckpoints {
+    fn finished(&self, finished: &[Checkpoint]) {
+        self.0.lock().unwrap().extend(finished.iter().cloned());
+    }
+}
+
 /// File events whose flushes deliver the event of every marker file present in a watched marker folder (the second
 /// folder of each stream), as the real stream does after the line-end procedure creates one.
 pub(crate) fn echoing_events(tree: &Arc<FakeTree>) -> ScriptedFileEvents {
@@ -143,6 +153,7 @@ pub(crate) fn shadows_with_holders(
         file_events: Arc::new(file_events),
         events,
         edges,
+        history: Arc::new(RecordedCheckpoints::default()),
         random: Arc::new(knsh_platform::testing::SeededRandom::new(3)),
         holders,
     })
@@ -684,4 +695,47 @@ fn unreadable_processes_mark_the_whole_change_possibly_torn() {
         checkpoint.possibly_torn,
         [(root(&written.to_string_lossy()), TornReason::Unchecked)].into()
     );
+}
+
+// KNSH-088: the engine's own restore writes belong to no edge. What changed before the window opened stays the
+// agent's edit; what changed inside it is applied to the shadow but captured nowhere; changes after it are
+// attributed again.
+#[test]
+fn a_restore_window_keeps_the_engines_writes_out_of_every_edge() {
+    let (tree, file_events, events, edges, shadows) = attributed_session(true);
+    let before = write(&tree, &file_events, "before.txt", b"by the agent");
+    applied(&events, 1);
+    let roots = [root(ROOT)];
+    RestoreWindows::begin(shadows.as_ref(), &roots);
+    let restored = write(&tree, &file_events, "restored.txt", b"by knshd");
+    RestoreWindows::end(shadows.as_ref(), &roots);
+    applied(&events, 2);
+    let after = write(&tree, &file_events, "after.txt", b"by the agent again");
+    assert_eq!(line_after(&shadows, &events, 3, 1), Attribution::Command);
+    let edges = edges.0.lock().unwrap();
+    let all: Vec<PathBuf> = edges
+        .iter()
+        .flat_map(|edge| edge.paths.values().flatten())
+        .map(|path| path.as_path().to_path_buf())
+        .collect();
+    assert!(all.contains(&before), "{all:?}");
+    assert!(all.contains(&after), "{all:?}");
+    assert!(
+        !all.contains(&restored),
+        "the restore's write is nobody's change: {all:?}"
+    );
+    let kinds: Vec<Attribution> = edges.iter().map(|edge| edge.attribution).collect();
+    assert_eq!(
+        kinds,
+        [Attribution::AgentEdit, Attribution::AgentEdit, Attribution::Command],
+        "the window split the agent's edits"
+    );
+    let reported: Vec<PathBuf> = events
+        .agent_edits
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|(_, paths, _)| paths.clone())
+        .collect();
+    assert!(!reported.contains(&restored), "never reported as an agent edit");
 }

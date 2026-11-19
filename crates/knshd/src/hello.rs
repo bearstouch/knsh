@@ -167,6 +167,7 @@ pub(crate) mod tests {
         handlers.extend(crate::authority::tests::idle_handlers());
         handlers.extend(crate::exec::unserved_handlers());
         handlers.extend(crate::start_agent::unserved_handlers());
+        handlers.extend(crate::checkpoints::tests::idle_handlers());
         handlers
     }
 

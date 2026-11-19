@@ -21,6 +21,7 @@ pub mod agent_sandbox;
 pub mod approvals;
 pub mod args;
 pub mod authority;
+pub mod checkpoints;
 pub mod client;
 pub mod commands;
 #[cfg(target_os = "macos")]

@@ -138,8 +138,8 @@ pub struct RecordsForgetParams {
     pub session_id: Option<SessionId>,
     /// Only records started at or after this instant.
     pub since: Option<Timestamp>,
-    /// Delete the matching records' checkpoints too. Phase 1 has no checkpoints: `knshd` answers `-32005` and deletes
-    /// nothing, rather than ignoring the flag (KNSH-017).
+    /// Delete the matching checkpoints too, at once (FR-CKP-34, KNSH-088). Where checkpoints cannot be taken `knshd`
+    /// answers `-32005` and deletes nothing, rather than ignoring the flag (KNSH-017).
     pub with_checkpoints: bool,
 }
 

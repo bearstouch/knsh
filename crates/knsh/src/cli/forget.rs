@@ -8,8 +8,9 @@
 //! - `--session` must be a canonical session ID;
 //! - `--since` is a UTC date, `YYYY-MM-DD` (from midnight UTC), or an engine timestamp `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`.
 //!
-//! `--with-checkpoints` is sent as asked. Phase 1 has no checkpoints, so `knshd` answers `-32005` and deletes nothing;
-//! that is reported as an error, never ignored ([`failure_message`]).
+//! `--with-checkpoints` is sent as asked: `knshd` removes the matching checkpoints at once (FR-CKP-34, KNSH-088).
+//! Where checkpoints cannot be taken it answers `-32005` and deletes nothing; that is reported as an error, never
+//! ignored ([`failure_message`]).
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -130,7 +131,7 @@ pub fn failure_message(error: &ClientError) -> String {
     match error {
         // The only capability `forget` can lack: say what it means rather than echo the code.
         ClientError::Rpc(rpc) if rpc.code == ErrorCode::CapabilityUnavailable => String::from(
-            "knsh: forget: checkpoints are not available on this machine yet; nothing was deleted \
+            "knsh: forget: checkpoints are not available on this machine; nothing was deleted \
              (run again without --with-checkpoints to delete records only)\n",
         ),
         ClientError::Rpc(rpc) if rpc.code == ErrorCode::InvalidParams => {

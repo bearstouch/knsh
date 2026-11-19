@@ -994,3 +994,73 @@ fn conflict_on_a_new_inode_with_the_same_contents_is_not_refreshed() {
     assert_eq!(history.tree().head(), s3);
     assert_eq!(fixture.contents("a.txt").as_deref(), Some(&b"a2"[..]));
 }
+
+// KNSH-088: `checkpoint.list` on agent.sock shows an agent only what it could undo: its own session's changes and
+// their reverts, never another session's or external edits. The user and the authority see every change.
+#[test]
+fn agents_see_only_their_own_changes() {
+    let fixture = Fixture::new();
+    fixture.tree.add_file(live("a.txt"), b"a0");
+    let mut history = history(&fixture);
+    let own = fixture.command(1, &["a.txt"], |tree| tree.add_file(live("a.txt"), b"a1"));
+    let own_id = own.id;
+    history.record(own).unwrap();
+    let theirs = fixture.change(
+        &Taken {
+            n: 2,
+            attribution: Attribution::Command,
+            session: session(2),
+            paths: &["b.txt"],
+        },
+        |tree| tree.add_file(live("b.txt"), b"b1"),
+    );
+    let theirs_id = theirs.id;
+    history.record(theirs).unwrap();
+    let external = fixture.change(
+        &Taken {
+            n: 3,
+            attribution: Attribution::External,
+            session: session(1),
+            paths: &["c.txt"],
+        },
+        |tree| tree.add_file(live("c.txt"), b"c1"),
+    );
+    let external_id = external.id;
+    history.record(external).unwrap();
+    // A revert of the agent's own change is its too.
+    history.undo(&user(1), &Events::default()).unwrap();
+    let revert = history
+        .tree()
+        .edges()
+        .find(|edge| matches!(edge.kind, EdgeKind::Undo { of } if of == own_id))
+        .map(|edge| edge.checkpoint)
+        .unwrap();
+
+    let agent = Caller::Agent(session(1));
+    assert!(history.visible_to(agent, own_id));
+    assert!(history.visible_to(agent, revert));
+    assert!(!history.visible_to(agent, theirs_id));
+    assert!(!history.visible_to(agent, external_id));
+    for id in [own_id, revert, theirs_id, external_id] {
+        assert!(history.visible_to(Caller::User, id));
+        assert!(history.visible_to(Caller::Authority, id));
+    }
+}
+
+// KNSH-088: knshd stops attributing changes in exactly the roots a restore may write in.
+#[test]
+fn roots_of_a_target_and_a_state() {
+    let (_fixture, mut history, [s1, _, _]) = three_changes();
+    let root = canonical(ROOT);
+    assert_eq!(history.target_roots(Target::Record(record(2))), vec![root.clone()]);
+    assert_eq!(history.state_roots(s1), vec![root.clone()]);
+    assert!(history.target_roots(Target::Record(record(9))).is_empty(), "unknown");
+    assert!(history.state_roots(StateId::new(99).unwrap()).is_empty(), "unknown");
+    assert!(
+        history.state_roots(history.tree().head()).is_empty(),
+        "nothing on the way"
+    );
+    // After an undo, the redo writes the versions it saved: still the same root.
+    history.undo(&user(3), &Events::default()).unwrap();
+    assert_eq!(history.target_roots(Target::Record(record(3))), vec![root]);
+}

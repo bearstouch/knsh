@@ -121,8 +121,8 @@ impl Inbox for NoDescriptors {
 struct Step {
     /// The answer to send, if any.
     reply: Option<Message>,
-    /// Raw bytes to send after the answer, on this stream.
-    stream: Option<(StreamId, Vec<u8>)>,
+    /// Raw bytes to send after the answer, one stream after the other.
+    streams: Vec<(StreamId, Vec<u8>)>,
     /// Whether the connection is closed after the answer.
     close: bool,
 }
@@ -131,7 +131,7 @@ impl Step {
     const fn reply(message: Message) -> Self {
         Self {
             reply: Some(message),
-            stream: None,
+            streams: Vec::new(),
             close: false,
         }
     }
@@ -139,20 +139,20 @@ impl Step {
     const fn reply_and_close(message: Message) -> Self {
         Self {
             reply: Some(message),
-            stream: None,
+            streams: Vec::new(),
             close: true,
         }
     }
 
     const NOTHING: Self = Self {
         reply: None,
-        stream: None,
+        streams: Vec::new(),
         close: false,
     };
 
     const CLOSE: Self = Self {
         reply: None,
-        stream: None,
+        streams: Vec::new(),
         close: true,
     };
 }
@@ -229,15 +229,21 @@ impl Session<'_> {
 
     fn dispatch(&mut self, request: Request, descriptors: &Passed) -> Step {
         match self.call(&request, descriptors) {
-            Ok(Answer { result, bytes }) => {
+            Ok(Answer {
+                result,
+                bytes,
+                streams: named,
+            }) => {
                 // A repeated `hello` echoes its own `binary_frames` choice, so the connection must follow it too;
                 // otherwise the client would be told one transport and sent the other.
                 if request.method.as_str() == HELLO {
                     self.settle_bytes(&request);
                 }
-                let stream = bytes.map(|bytes| (self.take_stream(), bytes));
+                let mut streams: Vec<(StreamId, Vec<u8>)> =
+                    bytes.map(|bytes| (self.take_stream(), bytes)).into_iter().collect();
+                streams.extend(named);
                 Step {
-                    stream,
+                    streams,
                     ..Step::reply(success(request.id, result))
                 }
             }
@@ -409,7 +415,7 @@ pub(crate) fn serve_with_descriptors<R: Read, W: Write + Send>(
                 on_greeted();
             }
             if let Some(reply) = step.reply
-                && let Err(error) = write(&mut out, &reply, step.stream.as_ref())
+                && let Err(error) = write(&mut out, &reply, &step.streams)
             {
                 break Closed::Write(error);
             }
@@ -605,13 +611,14 @@ fn notification_value(notification: Result<knsh_proto::Notification, ProtoError>
         .ok()
 }
 
-/// Writes one message, then `stream`'s bytes if the message went out as it was, and flushes. A result that cannot
-/// be written as strict JSON (too deep, too large) is replaced by `-32603` for the same request, so the client is
-/// never left waiting; the stream it announced is then not sent, since the client never learned of it.
+/// Writes one message, then each of `streams`' bytes in order if the message went out as it was, and flushes. A
+/// result that cannot be written as strict JSON (too deep, too large) is replaced by `-32603` for the same request,
+/// so the client is never left waiting; the streams it announced are then not sent, since the client never learned
+/// of them.
 fn write<W: Write>(
     writer: &mut FrameWriter<W>,
     message: &Message,
-    stream: Option<&(StreamId, Vec<u8>)>,
+    streams: &[(StreamId, Vec<u8>)],
 ) -> Result<(), JsonError> {
     let written = match message.to_value() {
         Ok(value) => writer.write_json(&value),
@@ -620,7 +627,7 @@ fn write<W: Write>(
     };
     match written {
         Ok(()) => {
-            if let Some((id, bytes)) = stream {
+            for (id, bytes) in streams {
                 // The result declared exactly `bytes.len()` bytes on `id`; the end frame closes the stream.
                 writer.write_chunk(*id, bytes)?;
                 writer.write_end(*id)?;
@@ -733,7 +740,9 @@ impl MessageConnection {
         let (json, bytes) = match step.reply {
             None => (None, None),
             Some(reply) => match encode(&reply) {
-                Some(json) => (Some(json), step.stream.map(|(_, bytes)| bytes)),
+                // A control message carries at most one data value: handlers name at most one stream there
+                // (`Answer::streams`).
+                Some(json) => (Some(json), step.streams.into_iter().next().map(|(_, bytes)| bytes)),
                 // As on a socket: an answer that cannot be sent as strict JSON is replaced by `-32603` for the same
                 // request, and the stream it announced is not sent.
                 None => (encode(&internal_error(&reply)), None),

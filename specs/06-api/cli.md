@@ -155,6 +155,27 @@ installs and removes it without talking to `knshd`.
 - The property list declares `user.sock` and `agent.sock` (mode `0600`) and the control service, starts `knshd` on
   demand (`RunAtLoad` false) and restarts it after a crash (`KeepAlive` → `Crashed`).
 
+## Undo, redo and checkpoints
+
+`knsh undo [--checkpoint] [--force] <id>`, `knsh redo …` and `knsh checkpoints [--session <id>]` (KNSH-088) call
+[`checkpoint.undo`, `checkpoint.redo` and `checkpoint.list`](user-socket.md#checkpoints) on `user.sock`.
+
+- `<id>` is the line's record ID (`knsh history`); with `--checkpoint` it is a checkpoint ID (`knsh checkpoints`),
+  for a change without a line such as a run of agent edits. An ID that is not 26 ULID characters, or a malformed
+  `--session`, is a usage error (status 2) and nothing is sent.
+- `--force` restores paths that changed since the change (losing what is there now) and possibly-torn files. The user
+  may; an agent never can (FR-CKP-21).
+- `knsh undo` prints `Undid change <checkpoint_id>: restored <n> file(s); now at state <s>.`, then a line per
+  excluded folder not restored, possibly-torn file skipped or forced, and irreversible effect; `knsh redo` the same
+  with `Redid`. `--json` prints the API's result object unchanged, as one line.
+- `knsh checkpoints` reads every page (a cursor that does not advance is a protocol error, status 1) and prints one
+  line per change, oldest first: `created_at  checkpoint_id  status  kind  <n> files  from->to  records`, where
+  `kind` is the attribution or `revert of <checkpoint_id>`, then `Current state: <head>.` (`No checkpoints.` first
+  when there are none). `--json` prints each change object as the API returns it, one per line.
+- A refusal exits with 1 and says why on stderr: each conflicting path with its reason (`-32004`), the change being
+  unknown, expired, not in effect, not undone or blocked by a newer branch (`-32602`), or checkpoints not being
+  available on this machine (`-32005`). Text from the engine is escaped as in [terminal safety](#terminal-safety).
+
 ## Forget
 
 `knsh forget` calls [`records.forget`](user-socket.md#recordsforget) and prints the number of records deleted
@@ -163,8 +184,9 @@ installs and removes it without talking to `knshd`.
 - At least one of `--session <id>` and `--since <date>` is required; with both, a record must match both. Without
   one, or with a malformed value, it is a usage error (status 2) and nothing is sent.
 - `--since` takes a UTC date `YYYY-MM-DD` (from midnight UTC) or an engine timestamp `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`.
-- `--with-checkpoints` is passed on. Until the history is wired into `knshd` (KNSH-088; the removal itself is
-  `History::forget`, KNSH-087) `knshd` answers `-32005`: `knsh forget` says so, deletes nothing and exits with 1.
+- `--with-checkpoints` is passed on: `knshd` removes the matching checkpoints at once, then the records (FR-CKP-34,
+  KNSH-088). Where checkpoints cannot be taken it answers `-32005`: `knsh forget` says so, deletes nothing and exits
+  with 1.
 
 ## History
 
@@ -207,8 +229,9 @@ knshd …; see 'knsh daemon install'`), printing nothing on stdout.
 
 ## Terminal safety
 
-Records and events carry text the engine did not author (commands, directories, event data). `knsh history` and
-`knsh events` never print it raw (KNSH-023):
+Records and events carry text the engine did not author (commands, directories, event data, file paths).
+`knsh history`, `knsh events`, `knsh undo`, `knsh redo` and `knsh checkpoints` never print it raw (KNSH-023,
+KNSH-088):
 
 - Text output shows every control character (C0, DEL, C1) and every bidirectional control (U+061C, U+200E, U+200F,
   U+202A–U+202E, U+2066–U+2069) as a visible escape: `\n`, `\t`, `\r`, `\e`, `\xHH` or `\u{H…}`; a backslash is

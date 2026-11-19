@@ -66,9 +66,32 @@ pub static KNSH: Command = group(
             ],
             ..leaf("history", "Query records, newest first")
         },
-        leaf("undo", "Undo a change"),
-        leaf("redo", "Redo a change"),
-        leaf("checkpoints", "List checkpoints and states"),
+        // KNSH-088: undo and redo by record, or by checkpoint for changes without a line (agent edits).
+        Command {
+            options: STEP_OPTIONS,
+            positionals: &[Positional {
+                name: "id",
+                help: "The line's record ID (knsh history), or with --checkpoint the checkpoint ID (knsh checkpoints)",
+            }],
+            ..leaf("undo", "Undo a change")
+        },
+        Command {
+            options: STEP_OPTIONS,
+            positionals: &[Positional {
+                name: "id",
+                help: "The line's record ID (knsh history), or with --checkpoint the checkpoint ID (knsh checkpoints)",
+            }],
+            ..leaf("redo", "Redo a change")
+        },
+        Command {
+            options: &[OptionSpec {
+                long: "session",
+                value: Some("id"),
+                required: false,
+                help: "Only this session's changes",
+            }],
+            ..leaf("checkpoints", "List checkpoints and states")
+        },
         Command {
             options: &[
                 OptionSpec {
@@ -236,6 +259,22 @@ pub static KNSH: Command = group(
         ),
     ],
 );
+
+/// The options of `knsh undo` and `knsh redo` (KNSH-088).
+const STEP_OPTIONS: &[OptionSpec] = &[
+    OptionSpec {
+        long: "checkpoint",
+        value: None,
+        required: false,
+        help: "The ID is a checkpoint ID, for a change without a line (agent edits)",
+    },
+    OptionSpec {
+        long: "force",
+        value: None,
+        required: false,
+        help: "Restore files that changed since, or that may be torn, losing what is there now",
+    },
+];
 
 /// A leaf command with no options or arguments besides the global ones. Commands that take some override the
 /// relevant fields with struct-update syntax (`Command { options: …, ..leaf(name, about) }`).

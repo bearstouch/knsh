@@ -35,6 +35,16 @@
 //!   [`Ledger::line_ended`] is called. Its start is not: opening a line never waits for the watcher, so a change made
 //!   just before the line, whose event the watcher had not applied yet, is attributed to the line.
 //!
+//! # The engine's own restores (KNSH-088)
+//!
+//! Undo, redo and `checkpoint.restore` write files in the roots, and the watchers report those writes like any
+//! other. They are not a change of anybody's: recorded, they would become a new edge from the state the restore just
+//! reached, and the redo that should follow would be refused (the head moved on). So `knshd` brackets each restore
+//! with [`Ledger::restore_started`] and [`Ledger::restore_ended`] (after flushing the roots' watchers), and while a
+//! root is restoring, its changes belong to no edge: the shadow still follows them, but nothing is captured. A line
+//! running there meanwhile loses the changes it made in that window, so its edge is reported through
+//! [`Ledger::take_missed`] and its checkpoint marked uncertain: it may miss paths, never hold wrong ones.
+//!
 //! # Invariants
 //!
 //! - A line's attribution is final when it ends: an edge only grows while one of its lines runs, so a line that ends
@@ -63,9 +73,11 @@ impl EdgeId {
         self.0
     }
 
-    /// An edge numbered `n`, for tests that build checkpoints without a ledger.
-    #[cfg(test)]
-    pub(crate) const fn for_tests(n: u64) -> Self {
+    /// An edge numbered `n`, for tests that build checkpoints without a ledger (here, and other crates' tests
+    /// through [`crate::testing::capture_change`]).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn for_tests(n: u64) -> Self {
         Self(n)
     }
 }
@@ -221,6 +233,9 @@ struct Root {
     envelopes: BTreeMap<SessionId, usize>,
     /// Agent edits not yet reported.
     pending: PendingEdits,
+    /// How many restores of the engine are writing in it ([`Ledger::restore_started`]); its changes belong to no
+    /// edge while this is not zero.
+    restoring: usize,
 }
 
 impl Root {
@@ -232,6 +247,7 @@ impl Root {
             && self.watchers == 0
             && self.envelopes.is_empty()
             && self.pending.is_empty()
+            && self.restoring == 0
     }
 }
 
@@ -244,6 +260,8 @@ pub struct Ledger {
     open: BTreeMap<EdgeId, OpenEdge>,
     /// Edges closed and not yet taken.
     closed: Vec<Edge>,
+    /// Open line edges that lost a change to a restore of the engine, not yet taken ([`Ledger::take_missed`]).
+    missed: BTreeSet<EdgeId>,
 }
 
 impl Ledger {
@@ -375,7 +393,18 @@ impl Ledger {
     ///
     /// Returns the edge the change belongs to, `None` when it was dropped: capture (KNSH-082) keeps its pre-image in
     /// that edge's checkpoint.
+    ///
+    /// While the engine restores files in the root ([`Ledger::restore_started`]) the change belongs to no edge, and
+    /// the edge of any line running there is noted as having missed it ([`Ledger::take_missed`]).
     pub fn changed(&mut self, root: &CanonicalPath, path: &CanonicalPath) -> Option<EdgeId> {
+        if let Some(state) = self.roots.get(root)
+            && state.restoring > 0
+        {
+            if let Some(edge) = state.busy {
+                self.missed.insert(edge);
+            }
+            return None;
+        }
         let edge = self.edge_for_change(root)?;
         let open = self.open.get_mut(&edge)?;
         open.edge.add_path(root, path);
@@ -391,7 +420,51 @@ impl Ledger {
     /// [`Ledger::changed`] would); `None` when no line runs there and nothing watches it. For an uncertain window
     /// outside any line (KNSH-082): the checkpoint of that edge is marked uncertain.
     pub fn edge_of(&mut self, root: &CanonicalPath) -> Option<EdgeId> {
+        if self.is_restoring(root) {
+            return None;
+        }
         self.edge_for_change(root)
+    }
+
+    /// The engine starts restoring files in `roots` (undo, redo or `checkpoint.restore`, KNSH-088): until the
+    /// matching [`Ledger::restore_ended`], changes reported there belong to no edge (module documentation). The open
+    /// agent-edit or external run of each root is closed first, so what changed before the restore stays its own.
+    /// Restores may nest; each call is undone by one [`Ledger::restore_ended`] with the same roots.
+    pub fn restore_started(&mut self, roots: &[CanonicalPath]) {
+        let mut roots = roots.to_vec();
+        roots.sort();
+        roots.dedup();
+        for root in &roots {
+            self.close_idle(root);
+            let state = self.roots.entry(root.clone()).or_default();
+            state.restoring = state.restoring.saturating_add(1);
+        }
+    }
+
+    /// The restore of `roots` begun by [`Ledger::restore_started`] is over and its changes were reported: changes
+    /// there are attributed again.
+    pub fn restore_ended(&mut self, roots: &[CanonicalPath]) {
+        let mut roots = roots.to_vec();
+        roots.sort();
+        roots.dedup();
+        for root in &roots {
+            if let Some(state) = self.roots.get_mut(root) {
+                state.restoring = state.restoring.saturating_sub(1);
+            }
+            self.forget_if_unused(root);
+        }
+    }
+
+    /// Whether the engine is restoring files in `root`.
+    #[must_use]
+    pub fn is_restoring(&self, root: &CanonicalPath) -> bool {
+        self.roots.get(root).is_some_and(|state| state.restoring > 0)
+    }
+
+    /// The open line edges that lost a change to a restore of the engine since the last call: their checkpoints may
+    /// miss paths and must be marked uncertain.
+    pub fn take_missed(&mut self) -> Vec<EdgeId> {
+        std::mem::take(&mut self.missed).into_iter().collect()
     }
 
     /// The agent edits of `root` not reported yet, for one `agent.edit` event (FR-CKP-06); `None` when there are

@@ -382,3 +382,75 @@ fn line_outliving_its_session_keeps_its_changes() {
     assert_eq!(paths_of(&closed[0], APP), [path(APP, "a")]);
     assert!(ledger.roots.is_empty());
 }
+
+// KNSH-088: the engine's own restore writes are no change of anybody's. Recorded, they would move the history's head
+// and block the redo that should follow.
+#[test]
+fn changes_while_the_engine_restores_belong_to_no_edge() {
+    let mut ledger = watched();
+    // An agent edit before the restore stays its own: the run is closed when the restore starts.
+    assert!(ledger.changed(&root(APP), &path(APP, "before")).is_some());
+    ledger.restore_started(&[root(APP)]);
+    let closed = ledger.take_closed();
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].attribution, Attribution::AgentEdit);
+    assert_eq!(paths_of(&closed[0], APP), vec![path(APP, "before")]);
+
+    assert!(ledger.is_restoring(&root(APP)));
+    assert_eq!(ledger.changed(&root(APP), &path(APP, "restored")), None);
+    assert_eq!(
+        ledger.edge_of(&root(APP)),
+        None,
+        "no idle run is opened while restoring"
+    );
+    // Only the edit before the restore is reported: a restore is not an agent edit.
+    let edits = ledger.take_agent_edits(&root(APP)).unwrap();
+    assert_eq!(edits.paths, vec![path(APP, "before")]);
+    // Other roots are attributed as usual.
+    assert!(ledger.changed(&root(LIB), &path(LIB, "other")).is_some());
+    assert!(ledger.take_missed().is_empty(), "no line ran in the restored root");
+
+    ledger.restore_ended(&[root(APP)]);
+    assert!(!ledger.is_restoring(&root(APP)));
+    let after = ledger.changed(&root(APP), &path(APP, "after")).unwrap();
+    ledger.line_started(record(1), session(1), &[root(APP)]);
+    let closed = ledger.take_closed();
+    let edge = closed.iter().find(|edge| edge.id == after).unwrap();
+    assert_eq!(
+        paths_of(edge, APP),
+        vec![path(APP, "after")],
+        "the restored path is in no edge"
+    );
+}
+
+// KNSH-088: a line running in a root while the engine restores it loses those changes; its edge is reported so its
+// checkpoint can be marked uncertain (it may miss paths, never hold wrong ones).
+#[test]
+fn a_line_overlapping_a_restore_is_reported_as_missing_changes() {
+    let mut ledger = watched();
+    ledger.line_started(record(1), session(1), &[root(APP)]);
+    let line_edge = ledger.running_edge(record(1)).unwrap().id;
+    // Nested restores: the root is attributed again only after both end.
+    ledger.restore_started(&[root(APP), root(APP)]);
+    ledger.restore_started(&[root(APP)]);
+    assert_eq!(ledger.changed(&root(APP), &path(APP, "a")), None);
+    assert_eq!(ledger.take_missed(), vec![line_edge]);
+    assert!(ledger.take_missed().is_empty(), "taken once");
+    ledger.restore_ended(&[root(APP)]);
+    assert!(ledger.is_restoring(&root(APP)));
+    ledger.restore_ended(&[root(APP)]);
+    assert_eq!(ledger.changed(&root(APP), &path(APP, "b")), Some(line_edge));
+    let ended = ledger.line_ended(record(1)).unwrap();
+    assert_eq!(ended.attribution, Attribution::Command);
+}
+
+// A root only restored, never watched, is forgotten once the restore ends.
+#[test]
+fn a_restore_of_an_unwatched_root_leaves_nothing_behind() {
+    let mut ledger = Ledger::new();
+    ledger.restore_started(&[root(APP)]);
+    assert_eq!(ledger.changed(&root(APP), &path(APP, "a")), None);
+    ledger.restore_ended(&[root(APP)]);
+    assert!(ledger.roots.is_empty());
+    assert_eq!(ledger.take_closed().len(), 0);
+}

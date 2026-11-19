@@ -6,8 +6,12 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
+use knsh_core::{Attribution, CanonicalPath, CheckpointId, RecordId, SessionId};
 use knsh_platform::{ContentHash, FileIdentity, FileKind, ModifiedTime, Operation, PlatformError};
 
+use crate::attribution::EdgeId;
+use crate::capture::{CHECKPOINTS_DIR, CapturedPath, Checkpoint, StoredPreImage};
+use crate::identity::post_image;
 use crate::shadow::ShadowFiles;
 
 /// `errno` values (macOS); `libc` is reserved to `knsh-platform` (NFR-SUP-02).
@@ -644,5 +648,71 @@ impl ShadowFiles for FakeTree {
             Some(_) => Err(PlatformError::UnexpectedKind),
             None => Err(os(Operation::Open, ENOENT)),
         }
+    }
+}
+
+/// A change for [`capture_change`] to take over a [`FakeTree`] (KNSH-088: other crates' tests of the history).
+#[derive(Debug, Clone)]
+pub struct TestChange<'a> {
+    /// Its checkpoint.
+    pub id: CheckpointId,
+    /// How it was attributed.
+    pub attribution: Attribution,
+    /// Its lines.
+    pub records: &'a [RecordId],
+    /// The session it belongs to.
+    pub session: SessionId,
+    /// The checkpoint root it is in.
+    pub root: &'a CanonicalPath,
+    /// The root's store: its pre-images go in `<store>/checkpoints/<id>/`.
+    pub store: &'a Path,
+    /// The paths it changes, relative to `root`.
+    pub paths: &'a [&'a str],
+}
+
+/// The checkpoint of `change`, made by `edit`, captured as the watcher would: each path's pre-image set aside first
+/// (a clone into the checkpoint's folder, or a marker), its post-image identity read after the edit.
+///
+/// # Panics
+///
+/// If a path is not a valid canonical path below the root, or a pre-image cannot be cloned: test set-up mistakes.
+#[allow(clippy::missing_panics_doc, clippy::unwrap_used, reason = "test-only helper")]
+pub fn capture_change(tree: &FakeTree, change: &TestChange<'_>, edit: impl FnOnce(&FakeTree)) -> Checkpoint {
+    let folder = change.store.join(CHECKPOINTS_DIR).join(change.id.to_string());
+    tree.add_dir(&folder);
+    let mut pres = Vec::new();
+    for (index, relative) in change.paths.iter().enumerate() {
+        let path = change.root.as_path().join(relative);
+        let pre = match tree.node(&path) {
+            None => StoredPreImage::NotExisted,
+            Some(FakeNode::Dir) => StoredPreImage::Folder,
+            Some(_) => {
+                let copy = folder.join(index.to_string());
+                tree.clone_file(&path, &copy).unwrap();
+                StoredPreImage::Kept(copy)
+            }
+        };
+        pres.push((CanonicalPath::new(path).unwrap(), pre));
+    }
+    edit(tree);
+    let paths = pres
+        .into_iter()
+        .map(|(path, pre)| {
+            let post = post_image(tree, path.as_path());
+            (path, CapturedPath { pre, post })
+        })
+        .collect();
+    Checkpoint {
+        id: change.id,
+        edge: EdgeId::for_tests(0),
+        attribution: change.attribution,
+        records: change.records.iter().copied().collect(),
+        sessions: [change.session].into(),
+        paths: [(change.root.clone(), paths)].into(),
+        uncertain: std::collections::BTreeSet::new(),
+        stores: [(change.root.clone(), change.store.to_path_buf())].into(),
+        excluded: BTreeMap::new(),
+        excluded_overflowed: false,
+        possibly_torn: BTreeMap::new(),
     }
 }

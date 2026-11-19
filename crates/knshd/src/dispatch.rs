@@ -130,12 +130,22 @@ pub(crate) struct Answer {
     pub(crate) result: Value,
     /// Raw bytes for a binary stream, sent in chunks after the result and closed with an end-of-stream frame.
     pub(crate) bytes: Option<Vec<u8>>,
+    /// Further streams the result names itself, each with its own ID, sent in order after `bytes` and each closed
+    /// before the next (`checkpoint.diff`, KNSH-088: one per file). IDs may repeat [`Call::stream`]'s or an earlier
+    /// answer's, since every stream of an answer ends before the next message is read; within one answer each is
+    /// distinct, and there are at most [`knsh_json::MAX_OPEN_STREAMS`] in all. Only answers on the sockets may have
+    /// any: a control-service message carries at most one data value.
+    pub(crate) streams: Vec<(StreamId, Vec<u8>)>,
 }
 
 impl From<Value> for Answer {
     /// A result with no raw bytes.
     fn from(result: Value) -> Self {
-        Self { result, bytes: None }
+        Self {
+            result,
+            bytes: None,
+            streams: Vec::new(),
+        }
     }
 }
 

@@ -45,6 +45,12 @@
 //!   writable ([`knsh_checkpoint::held_in_roots`], decision 17), outside every lock, and marks those inside the
 //!   line's roots possibly torn in its checkpoint before the line ends; when they cannot all be read, every file of
 //!   the change is (fail closed). SQLite databases with journals are marked by the captures themselves.
+//! - **History (KNSH-088).** Each finished checkpoint goes to a [`CheckpointSink`] (the daemon's history) before
+//!   `checkpoint.created` is published, so a client that saw the event can undo the change. The engine's own
+//!   restores are bracketed by [`RestoreWindows`] ([`Shadows`] implements it): every watcher on the roots is
+//!   flushed, the ledger stops attributing changes there, the restore runs, the watchers are flushed again so its
+//!   writes are applied to the shadows while nothing captures them, and attribution resumes. A line running in such
+//!   a root meanwhile loses those changes, so its checkpoint is marked uncertain (`capture_failed`).
 //!
 //! # Locks
 //!
@@ -52,7 +58,9 @@
 //! lock is taken only without the table lock; the [`EdgeSink`] is called under it (so edges arrive in the order they
 //! closed) and must not block or call back. The captures' lock is taken under it (lock order: ledger, then
 //! captures), never the other way round; a capture's renames happen after both are released. Events are published
-//! after it is released. A caller waiting on a shadow ([`Shadows::wait`]) holds only that shadow's own lock, inside
+//! after it is released. The [`CheckpointSink`] is called with no lock of this module held, and must not block on
+//! a lock held while a restore runs: a restore flushes watchers, whose reports end here. A caller waiting on a
+//! shadow ([`Shadows::wait`]) holds only that shadow's own lock, inside
 //! `knsh-checkpoint`. Watchers are looked up under the table lock and used after it is released; their reports
 //! publish events (the hub's lock), never under the table lock.
 
@@ -149,6 +157,26 @@ impl CheckpointEvents for EventHub {
     }
 }
 
+/// Where finished checkpoints go (KNSH-088): the daemon's history, which records each as a change. Called in the
+/// order the checkpoints finished, before `checkpoint.created` is published, with no lock of this module held. Must
+/// not block waiting for a restore to end: a restore flushes the watchers whose reports call it.
+pub(crate) trait CheckpointSink: Send + Sync {
+    /// `finished` are final: record them.
+    fn finished(&self, finished: &[Checkpoint]);
+}
+
+/// The engine's own restores (undo, redo, `checkpoint.restore`), bracketed so their writes are not captured as a
+/// change of anybody's (KNSH-088, [`knsh_checkpoint::Ledger::restore_started`]).
+pub(crate) trait RestoreWindows: Send + Sync {
+    /// A restore is about to write in `roots`: what changed there before it is reported first, then changes there
+    /// belong to no edge. Waits at most the flush deadline per watcher.
+    fn begin(&self, roots: &[CanonicalPath]);
+
+    /// The restore of `roots` is over: its writes are reported (and not captured), then attribution resumes. Called
+    /// exactly once per [`RestoreWindows::begin`], with the same roots.
+    fn end(&self, roots: &[CanonicalPath]);
+}
+
 /// Where closed edges go (KNSH-081): the units the history tree (KNSH-083) will store (their checkpoints are taken by
 /// [`Captures`], KNSH-082). Called under the attributor's lock, in the order the edges closed; must not block or call
 /// back into the attributor.
@@ -174,6 +202,8 @@ pub(crate) struct Attributor {
     captures: Captures,
     events: Arc<dyn CheckpointEvents>,
     edges: Arc<dyn EdgeSink>,
+    /// Where finished checkpoints are recorded (KNSH-088).
+    history: Arc<dyn CheckpointSink>,
     /// Asked at each line's end which files its processes still hold for writing (KNSH-085).
     holders: Arc<dyn WriteHolders>,
 }
@@ -182,6 +212,7 @@ impl Attributor {
     fn new(
         events: Arc<dyn CheckpointEvents>,
         edges: Arc<dyn EdgeSink>,
+        history: Arc<dyn CheckpointSink>,
         captures: Captures,
         holders: Arc<dyn WriteHolders>,
     ) -> Arc<Self> {
@@ -190,6 +221,7 @@ impl Attributor {
             captures,
             events,
             edges,
+            history,
             holders,
         })
     }
@@ -202,6 +234,10 @@ impl Attributor {
             // The ledger stays consistent at each step of every operation, so a panic elsewhere cannot corrupt it.
             let mut ledger = self.ledger.lock().unwrap_or_else(PoisonError::into_inner);
             let result = change(&mut ledger, &self.captures);
+            // KNSH-088: a line that lost changes to a restore of the engine may miss paths.
+            for edge in ledger.take_missed() {
+                self.captures.mark_uncertain(edge, UncertainReason::CaptureFailed);
+            }
             let closed = ledger.take_closed();
             let finished = if closed.is_empty() {
                 Vec::new()
@@ -230,8 +266,13 @@ impl Attributor {
         }
     }
 
-    /// `checkpoint.created` for each of `finished`, on each session it belongs to (FR-CKP-11).
+    /// Records `finished` in the history (KNSH-088), then publishes `checkpoint.created` for each, on each session it
+    /// belongs to (FR-CKP-11).
     fn publish_created(&self, finished: &[Checkpoint]) {
+        if finished.is_empty() {
+            return;
+        }
+        self.history.finished(finished);
         for checkpoint in finished {
             for session_id in &checkpoint.sessions {
                 self.events.checkpoint_created(*session_id, checkpoint);
@@ -363,8 +404,10 @@ pub(crate) struct ShadowParts {
     pub(crate) file_events: Arc<dyn FileEvents>,
     /// Where `file.changed`, `checkpoint.uncertain` and `agent.edit` are published.
     pub(crate) events: Arc<dyn CheckpointEvents>,
-    /// Where closed edges go (KNSH-081): [`UncapturedEdges`] until the history tree exists.
+    /// Where closed edges go (KNSH-081): [`UncapturedEdges`]; the history takes their checkpoints instead.
     pub(crate) edges: Arc<dyn EdgeSink>,
+    /// Where finished checkpoints are recorded (KNSH-088): the daemon's history.
+    pub(crate) history: Arc<dyn CheckpointSink>,
     /// Checkpoint identifiers (KNSH-082).
     pub(crate) random: Arc<dyn Random>,
     /// Files held for writing at a line's end (KNSH-085, FR-CKP-24).
@@ -401,6 +444,7 @@ impl Shadows {
         let attributor = Attributor::new(
             Arc::clone(&parts.events),
             Arc::clone(&parts.edges),
+            Arc::clone(&parts.history),
             captures,
             Arc::clone(&parts.holders),
         );
@@ -663,6 +707,47 @@ impl Shadows {
             };
             log_settled(log.as_ref(), session_id, index, &status);
         });
+    }
+}
+
+impl Shadows {
+    /// Every running watcher on one of `roots`, whichever session keeps it, each once. Collected under the table
+    /// lock and used after it is released (module documentation, "Locks").
+    fn watchers_on(&self, roots: &[CanonicalPath]) -> Vec<Arc<Watcher>> {
+        let table = self.table();
+        let mut watchers: Vec<Arc<Watcher>> = Vec::new();
+        for entry in table.values().flatten() {
+            let Some(watcher) = &entry.watcher else {
+                continue;
+            };
+            if roots.contains(&entry.root) && !watchers.iter().any(|kept| Arc::ptr_eq(kept, watcher)) {
+                watchers.push(Arc::clone(watcher));
+            }
+        }
+        watchers
+    }
+
+    /// Flushes every watcher on `roots`: each applies (and reports) every event it was sent so far, or gives up at
+    /// its flush deadline. Best effort: a late event is attributed to whatever follows, which undo's post-image check
+    /// makes safe (FR-CKP-20).
+    fn flush_roots(&self, roots: &[CanonicalPath]) {
+        for watcher in self.watchers_on(roots) {
+            let _ = watcher.flush();
+        }
+    }
+}
+
+impl RestoreWindows for Shadows {
+    fn begin(&self, roots: &[CanonicalPath]) {
+        // What was written before the restore is reported first, so it stays an edit of whoever made it.
+        self.flush_roots(roots);
+        self.attributor.with(|ledger, _| ledger.restore_started(roots));
+    }
+
+    fn end(&self, roots: &[CanonicalPath]) {
+        // The restore's own writes are applied to the shadows while the ledger still drops them.
+        self.flush_roots(roots);
+        self.attributor.with(|ledger, _| ledger.restore_ended(roots));
     }
 }
 

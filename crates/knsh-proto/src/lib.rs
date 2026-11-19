@@ -136,8 +136,10 @@ pub use hello::{
 };
 
 pub use checkpoint::{
-    CheckpointDiffParams, CheckpointRestoreParams, CheckpointRestoreResult, DIFF_CONTENT_TYPE, DiffAnswer,
-    MAX_BASE64_DIFF, MAX_DIFF_PAGE, MAX_LISTED_RESTORED, RestoredChange, diff_answer, undo_conflict,
+    ChangeTarget, CheckpointDiffParams, CheckpointListParams, CheckpointListResult, CheckpointRestoreParams,
+    CheckpointRestoreResult, CheckpointUndoParams, CheckpointUndoResult, DIFF_CONTENT_TYPE, DiffAnswer, LATER_CHANGE,
+    ListedChange, ListedKind, ListedStatus, MAX_BASE64_DIFF, MAX_DIFF_PAGE, MAX_LIST_PAGE, MAX_LISTED_CONFLICTS,
+    MAX_LISTED_RESTORED, RestoredChange, diff_answer, history_error, overlap_conflict, undo_conflict,
 };
 pub use envelope::{
     ErrorResponse, MAX_ID_LEN, Message, Notification, Rejection, Request, RequestId, RpcError, SuccessResponse, decode,
