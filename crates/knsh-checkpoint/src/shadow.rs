@@ -163,11 +163,14 @@ pub trait ShadowFiles: Send + Sync {
     /// A [`PlatformError`]; the previous file is untouched on error.
     fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), PlatformError>;
 
-    /// Reads the whole file `path`, refusing one larger than `limit` bytes before allocating.
+    /// Reads the whole regular file `path`, refusing one larger than `limit` bytes before allocating. A final symlink
+    /// is never followed and anything not a regular file is refused: `checkpoint.diff` reads live files in roots an
+    /// agent can write, from the unsandboxed daemon (KNSH-086).
     ///
     /// # Errors
     ///
-    /// A [`PlatformError`]; [`PlatformError::TooLarge`] above `limit`, `ENOENT` if nothing is there.
+    /// A [`PlatformError`]; [`PlatformError::TooLarge`] above `limit`, `ENOENT` if nothing is there,
+    /// [`PlatformError::UnexpectedKind`] (or `ELOOP`) for a symlink or anything not a regular file.
     fn read_file(&self, path: &Path, limit: u64) -> Result<Vec<u8>, PlatformError>;
 
     /// Called once on each build thread before it does anything else: the real backend lowers the thread to the
@@ -243,7 +246,9 @@ impl ShadowFiles for PlatformShadowFiles {
     }
 
     fn read_file(&self, path: &Path, limit: u64) -> Result<Vec<u8>, PlatformError> {
-        self.fs.read(path, limit)
+        // Never through a final symlink (the trait's promise): `checkpoint.diff` reads live files in roots an agent
+        // can write (KNSH-086).
+        self.volumes.read_regular(path, limit)
     }
 
     fn prepare_thread(&self) {

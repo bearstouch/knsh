@@ -793,6 +793,8 @@ fn log_watch_failed(log: &dyn SystemLog, session_id: SessionId, index: usize, er
         | CheckpointError::Conflicts(_)
         | CheckpointError::ForceNotAllowed
         | CheckpointError::NotOwnChange
+        | CheckpointError::RestoreNotAllowed
+        | CheckpointError::RestoreStopped(_)
         | CheckpointError::NoStore
         | CheckpointError::Journal
         | CheckpointError::RolledBack(_)

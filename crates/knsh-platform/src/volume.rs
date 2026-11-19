@@ -197,6 +197,19 @@ pub trait Volumes: Send + Sync {
     /// [`Operation::Read`](crate::Operation::Read).
     fn hash(&self, path: &Path, limit: u64) -> Result<Option<ContentHash>, PlatformError>;
 
+    /// The whole contents of the regular file at `path`, refusing one larger than `limit` bytes before allocating
+    /// for it (and one that grows past `limit` while being read). A final symlink is never followed, so a file an
+    /// agent swapped for a symlink to a secret elsewhere is refused rather than read by the unsandboxed daemon
+    /// (KNSH-086, `checkpoint.diff`).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::InvalidPath`]; [`PlatformError::UnexpectedKind`] if `path` is not a regular file (a FIFO is
+    /// refused without waiting for a writer); [`PlatformError::TooLarge`] above `limit`; [`PlatformError::Os`] with
+    /// [`Operation::Open`](crate::Operation::Open) (`ELOOP` for a symlink, `ENOENT`) or
+    /// [`Operation::Read`](crate::Operation::Read).
+    fn read_regular(&self, path: &Path, limit: u64) -> Result<Vec<u8>, PlatformError>;
+
     /// Writes the contents of the regular file `src` into the existing regular file `dst` **in place**: `dst` keeps
     /// its inode, so its hard links and every descriptor open on it see the new contents (FR-CKP-22, KNSH-084). Then
     /// sets `dst`'s modification time to now, so build tools notice (FR-CKP-23), and flushes it to stable storage.

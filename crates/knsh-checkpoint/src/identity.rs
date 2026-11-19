@@ -79,6 +79,8 @@ pub(crate) fn post_image(files: &dyn ShadowFiles, path: &Path) -> PostImage {
             | CheckpointError::Conflicts(_)
             | CheckpointError::ForceNotAllowed
             | CheckpointError::NotOwnChange
+            | CheckpointError::RestoreNotAllowed
+            | CheckpointError::RestoreStopped(_)
             | CheckpointError::NoStore
             | CheckpointError::Journal
             | CheckpointError::RolledBack(_)
@@ -206,6 +208,9 @@ mod tests {
                 self.inner.write(path, b"changed meanwhile");
             }
             hash
+        }
+        fn read_regular(&self, path: &Path, limit: u64) -> Result<Vec<u8>, PlatformError> {
+            self.inner.read_regular(path, limit)
         }
         fn write_in_place(&self, src: &Path, dst: &Path, expect: Option<&FileIdentity>) -> Result<(), PlatformError> {
             self.inner.write_in_place(src, dst, expect)
