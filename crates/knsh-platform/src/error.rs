@@ -342,6 +342,15 @@ pub enum PlatformError {
     /// A Keychain item exists but its value is not what the engine stores there (for example a signing key of the
     /// wrong length). Treated like a read failure: tampering, fail closed (decision 11).
     KeychainValueInvalid,
+    /// No secret of the requested name exists in the store (KNSH-089). A line that needs it is denied.
+    SecretNotFound,
+    /// A secret exists but could not be read (KNSH-089): not readable by this program, a locked keychain, an item
+    /// overwritten by another program (decision 11), or a value too large. Carries the `OSStatus` when the Keychain
+    /// gave one, never the value. A line that needs it is denied.
+    SecretAccessDenied {
+        /// The `OSStatus`, or `None` when the value itself was refused.
+        status: Option<i32>,
+    },
     /// A Security framework call about code signatures failed (KNSH-067). Carries the `OSStatus`, for example
     /// `-67065` when the code that sent a message is gone (it exited or exec'd another binary).
     Security {
@@ -392,6 +401,8 @@ impl PlatformError {
             | Self::Launchctl { .. }
             | Self::Keychain { .. }
             | Self::KeychainValueInvalid
+            | Self::SecretNotFound
+            | Self::SecretAccessDenied { .. }
             | Self::Security { .. }
             | Self::Xpc
             | Self::CrossVolume
@@ -419,6 +430,8 @@ impl PlatformError {
             | Self::Launchctl { .. }
             | Self::Keychain { .. }
             | Self::KeychainValueInvalid
+            | Self::SecretNotFound
+            | Self::SecretAccessDenied { .. }
             | Self::Security { .. }
             | Self::Xpc
             | Self::CrossVolume
@@ -475,6 +488,9 @@ impl fmt::Display for PlatformError {
                 write!(f, "{} failed: OSStatus {status}", operation.as_str())
             }
             Self::KeychainValueInvalid => f.write_str("keychain item does not hold a value the engine wrote"),
+            Self::SecretNotFound => f.write_str("secret not found"),
+            Self::SecretAccessDenied { status: Some(status) } => write!(f, "secret not readable: OSStatus {status}"),
+            Self::SecretAccessDenied { status: None } => f.write_str("secret not readable: value refused"),
             Self::Xpc => f.write_str("xpc call failed"),
             Self::CrossVolume => f.write_str("clone source and destination are on different volumes"),
             Self::ClonesUnsupported => f.write_str("file system does not support copy-on-write clones"),
@@ -501,6 +517,8 @@ impl std::error::Error for PlatformError {
             | Self::Launchctl { .. }
             | Self::Keychain { .. }
             | Self::KeychainValueInvalid
+            | Self::SecretNotFound
+            | Self::SecretAccessDenied { .. }
             | Self::Security { .. }
             | Self::Xpc
             | Self::CrossVolume

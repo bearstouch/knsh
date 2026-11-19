@@ -174,6 +174,7 @@ mod record;
 mod redacted;
 mod registry;
 mod resolve;
+mod secret;
 mod session;
 mod time;
 mod ulid;
@@ -241,6 +242,7 @@ pub use registry::{EqualProfileOnly, ProfileOrder, SessionRegistry};
 pub use resolve::{
     BinaryLookup, CommandName, DEFAULT_TRUSTED_FOLDERS, MAX_PATH_ENTRIES, Resolution, TrustedFolders, resolve,
 };
+pub use secret::{MAX_SECRET_VALUE_LEN, SecretName};
 pub use session::{
     Actor, ActorKind, AgentId, DERIVED_AGENT_IDS, MAX_NAME_LEN, ProfileName, STATE_CHANGED_EVENT, Session, SessionSpec,
     SessionState, StateChanged, Transition, default_recording,

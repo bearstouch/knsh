@@ -68,6 +68,16 @@ pub(crate) fn idle_handlers() -> Handlers {
         })
         .handlers(),
     );
+    // `secrets.provide` and `secrets.revoke` (KNSH-089) over an empty Keychain.
+    handlers.extend(
+        crate::secrets::SecretBroker::new(
+            Arc::new(knsh_platform::testing::MemSecretStore::new()),
+            Arc::new(knsh_platform::testing::FakeClock::new(
+                knsh_core::Timestamp::from_unix_micros(1_800_000_000_000_000).unwrap(),
+            )),
+        )
+        .handlers(),
+    );
     handlers
 }
 

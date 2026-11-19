@@ -21,16 +21,16 @@ control service, memory-only storage, expiry.
 *Keychain secret store*
 
 - [ ] A secret stored under service `knsh` and a given name can be read by `knshd`.
-- [ ] Missing or inaccessible secrets return typed errors; a line that needs one is denied, not run without it.
-- [ ] Secret values live in a type whose `Debug`/`Display` never print the value and whose memory is zeroed on drop.
-- [ ] No API returns a secret value to any client.
+- [ ] Missing or inaccessible secrets return typed errors; a line that needs one is denied, not run without it. *(Typed errors: observed; denial: KNSH-092.)*
+- [x] Secret values live in a type whose `Debug`/`Display` never print the value and whose memory is zeroed on drop.
+- [x] No API returns a secret value to any client.
 
 *Authority-supplied secrets*
 
-- [ ] `secrets.provide` stores the value in memory only, for the given duration.
-- [ ] After expiry or `secrets.revoke`, the secret is unavailable and lines needing it are denied.
-- [ ] Authority-supplied secrets are lost when `knshd` exits and never written to disk.
-- [ ] Both methods exist only on the control service.
+- [x] `secrets.provide` stores the value in memory only, for the given duration.
+- [ ] After expiry or `secrets.revoke`, the secret is unavailable and lines needing it are denied. *(Unavailable: observed; denial: KNSH-092.)*
+- [x] Authority-supplied secrets are lost when `knshd` exits and never written to disk.
+- [x] Both methods exist only on the control service.
 
 **Unit tests**
 *Keychain secret store*
@@ -49,3 +49,28 @@ control service, memory-only storage, expiry.
 *Keychain secret store*
 
 - Read a test item from a temporary Keychain (pending if not runnable in CI).
+
+**Notes.** Implemented across `knsh-core` (`SecretName`, `MAX_SECRET_VALUE_LEN`), `knsh-platform` (`SecretValue`,
+zeroed on drop; the `SecretStore` trait; `KeychainSecrets`, service `knsh`; the `MemSecretStore` fake; a Keychain
+reachability check in the capability probe), `knsh-proto` (`secrets.provide` and `secrets.revoke` params and results)
+and `knshd` (the secrets broker and both control methods). Spec: [control service](../06-api/control-service.md#secretsprovide),
+[secret](../05-models/secret.md#lookup-knsh-089), [capabilities](../05-models/capabilities.md#probe),
+[defaults and limits](../09-reference/defaults-and-limits.md).
+
+Decisions taken here: a provided secret takes the place of a Keychain item of the same name while it lives; expiry is
+the earlier of the wall-clock `expires_at` and the same duration on the monotonic clock, and an unreadable wall clock
+counts as expired; at most 256 provided names, values 1 byte to 64 KiB, durations 1 s to 24 hours; `secrets: keychain`
+is reported only when a Keychain lookup of a never-created item answers without an error ("not found", or the item
+should someone have created it); the probe now has five sequential checks, so its worst case is 10 s (was 8 s).
+
+**Pending (unchecked boxes):**
+
+- *Read by `knshd` from the real Keychain:* the backend is built and unit-tested through the fake; the real read is the
+  manual, ignored test `reads_a_secret_added_to_a_throwaway_service` (it needs an item added to the login keychain, so
+  it never runs by default). The integration test against a temporary keychain is not written: a temporary keychain
+  needs `security create-keychain` and the search list changed, which touches the user's keychain configuration.
+- *"A line that needs one is denied" / "lines needing it are denied":* the broker answers typed not found or access
+  denied, expired and revoked secrets are unavailable at once, and `SecretBroker::resolve` gives a line all its secrets
+  or names the first missing one. No line needs a secret until injection exists (KNSH-092), which must deny with that
+  name.
+- The `security` steps for adding an item `knshd` can read (in the secret model) are not verified end to end.

@@ -1,8 +1,8 @@
 //! Capability probes: real checks that a backend works on this machine, each bounded in time (KNSH-014).
 //!
 //! A probe never guesses from a version number. [`run_to_exit`] runs a probe command (the sandbox probe runs
-//! `knsh-exec` under a deny profile, KNSH-046) and reports how it ended; [`SystemProbe`] reads the OS version and
-//! starts and stops an `FSEvents` stream. Every probe has a deadline on the injected [`Clock`]: one that hangs is
+//! `knsh-exec` under a deny profile, KNSH-046) and reports how it ended; [`SystemProbe`] reads the OS version,
+//! starts and stops an `FSEvents` stream, and asks the Keychain for an item that never exists (KNSH-089). Every probe has a deadline on the injected [`Clock`]: one that hangs is
 //! abandoned and reported as failed, so `knshd` reports the backend as `none` (NFR-SEC-10, NFR-REL-08) instead of
 //! never answering `hello`.
 //!
@@ -40,6 +40,15 @@ pub trait SystemProbe: Send + Sync {
     ///
     /// [`PlatformError::Os`] with [`Operation::FileEvents`](crate::Operation::FileEvents) if any step fails.
     fn check_file_events(&self) -> Result<(), PlatformError>;
+
+    /// Looks up an item that is never created, with user interaction disabled, to show that the secret store answers
+    /// here (KNSH-089). "Not found" is a pass; it never shows a dialog and never reads a real secret.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Keychain`] with the `OSStatus` if the store gives any other answer (unreachable, or a
+    /// keychain that refuses lookups).
+    fn check_secrets(&self) -> Result<(), PlatformError>;
 }
 
 /// Why a probe did not pass. Holds no input, so it can be logged.

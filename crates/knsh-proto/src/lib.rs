@@ -79,6 +79,13 @@
 //! [`LineStatus`] only; [`Denial`] reads a `-32001`'s rule and reason. [`SESSION_TOKEN_VAR`] names the variable the
 //! envelope's token travels in.
 //!
+//! # Secrets (KNSH-089)
+//!
+//! [`SecretsProvideParams`] reads `secrets.provide` (control service only): a secret name, a value held as
+//! [`Redacted`](knsh_core::Redacted) and a `duration_s` of at most [`MAX_SECRET_DURATION_S`]. It has no `ToJson`, and
+//! neither [`SecretsProvideResult`] nor [`SecretsRevokeResult`] carries a value: no method returns a secret value to
+//! any client (FR-SEC-07).
+//!
 //! Parameters and results of the other methods arrive with the stories that implement them.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
@@ -103,6 +110,7 @@ mod policy;
 mod policy_edit;
 mod profile_use;
 mod records;
+mod secrets;
 mod session;
 mod start_agent;
 
@@ -133,6 +141,9 @@ pub use decision::{
 pub use hello::{
     ByteTransport, HelloParams, HelloResult, MAX_CLIENT_FIELD_LEN, MAX_PROTOCOLS, MAX_SESSION_TOKEN_LEN,
     PROTOCOL_CAPABILITY, SUPPORTED_PROTOCOLS, negotiate,
+};
+pub use secrets::{
+    MAX_SECRET_DURATION_S, SecretsProvideParams, SecretsProvideResult, SecretsRevokeParams, SecretsRevokeResult,
 };
 
 pub use checkpoint::{

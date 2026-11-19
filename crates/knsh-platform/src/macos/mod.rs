@@ -35,7 +35,8 @@ pub use fs::RealFs;
 pub use fsevents::{FsEventStreams, MAX_WATCHED_PATHS};
 pub use holders::SystemWriteHolders;
 pub use keychain::{
-    KeychainSigningKey, KeychainTrustStore, SIGNING_KEY_ACCOUNT, SIGNING_KEY_SERVICE, TRUST_ACCOUNT, TRUST_SERVICE,
+    KeychainSecrets, KeychainSigningKey, KeychainTrustStore, SECRET_SERVICE, SIGNING_KEY_ACCOUNT, SIGNING_KEY_SERVICE,
+    TRUST_ACCOUNT, TRUST_SERVICE,
 };
 pub use kqueue::{Kqueue, Token};
 pub use launchd::{Launchctl, LaunchdSockets, SystemPeerCredentials};
