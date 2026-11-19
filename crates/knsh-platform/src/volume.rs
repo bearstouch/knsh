@@ -196,6 +196,36 @@ pub trait Volumes: Send + Sync {
     /// [`Operation::Open`](crate::Operation::Open) (`ELOOP` for a symlink) or
     /// [`Operation::Read`](crate::Operation::Read).
     fn hash(&self, path: &Path, limit: u64) -> Result<Option<ContentHash>, PlatformError>;
+
+    /// Writes the contents of the regular file `src` into the existing regular file `dst` **in place**: `dst` keeps
+    /// its inode, so its hard links and every descriptor open on it see the new contents (FR-CKP-22, KNSH-084). Then
+    /// sets `dst`'s modification time to now, so build tools notice (FR-CKP-23), and flushes it to stable storage.
+    /// Neither final component is followed.
+    ///
+    /// With `expect`, `dst` is written only if its identity read on the open descriptor still equals `expect`
+    /// (kind, inode, size, modification time), which narrows the window between a caller's check and the write to
+    /// the copy itself (FR-CKP-20).
+    ///
+    /// Not atomic: a failure or crash during the copy can leave `dst` holding part of each version. Callers that must
+    /// never leave a mixed file keep a copy of the old version to write back (the restore journal, KNSH-084).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::InvalidPath`]; [`PlatformError::UnexpectedKind`] if either is not a regular file;
+    /// [`PlatformError::Changed`] if `dst` no longer matches `expect` (nothing was written then);
+    /// [`PlatformError::Os`] with [`Operation::Open`](crate::Operation::Open) (`ELOOP` for a symlink, `ENOENT`),
+    /// [`Operation::Read`](crate::Operation::Read), [`Operation::Write`](crate::Operation::Write) or
+    /// [`Operation::SyncFile`](crate::Operation::SyncFile).
+    fn write_in_place(&self, src: &Path, dst: &Path, expect: Option<&FileIdentity>) -> Result<(), PlatformError>;
+
+    /// Sets the modification (and access) time of `path` itself to now, without following a final symlink: a file
+    /// restored by a clone, which keeps its pre-image's time, is then seen as changed (FR-CKP-23, KNSH-084).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::InvalidPath`]; [`PlatformError::Os`] with [`Operation::Write`](crate::Operation::Write)
+    /// (`ENOENT` if nothing exists there).
+    fn touch(&self, path: &Path) -> Result<(), PlatformError>;
 }
 
 /// Maps a `clonefile` `errno`, shared by the real backend and the fake so both report failures alike. The two

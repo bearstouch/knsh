@@ -40,7 +40,8 @@ logged as an error (NFR-PERF-06). Roots whose store is `plain-copy` get no shado
 when their session ends yet (retention, KNSH-087).
 **Known limit (pending):** the walk goes by path, so a folder swapped for a symlink between its `lstat` and its
 listing (by a writer racing the build, such as the envelope) is still followed for that folder; an `openat`-relative
-walk with `O_NOFOLLOW` closes this, and restore (KNSH-08x) must not trust shadow contents until it does.
+walk with `O_NOFOLLOW` closes this. Restore (KNSH-084) writes pre-images only to their own paths inside the root, so
+such a race can at worst put content the user could already read into the root; it stays open until the walk is fixed.
 
 **Lines that touch a root (FR-CKP-02).** A line touches a root when its `cwd` is in the root, or the profile's
 `fs.write` holds a path in the root or one containing it: lines are sandboxed to `fs.write`, so a line meeting neither
@@ -131,9 +132,13 @@ File events carry no process ID, so a human edit made at the same moment can be 
   `files_changed` 0 (`[]` in the record) and no checkpoint, unless one of its roots was uncertain (it then gets an
   empty, uncertain checkpoint, so its record says changes may be missing); one that touched none has `null`. A line of a concurrent
   set that ends before the set closes gets the set's changes so far.
-- **Pending:** only a summary of the last 64 checkpoints is kept in memory, and their pre-images on disk; writing the history tree
-  (KNSH-083) to disk is wired with undo (KNSH-084), removal by retention KNSH-087, and plain-copy roots (which have no shadow yet)
-  are not captured.
+- **Excluded folders (FR-CKP-31, KNSH-084).** The watcher reports the outermost excluded folder of each event path
+  below one (or of an event on an excluded folder itself), and the checkpoint lists it, at most 256 per checkpoint
+  (then marked incomplete), so an undo can name it as not restored. Excluded changes alone make no checkpoint.
+- **Pending:** `captures` keeps only a summary of the last 64 checkpoints, and their pre-images on disk; the full
+  checkpoints and the history tree (KNSH-084's `History`) live in memory, are written to disk with retention
+  (KNSH-087), and are fed and called by `knshd` with the endpoints (KNSH-088). Plain-copy roots (which have no shadow
+  yet) are not captured.
 - **Known limit (sessions sharing a root):** each session's watcher reports every change in the root. If one of them
   applies a change after the next line has started (the KNSH-081 limit), that change can be captured in the line's
   checkpoint with that watcher's older shadow copy as its pre-image, so undoing the line could also undo the agent edit
@@ -149,6 +154,54 @@ File events carry no process ID, so a human edit made at the same moment can be 
 | FR-CKP-23 | The modification time must be set to now, so build tools notice the change. |
 | FR-CKP-24 | Files that were open for writing or memory-mapped during the change, and SQLite databases with journal files, must be marked **possibly torn** and not restored without `force`. |
 | FR-CKP-25 | `checkpoint.restored` must be emitted after a restore. |
+
+**Undo and redo (KNSH-084).** `knsh_checkpoint::History` holds the history tree and every checkpoint it refers to;
+`undo` and `redo` take the change (by `record_id` or checkpoint), the caller (agent session, user or authority) and
+`force`:
+
+1. **Who.** `force` from an agent is refused before anything else (FR-CKP-21). An agent may undo or redo only a change
+   of its own session, never external edits.
+2. **Plan.** The history tree plans a step back, a step forward or a revert (below); nothing changes yet.
+3. **Check every path, change nothing.** Each path of the checkpoint to restore must hold what the change left there:
+   same kind, inode, size and modification time, and the same SHA-256 where one was recorded (so a write through a
+   mapping is caught); a folder by kind and inode only (its time moves with its entries). A mismatch is a conflict
+   (`changed`, `missing`, `exists`, or `unverifiable` when the post-image could not be read). So is a version that was
+   never captured (`pre_image_lost`), a folder that would be removed while it holds entries the change did not record
+   (`folder_not_empty`), and a path whose folder will not exist (`parent_missing`). Any conflict refuses the whole
+   undo with `-32004` listing every conflicting path and reason, and nothing is written (no partial restore).
+   `force` (user and authority only) overrides the first four, never the last three. Every folder from the root down
+   to each path must be a real folder or one the undo puts back (`parent_missing` otherwise): `knshd` is not sandboxed,
+   so a folder an agent swapped for a symlink must never let a restore write outside the root. This is checked again
+   right before each path changes; being by path, it leaves the same instant-wide race as the shadow builder's walk.
+4. **Save the current versions.** Each live file or symlink about to be replaced is cloned into a new checkpoint in
+   the root's store; these are what redo restores, and what a failed restore is put back from.
+5. **Restore**, in path order: first remove, deepest first, what must go; then put back folders and files, shallowest
+   first. A file's old contents are written **into the existing file** (same inode, so hard links and open
+   descriptors see them, FR-CKP-22), after checking again on the open descriptor that it is still the file checked;
+   a path with nothing there gets a clone. Every restored file's modification time is set to now (FR-CKP-23).
+6. **Commit and report.** The tree records the restore; for an undo the saved versions stay for redo, for a redo they
+   are removed. The result lists the paths restored, the excluded folders the change touched as not restored
+   (FR-CKP-31), and what the change did that cannot be undone (FR-CKP-36, its files are still restored);
+   `checkpoint.restored` is published on each session of the change (FR-CKP-25). The restored files were rewritten
+   (new times), so each checkpoint a later undo or redo checks them against (the newest change of each path still on
+   the way to the head, and the saved versions of each change the head stepped back from) gets their new identities
+   as post-images, but only where it recorded the same contents (kind, size and SHA-256): two changes of one file can
+   be undone in turn, and an edit the history never recorded still conflicts.
+
+**Never mixed (journal).** Several files cannot be replaced in one step, and a write in place is not atomic. Before
+the first live path changes, a journal listing each path and its version before the restore (absent, folder, or the
+saved copy) is written atomically to `restores/<saved id>.json` in each store involved. If any step fails, every path
+already touched is put back from the saved copies (a half-written file is written over in full), then the journal and
+the copies are removed. If `knshd` stops part-way, the journal is still there and `recover_restores` puts every listed
+path back at the next start, before sessions use the root, then removes the journal before the copies it points at
+(only `<id>.json` files are journals; a temporary file of an interrupted journal write is ignored). The journal is removed only once every path is restored;
+if that fails, the restore is put back too, so a recovery never undoes a restore reported as done. Every failure thus
+ends with every file as it was before the undo or redo.
+
+**Limits.** Recovery writes the saved copies over whatever is at the listed paths, so a human edit made between a
+crash and the next start is overwritten there. A special file (socket, FIFO, device) is replaced only under `force`
+and cannot be put back by a rollback. **Pending:** possibly-torn files (FR-CKP-24) are KNSH-085; calling
+`recover_restores` at `knshd` start and the endpoints are KNSH-088.
 
 ## History tree
 

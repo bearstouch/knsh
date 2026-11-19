@@ -89,6 +89,7 @@ mod approval;
 mod authority;
 mod capability;
 mod catalogue;
+mod checkpoint;
 mod control;
 mod decision;
 mod envelope;
@@ -134,6 +135,7 @@ pub use hello::{
     PROTOCOL_CAPABILITY, SUPPORTED_PROTOCOLS, negotiate,
 };
 
+pub use checkpoint::undo_conflict;
 pub use envelope::{
     ErrorResponse, MAX_ID_LEN, Message, Notification, Rejection, Request, RequestId, RpcError, SuccessResponse, decode,
     encode,

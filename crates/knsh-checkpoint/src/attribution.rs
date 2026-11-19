@@ -62,6 +62,12 @@ impl EdgeId {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    /// An edge numbered `n`, for tests that build checkpoints without a ledger.
+    #[cfg(test)]
+    pub(crate) const fn for_tests(n: u64) -> Self {
+        Self(n)
+    }
 }
 
 /// One unit of undo: a line, a concurrent set or a run of agent or external edits, from one state to the next

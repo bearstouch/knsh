@@ -65,6 +65,10 @@ pub const CHECKPOINTS_DIR: &str = "checkpoints";
 /// The most paths one checkpoint lists: as many as an edge ([`MAX_EDGE_PATHS`]).
 pub const MAX_CHECKPOINT_PATHS: usize = MAX_EDGE_PATHS;
 
+/// The most excluded folders one checkpoint lists (FR-CKP-31); more are not listed, and the checkpoint says so
+/// ([`Checkpoint::excluded_overflowed`]).
+pub const MAX_EXCLUDED: usize = 256;
+
 /// Finished checkpoints [`Captures::summary`] can still find. A summary is read right after its line ends, so a few
 /// dozen suffice; each lists at most [`MAX_RECORD_FILES_CHANGED`] paths, so the cache stays small.
 pub const RECENT_CHECKPOINTS: usize = 64;
@@ -161,6 +165,14 @@ pub struct Checkpoint {
     pub paths: BTreeMap<CanonicalPath, BTreeMap<CanonicalPath, CapturedPath>>,
     /// Why it is uncertain; empty when it is not.
     pub uncertain: BTreeSet<UncertainReason>,
+    /// The store of each root it has paths in: where its pre-images are, and where an undo saves the current
+    /// versions (KNSH-084).
+    pub stores: BTreeMap<CanonicalPath, PathBuf>,
+    /// Excluded folders (`checkpoints.exclude`) the edge changed something in, by root: not protected, so an undo
+    /// lists them as not restored (FR-CKP-31). At most [`MAX_EXCLUDED`].
+    pub excluded: BTreeMap<CanonicalPath, BTreeSet<CanonicalPath>>,
+    /// More excluded folders changed than `excluded` lists.
+    pub excluded_overflowed: bool,
 }
 
 impl Checkpoint {
@@ -211,6 +223,10 @@ struct Open {
     count: usize,
     uncertain: BTreeSet<UncertainReason>,
     sessions: BTreeSet<SessionId>,
+    stores: BTreeMap<CanonicalPath, PathBuf>,
+    excluded: BTreeMap<CanonicalPath, BTreeSet<CanonicalPath>>,
+    excluded_count: usize,
+    excluded_overflowed: bool,
     /// Pre-images kept so far, for unique names in the checkpoint's folders.
     kept: u64,
     /// The checkpoint's folder in each store it has one in.
@@ -296,6 +312,7 @@ impl Captures {
             let mut state = lock(&self.state);
             let open = self.open(&mut state, ticket.edge);
             open.sessions.insert(session_id);
+            open.stores.entry(root.clone()).or_insert_with(|| store.to_path_buf());
             if matches!(post, PostImage::Unknown) {
                 open.uncertain.insert(UncertainReason::CaptureFailed);
             }
@@ -366,6 +383,23 @@ impl Captures {
         }
     }
 
+    /// Something changed in the excluded folder `folder` of `root` (FR-CKP-31), during `edge`: not protected, so not
+    /// captured, but listed so that an undo can say it was not restored. Call it under the ledger's lock, while the
+    /// edge is open. Excluded changes alone make no checkpoint: with nothing to restore, there is nothing to undo.
+    pub fn excluded(&self, edge: EdgeId, root: &CanonicalPath, folder: CanonicalPath) {
+        let mut state = lock(&self.state);
+        let open = self.open(&mut state, edge);
+        if open.excluded.get(root).is_some_and(|listed| listed.contains(&folder)) {
+            return;
+        }
+        if open.excluded_count >= MAX_EXCLUDED {
+            open.excluded_overflowed = true;
+            return;
+        }
+        open.excluded_count += 1;
+        open.excluded.entry(root.clone()).or_default().insert(folder);
+    }
+
     /// Changes of `edge` may be missing (FR-CKP-04): its checkpoint is uncertain, and exists even if no change of it
     /// was captured, so the line's record can say so. Call it under the ledger's lock, while the edge is open.
     pub fn mark_uncertain(&self, edge: EdgeId, reason: UncertainReason) {
@@ -417,6 +451,10 @@ impl Captures {
             count: 0,
             uncertain: BTreeSet::new(),
             sessions: BTreeSet::new(),
+            stores: BTreeMap::new(),
+            excluded: BTreeMap::new(),
+            excluded_count: 0,
+            excluded_overflowed: false,
             kept: 0,
             folders: BTreeSet::new(),
             in_flight: 0,
@@ -444,20 +482,26 @@ impl Captures {
     /// A new checkpoint identifier: a ULID from the clock and the random source. If either fails, the time is 0 or a
     /// counter stands in for the random bytes, so the identifier is still distinct within this `knshd`.
     fn new_id(&self) -> CheckpointId {
-        let millis = self.clock.now().map_or(0, knsh_core::Timestamp::as_unix_millis);
-        let mut random = [0u8; 10];
-        if self.random.fill(&mut random).is_err() {
-            let count = self.fallback.fetch_add(1, Ordering::Relaxed);
-            random[2..].copy_from_slice(&count.to_be_bytes());
-        }
-        let ulid = Ulid::new(millis, random).unwrap_or_else(|_| Ulid::new(0, random).unwrap_or(Ulid::from_u128(0)));
-        CheckpointId::from_ulid(ulid)
+        new_checkpoint_id(self.clock.as_ref(), self.random.as_ref(), &self.fallback)
     }
 
     /// Removes a held copy, best effort: a leftover is only a file in the owner-only store.
     fn remove(&self, held: &Path) {
         let _ = self.files.remove(held, false);
     }
+}
+
+/// A new checkpoint identifier: a ULID from `clock` and `random`. If either fails, the time is 0 or `fallback`, a
+/// counter, stands in for the random bytes, so the identifier is still distinct within this `knshd`.
+pub(crate) fn new_checkpoint_id(clock: &dyn Clock, random: &dyn Random, fallback: &AtomicU64) -> CheckpointId {
+    let millis = clock.now().map_or(0, knsh_core::Timestamp::as_unix_millis);
+    let mut bytes = [0u8; 10];
+    if random.fill(&mut bytes).is_err() {
+        let count = fallback.fetch_add(1, Ordering::Relaxed);
+        bytes[2..].copy_from_slice(&count.to_be_bytes());
+    }
+    let ulid = Ulid::new(millis, bytes).unwrap_or_else(|_| Ulid::new(0, bytes).unwrap_or(Ulid::from_u128(0)));
+    CheckpointId::from_ulid(ulid)
 }
 
 /// What to do with the pre-image of a change that is not kept: a held copy is removed.
@@ -511,6 +555,9 @@ fn finish_ready(state: &mut State, edge: EdgeId) -> Option<Checkpoint> {
         sessions,
         paths,
         uncertain: open.uncertain,
+        stores: open.stores,
+        excluded: open.excluded,
+        excluded_overflowed: open.excluded_overflowed,
     };
     if state.recent.len() >= RECENT_CHECKPOINTS {
         state.recent.pop_front();

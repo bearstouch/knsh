@@ -267,6 +267,15 @@ impl WatchReport for SessionReport {
         self.events.uncertain(self.session_id, root, None, reason);
     }
 
+    fn excluded(&self, root: &CanonicalPath, folder: CanonicalPath) {
+        // FR-CKP-31 (KNSH-084): listed on the open edge's checkpoint, so its undo can say it was not restored.
+        self.attributor.with(|ledger, captures| {
+            if let Some(edge) = ledger.edge_of(root) {
+                captures.excluded(edge, root, folder);
+            }
+        });
+    }
+
     fn settled(&self, root: &CanonicalPath) {
         self.attributor.publish_agent_edits(root);
     }
@@ -516,7 +525,7 @@ impl Shadows {
         ) {
             Ok(watcher) => Some(watcher),
             Err(error) => {
-                log_watch_failed(parts.log.as_ref(), session_id, index, error);
+                log_watch_failed(parts.log.as_ref(), session_id, index, &error);
                 None
             }
         }
@@ -740,12 +749,21 @@ fn cancel_all(shadows: &[RootShadow]) {
 }
 
 /// One log entry for a watcher that could not start: the root's lines will be reported uncertain.
-fn log_watch_failed(log: &dyn SystemLog, session_id: SessionId, index: usize, error: CheckpointError) {
+fn log_watch_failed(log: &dyn SystemLog, session_id: SessionId, index: usize, error: &CheckpointError) {
     let (reason, errno) = match error {
-        CheckpointError::Platform(PlatformError::Os { errno, .. }) => ("platform", errno),
+        CheckpointError::Platform(PlatformError::Os { errno, .. }) => ("platform", *errno),
         CheckpointError::Platform(_) => ("platform", 0),
         CheckpointError::Threads => ("threads", 0),
         CheckpointError::IdentityUnstable => ("identity_unstable", 0),
+        // Undo and redo failures (KNSH-084); a watcher's start returns none of them.
+        CheckpointError::History(_)
+        | CheckpointError::Conflicts(_)
+        | CheckpointError::ForceNotAllowed
+        | CheckpointError::NotOwnChange
+        | CheckpointError::NoStore
+        | CheckpointError::Journal
+        | CheckpointError::RolledBack(_)
+        | CheckpointError::RollbackFailed(_) => ("restore", 0),
     };
     let fields = [
         Field::new("session", Value::Id(session_id.ulid())),

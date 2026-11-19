@@ -95,7 +95,7 @@ use knsh_platform::{
 
 use crate::capture::{Change, PostImage, PreImage};
 use crate::error::CheckpointError;
-use crate::identity::post_image_identity_of;
+use crate::identity::post_image;
 use crate::shadow::{MAX_FOLDER_ENTRIES, Shadow, ShadowFiles, ShadowStatus};
 
 /// How long the system may hold events before delivering them. The line-end procedure flushes, so this only bounds
@@ -149,6 +149,13 @@ pub trait WatchReport: Send + Sync {
     /// (`checkpoint.uncertain` with no record, FR-CKP-04, NFR-REL-04). Lines learn of theirs from
     /// [`Watcher::close_line`].
     fn uncertain(&self, root: &CanonicalPath, reason: UncertainReason);
+
+    /// Something changed in `folder`, an excluded folder of `root` (`checkpoints.exclude`), which is not shadowed or
+    /// captured: an undo lists it as not restored (FR-CKP-31, KNSH-084). Reported once per event, so possibly many
+    /// times per folder. Nothing by default.
+    fn excluded(&self, root: &CanonicalPath, folder: CanonicalPath) {
+        let _ = (root, folder);
+    }
 
     /// The worker has applied one batch of events to the shadow of `root`: every [`WatchReport::changed`] of it has
     /// been called. Where agent edits are reported, one `agent.edit` per batch (KNSH-081). Nothing by default.
@@ -892,6 +899,8 @@ impl InStep<'_> {
     /// `lstat` on both sides; at the first one that is not a folder on both sides, that folder is brought in step
     /// instead (which replaces or removes everything below it in the shadow) and the entry is left alone.
     fn entry(&self, relative: &Path, depth: Depth) -> Result<(), Failed> {
+        // Each event's own path (never a rescan passing by, which would list excluded folders on every rescan).
+        self.report_excluded(relative);
         if !self.watched(relative) {
             return Ok(());
         }
@@ -1131,16 +1140,10 @@ impl InStep<'_> {
         Failed
     }
 
-    /// The post-image identity of the live path `live`, read right after the shadow followed it (FR-CKP-09).
+    /// The post-image identity of the live path `live`, read right after the shadow followed it (FR-CKP-09). A path
+    /// removed since is deleted: its own event follows, and reports the removal.
     fn post_image(&self, live: &Path) -> PostImage {
-        match post_image_identity_of(self.files, live) {
-            Ok(identity) => PostImage::Present(identity),
-            // Removed since: its own event follows, and reports the removal.
-            Err(CheckpointError::Platform(error)) if error.is_not_found() => PostImage::Deleted,
-            Err(CheckpointError::Platform(_) | CheckpointError::IdentityUnstable | CheckpointError::Threads) => {
-                PostImage::Unknown
-            }
-        }
+        post_image(self.files, live)
     }
 
     /// A new path in the holding folder, unique for this watcher.
@@ -1176,6 +1179,40 @@ impl InStep<'_> {
         let mut above = relative.components();
         above.next_back();
         !above.any(|component| self.is_excluded(component.as_os_str()))
+    }
+
+    /// Reports the outermost excluded folder at or above `relative` as changed (FR-CKP-31), if there is one and the
+    /// path is otherwise one the watcher follows (not the store, the engine folders or the shadow). Only folders are
+    /// excluded: an entry that merely has an excluded name is reported only while it is a folder.
+    fn report_excluded(&self, relative: &Path) {
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return;
+        }
+        let live = self.plan.root.as_path().join(relative);
+        if self.plan.skip.iter().any(|skip| live.starts_with(skip)) || live.starts_with(&self.plan.shadow) {
+            return;
+        }
+        let mut folder = PathBuf::new();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            folder.push(component);
+            if !self.is_excluded(component.as_os_str()) {
+                continue;
+            }
+            let path = self.plan.root.as_path().join(&folder);
+            let last = components.peek().is_none();
+            if last && !matches!(self.files.kind(&path), Ok(FileKind::Directory)) {
+                // A file named like an excluded folder is protected like any other (or already gone).
+                return;
+            }
+            if let Ok(folder) = CanonicalPath::new(path) {
+                self.report.excluded(&self.plan.root, folder);
+            }
+            return;
+        }
     }
 
     /// Whether the last name of `relative` is an excluded folder name.

@@ -147,6 +147,8 @@
 //! again with the versions the undo saved, or revert an older edge only if no later edge touched its paths
 //! (FR-CKP-30, else [`HistoryError::Conflict`] lists them). [`HistoryTree::commit`] records a plan once its files
 //! were restored. The tree is stored as versioned JSON ([`HISTORY_FORMAT`]); history errors are [`HistoryError`].
+//! KNSH-084 adds what an undo or redo reports: [`RestoreConflict`] with its [`ConflictReason`] (`-32004`), and the
+//! [`RestoreOperation`] of `checkpoint.restored`.
 //!
 //! Failures are reported through [`CoreError`], except the profile loader's, which are [`ProfileError`] because they
 //! must name the key at fault.
@@ -183,8 +185,8 @@ pub use event::{
     SubscriptionId, UncertainReason,
 };
 pub use history::{
-    Action, Change, Committed, EdgeKind, HISTORY_FORMAT, HistoryEdge, HistoryError, HistoryTree, MAX_HISTORY_LEN, Plan,
-    StateId,
+    Action, Change, Committed, ConflictReason, EdgeKind, HISTORY_FORMAT, HistoryEdge, HistoryError, HistoryTree,
+    MAX_HISTORY_LEN, Plan, RestoreConflict, RestoreOperation, StateId,
 };
 pub use hook::{
     ConfigProblem, Ended, Execution, HOOK_EVENT, HOOKS_KEY, HookConfig, HookEntry, HookExecutor, HookExit, HookId,

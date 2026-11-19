@@ -20,6 +20,13 @@
 //! post-image of each path of an edge as that edge's [`Checkpoint`], uncertain (never wrong) when something could not
 //! be captured.
 //!
+//! KNSH-084 adds [`mod@restore`] and [`undo`]: undo and redo through the history tree, restoring a path only while the
+//! live file matches its post-image identity (FR-CKP-20), in place so inodes, hard links and open descriptors stay
+//! valid (FR-CKP-22), with the modification time set to now (FR-CKP-23), after saving the current versions for redo.
+//! Any conflict refuses the whole restore; a journal makes a failure or crash part-way end with every file as it was.
+//! `force` is only for the user and the authority (FR-CKP-21); excluded folders are listed as not restored
+//! (FR-CKP-31); `checkpoint.restored` is published (FR-CKP-25).
+//!
 //! KNSH-081 adds [`attribution`]: each change in a root is attributed to the supervised line running there
 //! (`command`), to the lines overlapping there as one set (`concurrent`), to the envelope's agent between lines
 //! (`agent_edit`), or to nobody supervised (`external`), grouped into the edges the history tree will store. File
@@ -35,7 +42,8 @@
 //!
 //! # Specification
 //!
-//! - `specs/03-functional-requirements/checkpoints.md`: FR-CKP-01 to FR-CKP-11, FR-CKP-31, FR-CKP-35
+//! - `specs/03-functional-requirements/checkpoints.md`: FR-CKP-01 to FR-CKP-11, FR-CKP-20 to FR-CKP-23, FR-CKP-25,
+//!   FR-CKP-30, FR-CKP-31, FR-CKP-35, FR-CKP-36
 //! - FR-EVT-08 (`file.changed`), NFR-REL-04 (rescan after a restart) and decision 16 (closing a line, dropped events)
 //! - NFR-PERF-06 and decision 15 (`specs/09-reference/decisions.md`): how the initial shadow is built and timed
 //! - `specs/05-models/checkpoint.md` (storage), `specs/05-models/capabilities.md` (`checkpoints` per root)
@@ -50,8 +58,10 @@ pub mod attribution;
 pub mod capture;
 mod error;
 pub mod identity;
+pub mod restore;
 pub mod shadow;
 pub mod store;
+pub mod undo;
 pub mod watcher;
 
 // Also built for `cargo doc`, so the fakes are documented.
@@ -60,11 +70,12 @@ pub mod testing;
 
 pub use attribution::{AgentEdits, Edge, EdgeId, Ledger, LineAttribution, MAX_EDGE_PATHS};
 pub use capture::{
-    CHECKPOINTS_DIR, CapturedPath, Captures, Change, Checkpoint, CheckpointSummary, MAX_CHECKPOINT_PATHS, PostImage,
-    PreImage, RECENT_CHECKPOINTS, StoredPreImage, Ticket,
+    CHECKPOINTS_DIR, CapturedPath, Captures, Change, Checkpoint, CheckpointSummary, MAX_CHECKPOINT_PATHS, MAX_EXCLUDED,
+    PostImage, PreImage, RECENT_CHECKPOINTS, StoredPreImage, Ticket,
 };
 pub use error::CheckpointError;
 pub use identity::{HASH_LIMIT, PostImageIdentity, post_image_identity};
+pub use restore::{JOURNAL_FORMAT, RESTORES_DIR, RestoreOutcome, RestoreRequest, recover_restores, restore};
 pub use shadow::{
     Gate, PlatformShadowFiles, RootReadiness, SHADOW_BUDGET, SHADOW_THREADS, Shadow, ShadowFailure, ShadowFiles,
     ShadowPlan, ShadowProgress, ShadowStatus, ShadowSummary, gate, line_touches_root, shadow_dir, start_shadow,
@@ -73,6 +84,7 @@ pub use store::{
     FORMAT_FILE, FORMAT_VERSION, Fallback, Method, PLAIN_COPY_LIMIT, Protection, RootStore, StoreFault, Unprotected,
     capability_report, place_roots,
 };
+pub use undo::{Caller, History, Request, RestoreEvents, Restored, Target};
 pub use watcher::{
     FLUSH_DEADLINE, FLUSH_INTERVAL, HELD_DIR, LineClose, LineMark, MARKERS_DIR, MAX_PENDING_PATHS, STREAM_LATENCY,
     WatchPlan, WatchReport, Watcher, held_dir, marker_dir, start_watch,

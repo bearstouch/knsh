@@ -51,7 +51,7 @@ Each crate has one concern. Dependencies point downwards only: binaries → serv
 | `knsh-sandbox` | Compiles policy into Seatbelt profile text. Pure function: same input, same bytes. | `knsh-core` |
 | `knsh-proxy` | HTTP CONNECT and SOCKS proxy, TLS server-name reader, host and address checks. | `knsh-core`, `knsh-platform` |
 | `knsh-store` | Record store (system SQLite), retention, redaction at write time. | `knsh-core`, `knsh-platform` |
-| `knsh-checkpoint` | Shadows, capture, post-image identity, history tree, restore rules. | `knsh-core`, `knsh-platform` |
+| `knsh-checkpoint` | Shadows, capture, post-image identity, history tree, restore rules. | `knsh-core`, `knsh-json`, `knsh-platform` |
 | `knshd` | Daemon binary: endpoints, supervisor, event bus, wiring. Thin; logic lives in libraries. | all services |
 | `knsh` | Shell front end (integration mode), agent client, shims and CLI. | `knsh-proto`, `knsh-json`, `knsh-core` (IDs, timestamps), `knsh-platform` (engine paths, launchd agent), `knsh-toml` (user settings) |
 | `knsh-exec` | Trampoline: applies a profile with `sandbox-exec -f`, then execs. **std only**, single-threaded, no workspace deps. | — |

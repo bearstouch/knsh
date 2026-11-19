@@ -66,6 +66,15 @@ struct State {
     hash_failures: BTreeMap<PathBuf, i32>,
     /// While set, clones wait until [`FakeTree::release`].
     held: bool,
+    /// Each entry's inode. Hard links ([`FakeTree::link`]) share one, and a write to any of them is seen by all.
+    inodes: BTreeMap<PathBuf, u64>,
+    /// The last inode handed out.
+    next_inode: u64,
+    /// `errno` a [`ShadowFiles::write_in_place`] into a path fails with, after writing part of the file (a torn
+    /// write); also makes [`ShadowFiles::write_file`] of the path fail, without writing.
+    write_failures: BTreeMap<PathBuf, (i32, bool)>,
+    /// Every successful [`ShadowFiles::write_in_place`], `(src, dst)`, in order.
+    writes: Vec<(PathBuf, PathBuf)>,
 }
 
 /// An in-memory file tree implementing [`ShadowFiles`]. `/` always exists. Clones copy the node and its modification
@@ -93,17 +102,40 @@ fn os(operation: Operation, errno: i32) -> PlatformError {
 }
 
 impl State {
-    /// Inserts `node` at `path` with a new modification time.
+    /// Inserts `node` at `path` with a new modification time. An existing entry is written in place: it keeps its
+    /// inode, and every hard link to it sees the write. A new entry gets a new inode.
     fn put(&mut self, path: &Path, node: FakeNode) {
         self.tick += 1;
-        self.modified.insert(path.to_path_buf(), self.tick);
+        let tick = self.tick;
+        let inode = match self.inodes.get(path) {
+            Some(inode) if self.nodes.contains_key(path) => *inode,
+            _ => self.new_inode(),
+        };
+        self.inodes.insert(path.to_path_buf(), inode);
+        let links: Vec<PathBuf> = self
+            .inodes
+            .iter()
+            .filter(|(link, other)| **other == inode && link.as_path() != path)
+            .map(|(link, _)| link.clone())
+            .collect();
+        for link in links {
+            self.modified.insert(link.clone(), tick);
+            self.nodes.insert(link, node.clone());
+        }
+        self.modified.insert(path.to_path_buf(), tick);
         self.nodes.insert(path.to_path_buf(), node);
+    }
+
+    fn new_inode(&mut self) -> u64 {
+        self.next_inode += 1;
+        self.next_inode
     }
 
     /// Removes `path` and everything below it.
     fn drop_below(&mut self, path: &Path) {
         self.nodes.retain(|other, _| !other.starts_with(path));
         self.modified.retain(|other, _| !other.starts_with(path));
+        self.inodes.retain(|other, _| !other.starts_with(path));
     }
 }
 
@@ -145,17 +177,17 @@ impl FakeTree {
         let (from, to) = (from.as_ref(), to.as_ref());
         let mut state = lock(&self.state);
         state.drop_below(to);
-        let moved: Vec<(PathBuf, FakeNode, i64)> = state
+        let moved: Vec<(PathBuf, FakeNode, i64, Option<u64>)> = state
             .nodes
             .iter()
             .filter(|(path, _)| path.starts_with(from))
             .map(|(path, node)| {
                 let modified = state.modified.get(path).copied().unwrap_or_default();
-                (path.clone(), node.clone(), modified)
+                (path.clone(), node.clone(), modified, state.inodes.get(path).copied())
             })
             .collect();
         state.drop_below(from);
-        for (path, node, modified) in moved {
+        for (path, node, modified, inode) in moved {
             let Ok(rest) = path.strip_prefix(from) else { continue };
             let target = if rest.as_os_str().is_empty() {
                 to.to_path_buf()
@@ -163,6 +195,9 @@ impl FakeTree {
                 to.join(rest)
             };
             state.modified.insert(target.clone(), modified);
+            if let Some(inode) = inode {
+                state.inodes.insert(target.clone(), inode);
+            }
             state.nodes.insert(target, node);
         }
     }
@@ -286,7 +321,85 @@ impl FakeTree {
         lock(&self.state).held = false;
         self.released.notify_all();
     }
+
+    /// Replaces the entry at `path` with a new file holding `contents`, as an editor that writes a new file and
+    /// renames it over the old one does (`sed -i`): a new inode, and the old one's hard links keep the old contents.
+    pub fn replace_file(&self, path: impl AsRef<Path>, contents: &[u8]) {
+        let path = path.as_ref();
+        let mut state = lock(&self.state);
+        state.inodes.remove(path);
+        state.nodes.remove(path);
+        state.put(path, FakeNode::File(contents.to_vec()));
+    }
+
+    /// Adds the hard link `new` to the existing entry `existing`: both share one inode and contents. Does nothing if
+    /// `existing` does not exist.
+    pub fn link(&self, existing: impl AsRef<Path>, new: impl AsRef<Path>) {
+        let (existing, new) = (existing.as_ref(), new.as_ref());
+        let mut state = lock(&self.state);
+        let (Some(node), Some(inode)) = (state.nodes.get(existing).cloned(), state.inodes.get(existing).copied())
+        else {
+            return;
+        };
+        let modified = state.modified.get(existing).copied().unwrap_or_default();
+        state.nodes.insert(new.to_path_buf(), node);
+        state.inodes.insert(new.to_path_buf(), inode);
+        state.modified.insert(new.to_path_buf(), modified);
+    }
+
+    /// Opens `path` as a process would: the descriptor names its inode, whatever later happens to the path. `None` if
+    /// nothing is there.
+    #[must_use]
+    pub fn open(&self, path: impl AsRef<Path>) -> Option<FakeDescriptor> {
+        lock(&self.state).inodes.get(path.as_ref()).copied().map(FakeDescriptor)
+    }
+
+    /// What a read through `descriptor` returns now: the contents of its inode while any path still names it, or
+    /// `None` once none does (the fake keeps no unlinked inodes, so a test sees that the file was replaced).
+    #[must_use]
+    pub fn read(&self, descriptor: FakeDescriptor) -> Option<Vec<u8>> {
+        let state = lock(&self.state);
+        let path = state
+            .inodes
+            .iter()
+            .find(|(_, inode)| **inode == descriptor.0)
+            .map(|(path, _)| path.clone())?;
+        match state.nodes.get(&path) {
+            Some(FakeNode::File(contents)) => Some(contents.clone()),
+            _ => None,
+        }
+    }
+
+    /// Makes a [`ShadowFiles::write_in_place`] into `dst` fail with `errno` after writing part of it (a torn write),
+    /// and a [`ShadowFiles::write_file`] of `dst` fail before writing anything.
+    pub fn fail_write(&self, dst: impl AsRef<Path>, errno: i32) {
+        lock(&self.state)
+            .write_failures
+            .insert(dst.as_ref().to_path_buf(), (errno, false));
+    }
+
+    /// As [`FakeTree::fail_write`], for the next write into `dst` only.
+    pub fn fail_write_once(&self, dst: impl AsRef<Path>, errno: i32) {
+        lock(&self.state)
+            .write_failures
+            .insert(dst.as_ref().to_path_buf(), (errno, true));
+    }
+
+    /// Lets writes into `dst` succeed again.
+    pub fn allow_write(&self, dst: impl AsRef<Path>) {
+        lock(&self.state).write_failures.remove(dst.as_ref());
+    }
+
+    /// Every successful [`ShadowFiles::write_in_place`] so far, `(src, dst)`, in order.
+    #[must_use]
+    pub fn writes(&self) -> Vec<(PathBuf, PathBuf)> {
+        lock(&self.state).writes.clone()
+    }
 }
+
+/// A descriptor [`FakeTree::open`] returned: it follows its inode, not its path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FakeDescriptor(u64);
 
 impl ShadowFiles for FakeTree {
     fn kind(&self, path: &Path) -> Result<FileKind, PlatformError> {
@@ -353,8 +466,10 @@ impl ShadowFiles for FakeTree {
             return Err(os(Operation::Clone, ENOENT));
         }
         let modified = state.modified.get(src).copied().unwrap_or_default();
+        let inode = state.new_inode();
         state.nodes.insert(dst.to_path_buf(), node);
         state.modified.insert(dst.to_path_buf(), modified);
+        state.inodes.insert(dst.to_path_buf(), inode);
         state.clones += 1;
         Ok(())
     }
@@ -369,7 +484,7 @@ impl ShadowFiles for FakeTree {
         };
         Ok(FileIdentity {
             kind: node.kind(),
-            inode: 0,
+            inode: state.inodes.get(path).copied().unwrap_or_default(),
             size,
             modified: ModifiedTime {
                 seconds: state.modified.get(path).copied().unwrap_or_default(),
@@ -401,6 +516,7 @@ impl ShadowFiles for FakeTree {
         }
         state.nodes.remove(path);
         state.modified.remove(path);
+        state.inodes.remove(path);
         state.removed.push(path.to_path_buf());
         Ok(())
     }
@@ -453,6 +569,78 @@ impl ShadowFiles for FakeTree {
         match state.nodes.get(path) {
             Some(FakeNode::File(contents)) if contents.len() as u64 > limit => Ok(None),
             Some(FakeNode::File(contents)) => Ok(Some(Self::digest_of(contents))),
+            Some(_) => Err(PlatformError::UnexpectedKind),
+            None => Err(os(Operation::Open, ENOENT)),
+        }
+    }
+
+    fn write_in_place(&self, src: &Path, dst: &Path, expect: Option<&FileIdentity>) -> Result<(), PlatformError> {
+        let current = self.identity(dst).map_err(|_| os(Operation::Open, ENOENT))?;
+        let mut state = lock(&self.state);
+        let contents = match (state.nodes.get(src), state.nodes.get(dst)) {
+            (Some(FakeNode::File(contents)), Some(FakeNode::File(_))) => contents.clone(),
+            (None, _) | (_, None) => return Err(os(Operation::Open, ENOENT)),
+            _ => return Err(PlatformError::UnexpectedKind),
+        };
+        if expect.is_some_and(|expect| *expect != current) {
+            return Err(PlatformError::Changed);
+        }
+        if let Some((errno, once)) = state.write_failures.get(dst).copied() {
+            if once {
+                state.write_failures.remove(dst);
+            }
+            // Torn: the first half of the new contents over the old.
+            let Some(FakeNode::File(old)) = state.nodes.get(dst).cloned() else {
+                return Err(os(Operation::Write, errno));
+            };
+            let mut torn = contents[..contents.len() / 2].to_vec();
+            torn.extend(old.iter().skip(torn.len()));
+            torn.push(b'~');
+            state.put(dst, FakeNode::File(torn));
+            return Err(os(Operation::Write, errno));
+        }
+        // In place: `put` keeps the inode (and every hard link sees it) and moves the time on, to "now".
+        state.put(dst, FakeNode::File(contents));
+        state.writes.push((src.to_path_buf(), dst.to_path_buf()));
+        Ok(())
+    }
+
+    fn touch(&self, path: &Path) -> Result<(), PlatformError> {
+        let mut state = lock(&self.state);
+        if !state.nodes.contains_key(path) {
+            return Err(os(Operation::Write, ENOENT));
+        }
+        state.tick += 1;
+        let tick = state.tick;
+        state.modified.insert(path.to_path_buf(), tick);
+        Ok(())
+    }
+
+    fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), PlatformError> {
+        let mut state = lock(&self.state);
+        if let Some((errno, once)) = state.write_failures.get(path).copied() {
+            if once {
+                state.write_failures.remove(path);
+            }
+            return Err(os(Operation::Write, errno));
+        }
+        let parent_is_dir = path
+            .parent()
+            .is_some_and(|parent| state.nodes.get(parent) == Some(&FakeNode::Dir));
+        if !parent_is_dir {
+            return Err(os(Operation::Write, ENOENT));
+        }
+        // An atomic replace: a new file renamed over the old one.
+        state.inodes.remove(path);
+        state.nodes.remove(path);
+        state.put(path, FakeNode::File(data.to_vec()));
+        Ok(())
+    }
+
+    fn read_file(&self, path: &Path, limit: u64) -> Result<Vec<u8>, PlatformError> {
+        match lock(&self.state).nodes.get(path) {
+            Some(FakeNode::File(contents)) if contents.len() as u64 > limit => Err(PlatformError::TooLarge { limit }),
+            Some(FakeNode::File(contents)) => Ok(contents.clone()),
             Some(_) => Err(PlatformError::UnexpectedKind),
             None => Err(os(Operation::Open, ENOENT)),
         }

@@ -901,6 +901,82 @@ fn read_set<T: Ord>(
     }
 }
 
+/// Whether a restore undid a change or redid it (`checkpoint.restored`, KNSH-084).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RestoreOperation {
+    /// `checkpoint.undo`: the change's pre-images were restored.
+    Undo,
+    /// `checkpoint.redo`: the versions its undo saved were restored.
+    Redo,
+}
+
+impl RestoreOperation {
+    /// The wire value: `undo` or `redo`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Undo => "undo",
+            Self::Redo => "redo",
+        }
+    }
+}
+
+/// Why a path cannot be restored (`-32004`, FR-CKP-20, KNSH-084). Ordered by declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConflictReason {
+    /// The live file no longer matches its recorded post-image identity: something changed it after the change.
+    Changed,
+    /// The change left something at the path, and nothing is there now.
+    Missing,
+    /// The change left nothing at the path, and something is there now.
+    Exists,
+    /// The post-image identity could not be read when the change was captured, so the live file cannot be checked.
+    Unverifiable,
+    /// The version to restore could not be captured (the checkpoint is uncertain): there is nothing to restore.
+    PreImageLost,
+    /// Restoring would remove a folder that holds entries the change did not record.
+    FolderNotEmpty,
+    /// The folder the path must be restored into does not exist and is not restored either.
+    ParentMissing,
+}
+
+impl ConflictReason {
+    /// The wire value: `changed`, `missing`, `exists`, `unverifiable`, `pre_image_lost`, `folder_not_empty` or
+    /// `parent_missing`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Changed => "changed",
+            Self::Missing => "missing",
+            Self::Exists => "exists",
+            Self::Unverifiable => "unverifiable",
+            Self::PreImageLost => "pre_image_lost",
+            Self::FolderNotEmpty => "folder_not_empty",
+            Self::ParentMissing => "parent_missing",
+        }
+    }
+
+    /// Whether `force` (user and authority only, FR-CKP-21) restores the path anyway. Only an identity check can be
+    /// overridden: what was recorded no longer matches, and the caller accepts losing what is there now. Nothing
+    /// overrides a missing version or a restore that would delete unrecorded entries or cannot be placed.
+    #[must_use]
+    pub const fn forceable(self) -> bool {
+        match self {
+            Self::Changed | Self::Missing | Self::Exists | Self::Unverifiable => true,
+            Self::PreImageLost | Self::FolderNotEmpty | Self::ParentMissing => false,
+        }
+    }
+}
+
+/// One path an undo or redo refused to restore, with why (`-32004` `conflicts`, FR-CKP-20).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RestoreConflict {
+    /// The path.
+    pub path: CanonicalPath,
+    /// Why.
+    pub reason: ConflictReason,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

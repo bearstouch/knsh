@@ -18,7 +18,7 @@ codes:
 | -32001 | Denied by policy, hook, authority or rate limit | `rule_id`, `reason`, `source` |
 | -32002 | No decision before the timeout | `request_id` |
 | -32003 | Caller not allowed on this endpoint or session | none |
-| -32004 | Undo or redo conflict | `conflicts`: one entry per conflicting path, with its path and reason |
+| -32004 | Undo or redo conflict | `conflicts`: one {path, reason} object per conflicting path, and nothing was restored; reason is changed, missing, exists, unverifiable, pre_image_lost, folder_not_empty or parent_missing ([checkpoints](../03-functional-requirements/checkpoints.md#restore-rules), KNSH-084) |
 | -32005 | Capability not available on this machine | `capability` |
 | -32006 | Session not found or ended | `session_id` |
 | -32007 | Session paused or under human control; the line is held | `state` |

@@ -15,6 +15,7 @@ use std::path::Path;
 
 use knsh_platform::{ContentHash, FileIdentity, FileKind, PlatformError, Volumes};
 
+use crate::capture::PostImage;
 use crate::error::CheckpointError;
 use crate::shadow::ShadowFiles;
 
@@ -60,6 +61,30 @@ pub(crate) fn post_image_identity_of(
     path: &Path,
 ) -> Result<PostImageIdentity, CheckpointError> {
     read(path, |path| files.identity(path), |path, limit| files.hash(path, limit))
+}
+
+/// The post-image of `path` as capture and restore record it (FR-CKP-09, KNSH-082, KNSH-084): its identity,
+/// [`PostImage::Deleted`] if nothing is there, or [`PostImage::Unknown`] if it cannot be read, never a guess.
+pub(crate) fn post_image(files: &dyn ShadowFiles, path: &Path) -> PostImage {
+    match post_image_identity_of(files, path) {
+        Ok(identity) => PostImage::Present(identity),
+        Err(CheckpointError::Platform(error)) if error.is_not_found() => PostImage::Deleted,
+        // Only the first two are returned by an identity read; the rest are listed so a new kind of failure is never
+        // mistaken for a deletion.
+        Err(
+            CheckpointError::Platform(_)
+            | CheckpointError::IdentityUnstable
+            | CheckpointError::Threads
+            | CheckpointError::History(_)
+            | CheckpointError::Conflicts(_)
+            | CheckpointError::ForceNotAllowed
+            | CheckpointError::NotOwnChange
+            | CheckpointError::NoStore
+            | CheckpointError::Journal
+            | CheckpointError::RolledBack(_)
+            | CheckpointError::RollbackFailed(_),
+        ) => PostImage::Unknown,
+    }
 }
 
 /// Reads an identity, and a hash between two identity reads that must agree (module documentation).
@@ -181,6 +206,12 @@ mod tests {
                 self.inner.write(path, b"changed meanwhile");
             }
             hash
+        }
+        fn write_in_place(&self, src: &Path, dst: &Path, expect: Option<&FileIdentity>) -> Result<(), PlatformError> {
+            self.inner.write_in_place(src, dst, expect)
+        }
+        fn touch(&self, path: &Path) -> Result<(), PlatformError> {
+            self.inner.touch(path)
         }
     }
 
