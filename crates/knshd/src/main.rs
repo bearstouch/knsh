@@ -984,6 +984,8 @@ fn checkpoint_shadows(
         edges: Arc::new(shadows::UncapturedEdges),
         // KNSH-082: checkpoint identifiers.
         random: random.clone(),
+        // KNSH-085: files the line's processes still hold for writing at its end (decision 17).
+        holders: Arc::new(knsh_platform::macos::SystemWriteHolders::new()),
     })
 }
 

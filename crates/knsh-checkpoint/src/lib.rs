@@ -27,6 +27,11 @@
 //! `force` is only for the user and the authority (FR-CKP-21); excluded folders are listed as not restored
 //! (FR-CKP-31); `checkpoint.restored` is published (FR-CKP-25).
 //!
+//! KNSH-085 adds [`torn`]: files held open for writing or mapped writable by the line's processes when it ends
+//! ([`held_in_roots`], through `knsh_platform::WriteHolders`), and SQLite databases with journal files beside them,
+//! are marked possibly torn in their checkpoint ([`Checkpoint::possibly_torn`]); undo and redo skip them and list
+//! them with their reasons unless `force` is given, and then say they were forced (FR-CKP-24).
+//!
 //! KNSH-081 adds [`attribution`]: each change in a root is attributed to the supervised line running there
 //! (`command`), to the lines overlapping there as one set (`concurrent`), to the envelope's agent between lines
 //! (`agent_edit`), or to nobody supervised (`external`), grouped into the edges the history tree will store. File
@@ -43,8 +48,9 @@
 //! # Specification
 //!
 //! - `specs/03-functional-requirements/checkpoints.md`: FR-CKP-01 to FR-CKP-11, FR-CKP-20 to FR-CKP-23, FR-CKP-25,
-//!   FR-CKP-30, FR-CKP-31, FR-CKP-35, FR-CKP-36
+//!   FR-CKP-24, FR-CKP-30, FR-CKP-31, FR-CKP-35, FR-CKP-36
 //! - FR-EVT-08 (`file.changed`), NFR-REL-04 (rescan after a restart) and decision 16 (closing a line, dropped events)
+//! - Decision 17: memory-mapped writes, possibly torn files
 //! - NFR-PERF-06 and decision 15 (`specs/09-reference/decisions.md`): how the initial shadow is built and timed
 //! - `specs/05-models/checkpoint.md` (storage), `specs/05-models/capabilities.md` (`checkpoints` per root)
 //! - `specs/09-reference/file-locations.md`, NFR-PRIV-04 (owner-only stores, excluded from Spotlight and Time
@@ -61,6 +67,7 @@ pub mod identity;
 pub mod restore;
 pub mod shadow;
 pub mod store;
+pub mod torn;
 pub mod undo;
 pub mod watcher;
 
@@ -84,6 +91,7 @@ pub use store::{
     FORMAT_FILE, FORMAT_VERSION, Fallback, Method, PLAIN_COPY_LIMIT, Protection, RootStore, StoreFault, Unprotected,
     capability_report, place_roots,
 };
+pub use torn::{HeldScan, LineProcesses, MAX_TORN_PATHS, SQLITE_SIDECARS, held_in_roots, sqlite_marks};
 pub use undo::{Caller, History, Request, RestoreEvents, Restored, Target};
 pub use watcher::{
     FLUSH_DEADLINE, FLUSH_INTERVAL, HELD_DIR, LineClose, LineMark, MARKERS_DIR, MAX_PENDING_PATHS, STREAM_LATENCY,

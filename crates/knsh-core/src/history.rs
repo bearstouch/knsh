@@ -977,6 +977,47 @@ pub struct RestoreConflict {
     pub reason: ConflictReason,
 }
 
+/// Why a path of a change is **possibly torn** (FR-CKP-24, KNSH-085): its captured versions may mix writes from
+/// before and after the capture, so undo and redo skip it unless `force` is given (user and authority only,
+/// FR-CKP-21). Ordered by declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TornReason {
+    /// A process of the line, or still alive in its envelope, held the file open for writing when the line ended
+    /// (decision 17).
+    OpenForWriting,
+    /// A process of the line, or still alive in its envelope, had the file mapped writable when the line ended:
+    /// stores through a live mapping move neither size, time nor events (decision 17).
+    MappedWritable,
+    /// A SQLite database with a `-wal`, `-shm` or `-journal` file beside it (or that file itself): the database is
+    /// only consistent together with its journal, which a restore of one file cannot keep.
+    SqliteJournal,
+    /// The processes that might hold files open could not all be listed or read when the line ended, so none of
+    /// the change's files can be shown untorn (fail closed).
+    Unchecked,
+}
+
+impl TornReason {
+    /// The wire value: `open_for_writing`, `mapped_writable`, `sqlite_journal` or `unchecked`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenForWriting => "open_for_writing",
+            Self::MappedWritable => "mapped_writable",
+            Self::SqliteJournal => "sqlite_journal",
+            Self::Unchecked => "unchecked",
+        }
+    }
+}
+
+/// One possibly-torn path an undo or redo skipped, or restored under `force` (FR-CKP-24).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TornPath {
+    /// The path.
+    pub path: CanonicalPath,
+    /// Why it is possibly torn.
+    pub reason: TornReason,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1403,5 +1444,23 @@ mod tests {
     fn refuses_oversized_stored_tree() {
         let text = vec![b' '; MAX_HISTORY_LEN + 1];
         assert_eq!(HistoryTree::decode(&text), Err(HistoryError::TooLarge));
+    }
+
+    // FR-CKP-24 (KNSH-085): the wire values of why a path is possibly torn.
+    #[test]
+    fn torn_reasons_have_stable_wire_values() {
+        let all = [
+            TornReason::OpenForWriting,
+            TornReason::MappedWritable,
+            TornReason::SqliteJournal,
+            TornReason::Unchecked,
+        ];
+        let wire: Vec<&str> = all.iter().map(|reason| reason.as_str()).collect();
+        assert_eq!(
+            wire,
+            ["open_for_writing", "mapped_writable", "sqlite_journal", "unchecked"]
+        );
+        // A mapping outranks a descriptor when both hold a file (`knsh_checkpoint::held_in_roots`).
+        assert!(TornReason::MappedWritable > TornReason::OpenForWriting);
     }
 }

@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use knsh_core::{ConflictReason, RestoreConflict, Timestamp};
+use knsh_core::{ConflictReason, RestoreConflict, Timestamp, TornPath, TornReason};
 use knsh_platform::testing::{FakeClock, SeededRandom};
 
 use super::*;
@@ -508,4 +508,124 @@ fn unrecorded_edit_between_changes_still_conflicts_after_undo() {
         }])
     );
     assert_eq!(fixture.contents("a.txt").as_deref(), Some(&b"human"[..]));
+}
+
+/// A history holding one line's change of `a.txt` (old to new) and `app.db` (v1 to v2), with `app.db` possibly torn.
+fn torn_edit() -> (Fixture, History, Events) {
+    let fixture = Fixture::new();
+    fixture.tree.add_file(live("a.txt"), b"old");
+    fixture.tree.add_file(live("app.db"), b"v1");
+    let mut history = history(&fixture);
+    let mut checkpoint = fixture.command(1, &["a.txt", "app.db"], |tree| {
+        tree.add_file(live("a.txt"), b"new");
+        tree.add_file(live("app.db"), b"v2");
+    });
+    checkpoint
+        .possibly_torn
+        .insert(canonical(live("app.db")), TornReason::SqliteJournal);
+    history.record(checkpoint).unwrap();
+    (fixture, history, Events::default())
+}
+
+// FR-CKP-24: without `force`, a possibly-torn file is skipped and listed with its reason; the rest is restored.
+#[test]
+fn possibly_torn_file_skipped_without_force() {
+    let (fixture, mut history, events) = torn_edit();
+    let restored = history.undo(&agent(1), &events).unwrap();
+    assert_eq!(fixture.contents("a.txt").as_deref(), Some(&b"old"[..]));
+    assert_eq!(
+        fixture.contents("app.db").as_deref(),
+        Some(&b"v2"[..]),
+        "left as the change left it"
+    );
+    assert_eq!(restored.restored, vec![canonical(live("a.txt"))]);
+    assert_eq!(
+        restored.skipped_torn,
+        vec![TornPath {
+            path: canonical(live("app.db")),
+            reason: TornReason::SqliteJournal,
+        }]
+    );
+    assert_eq!(restored.forced_torn, Vec::<TornPath>::new());
+    assert!(!restored.forced);
+    // Redo puts back only what the undo restored.
+    let redone = history.redo(&agent(1), &events).unwrap();
+    assert_eq!(fixture.contents("a.txt").as_deref(), Some(&b"new"[..]));
+    assert_eq!(redone.restored, vec![canonical(live("a.txt"))]);
+    assert_eq!(redone.skipped_torn, Vec::<TornPath>::new());
+}
+
+// FR-CKP-24, FR-CKP-21: with `force` (user or authority only) the file is restored and the result says it was
+// forced; its redo needs `force` too, since the version the undo replaced is the one that may be torn.
+#[test]
+fn forced_restore_of_torn_file_is_reported() {
+    let (fixture, mut history, events) = torn_edit();
+    let forced = Request { force: true, ..user(1) };
+    let restored = history.undo(&forced, &events).unwrap();
+    assert_eq!(fixture.contents("a.txt").as_deref(), Some(&b"old"[..]));
+    assert_eq!(fixture.contents("app.db").as_deref(), Some(&b"v1"[..]));
+    assert_eq!(
+        restored.restored,
+        vec![canonical(live("a.txt")), canonical(live("app.db"))]
+    );
+    let torn = vec![TornPath {
+        path: canonical(live("app.db")),
+        reason: TornReason::SqliteJournal,
+    }];
+    assert_eq!(restored.forced_torn, torn);
+    assert_eq!(restored.skipped_torn, Vec::<TornPath>::new());
+    assert!(restored.forced);
+    let published = events.take();
+    assert!(
+        matches!(&published[0].1, EventData::CheckpointRestored { forced: true, .. }),
+        "checkpoint.restored says it was forced"
+    );
+
+    // An agent can never force (FR-CKP-21): its redo skips the file.
+    let redone = history.redo(&agent(1), &events).unwrap();
+    assert_eq!(redone.skipped_torn, torn);
+    assert_eq!(fixture.contents("app.db").as_deref(), Some(&b"v1"[..]));
+    assert_eq!(fixture.contents("a.txt").as_deref(), Some(&b"new"[..]));
+}
+
+// FR-CKP-21: `force` from an agent is refused before anything else, possibly-torn files or not.
+#[test]
+fn agent_cannot_force_a_torn_file() {
+    let (fixture, mut history, events) = torn_edit();
+    let error = history
+        .undo(
+            &Request {
+                force: true,
+                ..agent(1)
+            },
+            &events,
+        )
+        .unwrap_err();
+    assert_eq!(error, CheckpointError::ForceNotAllowed);
+    assert_eq!(fixture.contents("app.db").as_deref(), Some(&b"v2"[..]));
+}
+
+// A folder the change created, holding a possibly-torn file, cannot be removed without `force`: the skipped file
+// would still be in it. The whole undo is refused and nothing changes.
+#[test]
+fn folder_holding_a_skipped_torn_file_is_not_removed() {
+    let fixture = Fixture::new();
+    let mut history = history(&fixture);
+    let mut checkpoint = fixture.command(1, &["data", "data/app.db"], |tree| {
+        tree.add_dir(live("data"));
+        tree.add_file(live("data/app.db"), b"v1");
+    });
+    checkpoint
+        .possibly_torn
+        .insert(canonical(live("data/app.db")), TornReason::MappedWritable);
+    history.record(checkpoint).unwrap();
+    let error = history.undo(&agent(1), &Events::default()).unwrap_err();
+    assert_eq!(
+        error,
+        CheckpointError::Conflicts(vec![RestoreConflict {
+            path: canonical(live("data")),
+            reason: ConflictReason::FolderNotEmpty,
+        }])
+    );
+    assert_eq!(fixture.contents("data/app.db").as_deref(), Some(&b"v1"[..]));
 }

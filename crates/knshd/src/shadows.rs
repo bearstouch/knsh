@@ -40,6 +40,11 @@
 //!   each of its sessions (FR-CKP-11). A line's uncertain roots mark its checkpoint uncertain before it ends, and so
 //!   does an uncertain window outside lines for the run of edits it opens (FR-CKP-04). [`close_lines`] returns the
 //!   line's checkpoint for its record (`checkpoint_id`, `files_changed`).
+//! - **Possibly torn (KNSH-085, FR-CKP-24).** After its line-end flush, [`close_lines`] asks the line's processes
+//!   still alive (its group's members and its session's envelopes) which files they hold open for writing or mapped
+//!   writable ([`knsh_checkpoint::held_in_roots`], decision 17), outside every lock, and marks those inside the
+//!   line's roots possibly torn in its checkpoint before the line ends; when they cannot all be read, every file of
+//!   the change is (fail closed). SQLite databases with journals are marked by the captures themselves.
 //!
 //! # Locks
 //!
@@ -58,16 +63,16 @@ use std::thread;
 use std::time::Duration;
 
 use knsh_checkpoint::{
-    Captures, Change, Checkpoint, CheckpointError, CheckpointSummary, Edge, FLUSH_DEADLINE, Ledger, LineClose,
-    LineMark, Method, RootReadiness, SHADOW_THREADS, STREAM_LATENCY, Shadow, ShadowFailure, ShadowFiles, ShadowPlan,
-    ShadowStatus, WatchPlan, WatchReport, Watcher, held_dir, marker_dir, place_roots, shadow_dir, start_shadow,
-    start_watch,
+    Captures, Change, Checkpoint, CheckpointError, CheckpointSummary, Edge, FLUSH_DEADLINE, HeldScan, Ledger,
+    LineClose, LineMark, LineProcesses, Method, RootReadiness, SHADOW_THREADS, STREAM_LATENCY, Shadow, ShadowFailure,
+    ShadowFiles, ShadowPlan, ShadowStatus, WatchPlan, WatchReport, Watcher, held_dir, marker_dir, place_roots,
+    shadow_dir, start_shadow, start_watch,
 };
 use knsh_core::{
-    Attribution, CanonicalPath, EventData, Profile, RecordId, SessionId, UncertainReason, UnprotectedReason,
+    Attribution, CanonicalPath, EventData, Profile, RecordId, SessionId, TornReason, UncertainReason, UnprotectedReason,
 };
 use knsh_platform::{
-    Clock, EnginePaths, Field, FileEvents, Fs, Level, PlatformError, Random, SystemLog, Value, Volumes,
+    Clock, EnginePaths, Field, FileEvents, Fs, Level, PlatformError, Random, SystemLog, Value, Volumes, WriteHolders,
 };
 use knsh_proto::CheckpointBackend;
 
@@ -169,15 +174,23 @@ pub(crate) struct Attributor {
     captures: Captures,
     events: Arc<dyn CheckpointEvents>,
     edges: Arc<dyn EdgeSink>,
+    /// Asked at each line's end which files its processes still hold for writing (KNSH-085).
+    holders: Arc<dyn WriteHolders>,
 }
 
 impl Attributor {
-    fn new(events: Arc<dyn CheckpointEvents>, edges: Arc<dyn EdgeSink>, captures: Captures) -> Arc<Self> {
+    fn new(
+        events: Arc<dyn CheckpointEvents>,
+        edges: Arc<dyn EdgeSink>,
+        captures: Captures,
+        holders: Arc<dyn WriteHolders>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             ledger: Mutex::new(Ledger::new()),
             captures,
             events,
             edges,
+            holders,
         })
     }
 
@@ -354,6 +367,8 @@ pub(crate) struct ShadowParts {
     pub(crate) edges: Arc<dyn EdgeSink>,
     /// Checkpoint identifiers (KNSH-082).
     pub(crate) random: Arc<dyn Random>,
+    /// Files held for writing at a line's end (KNSH-085, FR-CKP-24).
+    pub(crate) holders: Arc<dyn WriteHolders>,
 }
 
 /// One root of one session.
@@ -383,7 +398,12 @@ impl Shadows {
             Arc::clone(&parts.clock),
             Arc::clone(&parts.random),
         );
-        let attributor = Attributor::new(Arc::clone(&parts.events), Arc::clone(&parts.edges), captures);
+        let attributor = Attributor::new(
+            Arc::clone(&parts.events),
+            Arc::clone(&parts.edges),
+            captures,
+            Arc::clone(&parts.holders),
+        );
         Arc::new(Self {
             parts,
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -646,8 +666,9 @@ impl Shadows {
     }
 }
 
-/// The line of `line` has ended and been reaped: closes it in each root (decision 16), one after the other, then
-/// ends it in the attribution ledger. Returns the roots whose checkpoints are uncertain, and why (FR-CKP-04; a root
+/// The line of `line` has ended and been reaped: closes it in each root (decision 16), one after the other, asks
+/// `processes` which files in its roots they still hold for writing (possibly torn, FR-CKP-24), then ends it in the
+/// attribution ledger. Returns the roots whose checkpoints are uncertain, and why (FR-CKP-04; a root
 /// without a watcher is `not_watched`), the line's attribution (FR-CKP-05, FR-CKP-07), and its checkpoint (KNSH-082):
 /// final when its edge closed with it, the changes so far while a concurrent line still runs.
 ///
@@ -656,7 +677,7 @@ impl Shadows {
 /// (flushed, not closed: their uncertainty is their own session's): each reports the line's changes too, and one
 /// reported after the line ended would be attributed to whatever follows it, an agent edit of another session
 /// for instance (KNSH-081).
-pub(crate) fn close_lines(line: CheckpointLine) -> ClosedLine {
+pub(crate) fn close_lines(line: CheckpointLine, processes: &LineProcesses) -> ClosedLine {
     let CheckpointLine {
         record_id,
         roots,
@@ -664,6 +685,7 @@ pub(crate) fn close_lines(line: CheckpointLine) -> ClosedLine {
         table,
     } = line;
     let peers = table.map(|table| peer_watchers(&table, &roots)).unwrap_or_default();
+    let line_roots: Vec<CanonicalPath> = roots.iter().map(|line| line.root.clone()).collect();
     let uncertain = close_roots(roots);
     for peer in peers {
         // Best effort, bounded by the flush deadline: a peer that is late only risks attributing a late event of
@@ -672,11 +694,22 @@ pub(crate) fn close_lines(line: CheckpointLine) -> ClosedLine {
     }
     let protected = attributor.is_some();
     let ended = attributor.and_then(|attributor| {
+        // Decision 17: asked outside every lock (it reads the process table); a few milliseconds per process.
+        let held = knsh_checkpoint::held_in_roots(attributor.holders.as_ref(), processes, &line_roots);
         let ended = attributor.with(|ledger, captures| {
             // FR-CKP-04: marked before the line ends, so its checkpoint is uncertain when it is finished.
             if let Some(edge) = ledger.running_edge(record_id) {
                 for (_, reason) in &uncertain {
                     captures.mark_uncertain(edge.id, *reason);
+                }
+                // FR-CKP-24: likewise, so the finished checkpoint carries them.
+                match held {
+                    HeldScan::Held(paths) => {
+                        for (path, reason) in paths {
+                            captures.mark_possibly_torn(edge.id, path, reason);
+                        }
+                    }
+                    HeldScan::Unchecked => captures.mark_all_possibly_torn(edge.id, TornReason::Unchecked),
                 }
             }
             ledger.line_ended(record_id)

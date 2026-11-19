@@ -58,12 +58,21 @@
 //! the shadow builder's). Recovery writes the saved copies over whatever is at the listed paths: it runs before sessions start, but a human
 //! edit made to such a path between the crash and the next start is overwritten. A path whose live entry is a special
 //! file (socket, FIFO, device) can only be replaced under `force`, and then cannot be put back by a rollback.
-//! Possibly-torn files (FR-CKP-24) are KNSH-085.
+//!
+//! # Possibly torn (FR-CKP-24, KNSH-085)
+//!
+//! A path the checkpoint marks possibly torn ([`crate::torn`]) is **skipped** in step 1 without `force`: it is not
+//! checked, saved or written, and the outcome lists it with its reason ([`RestoreOutcome::skipped`]); the other paths
+//! are restored. A skip is not a conflict, since nothing is wrong with the live file; it is only not safe to put
+//! the recorded version back. A folder the restore would remove while a skipped path is still in it is refused
+//! (`folder_not_empty`) like any other entry the restore does not remove. With `force` (user and authority only,
+//! FR-CKP-21) the path goes through the usual checks and is restored, and the outcome lists it as forced
+//! ([`RestoreOutcome::forced_torn`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use knsh_core::{CanonicalPath, CheckpointId, ConflictReason, RestoreConflict};
+use knsh_core::{CanonicalPath, CheckpointId, ConflictReason, RestoreConflict, TornPath};
 use knsh_json::{Fields, Object, ToJson, Value};
 use knsh_platform::{FileIdentity, FileKind, PlatformError};
 
@@ -109,8 +118,20 @@ pub struct RestoreOutcome {
     pub saved: BTreeMap<CanonicalPath, BTreeMap<CanonicalPath, CapturedPath>>,
     /// The paths restored, sorted.
     pub restored: Vec<CanonicalPath>,
-    /// Whether `force` overrode at least one identity check.
+    /// Whether `force` overrode at least one identity check, or restored a possibly-torn path.
     pub forced: bool,
+    /// Possibly-torn paths not restored, with why (FR-CKP-24): `force` was not given. Sorted.
+    pub skipped: Vec<TornPath>,
+    /// Possibly-torn paths restored because `force` was given (FR-CKP-24). Sorted.
+    pub forced_torn: Vec<TornPath>,
+}
+
+/// What [`check`] found: the steps, whether `force` was used, and the possibly-torn paths skipped and forced.
+struct Checked {
+    steps: BTreeMap<CanonicalPath, Step>,
+    forced: bool,
+    skipped: Vec<TornPath>,
+    forced_torn: Vec<TornPath>,
 }
 
 /// What a path must hold after the restore (or after a rollback).
@@ -149,7 +170,12 @@ struct Step {
 /// failed part-way and every path was put back; [`CheckpointError::RollbackFailed`] if putting back failed too (the
 /// journal is kept for [`recover_restores`]).
 pub fn restore(files: &dyn ShadowFiles, request: &RestoreRequest<'_>) -> Result<RestoreOutcome, CheckpointError> {
-    let (mut steps, forced) = check(files, request)?;
+    let Checked {
+        mut steps,
+        forced,
+        skipped,
+        forced_torn,
+    } = check(files, request)?;
     let stores = stores_of(request.from, &steps)?;
     save(files, &stores, request.saved, &mut steps)?;
     if let Err(error) = write_journals(files, &stores, request.saved, &steps) {
@@ -171,7 +197,10 @@ pub fn restore(files: &dyn ShadowFiles, request: &RestoreRequest<'_>) -> Result<
             changed,
         ));
     }
-    Ok(outcome(files, steps, forced))
+    let mut outcome = outcome(files, steps, forced);
+    outcome.skipped = skipped;
+    outcome.forced_torn = forced_torn;
+    Ok(outcome)
 }
 
 /// Puts back every restore a stopped `knshd` left part-way in `store` (module documentation, "Never mixed"): each
@@ -251,18 +280,29 @@ fn journal_path(store: &Path, saved: CheckpointId) -> PathBuf {
 }
 
 /// Step 1: every path's step, or every conflict. Changes nothing.
-fn check(
-    files: &dyn ShadowFiles,
-    request: &RestoreRequest<'_>,
-) -> Result<(BTreeMap<CanonicalPath, Step>, bool), CheckpointError> {
+fn check(files: &dyn ShadowFiles, request: &RestoreRequest<'_>) -> Result<Checked, CheckpointError> {
     let mut steps = BTreeMap::new();
     let mut conflicts = BTreeSet::new();
     let mut forced = false;
+    let mut skipped = BTreeSet::new();
+    let mut forced_torn = BTreeSet::new();
     for (root, paths) in &request.from.paths {
         for (path, captured) in paths {
             // Roots may nest: a path listed under two roots is restored once.
             if captured.change().is_none() || steps.contains_key(path) {
                 continue;
+            }
+            // FR-CKP-24: the recorded version may be torn; only `force` puts it back.
+            if let Some(&reason) = request.from.possibly_torn.get(path) {
+                let torn = TornPath {
+                    path: path.clone(),
+                    reason,
+                };
+                if !request.force {
+                    skipped.insert(torn);
+                    continue;
+                }
+                forced_torn.insert(torn);
             }
             let Some(want) = want_of(files, &captured.pre)? else {
                 conflicts.insert(conflict(path, ConflictReason::PreImageLost));
@@ -295,7 +335,14 @@ fn check(
     }
     check_structure(files, &steps, &mut conflicts)?;
     if conflicts.is_empty() {
-        Ok((steps, forced))
+        // Only paths actually restored are reported as forced (a conflict above refused the whole restore).
+        forced_torn.retain(|torn: &TornPath| steps.contains_key(&torn.path));
+        Ok(Checked {
+            steps,
+            forced: forced || !forced_torn.is_empty(),
+            skipped: skipped.into_iter().collect(),
+            forced_torn: forced_torn.into_iter().collect(),
+        })
     } else {
         Err(CheckpointError::Conflicts(conflicts.into_iter().collect()))
     }
@@ -676,6 +723,8 @@ fn outcome(files: &dyn ShadowFiles, steps: BTreeMap<CanonicalPath, Step>, forced
         saved,
         restored,
         forced,
+        skipped: Vec::new(),
+        forced_torn: Vec::new(),
     }
 }
 

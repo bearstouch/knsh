@@ -15,8 +15,12 @@
 //!    as is any set of saved versions the tree released; the checkpoints later undos and redos check the restored
 //!    paths against get their new identities ([`History`]'s post-image refresh, same contents only);
 //! 5. publish `checkpoint.restored` on each session of the change (FR-CKP-25), and return what was restored, the
-//!    excluded folders it changed, which were not restored (FR-CKP-31), and what it did that cannot be undone
-//!    (FR-CKP-36: those changes' files are still restored).
+//!    excluded folders it changed, which were not restored (FR-CKP-31), what it did that cannot be undone
+//!    (FR-CKP-36: those changes' files are still restored), and its possibly-torn files (FR-CKP-24, KNSH-085):
+//!    skipped with their reasons without `force`, or restored and listed as forced with it.
+//!
+//! A possibly-torn path restored under `force` stays possibly torn in the saved versions, so redoing it needs
+//! `force` too: what the undo replaced is the same version the change left, which may be torn.
 //!
 //! Every method takes `&mut self`, so the tree cannot change between a plan and its commit; the caller holds the
 //! history behind one lock and keeps the time it is held to one restore.
@@ -30,7 +34,7 @@ use std::sync::atomic::AtomicU64;
 
 use knsh_core::{
     Attribution, CanonicalPath, Change, CheckpointId, EdgeKind, EventData, HistoryError, HistoryTree, RecordId,
-    RestoreOperation, SessionId, StateId,
+    RestoreOperation, SessionId, StateId, TornPath,
 };
 use knsh_platform::{Clock, FileKind, Random};
 
@@ -106,8 +110,12 @@ pub struct Restored {
     /// What the change did that no restore can undo, such as a network request (FR-CKP-36). Its files were still
     /// restored.
     pub irreversible: Vec<String>,
-    /// Whether `force` overrode an identity check.
+    /// Whether `force` overrode an identity check or restored a possibly-torn file.
     pub forced: bool,
+    /// Possibly-torn files not restored, with why (FR-CKP-24): `force` was not given. Sorted.
+    pub skipped_torn: Vec<TornPath>,
+    /// Possibly-torn files restored because `force` was given (FR-CKP-24). Sorted.
+    pub forced_torn: Vec<TornPath>,
 }
 
 /// Where `checkpoint.restored` goes (FR-CKP-25).
@@ -237,7 +245,7 @@ impl History {
                 force: request.force,
             },
         )?;
-        let saved = Checkpoint {
+        let mut saved = Checkpoint {
             id: saved_id,
             edge: source.edge,
             attribution: source.attribution,
@@ -248,6 +256,7 @@ impl History {
             stores: source.stores.clone(),
             excluded: BTreeMap::new(),
             excluded_overflowed: false,
+            possibly_torn: BTreeMap::new(),
         };
         let committed = match self.tree.commit(&plan, plan.saves_current().then_some(saved_id)) {
             Ok(committed) => committed,
@@ -258,6 +267,12 @@ impl History {
                 return Err(error.into());
             }
         };
+        // Set only now: `put_back` above must restore every path it saved, torn or not.
+        saved.possibly_torn = outcome
+            .forced_torn
+            .iter()
+            .map(|torn| (torn.path.clone(), torn.reason))
+            .collect();
         if plan.saves_current() {
             self.checkpoints.insert(saved_id, saved.clone());
         } else {
@@ -273,7 +288,9 @@ impl History {
         {
             remove_checkpoint_files(self.files.as_ref(), released, &checkpoint.paths, &checkpoint.stores);
         }
-        let restored = self.report(operation, origin, committed.head, outcome.restored, outcome.forced);
+        let mut restored = self.report(operation, origin, committed.head, outcome.restored, outcome.forced);
+        restored.skipped_torn = outcome.skipped;
+        restored.forced_torn = outcome.forced_torn;
         publish(events, &restored);
         Ok(restored)
     }
@@ -399,6 +416,8 @@ impl History {
                 .map(|reasons| reasons.iter().cloned().collect())
                 .unwrap_or_default(),
             forced,
+            skipped_torn: Vec::new(),
+            forced_torn: Vec::new(),
         }
     }
 

@@ -35,7 +35,7 @@ const LAYOUT: &[(&str, &[&str])] = &[
     ("knsh-sandbox", &["knsh-core"]),
     ("knsh-proxy", &["knsh-core", "knsh-platform"]),
     ("knsh-store", &["knsh-core", "knsh-platform"]),
-    ("knsh-checkpoint", &["knsh-core", "knsh-platform"]),
+    ("knsh-checkpoint", &["knsh-core", "knsh-json", "knsh-platform"]),
     (
         "knshd",
         &[
