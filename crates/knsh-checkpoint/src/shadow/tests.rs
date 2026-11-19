@@ -299,6 +299,18 @@ fn a_slow_build_is_marked_over_budget() {
         fn hash(&self, path: &Path, limit: u64) -> Result<Option<knsh_platform::ContentHash>, PlatformError> {
             self.tree.hash(path, limit)
         }
+        fn write_in_place(&self, src: &Path, dst: &Path, expect: Option<&FileIdentity>) -> Result<(), PlatformError> {
+            self.tree.write_in_place(src, dst, expect)
+        }
+        fn touch(&self, path: &Path) -> Result<(), PlatformError> {
+            self.tree.touch(path)
+        }
+        fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), PlatformError> {
+            self.tree.write_file(path, data)
+        }
+        fn read_file(&self, path: &Path, limit: u64) -> Result<Vec<u8>, PlatformError> {
+            self.tree.read_file(path, limit)
+        }
     }
     let tree = tree();
     tree.add_file(Path::new(ROOT).join("a"), b"a");

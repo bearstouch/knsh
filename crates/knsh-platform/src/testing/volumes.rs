@@ -295,6 +295,28 @@ impl Volumes for FakeVolumes {
         state.hashes += 1;
         Ok(digest)
     }
+
+    fn write_in_place(&self, src: &Path, dst: &Path, expect: Option<&FileIdentity>) -> Result<(), PlatformError> {
+        require_absolute(src)?;
+        require_absolute(dst)?;
+        let current = self.identity(dst).map_err(|_| not_found(Operation::Open))?;
+        if expect.is_some_and(|expect| *expect != current) {
+            return Err(PlatformError::Changed);
+        }
+        let contents = self.contents(src).ok_or(not_found(Operation::Open))?;
+        // In place: the inode stays, the time moves on to "now" (the fake's next tick).
+        self.write(dst, &contents);
+        Ok(())
+    }
+
+    fn touch(&self, path: &Path) -> Result<(), PlatformError> {
+        require_absolute(path)?;
+        let mut state = lock(&self.state);
+        let modified = tick(&mut state);
+        let file = state.files.get_mut(path).ok_or(not_found(Operation::Write))?;
+        file.modified = modified;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -415,6 +437,31 @@ mod tests {
         };
         volumes.set_modified(path, stamp);
         assert_eq!(volumes.identity(path).unwrap().modified, stamp);
+    }
+
+    // KNSH-084 (FR-CKP-20, FR-CKP-22, FR-CKP-23): a write in place keeps the inode, moves the time, and refuses a
+    // file that no longer has the identity the caller checked.
+    #[test]
+    fn write_in_place_keeps_inode_and_checks_identity() {
+        let (volumes, ..) = fake();
+        let (src, dst) = (Path::new("/Volumes/External/old"), Path::new("/Volumes/External/live"));
+        volumes.write(src, b"old");
+        volumes.write(dst, b"new");
+        let before = volumes.identity(dst).unwrap();
+        volumes.write(dst, b"newer");
+        assert_eq!(
+            volumes.write_in_place(src, dst, Some(&before)),
+            Err(PlatformError::Changed)
+        );
+        assert_eq!(volumes.contents(dst).as_deref(), Some(&b"newer"[..]));
+        let checked = volumes.identity(dst).unwrap();
+        volumes.write_in_place(src, dst, Some(&checked)).unwrap();
+        let after = volumes.identity(dst).unwrap();
+        assert_eq!(volumes.contents(dst).as_deref(), Some(&b"old"[..]));
+        assert_eq!(after.inode, before.inode);
+        assert!(after.modified > checked.modified);
+        volumes.touch(dst).unwrap();
+        assert!(volumes.identity(dst).unwrap().modified > after.modified);
     }
 
     #[test]

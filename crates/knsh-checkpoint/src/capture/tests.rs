@@ -77,6 +77,14 @@ impl WatchReport for Glue {
     }
 
     fn uncertain(&self, _root: &CanonicalPath, _reason: UncertainReason) {}
+
+    fn excluded(&self, root: &CanonicalPath, folder: CanonicalPath) {
+        self.with(|ledger, captures| {
+            if let Some(edge) = ledger.edge_of(root) {
+                captures.excluded(edge, root, folder);
+            }
+        });
+    }
 }
 
 struct Setup {
@@ -224,6 +232,62 @@ fn kept(tree: &FakeTree, captured: &CapturedPath) -> Option<FakeNode> {
         }
         other => panic!("not kept: {other:?}"),
     }
+}
+
+/// Drops every `checkpoint.restored`.
+struct Quiet;
+
+impl crate::RestoreEvents for Quiet {
+    fn restored(&self, _session_id: SessionId, _data: knsh_core::EventData) {}
+}
+
+// KNSH-084: a checkpoint knows each root's store (where an undo saves the current versions) and lists the excluded
+// folders the line changed something in (FR-CKP-31); captured for real, it undoes through the history.
+#[test]
+fn checkpoint_lists_stores_and_excluded_folders_and_undoes() {
+    let setup = ready(&tree());
+    let checkpoint = setup.line(1, |setup| {
+        setup.tree.add_file(live("README"), b"changed");
+        setup.emit("README", F::ITEM_MODIFIED.union(F::ITEM_IS_FILE));
+        setup.tree.add_file(live("node_modules/x/index.js"), b"x");
+        setup.emit("node_modules/x/index.js", F::ITEM_CREATED.union(F::ITEM_IS_FILE));
+        setup.emit("node_modules", F::ITEM_CREATED.union(F::ITEM_IS_DIR));
+    });
+    assert_eq!(checkpoint.stores, [(canonical(ROOT), PathBuf::from(STORE))].into());
+    assert_eq!(
+        checkpoint.excluded,
+        [(
+            canonical(ROOT),
+            [canonical(&live("node_modules").to_string_lossy())].into()
+        )]
+        .into()
+    );
+    assert!(!checkpoint.excluded_overflowed);
+
+    let mut history = crate::History::new(
+        Arc::clone(&setup.tree) as Arc<dyn ShadowFiles>,
+        Arc::new(FakeClock::new(
+            Timestamp::from_unix_micros(1_700_000_000_000_000).unwrap(),
+        )),
+        Arc::new(SeededRandom::new(9)),
+    );
+    history.record(checkpoint).unwrap();
+    let restored = history
+        .undo(
+            &crate::Request {
+                target: crate::Target::Record(record(1)),
+                caller: crate::Caller::Agent(session()),
+                force: false,
+            },
+            &Quiet,
+        )
+        .unwrap();
+    assert_eq!(setup.tree.node(live("README")), file(b"hello"));
+    assert_eq!(
+        restored.not_restored,
+        [canonical(&live("node_modules").to_string_lossy())]
+    );
+    assert_eq!(setup.tree.node(live("node_modules/x/index.js")), file(b"x"));
 }
 
 // FR-CKP-08: a file the line created did not exist before: its pre-image is the "did not exist" marker, and nothing

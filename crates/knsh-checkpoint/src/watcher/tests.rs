@@ -48,6 +48,7 @@ fn exclude() -> Vec<String> {
 struct Reports {
     changed: Mutex<Vec<PathBuf>>,
     uncertain: Mutex<Vec<UncertainReason>>,
+    excluded: Mutex<Vec<PathBuf>>,
 }
 
 impl WatchReport for Reports {
@@ -60,6 +61,11 @@ impl WatchReport for Reports {
         assert_eq!(root.as_path(), Path::new(ROOT));
         lock(&self.uncertain).push(reason);
     }
+
+    fn excluded(&self, root: &CanonicalPath, folder: CanonicalPath) {
+        assert_eq!(root.as_path(), Path::new(ROOT));
+        lock(&self.excluded).push(folder.into_path_buf());
+    }
 }
 
 impl Reports {
@@ -69,6 +75,10 @@ impl Reports {
 
     fn uncertain(&self) -> Vec<UncertainReason> {
         lock(&self.uncertain).clone()
+    }
+
+    fn excluded(&self) -> Vec<PathBuf> {
+        lock(&self.excluded).clone()
     }
 }
 
@@ -503,6 +513,12 @@ fn excluded_and_engine_paths_are_never_shadowed() {
     // `deep` itself is a new folder that is not excluded: shadowed, and the only change reported.
     assert_eq!(setup.tree.node(copy("deep")), Some(FakeNode::Dir));
     assert_eq!(setup.reports.changed(), [live("deep")]);
+    // FR-CKP-31 (KNSH-084): each excluded folder something changed in is reported, outermost excluded name first;
+    // the store, the shadow and paths leaving the root are not.
+    let mut excluded = setup.reports.excluded();
+    excluded.sort();
+    excluded.dedup();
+    assert_eq!(excluded, [live("deep/target"), live("node_modules")]);
 }
 
 // Decision 16: `RootChanged` rescans the root; while the root is gone, the shadow keeps its last known state rather

@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use crate::error::CoreError;
+use crate::history::RestoreOperation;
 use crate::id::{CheckpointId, EventId, RecordId, RequestId, SessionId};
 use crate::path::CanonicalPath;
 use crate::policy::DecisionSource;
@@ -257,6 +258,22 @@ pub enum EventData {
         /// so it may be incomplete (never wrong).
         uncertain: bool,
     },
+    /// `checkpoint.restored`: an undo or redo restored a change's files (FR-CKP-25, KNSH-084). Published after the
+    /// files were restored and the history recorded it, on each session the change belongs to.
+    CheckpointRestored {
+        /// The change undone or redone: its checkpoint.
+        checkpoint_id: CheckpointId,
+        /// Undo or redo.
+        operation: RestoreOperation,
+        /// The change's lines: one for `command`, the set for `concurrent`, none for agent or external edits.
+        record_ids: Vec<RecordId>,
+        /// The checkpoint roots it covers.
+        roots: Vec<CanonicalPath>,
+        /// How many paths were restored.
+        files_restored: u64,
+        /// Whether `force` overrode an identity check (user or authority only, FR-CKP-21).
+        forced: bool,
+    },
 }
 
 /// Why the changes of a window in a checkpoint root are uncertain (`checkpoint.uncertain`, FR-CKP-04, KNSH-080).
@@ -400,7 +417,8 @@ impl EventData {
             | Self::FileChanged { .. }
             | Self::AgentEdit { .. }
             | Self::CheckpointUncertain { .. }
-            | Self::CheckpointCreated { .. } => None,
+            | Self::CheckpointCreated { .. }
+            | Self::CheckpointRestored { .. } => None,
         }
     }
 
@@ -428,6 +446,7 @@ impl EventData {
             Self::AgentEdit { .. } => "agent.edit",
             Self::CheckpointUncertain { .. } => "checkpoint.uncertain",
             Self::CheckpointCreated { .. } => "checkpoint.created",
+            Self::CheckpointRestored { .. } => "checkpoint.restored",
         }
     }
 

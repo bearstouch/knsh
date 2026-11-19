@@ -140,6 +140,36 @@ pub trait ShadowFiles: Send + Sync {
     /// A [`PlatformError`]; `ENOENT` if nothing is there.
     fn hash(&self, path: &Path, limit: u64) -> Result<Option<ContentHash>, PlatformError>;
 
+    /// Writes the contents of the regular file `src` into the existing regular file `dst` in place, keeping its inode,
+    /// hard links and open descriptors, then sets its modification time to now (KNSH-084, FR-CKP-22, FR-CKP-23). With
+    /// `expect`, only while `dst` still has that identity ([`Volumes::write_in_place`]).
+    ///
+    /// # Errors
+    ///
+    /// A [`PlatformError`]; [`PlatformError::Changed`] if `dst` no longer matches `expect` (nothing written).
+    fn write_in_place(&self, src: &Path, dst: &Path, expect: Option<&FileIdentity>) -> Result<(), PlatformError>;
+
+    /// Sets the modification time of `path` itself to now (KNSH-084, FR-CKP-23).
+    ///
+    /// # Errors
+    ///
+    /// A [`PlatformError`]; `ENOENT` if nothing is there.
+    fn touch(&self, path: &Path) -> Result<(), PlatformError>;
+
+    /// Replaces the owner-only file `path` with `data`, atomically and durably: the restore journal (KNSH-084).
+    ///
+    /// # Errors
+    ///
+    /// A [`PlatformError`]; the previous file is untouched on error.
+    fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), PlatformError>;
+
+    /// Reads the whole file `path`, refusing one larger than `limit` bytes before allocating.
+    ///
+    /// # Errors
+    ///
+    /// A [`PlatformError`]; [`PlatformError::TooLarge`] above `limit`, `ENOENT` if nothing is there.
+    fn read_file(&self, path: &Path, limit: u64) -> Result<Vec<u8>, PlatformError>;
+
     /// Called once on each build thread before it does anything else: the real backend lowers the thread to the
     /// utility class (decision 15). Best effort.
     fn prepare_thread(&self) {}
@@ -198,6 +228,22 @@ impl ShadowFiles for PlatformShadowFiles {
 
     fn hash(&self, path: &Path, limit: u64) -> Result<Option<ContentHash>, PlatformError> {
         self.volumes.hash(path, limit)
+    }
+
+    fn write_in_place(&self, src: &Path, dst: &Path, expect: Option<&FileIdentity>) -> Result<(), PlatformError> {
+        self.volumes.write_in_place(src, dst, expect)
+    }
+
+    fn touch(&self, path: &Path) -> Result<(), PlatformError> {
+        self.volumes.touch(path)
+    }
+
+    fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), PlatformError> {
+        self.fs.atomic_replace(path, data, FILE_MODE)
+    }
+
+    fn read_file(&self, path: &Path, limit: u64) -> Result<Vec<u8>, PlatformError> {
+        self.fs.read(path, limit)
     }
 
     fn prepare_thread(&self) {

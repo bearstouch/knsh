@@ -1,12 +1,13 @@
 //! The real [`Volumes`]: `clonefile(2)`, `statfs(2)`, `lstat(2)` and a streamed `CommonCrypto` SHA-256 (KNSH-078).
 
 use std::ffi::{CStr, OsStr};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, FileTimes, OpenOptions};
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::error::{Operation, PlatformError};
 use crate::fs::require_absolute;
@@ -114,6 +115,61 @@ impl Volumes for SystemVolumes {
         let digest =
             sha256_reader(&mut file, limit).map_err(|error| PlatformError::from_io(Operation::Read, &error))?;
         Ok(digest.map(ContentHash::from_bytes))
+    }
+
+    fn write_in_place(&self, src: &Path, dst: &Path, expect: Option<&FileIdentity>) -> Result<(), PlatformError> {
+        require_absolute(src)?;
+        require_absolute(dst)?;
+        // `O_NOFOLLOW`: never read or write through a symlink. `O_NONBLOCK`: a FIFO is refused below instead of
+        // waiting for its other end.
+        let open = |path: &Path, write: bool| {
+            OpenOptions::new()
+                .read(!write)
+                .write(write)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+                .map_err(|error| PlatformError::from_io(Operation::Open, &error))
+        };
+        let mut from = open(src, false)?;
+        let from_meta = from
+            .metadata()
+            .map_err(|error| PlatformError::from_io(Operation::Metadata, &error))?;
+        let mut to = open(dst, true)?;
+        let to_meta = to
+            .metadata()
+            .map_err(|error| PlatformError::from_io(Operation::Metadata, &error))?;
+        if !from_meta.file_type().is_file() || !to_meta.file_type().is_file() {
+            return Err(PlatformError::UnexpectedKind);
+        }
+        // Checked on the descriptor that is written, so a file replaced after the caller's check (a new inode at the
+        // path) or written since (size or time moved) is never overwritten.
+        if expect.is_some_and(|expect| *expect != identity_of(&to_meta)) {
+            return Err(PlatformError::Changed);
+        }
+        // Written over from the start, then cut to length: no `O_TRUNC`, so the file is never empty in between.
+        let copied = io::copy(&mut from, &mut to).map_err(|error| PlatformError::from_io(Operation::Write, &error))?;
+        to.set_len(copied)
+            .map_err(|error| PlatformError::from_io(Operation::Write, &error))?;
+        let now = SystemTime::now();
+        to.set_times(FileTimes::new().set_modified(now).set_accessed(now))
+            .map_err(|error| PlatformError::from_io(Operation::Write, &error))?;
+        // `sync_all` is `F_FULLFSYNC` on macOS: the restored contents are on stable storage before the caller
+        // removes its copy of the old version.
+        to.sync_all()
+            .map_err(|error| PlatformError::from_io(Operation::SyncFile, &error))
+    }
+
+    fn touch(&self, path: &Path) -> Result<(), PlatformError> {
+        let c = c_path(path)?;
+        // SAFETY: `c` is a NUL-terminated path alive for the call. A null `times` sets both times to now;
+        // `AT_SYMLINK_NOFOLLOW` changes a final symlink itself, never its target.
+        let result =
+            unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), std::ptr::null(), libc::AT_SYMLINK_NOFOLLOW) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(PlatformError::from_io(Operation::Write, &io::Error::last_os_error()))
+        }
     }
 }
 

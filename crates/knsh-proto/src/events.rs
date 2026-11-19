@@ -492,6 +492,25 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
                 .with("files_changed", files_changed.to_json()?)?
                 .with("uncertain", *uncertain)
         }
+        // KNSH-084 (FR-CKP-25): shaped like `checkpoint.created`, with the operation and how many paths came back.
+        EventData::CheckpointRestored {
+            checkpoint_id,
+            operation,
+            record_ids,
+            roots,
+            files_restored,
+            forced,
+        } => {
+            let records = record_ids.iter().map(|id| Value::String(id.to_string())).collect();
+            let roots = roots.iter().map(|root| Value::String(path(root))).collect();
+            Object::new()
+                .with("checkpoint_id", checkpoint_id.to_string())?
+                .with("operation", operation.as_str())?
+                .with("record_ids", Value::Array(records))?
+                .with("roots", Value::Array(roots))?
+                .with("files_restored", files_restored.to_json()?)?
+                .with("forced", *forced)
+        }
     }
 }
 
@@ -948,6 +967,37 @@ mod tests {
                 r#""data":{{"checkpoint_id":"{checkpoint}","attribution":"command","record_ids":["{record}"],"roots":["/Users/me/app"],"files_changed":2,"uncertain":false}}"#
             )),
             "{created}"
+        );
+    }
+
+    // KNSH-084 (FR-CKP-25): `checkpoint.restored` names the change, the operation and how many paths came back.
+    #[test]
+    fn checkpoint_restored_payload() {
+        let checkpoint = knsh_core::CheckpointId::from_ulid(Ulid::from_u128(7));
+        let record = RecordId::from_ulid(Ulid::from_u128(8));
+        let restored = written(
+            event_notification(
+                SubscriptionId::new(1),
+                &event(
+                    EventData::CheckpointRestored {
+                        checkpoint_id: checkpoint,
+                        operation: knsh_core::RestoreOperation::Undo,
+                        record_ids: vec![record],
+                        roots: vec![CanonicalPath::new("/Users/me/app").unwrap()],
+                        files_restored: 3,
+                        forced: false,
+                    },
+                    Actor::Agent(AgentId::new("claude-code").unwrap()),
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(restored.contains(r#""event":"checkpoint.restored""#), "{restored}");
+        assert!(
+            restored.contains(&format!(
+                r#""data":{{"checkpoint_id":"{checkpoint}","operation":"undo","record_ids":["{record}"],"roots":["/Users/me/app"],"files_restored":3,"forced":false}}"#
+            )),
+            "{restored}"
         );
     }
 

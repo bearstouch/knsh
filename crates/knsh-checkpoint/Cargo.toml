@@ -9,6 +9,8 @@ license.workspace = true
 
 [dependencies]
 knsh-core = { path = "../knsh-core" }
+# The restore journal (KNSH-084) is strict JSON.
+knsh-json = { path = "../knsh-json" }
 knsh-platform = { path = "../knsh-platform" }
 
 [features]

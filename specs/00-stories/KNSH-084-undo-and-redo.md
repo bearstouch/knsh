@@ -14,18 +14,18 @@ saving current versions before undo so redo is possible, excluded paths listed a
 Out of scope: torn-file detection (KNSH-085), `restore` to a state (KNSH-086), endpoint wiring (KNSH-088).
 
 **Acceptance criteria**
-- [ ] A path is restored only if the live file matches its recorded post-image identity; otherwise it is a conflict
+- [x] A path is restored only if the live file matches its recorded post-image identity; otherwise it is a conflict
       and nothing changes for that change (FR-CKP-20).
-- [ ] Conflicts return `-32004` with the conflicting paths and reasons; no partial restore happens.
-- [ ] Restore writes old contents into the existing file; inode and hard links stay the same (FR-CKP-22).
-- [ ] The restored file's mtime is set to now (FR-CKP-23).
-- [ ] Before undoing, the current versions are saved so redo is possible.
-- [ ] Excluded paths are listed in the result as not restored (FR-CKP-31).
-- [ ] The engine API accepts `force` only from callers flagged as user or authority; an agent-scoped call with
+- [x] Conflicts return `-32004` with the conflicting paths and reasons; no partial restore happens.
+- [x] Restore writes old contents into the existing file; inode and hard links stay the same (FR-CKP-22).
+- [x] The restored file's mtime is set to now (FR-CKP-23).
+- [x] Before undoing, the current versions are saved so redo is possible.
+- [x] Excluded paths are listed in the result as not restored (FR-CKP-31).
+- [x] The engine API accepts `force` only from callers flagged as user or authority; an agent-scoped call with
       `force` is rejected (FR-CKP-21).
-- [ ] `checkpoint.restored` is emitted (FR-CKP-25).
-- [ ] An undo of a change flagged irreversible restores its files and lists what cannot be undone (FR-CKP-36).
-- [ ] A failure in the middle of a restore leaves every file either fully old or fully new, never mixed.
+- [x] `checkpoint.restored` is emitted (FR-CKP-25).
+- [x] An undo of a change flagged irreversible restores its files and lists what cannot be undone (FR-CKP-36).
+- [x] A failure in the middle of a restore leaves every file either fully old or fully new, never mixed.
 
 **Unit tests**
 - `undo_restores_when_identity_matches` (FR-CKP-20)
@@ -43,3 +43,6 @@ Out of scope: torn-file detection (KNSH-085), `restore` to a state (KNSH-086), e
 
 **Notes**
 - Atomic multi-file restore on a single volume needs a journal; describe the approach in the module docs.
+- Implemented in `knsh_checkpoint::{restore, undo}` (journal approach in the `restore` module docs). The engine API
+  enforces `force` and session scope; the endpoints that expose it are KNSH-088, and calling `recover_restores` at
+  `knshd` start is wired there too (**pending**).

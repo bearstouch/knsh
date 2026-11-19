@@ -359,6 +359,9 @@ pub enum PlatformError {
     /// The file system cannot clone files copy-on-write (`ENOTSUP`; anything but APFS on macOS). The root falls back
     /// to plain copies (FR-CKP-35, KNSH-078).
     ClonesUnsupported,
+    /// The file is no longer the one the caller checked: its identity, read on the open descriptor, differs from the
+    /// one expected, so nothing was written (FR-CKP-20, KNSH-084: a restore never overwrites work it did not record).
+    Changed,
 }
 
 impl PlatformError {
@@ -392,7 +395,8 @@ impl PlatformError {
             | Self::Security { .. }
             | Self::Xpc
             | Self::CrossVolume
-            | Self::ClonesUnsupported => None,
+            | Self::ClonesUnsupported
+            | Self::Changed => None,
         }
     }
 
@@ -418,7 +422,8 @@ impl PlatformError {
             | Self::Security { .. }
             | Self::Xpc
             | Self::CrossVolume
-            | Self::ClonesUnsupported => None,
+            | Self::ClonesUnsupported
+            | Self::Changed => None,
         }
     }
 
@@ -473,6 +478,7 @@ impl fmt::Display for PlatformError {
             Self::Xpc => f.write_str("xpc call failed"),
             Self::CrossVolume => f.write_str("clone source and destination are on different volumes"),
             Self::ClonesUnsupported => f.write_str("file system does not support copy-on-write clones"),
+            Self::Changed => f.write_str("file changed since its identity was checked"),
         }
     }
 }
@@ -498,7 +504,8 @@ impl std::error::Error for PlatformError {
             | Self::Security { .. }
             | Self::Xpc
             | Self::CrossVolume
-            | Self::ClonesUnsupported => None,
+            | Self::ClonesUnsupported
+            | Self::Changed => None,
         }
     }
 }
