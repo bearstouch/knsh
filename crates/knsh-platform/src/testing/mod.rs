@@ -38,6 +38,9 @@
 //! - [`ScriptedFileEvents`]: file-event streams whose events the test emits, with what a flush delivers scripted
 //!   (a marker file's event) and failing starts (KNSH-080).
 //!
+//! - [`FakeWriteHolders`]: processes and the files they hold for writing, with failures for the table or one
+//!   process, every question counted (KNSH-085).
+//!
 //! Locks in the fakes are independent (one per fake) and never held across calls into another fake.
 
 mod ancestry;
@@ -46,6 +49,7 @@ mod control;
 mod denials;
 mod file_events;
 mod fs;
+mod holders;
 mod keychain;
 mod launchd;
 mod log;
@@ -62,6 +66,7 @@ pub use control::FakeCodeSigning;
 pub use denials::{ScriptedDenialLog, kernel_entry};
 pub use file_events::{FlushHook, ScriptedFileEvents, watch_failure};
 pub use fs::{DEFAULT_UID, MemFs};
+pub use holders::FakeWriteHolders;
 pub use keychain::{MemKeyStore, MemTrustStore};
 pub use launchd::{FakeSocketActivation, FixedPeerCredentials, RecordingServiceManager, ServiceCall};
 pub use log::{Entry, RecordingLog};

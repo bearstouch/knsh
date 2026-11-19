@@ -12,11 +12,11 @@ Scope: detection based on KNSH-077 findings; SQLite detection by `-wal`, `-shm` 
 Out of scope: repairing torn files.
 
 **Acceptance criteria**
-- [ ] A SQLite database with a `-wal`, `-shm` or `-journal` file beside it is marked possibly torn.
-- [ ] A file detected as open for writing or memory-mapped during the change is marked possibly torn, using the
+- [x] A SQLite database with a `-wal`, `-shm` or `-journal` file beside it is marked possibly torn.
+- [x] A file detected as open for writing or memory-mapped during the change is marked possibly torn, using the
       method chosen in KNSH-077.
-- [ ] Undo and redo skip possibly-torn files without `force` and list them with the reason.
-- [ ] With `force` (user or authority only) the file is restored and the result says it was forced.
+- [x] Undo and redo skip possibly-torn files without `force` and list them with the reason.
+- [x] With `force` (user or authority only) the file is restored and the result says it was forced.
 
 **Unit tests**
 - `sqlite_with_wal_is_possibly_torn` (FR-CKP-24)

@@ -111,6 +111,7 @@ impl Fixture {
             stores: [(canonical(ROOT), PathBuf::from(STORE))].into(),
             excluded: BTreeMap::new(),
             excluded_overflowed: false,
+            possibly_torn: BTreeMap::new(),
         }
     }
 

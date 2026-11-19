@@ -66,7 +66,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
-use knsh_checkpoint::RootReadiness;
+use knsh_checkpoint::{LineProcesses, RootReadiness};
 use knsh_core::{
     Actor, ActorKind, CanonicalPath, CoreError, EventData, ExecutionRecord, Profile, ProfileName, ProfileOrder,
     RecordDetails, RecordId, Redacted, SessionId, SessionRegistry, SessionSpec, SessionState, Timestamp, Transition,
@@ -326,11 +326,20 @@ impl Sessions {
         }
     }
 
-    /// The line of `line` has been reaped: the line-end flush of each root (decision 16), then its attribution.
-    /// Returns the roots whose checkpoints are uncertain, and why (FR-CKP-04), and the record's `attribution`
-    /// (FR-CKP-05, FR-CKP-07).
-    pub(crate) fn close_checkpoint_lines(line: CheckpointLine) -> ClosedLine {
-        crate::shadows::close_lines(line)
+    /// The line of `line` has been reaped: the line-end flush of each root (decision 16), the files `processes` still
+    /// hold for writing (FR-CKP-24, KNSH-085), then its attribution. Returns the roots whose checkpoints are
+    /// uncertain, and why (FR-CKP-04), and the record's `attribution` (FR-CKP-05, FR-CKP-07).
+    pub(crate) fn close_checkpoint_lines(line: CheckpointLine, processes: &LineProcesses) -> ClosedLine {
+        crate::shadows::close_lines(line, processes)
+    }
+
+    /// The processes a line of `session_id` that ran as `group` may have left writing: the group's members and the
+    /// session's envelopes (FR-CKP-24, KNSH-085).
+    pub(crate) fn line_processes(&self, session_id: SessionId, group: Option<ProcessGroupId>) -> LineProcesses {
+        LineProcesses {
+            group: group.map(ProcessGroupId::as_raw),
+            envelopes: self.agents.envelopes(session_id),
+        }
     }
 
     /// `hello`'s `checkpoints` (KNSH-079): each root of a running agent session once its shadow settled. Empty

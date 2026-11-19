@@ -222,6 +222,15 @@ impl AgentAccess {
         }
     }
 
+    /// The root processes of `session_id`'s envelopes: at a line's end, they and their descendants are asked which
+    /// files they hold for writing (FR-CKP-24, KNSH-085). Empty for a session without envelopes or that ended.
+    pub(crate) fn envelopes(&self, session_id: SessionId) -> Vec<ProcessKey> {
+        self.entries()
+            .get(&session_id)
+            .map(|entry| entry.envelopes.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
     /// The identity of the live process `pid`, read from the process table, or `None` if it cannot be read.
     pub(crate) fn identity(&self, pid: i32) -> Option<ProcessIdentity> {
         self.tree.identity(pid).ok()

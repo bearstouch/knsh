@@ -200,8 +200,41 @@ ends with every file as it was before the undo or redo.
 
 **Limits.** Recovery writes the saved copies over whatever is at the listed paths, so a human edit made between a
 crash and the next start is overwritten there. A special file (socket, FIFO, device) is replaced only under `force`
-and cannot be put back by a rollback. **Pending:** possibly-torn files (FR-CKP-24) are KNSH-085; calling
-`recover_restores` at `knshd` start and the endpoints are KNSH-088.
+and cannot be put back by a rollback. **Pending:** calling `recover_restores` at `knshd` start and the endpoints are
+KNSH-088.
+
+**Possibly torn (KNSH-085, FR-CKP-24, decision 17).** A checkpoint lists its possibly-torn paths with a reason
+(`possibly_torn`):
+
+- `open_for_writing` / `mapped_writable`: when a line ends (after its line-end flush), `knshd` asks the processes that
+  may still be writing, the members of the line's process group that outlive its leader and every process of its
+  session's envelopes with their descendants (by unique id, never a bare pid), which regular files they hold open
+  for writing (`FWRITE` descriptors) or have mapped writable and shared (`PROC_PIDREGIONPATHINFO`: write protection,
+  and `VM_INHERIT_SHARE` or a shared share mode, since a file mapped `MAP_SHARED` by one process reports
+  `SM_PRIVATE`). Each such file inside one of the line's roots is possibly torn in the line's checkpoint; a mapping
+  wins over a descriptor.
+- `unchecked`: the process table, or one of those processes, could not be read (an exited process holds nothing and
+  is skipped), or more than 4,096 paths were marked: every file of the change is possibly torn (fail closed).
+- `sqlite_journal`: a changed file with a `-wal`, `-shm` or `-journal` file beside it, a changed journal file
+  itself, and the database a changed journal file belongs to (a rollback journal that came and went within the edge
+  still counts). By name only; no file is opened to see whether it is a database.
+
+Undo and redo **skip** a possibly-torn path without `force`: it is not checked, saved or written, the other paths are
+restored, and the result lists it with its reason (`skipped_torn`). A folder the restore would remove while a skipped
+path is still in it is a `folder_not_empty` conflict, as for any entry the restore does not remove. With `force`
+(user and authority only, never `agent.sock`, FR-CKP-21) the path goes through the usual checks and is restored, the
+result lists it (`forced_torn`) and says `forced`, as does `checkpoint.restored`. A path restored under `force` stays
+possibly torn in the saved versions, so its redo needs `force` too.
+
+**Limits (possibly torn).** The observation is at line end: a process that wrote through a mapping and unmapped
+before the line ended, a process outside the line's group and envelopes (a daemon the line asked to write, or a
+background process an earlier line left running, since lines are started by `knshd`, not by the envelope), a
+region whose inheritance was changed with `minherit`, or a path the kernel names other than its root does (through a
+symlink, or after a rename) is not seen. Such writes still change contents, which the post-image hash catches for
+files under 64 MiB (FR-CKP-09). **Pending:** the restore-time refusal of decision 17 for files of 64 MiB or more
+while any process holds them for writing; attributing a held file's next event (when its writer closes it) as an
+agent edit rather than to a later line (decision 17); showing `possibly_torn` in the line's record and on the wire
+(KNSH-088).
 
 ## History tree
 

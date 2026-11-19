@@ -118,6 +118,13 @@
 //! | --- | --- | --- | --- |
 //! | [`FileEvents`] | Watch folders, deliver events to a sink, flush | `FsEventStreams` (`FSEvents`, file events) | `ScriptedFileEvents` |
 //!
+//! The `holders` module (KNSH-085) lists processes and the files each holds open for writing or has mapped
+//! writable, so a line's possibly-torn files are found at line end (FR-CKP-24, decision 17).
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`WriteHolders`] | Process table; files a process holds for writing | `SystemWriteHolders` (`proc_pidinfo`, `proc_pidfdinfo`) | `FakeWriteHolders` |
+//!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
 //! in a fake. All failures use the single crate error, [`PlatformError`], whose messages never echo paths or other
 //! input (NFR-PRIV-02).
@@ -172,6 +179,7 @@ pub mod engine_dirs;
 mod error;
 mod file_events;
 mod fs;
+mod holders;
 pub mod launchd;
 mod log;
 mod lookup;
@@ -209,6 +217,7 @@ pub use engine_dirs::{EnginePaths, ensure_engine_dirs};
 pub use error::{Operation, PlatformError, SqliteCode};
 pub use file_events::{FileEvent, FileEventFlags, FileEventSink, FileEventStream, FileEvents};
 pub use fs::{FileKind, Fs, Metadata};
+pub use holders::{HeldFile, HoldKind, MAX_HELD_FILES, MAX_PROCESSES, ProcessEntry, WriteHolders};
 pub use launchd::{LaunchAgent, PeerCredentials, ServiceManager, SocketActivation, install_agent, uninstall_agent};
 pub use log::{Field, Level, SystemLog, Value, render};
 pub use policy_source::{EditableProfile, FileState, PolicyDirectory};

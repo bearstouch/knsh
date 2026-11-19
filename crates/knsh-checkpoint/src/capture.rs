@@ -51,13 +51,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use knsh_core::{
     Attribution, CanonicalPath, ChangedFile, CheckpointId, FileChange, MAX_RECORD_FILES_CHANGED, RecordId,
-    RecordedIdentity, SessionId, Ulid, UncertainReason,
+    RecordedIdentity, SessionId, TornReason, Ulid, UncertainReason,
 };
 use knsh_platform::{Clock, FileKind, PlatformError, Random};
 
 use crate::attribution::{Edge, EdgeId, MAX_EDGE_PATHS};
 use crate::identity::PostImageIdentity;
 use crate::shadow::ShadowFiles;
+use crate::torn::{MAX_TORN_PATHS, sqlite_marks};
 
 /// The folder below a store that holds checkpoints: `<store>/checkpoints/<checkpoint id>/`.
 pub const CHECKPOINTS_DIR: &str = "checkpoints";
@@ -173,6 +174,9 @@ pub struct Checkpoint {
     pub excluded: BTreeMap<CanonicalPath, BTreeSet<CanonicalPath>>,
     /// More excluded folders changed than `excluded` lists.
     pub excluded_overflowed: bool,
+    /// Paths that are possibly torn, with why (FR-CKP-24, KNSH-085, [`crate::torn`]): undo and redo skip them
+    /// without `force`. May name paths the checkpoint does not list (a file held for writing that showed no change).
+    pub possibly_torn: BTreeMap<CanonicalPath, TornReason>,
 }
 
 impl Checkpoint {
@@ -227,6 +231,11 @@ struct Open {
     excluded: BTreeMap<CanonicalPath, BTreeSet<CanonicalPath>>,
     excluded_count: usize,
     excluded_overflowed: bool,
+    /// Possibly-torn paths marked so far (FR-CKP-24), at most [`MAX_TORN_PATHS`].
+    torn: BTreeMap<CanonicalPath, TornReason>,
+    /// Every file of the checkpoint is possibly torn, for this reason: its writers could not be checked, or more
+    /// paths were marked than [`MAX_TORN_PATHS`].
+    torn_all: Option<TornReason>,
     /// Pre-images kept so far, for unique names in the checkpoint's folders.
     kept: u64,
     /// The checkpoint's folder in each store it has one in.
@@ -308,9 +317,16 @@ impl Captures {
         change: Change,
     ) -> Vec<Checkpoint> {
         let Change { path, pre, post } = change;
+        // FR-CKP-24: a SQLite database with a journal beside it, or a journal file. Read before the lock: at most a
+        // few `lstat`s.
+        let is_file = matches!(post, PostImage::Present(identity) if identity.identity.kind == FileKind::File);
+        let sqlite = sqlite_marks(self.files.as_ref(), &path, is_file);
         let then = {
             let mut state = lock(&self.state);
             let open = self.open(&mut state, ticket.edge);
+            for marked in sqlite {
+                mark_torn(open, marked, TornReason::SqliteJournal);
+            }
             open.sessions.insert(session_id);
             open.stores.entry(root.clone()).or_insert_with(|| store.to_path_buf());
             if matches!(post, PostImage::Unknown) {
@@ -407,6 +423,23 @@ impl Captures {
         self.open(&mut state, edge).uncertain.insert(reason);
     }
 
+    /// `path` is possibly torn in `edge`'s change, for `reason` (FR-CKP-24): a process of the line held it for writing
+    /// when the line ended ([`crate::held_in_roots`]). Call it under the ledger's lock, while the edge is open. The
+    /// first reason given for a path is kept; past [`MAX_TORN_PATHS`] paths every file of the change is
+    /// [`TornReason::Unchecked`].
+    pub fn mark_possibly_torn(&self, edge: EdgeId, path: CanonicalPath, reason: TornReason) {
+        let mut state = lock(&self.state);
+        mark_torn(self.open(&mut state, edge), path, reason);
+    }
+
+    /// Every file of `edge`'s change is possibly torn, for `reason` (FR-CKP-24): the line's writers could not be
+    /// checked, so none can be shown untorn (fail closed). Call it under the ledger's lock, while the edge is open.
+    pub fn mark_all_possibly_torn(&self, edge: EdgeId, reason: TornReason) {
+        let mut state = lock(&self.state);
+        let open = self.open(&mut state, edge);
+        open.torn_all.get_or_insert(reason);
+    }
+
     /// The ledger closed `edges` (call it under the ledger's lock). Returns the checkpoints this finished: those with
     /// no change still being added. An edge with no change and nothing uncertain has no checkpoint.
     pub fn closed(&self, edges: &[Edge]) -> Vec<Checkpoint> {
@@ -455,6 +488,8 @@ impl Captures {
             excluded: BTreeMap::new(),
             excluded_count: 0,
             excluded_overflowed: false,
+            torn: BTreeMap::new(),
+            torn_all: None,
             kept: 0,
             folders: BTreeSet::new(),
             in_flight: 0,
@@ -547,6 +582,14 @@ fn finish_ready(state: &mut State, edge: EdgeId) -> Option<Checkpoint> {
     }
     let mut sessions = closed.sessions;
     sessions.extend(open.sessions);
+    let mut possibly_torn = open.torn;
+    if let Some(reason) = open.torn_all {
+        for (path, captured) in paths.values().flat_map(BTreeMap::iter) {
+            if holds_file(captured) {
+                possibly_torn.entry(path.clone()).or_insert(reason);
+            }
+        }
+    }
     let checkpoint = Checkpoint {
         id: open.id,
         edge,
@@ -558,6 +601,7 @@ fn finish_ready(state: &mut State, edge: EdgeId) -> Option<Checkpoint> {
         stores: open.stores,
         excluded: open.excluded,
         excluded_overflowed: open.excluded_overflowed,
+        possibly_torn,
     };
     if state.recent.len() >= RECENT_CHECKPOINTS {
         state.recent.pop_front();
@@ -570,6 +614,30 @@ fn finish_ready(state: &mut State, edge: EdgeId) -> Option<Checkpoint> {
     };
     state.recent.push_back((edge, summary));
     Some(checkpoint)
+}
+
+/// Marks `path` possibly torn in `open` for `reason`, keeping the first reason; past [`MAX_TORN_PATHS`] paths the
+/// whole change is [`TornReason::Unchecked`] instead.
+fn mark_torn(open: &mut Open, path: CanonicalPath, reason: TornReason) {
+    if open.torn.contains_key(&path) {
+        return;
+    }
+    if open.torn.len() >= MAX_TORN_PATHS {
+        open.torn_all.get_or_insert(TornReason::Unchecked);
+        return;
+    }
+    open.torn.insert(path, reason);
+}
+
+/// Whether a captured path is or was a file or symlink (not only a folder): what a torn write can affect.
+fn holds_file(captured: &CapturedPath) -> bool {
+    let post_file = matches!(
+        captured.post,
+        PostImage::Present(identity) if identity.identity.kind != FileKind::Directory
+    );
+    post_file
+        || matches!(captured.pre, StoredPreImage::Kept(_) | StoredPreImage::Lost)
+        || matches!(captured.post, PostImage::Unknown)
 }
 
 /// How many paths `paths` lists that changed over the edge.

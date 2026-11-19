@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use knsh_checkpoint::testing::FakeTree;
 use knsh_core::{ProfileName, SessionId, Ulid};
-use knsh_platform::testing::{FakeClock, FakeVolumes, MemFs, RecordingLog, ScriptedFileEvents};
+use knsh_platform::testing::{FakeClock, FakeVolumes, FakeWriteHolders, MemFs, RecordingLog, ScriptedFileEvents};
 use knsh_platform::{FileEvent, FileEventFlags, FileSystemKind, ensure_engine_dirs};
 
 use knsh_checkpoint::Edge;
@@ -105,6 +105,17 @@ pub(crate) fn shadows_with_edges(
     events: Arc<dyn CheckpointEvents>,
     edges: Arc<dyn EdgeSink>,
 ) -> Arc<Shadows> {
+    shadows_with_holders(tree, file_events, events, edges, Arc::new(FakeWriteHolders::new()))
+}
+
+/// [`shadows_with_edges`], with the processes asked at line end for files held for writing (KNSH-085).
+pub(crate) fn shadows_with_holders(
+    tree: &Arc<FakeTree>,
+    file_events: ScriptedFileEvents,
+    events: Arc<dyn CheckpointEvents>,
+    edges: Arc<dyn EdgeSink>,
+    holders: Arc<dyn WriteHolders>,
+) -> Arc<Shadows> {
     let fs = MemFs::new();
     for dir in [HOME, ROOT, "/Volumes/Stick/code"] {
         fs.add_dir_all(Path::new(dir)).unwrap();
@@ -133,6 +144,7 @@ pub(crate) fn shadows_with_edges(
         events,
         edges,
         random: Arc::new(knsh_platform::testing::SeededRandom::new(3)),
+        holders,
     })
 }
 
@@ -338,7 +350,7 @@ fn a_change_under_a_root_is_published_as_file_changed() {
     tree.add_file(&new, b"by another process");
     file_events.emit(&[FileEvent::new(&new, FileEventFlags::ITEM_CREATED)]);
     let lines = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
-    assert_eq!(close_lines(lines).uncertain, Vec::new());
+    assert_eq!(close_lines(lines, &LineProcesses::default()).uncertain, Vec::new());
     assert_eq!(*events.changed.lock().unwrap(), [(session(1), new.clone())]);
     let shadow = store_dir()
         .join("shadows")
@@ -361,13 +373,13 @@ fn dropped_events_make_the_line_uncertain() {
     let lines = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
     drop();
     assert_eq!(
-        close_lines(lines).uncertain,
+        close_lines(lines, &LineProcesses::default()).uncertain,
         [(root(ROOT), UncertainReason::EventsDropped)]
     );
     assert_eq!(*events.uncertain.lock().unwrap(), Vec::new());
     drop();
     let lines = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
-    assert_eq!(close_lines(lines).uncertain, Vec::new());
+    assert_eq!(close_lines(lines, &LineProcesses::default()).uncertain, Vec::new());
     assert_eq!(
         *events.uncertain.lock().unwrap(),
         [(session(1), None, UncertainReason::EventsDropped)]
@@ -390,7 +402,7 @@ fn ending_the_session_stops_its_watchers() {
     assert_eq!(file_events.live_streams(), 0);
     // A line that was running when its session ended: its root is no longer watched.
     assert_eq!(
-        close_lines(lines).uncertain,
+        close_lines(lines, &LineProcesses::default()).uncertain,
         [(root(ROOT), UncertainReason::NotWatched)]
     );
     assert!(
@@ -413,7 +425,7 @@ fn a_watcher_that_cannot_start_makes_lines_uncertain() {
     assert_eq!(settled(&shadows, session(1), &root(ROOT)), RootReadiness::Ready);
     let lines = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
     assert_eq!(
-        close_lines(lines).uncertain,
+        close_lines(lines, &LineProcesses::default()).uncertain,
         [(root(ROOT), UncertainReason::NotWatched)]
     );
     assert_eq!(file_events.live_streams(), 0);
@@ -466,7 +478,7 @@ fn applied(events: &RecordedEvents, count: usize) {
 fn line_after(shadows: &Shadows, events: &RecordedEvents, count: usize, n: u128) -> Attribution {
     applied(events, count);
     let line = shadows.open_lines(session(1), record(n), &[root(ROOT)]);
-    close_lines(line).attribution
+    close_lines(line, &LineProcesses::default()).attribution
 }
 
 // KNSH-081 (FR-CKP-05): a change made while a line runs is attributed to it: the line is `command`, and its closed
@@ -476,7 +488,7 @@ fn change_during_line_is_attributed_to_it() {
     let (tree, file_events, events, edges, shadows) = attributed_session(true);
     let line = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
     let written = write(&tree, &file_events, "built.txt", b"out");
-    let closed = close_lines(line);
+    let closed = close_lines(line, &LineProcesses::default());
     assert_eq!(closed.attribution, Attribution::Command);
     let edges = edges.0.lock().unwrap();
     assert_eq!(edges.len(), 1);
@@ -530,8 +542,8 @@ fn overlapping_lines_are_one_concurrent_set() {
     write(&tree, &file_events, "a.txt", b"a");
     let second = shadows.open_lines(session(1), record(2), &[root(ROOT)]);
     write(&tree, &file_events, "b.txt", b"b");
-    let first = close_lines(first);
-    let second = close_lines(second);
+    let first = close_lines(first, &LineProcesses::default());
+    let second = close_lines(second, &LineProcesses::default());
     assert_eq!(first.attribution, Attribution::Concurrent);
     assert_eq!(second.attribution, Attribution::Concurrent);
     let edges = edges.0.lock().unwrap();
@@ -569,7 +581,7 @@ fn a_line_in_a_shared_root_is_never_another_sessions_agent_edit() {
     let line = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
     write(&tree, &file_events, "built.txt", b"out");
     let flushes = file_events.flushes();
-    let closed = close_lines(line);
+    let closed = close_lines(line, &LineProcesses::default());
     assert_eq!(closed.attribution, Attribution::Command);
     assert!(
         file_events.flushes() >= flushes + 2,
@@ -582,4 +594,94 @@ fn a_line_in_a_shared_root_is_never_another_sessions_agent_edit() {
     let kinds: Vec<Attribution> = edges.iter().map(|edge| edge.attribution).collect();
     assert_eq!(kinds, [Attribution::Command]);
     assert_eq!(edges[0].path_count(), 1);
+}
+
+// KNSH-085 (FR-CKP-24, decision 17): a file the line wrote that a member of its group still maps writable when the line
+// ends is possibly torn in the line's checkpoint; a file it only wrote is not; a process outside the line's group and
+// envelopes is never asked.
+#[test]
+fn file_still_mapped_at_line_end_is_possibly_torn() {
+    let tree = Arc::new(FakeTree::new());
+    let file_events = echoing_events(&tree);
+    let events = Arc::new(RecordedEvents::default());
+    let holders = Arc::new(FakeWriteHolders::new());
+    let straggler = knsh_platform::ProcessEntry {
+        key: knsh_platform::ProcessKey::new(77, 7700),
+        parent_unique_id: 1,
+        group: 77,
+    };
+    let stranger = knsh_platform::ProcessEntry {
+        key: knsh_platform::ProcessKey::new(88, 8800),
+        parent_unique_id: 1,
+        group: 88,
+    };
+    holders.add(
+        straggler,
+        vec![knsh_platform::HeldFile {
+            path: Path::new(ROOT).join("cache.bin"),
+            how: knsh_platform::HoldKind::MappedWritable,
+        }],
+    );
+    holders.add(stranger, Vec::new());
+    let shadows = shadows_with_holders(
+        &tree,
+        file_events.clone(),
+        Arc::clone(&events) as Arc<dyn CheckpointEvents>,
+        Arc::new(UncapturedEdges),
+        Arc::clone(&holders) as Arc<dyn WriteHolders>,
+    );
+    shadows.start(session(1), &profile(&[ROOT], true), true);
+    assert_eq!(settled(&shadows, session(1), &root(ROOT)), RootReadiness::Ready);
+    let line = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
+    let mapped = write(&tree, &file_events, "cache.bin", b"pages");
+    let plain = write(&tree, &file_events, "plain.txt", b"text");
+    let processes = LineProcesses {
+        group: Some(77),
+        envelopes: Vec::new(),
+    };
+    let closed = close_lines(line, &processes);
+    let id = closed.checkpoint.unwrap().id;
+    let created = events.created.lock().unwrap();
+    let checkpoint = &created.iter().find(|(_, checkpoint)| checkpoint.id == id).unwrap().1;
+    assert_eq!(
+        checkpoint.possibly_torn,
+        [(root(&mapped.to_string_lossy()), TornReason::MappedWritable)].into()
+    );
+    assert!(!checkpoint.possibly_torn.contains_key(&root(&plain.to_string_lossy())));
+    assert_eq!(holders.asked(), [straggler.key]);
+}
+
+// KNSH-085 (FR-CKP-24): when the line's processes cannot be read, no file of its change is shown untorn.
+#[test]
+fn unreadable_processes_mark_the_whole_change_possibly_torn() {
+    let tree = Arc::new(FakeTree::new());
+    let file_events = echoing_events(&tree);
+    let events = Arc::new(RecordedEvents::default());
+    let holders = Arc::new(FakeWriteHolders::new());
+    holders.fail_table(Some(PlatformError::Os {
+        operation: knsh_platform::Operation::ProcessInfo,
+        errno: 5,
+    }));
+    let shadows = shadows_with_holders(
+        &tree,
+        file_events.clone(),
+        Arc::clone(&events) as Arc<dyn CheckpointEvents>,
+        Arc::new(UncapturedEdges),
+        holders,
+    );
+    shadows.start(session(1), &profile(&[ROOT], true), true);
+    assert_eq!(settled(&shadows, session(1), &root(ROOT)), RootReadiness::Ready);
+    let line = shadows.open_lines(session(1), record(1), &[root(ROOT)]);
+    let written = write(&tree, &file_events, "out.txt", b"out");
+    let processes = LineProcesses {
+        group: Some(77),
+        envelopes: Vec::new(),
+    };
+    let id = close_lines(line, &processes).checkpoint.unwrap().id;
+    let created = events.created.lock().unwrap();
+    let checkpoint = &created.iter().find(|(_, checkpoint)| checkpoint.id == id).unwrap().1;
+    assert_eq!(
+        checkpoint.possibly_torn,
+        [(root(&written.to_string_lossy()), TornReason::Unchecked)].into()
+    );
 }

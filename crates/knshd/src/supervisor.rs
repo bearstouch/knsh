@@ -236,6 +236,9 @@ struct RunningEvents<'a> {
     control: &'a LineControl,
     /// Keeps the line's process group with its session's (KNSH-054).
     sessions: &'a Sessions,
+    /// The line's process group once spawned: at its end, members still alive are asked which files they hold for
+    /// writing (FR-CKP-24, KNSH-085).
+    group: Mutex<Option<ProcessGroupId>>,
 }
 
 impl RunningEvents<'_> {
@@ -247,6 +250,7 @@ impl RunningEvents<'_> {
 
 impl LineEvents for RunningEvents<'_> {
     fn keep(&self, group: ProcessGroupId, processes: Arc<dyn Processes>) -> Kept {
+        *self.group.lock().unwrap_or_else(PoisonError::into_inner) = Some(group);
         self.sessions
             .keep_group(self.session_id, group, processes, GroupKind::Line)
     }
@@ -868,6 +872,7 @@ impl Supervisor for Lifecycle {
             started_at,
             control: &control,
             sessions: &self.parts.sessions,
+            group: Mutex::new(None),
         };
         let plan = SpawnPlan {
             record_id,
@@ -886,7 +891,11 @@ impl Supervisor for Lifecycle {
         // Decision 16: the line has been reaped; its file events are flushed with a marker before it is recorded, the
         // one place the decision path waits for the watcher (bounded per root). Only then is its attribution read,
         // so every change it made has been attributed (KNSH-081).
-        let closed = Sessions::close_checkpoint_lines(checkpoint_line);
+        // FR-CKP-24 (decision 17): the group's members that outlive the line, and the session's envelopes, are asked
+        // which files they still hold for writing; those files are possibly torn.
+        let group = *events.group.lock().unwrap_or_else(PoisonError::into_inner);
+        let processes = self.parts.sessions.line_processes(session_id, group);
+        let closed = Sessions::close_checkpoint_lines(checkpoint_line, &processes);
         // KNSH-082: counted when the line touched a protected root, null otherwise. Read before `closed.uncertain` is
         // consumed below.
         let files_changed = closed
