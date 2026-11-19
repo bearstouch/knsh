@@ -404,7 +404,7 @@ pub(crate) mod tests {
         for _ in 0..3 {
             hello(&dispatcher, Endpoint::User, PARAMS).unwrap();
         }
-        assert_eq!(after_probe, 2, "os version and file events, once each");
+        assert_eq!(after_probe, 3, "os version, file events and secrets, once each");
         assert_eq!(system.calls(), after_probe, "hello never probes again");
         assert_eq!(machine.processes.scripted.spawned().len(), 1, "knsh-exec ran once");
         let result = hello(&dispatcher, Endpoint::User, PARAMS).unwrap();

@@ -44,6 +44,8 @@ pub enum CoreError {
     InvalidAgentId,
     /// A profile name was empty, too long or held a character outside `[A-Za-z0-9._-]`.
     InvalidProfileName,
+    /// A secret name was empty, too long or held a character outside `[A-Za-z0-9._-]` (KNSH-089).
+    InvalidSecretName,
     /// An agent actor had no `agent_id` (`specs/05-models/session.md`).
     AgentIdRequired,
     /// A human actor carried an `agent_id`, which only agents have.
@@ -121,6 +123,7 @@ impl fmt::Display for CoreError {
             Self::InvalidDecision => f.write_str("decision verdict must be allow, deny or rewrite"),
             Self::InvalidAgentId => f.write_str("agent_id must be 1 to 64 characters from [A-Za-z0-9._-]"),
             Self::InvalidProfileName => f.write_str("profile name must be 1 to 64 characters from [A-Za-z0-9._-]"),
+            Self::InvalidSecretName => f.write_str("secret name must be 1 to 64 characters from [A-Za-z0-9._-]"),
             Self::AgentIdRequired => f.write_str("an agent session requires actor.agent_id"),
             Self::AgentIdForHuman => f.write_str("a human session must not have actor.agent_id"),
             Self::EnvelopeForHuman => f.write_str("a human session cannot have an envelope"),

@@ -24,15 +24,21 @@
 //! the same way. Until the user removes such an item (`security delete-generic-password -s knsh.authority-trust`),
 //! no authority is trusted.
 //!
+//! Named secrets (KNSH-089, FR-SEC-01) are generic-password items under service [`SECRET_SERVICE`] (`knsh`), with
+//! the secret's name as the account. `knshd` only ever reads them ([`KeychainSecrets`]); the user adds them. Rule 1
+//! applies: an item `knshd`'s code is not trusted to read comes back as an error, never a dialog, and is reported as
+//! access denied. A missing item is "not found". Either way the caller has no value and fails closed.
+//!
 //! The data-protection keychain is not used: it needs `knshd` inside an app bundle with a provisioning profile.
 
 use std::ffi::c_void;
 
-use knsh_core::{MAX_TRUST_RECORD_LEN, TrustedAuthority};
+use knsh_core::{MAX_SECRET_VALUE_LEN, MAX_TRUST_RECORD_LEN, SecretName, TrustedAuthority};
 
 use crate::control::TrustStore;
 use crate::error::{Operation, PlatformError};
 use crate::presence::Authenticated;
+use crate::secret::{SecretStore, SecretValue};
 use crate::signing::{SIGNING_KEY_LEN, SigningKey, SigningKeyStore};
 
 /// The item's service: names the engine and what the item is for.
@@ -44,6 +50,9 @@ pub const SIGNING_KEY_ACCOUNT: &str = "hmac-sha256-v1";
 pub const TRUST_SERVICE: &str = "knsh.authority-trust";
 /// The trust record item's account: the record's format version, as in its header line.
 pub const TRUST_ACCOUNT: &str = "v1";
+
+/// Named secrets' service (KNSH-089, `specs/09-reference/file-locations.md`); the account is the secret's name.
+pub const SECRET_SERVICE: &str = "knsh";
 
 /// `errSecSuccess`.
 const ERR_SEC_SUCCESS: i32 = 0;
@@ -385,6 +394,73 @@ impl SigningKeyStore for KeychainSigningKey {
     }
 }
 
+/// Named secrets as Keychain items: service [`SECRET_SERVICE`], account the secret's name (module documentation,
+/// KNSH-089). Read only, stateless: every call queries the Keychain, so a secret the user changes or removes takes
+/// effect at the next lookup.
+#[derive(Debug, Clone)]
+pub struct KeychainSecrets {
+    service: String,
+}
+
+impl KeychainSecrets {
+    /// The engine's secrets: service [`SECRET_SERVICE`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_service(SECRET_SERVICE)
+    }
+
+    /// Secrets under another service: for a manual check against throwaway items, never the engine's.
+    #[must_use]
+    pub fn with_service(service: &str) -> Self {
+        Self {
+            service: service.to_owned(),
+        }
+    }
+}
+
+impl Default for KeychainSecrets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SecretStore for KeychainSecrets {
+    fn read(&self, name: &SecretName) -> Result<SecretValue, PlatformError> {
+        match Item::new(&self.service, name.as_str()).read(MAX_SECRET_VALUE_LEN) {
+            // `read` copies the bytes into a vector of exactly their length, moved here without another copy.
+            // An empty item is refused like an unreadable one: `secrets.provide` refuses empty values too.
+            Ok(Some(bytes)) if bytes.is_empty() => Err(PlatformError::SecretAccessDenied { status: None }),
+            Ok(Some(bytes)) => Ok(SecretValue::from_vec(bytes)),
+            Ok(None) => Err(PlatformError::SecretNotFound),
+            Err(PlatformError::Keychain { status, .. }) => {
+                Err(PlatformError::SecretAccessDenied { status: Some(status) })
+            }
+            // `KeychainValueInvalid` (a value that is not data, or larger than the limit) is the only other failure
+            // `Item::read` reports: refused like an unreadable one. Anything else would still mean no value.
+            Err(_) => Err(PlatformError::SecretAccessDenied { status: None }),
+        }
+    }
+}
+
+/// The capability probe's item (KNSH-089): a service and account the engine never creates, so the lookup reads no
+/// real secret.
+const PROBE_SERVICE: &str = "knsh.probe";
+/// See [`PROBE_SERVICE`].
+const PROBE_ACCOUNT: &str = "never-created";
+
+/// Whether the Keychain answers lookups here: one for an item that never exists, with user interaction disabled.
+/// An answer of "not found" (or, should someone have created the item, any item) passes.
+///
+/// # Errors
+///
+/// The Keychain's failure: `secrets` is then reported as `none`.
+pub(super) fn check_reachable() -> Result<(), PlatformError> {
+    match Item::new(PROBE_SERVICE, PROBE_ACCOUNT).read(MAX_SECRET_VALUE_LEN) {
+        Ok(_) | Err(PlatformError::KeychainValueInvalid) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// The authority trust record as a Keychain item (module documentation, FR-AUTH-11). Stateless: every call queries
 /// the Keychain.
 #[derive(Debug, Clone)]
@@ -482,6 +558,20 @@ mod tests {
         };
         store.replace(&second, Authenticated::new()).unwrap();
         assert_eq!(store.read().unwrap(), Some(second));
+    }
+
+    // Manual (KNSH-089, pending): reads a secret the tester added to the login keychain under a throwaway service,
+    // with `knshd`'s test binary allowed to read it:
+    //   security add-generic-password -s knsh.test.secrets -a manual -w test-value -T <this test binary>
+    // An item the binary is not trusted to read must come back as access denied, never a dialog.
+    #[test]
+    #[ignore = "reads the login keychain; manual check only"]
+    fn reads_a_secret_added_to_a_throwaway_service() {
+        let store = KeychainSecrets::with_service("knsh.test.secrets");
+        let name = SecretName::new("manual").unwrap();
+        assert_eq!(store.read(&name).unwrap().expose(), b"test-value");
+        let missing = SecretName::new("never-created").unwrap();
+        assert!(matches!(store.read(&missing), Err(PlatformError::SecretNotFound)));
     }
 
     #[test]

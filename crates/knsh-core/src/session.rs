@@ -20,7 +20,7 @@ pub const MAX_NAME_LEN: usize = 64;
 ///
 /// The narrow alphabet keeps these names safe to place in event payloads, record columns and log lines without
 /// escaping, and rules out look-alike Unicode and control characters coming from an untrusted client.
-fn is_valid_name(s: &str) -> bool {
+pub(crate) fn is_valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= MAX_NAME_LEN
         && s.bytes()

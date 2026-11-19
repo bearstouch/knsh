@@ -29,6 +29,9 @@
 //! - [`MemTrustStore`]: the authority trust record in memory, with read and write failures injected, every call
 //!   counted (KNSH-068).
 //!
+//! - [`MemSecretStore`]: named secrets in memory, with reads denied per name as an `OSStatus`, every read counted
+//!   (KNSH-089).
+//!
 //! - [`FakeCodeSigning`]: the code-signing facts of a control-service peer, scripted and changeable mid-test (a
 //!   peer that exec'd), every inspection counted (KNSH-067).
 //!
@@ -58,6 +61,7 @@ mod probe;
 mod process;
 mod random;
 mod resolver;
+mod secrets;
 mod volumes;
 
 pub use ancestry::FakeProcessTree;
@@ -75,6 +79,7 @@ pub use probe::FakeSystemProbe;
 pub use process::{Script, ScriptedProcesses};
 pub use random::SeededRandom;
 pub use resolver::FakeResolver;
+pub use secrets::MemSecretStore;
 pub use volumes::FakeVolumes;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};

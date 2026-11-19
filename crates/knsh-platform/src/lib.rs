@@ -102,6 +102,13 @@
 //! | [`CodeSigning`] | Signature facts of a message's sender | `SecCodeSigning` (`SecCodeCreateWithXPCMessage`) | `FakeCodeSigning` |
 //! | [`TrustStore`] | Read, create or replace the trust record (KNSH-068) | `KeychainTrustStore` (legacy login keychain) | `MemTrustStore` |
 //!
+//! The `secret` module (KNSH-089) holds secret values: [`SecretValue`] never prints its bytes and zeroes its buffer on
+//! drop. [`SecretStore`] reads a named secret; the engine never writes one.
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`SecretStore`] | Read a named secret (typed not found and access denied) | `KeychainSecrets` (legacy login keychain, service `knsh`) | `MemSecretStore` |
+//!
 //! The `volume` module (KNSH-078) holds the services behind checkpoints: copy-on-write clones, the volume and file
 //! system of a path, file identity and streamed content hashes. Policy about when to clone and where checkpoints
 //! live stays in `knsh-checkpoint`.
@@ -132,7 +139,8 @@
 //! # Boundaries
 //!
 //! One of only two crates allowed to use `unsafe` (with `knsh-exec`), and within it only the `macos` backend and
-//! `sqlite` modules: the crate root denies `unsafe_code` and those modules alone allow it. Every `unsafe` block needs a
+//! `sqlite` modules, plus the one function that zeroes a secret's buffer on drop (`secret`, KNSH-089): the crate root
+//! denies `unsafe_code` and those alone allow it. Every `unsafe` block needs a
 //! `// SAFETY:` comment and every `unsafe fn` a `# Safety` doc section. The only third-party dependency is `libc`,
 //! and no other crate may depend on it (NFR-SUP-02). The workspace dependencies are `knsh-core`, for
 //! [`knsh_core::CanonicalPath`], [`knsh_core::Timestamp`] and [`knsh_core::Ulid`], and `knsh-json`, for the log
@@ -165,6 +173,7 @@
 //! - FR-POL-40, FR-POL-41, FR-POL-42, decision 11 (policy file signatures, Keychain signing key, KNSH-065)
 //! - FR-AUTH-12 – FR-AUTH-14, NFR-SEC-01, decision 13, `specs/06-api/control-service.md`,
 //!   `specs/06-api/wire-format.md#control-service-xpc` (XPC control service with peer verification, KNSH-067)
+//! - FR-SEC-01, decision 11, `specs/05-models/secret.md` (Keychain secret store and zeroed secret values, KNSH-089)
 //! - FR-CKP-01, FR-CKP-09, FR-CKP-35, decision 17 (clones, volumes, file identity and streamed hashes, KNSH-078)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
@@ -189,6 +198,7 @@ pub mod probe;
 mod process;
 mod random;
 mod resolver;
+mod secret;
 mod signing;
 pub mod violation;
 mod volume;
@@ -226,6 +236,7 @@ pub use probe::{ProbeFailure, SystemProbe};
 pub use process::{ExitStatus, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest, Stdio};
 pub use random::Random;
 pub use resolver::{MAX_ADDRESSES, Resolver};
+pub use secret::{SecretStore, SecretValue};
 pub use signing::{
     Mac, PolicySigner, SIGNATURE_LINE_LEN, SIGNATURE_PREFIX, SIGNING_KEY_LEN, SignatureFault, SigningKey,
     SigningKeyStore, constant_time_eq, split_signed, strip_signature,

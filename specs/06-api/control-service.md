@@ -8,7 +8,7 @@ An XPC Mach service (`knsh.control`, final name tied to the signing identity) re
 | `decision.respond` | Answer a `decision.requested` |
 | `session.create`, `session.end`, `session.pause`, `session.resume`, `session.take_control`, `session.release_control`, `session.list` | Create, end, pause, resume, take and release control of any agent session; list every session ([below](#sessions)) |
 | `policy.set`, `policy.get`, `policy.grant`, `policy.grants`, `policy.revoke` | Push and read policy, manage grants ([below](#policy)) |
-| `secrets.provide`, `secrets.revoke` | Time-limited secrets held in memory |
+| `secrets.provide`, `secrets.revoke` | Time-limited secrets held in memory ([below](#secretsprovide)) |
 | `recording.set` | Turn command or output recording on or off for a session ([below](#recordingset)) |
 | `records.query`, `records.output`, `events.subscribe`, `events.unsubscribe`, `checkpoint.*` | Every `user.sock` read and checkpoint method, across all sessions |
 
@@ -244,4 +244,27 @@ output (FR-REC-06). A human session is `-32003`; neither params is `-32602`.
 
 ## `secrets.provide`
 
-Supplies a named secret for a limited time, held only in memory and lost when `knshd` exits. `secrets.revoke` removes it at once.
+Implemented in KNSH-089 (FR-SEC-07). Supplies a named secret for a limited time, held only in `knshd`'s memory and
+lost when it exits. Params: `name` (a [secret](../05-models/secret.md) name: 1 to 64 characters from
+`[A-Za-z0-9._-]`), `value` (a string of 1 byte to 64 KiB) and `duration_s` (1 s to 24 hours). Result:
+`{"name": …, "expires_at": …, "replaced": bool}`, never the value.
+
+- A missing or invalid member is `-32602`, and nothing is stored. Providing a name again replaces its value and
+  expiry (`replaced: true`).
+- At most 256 names may be provided at once; another name is then `-32602`. A replacement is always accepted, and
+  expired secrets free their place.
+- The secret is unavailable from `expires_at` on, or once the same duration has passed on the monotonic clock,
+  whichever comes first, so moving the system clock back never extends it. A wall clock that cannot be read makes
+  every provided secret unavailable. Expired secrets are dropped from memory within about a second, and at every
+  lookup.
+- While it lives, a provided secret takes the place of a Keychain item of the same name.
+- It is never written to the [state store](#state-store) or any other file, and never sent to any client: no method
+  returns a secret value.
+- Without a secret store (`secrets: "none"` in `hello`), both methods are `-32005` naming `secrets`.
+
+## `secrets.revoke`
+
+Implemented in KNSH-089 (FR-SEC-07). Params: `name`. Result: `{"revoked": bool}`, whether a live provided secret of
+that name was removed. It is unavailable from that moment, and its memory is zeroed. Revoking a name that is not
+provided (never, or already expired or revoked) is `{"revoked": false}`, not an error. Keychain items are never
+touched. An invalid name is `-32602`.

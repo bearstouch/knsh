@@ -9,7 +9,8 @@
 //! | `sandbox` | `knsh-exec` applies a deny-write profile and a line's write is observed to fail ([`check_sandbox`]) |
 //! | `file_events` | An `FSEvents` stream is created, started and stopped |
 //! | `platform` | The OS major version from `sysctl` |
-//! | `network_filter`, `secrets` | No backend exists yet: always `none` |
+//! | `network_filter` | No backend exists yet: always `none` |
+//! | `secrets` | A Keychain lookup of an item that never exists answers "not found" (or returns the item, should someone have created it), without a dialog (KNSH-089) |
 //! | `checkpoints` | No root is configured yet: always `{}` |
 //!
 //! Every check is real, bounded by [`PROBE_TIMEOUT`], and any failure (an error, a bad exit, a timeout) reports the
@@ -34,7 +35,8 @@ use knsh_proto::{Capabilities, FileEvents, NetworkFilter, Platform, Sandbox, San
 
 /// How long each check may take. A working check takes milliseconds; the bound only matters when something hangs.
 /// The checks run one after another, and a hung `knsh-exec` gets one more bound to be reaped after it is killed,
-/// so the worst case delays start-up by four times this.
+/// so the worst case delays start-up by five times this (sandbox, its reaping, file events, secrets and platform;
+/// KNSH-089 added the secrets check).
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The probe's profile: everything allowed except writing files. Constant text, no path in it: the probe asks only
@@ -123,14 +125,20 @@ pub(crate) fn probe(probes: &Probes) -> Probed {
         Some(()) => FileEvents::FsEvents,
         None => FileEvents::None,
     };
+    // KNSH-089: the store answers lookups; whether one item can be read is answered per secret (typed not found or
+    // access denied), never by this capability.
+    let secrets = match bounded_check(probes, "secrets", |system| system.check_secrets()) {
+        Some(()) => Secrets::Keychain,
+        None => Secrets::None,
+    };
     let major = bounded_check(probes, "platform", |system| system.os_major_version());
 
     let capabilities = Capabilities {
         sandbox,
-        // No feature is claimed before it exists: the proxy arrives later in phase 3, secrets and checkpoints later.
+        // No feature is claimed before it exists: the proxy arrives later in phase 3, checkpoints later.
         network_filter: NetworkFilter::None,
         file_events,
-        secrets: Secrets::None,
+        secrets,
         checkpoints: BTreeMap::new(),
         // Not probed: the violation reader reports its own state at each `hello` (KNSH-047, `violations.rs`).
         sandbox_violations: SandboxViolations::None,
@@ -588,12 +596,13 @@ pub(crate) mod tests {
         assert_eq!(SandboxProbe::trampoline_beside(Path::new("/")), None);
     }
 
-    // KNSH-014: phase 1 claims no feature before it exists, whatever the machine offers.
+    // KNSH-014: no feature is claimed before it exists, whatever the machine offers. KNSH-089: a Keychain that answers
+    // is reported as `keychain`.
     #[test]
-    fn phase1_reports_unbuilt_backends_as_none() {
+    fn reports_unbuilt_backends_as_none_and_a_working_keychain() {
         let probed = probe(&Machine::working().probes());
         assert_eq!(probed.capabilities.network_filter, NetworkFilter::None);
-        assert_eq!(probed.capabilities.secrets, Secrets::None);
+        assert_eq!(probed.capabilities.secrets, Secrets::Keychain);
         assert!(probed.capabilities.checkpoints.is_empty());
     }
 
@@ -604,13 +613,14 @@ pub(crate) mod tests {
         let probed = probe(&machine.probes());
         assert_eq!(probed.capabilities.sandbox, Sandbox::None);
         assert_eq!(probed.capabilities.file_events, FileEvents::None);
+        assert_eq!(probed.capabilities.secrets, Secrets::None);
         assert_eq!(probed.platform.major(), None);
         assert_eq!(
             probed.platform,
             Platform::this_build(None),
             "an unreadable version is `unknown`, never guessed"
         );
-        assert_eq!(machine.failure_reasons().len(), 3);
+        assert_eq!(machine.failure_reasons().len(), 4);
         for entry in machine.failure_reasons() {
             assert!(!entry.contains(DIR), "no path is logged: {entry}");
         }
@@ -639,6 +649,11 @@ pub(crate) mod tests {
             self.hang();
             Ok(())
         }
+
+        fn check_secrets(&self) -> Result<(), PlatformError> {
+            self.hang();
+            Ok(())
+        }
     }
 
     // KNSH-014: probing is bounded; a hanging probe reports `none` (fake clock: no real waiting for knsh-exec).
@@ -655,6 +670,7 @@ pub(crate) mod tests {
         let probed = probe(&machine.probes());
         assert_eq!(probed.capabilities.sandbox, Sandbox::None);
         assert_eq!(probed.capabilities.file_events, FileEvents::None);
+        assert_eq!(probed.capabilities.secrets, Secrets::None);
         assert_eq!(probed.platform.major(), None);
         // The hung knsh-exec was killed, not left running, and its files removed.
         assert_eq!(machine.processes.scripted.signals().len(), 1);

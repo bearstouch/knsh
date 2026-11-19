@@ -54,6 +54,10 @@ impl SystemProbe for SystemProbes {
     fn check_file_events(&self) -> Result<(), PlatformError> {
         check_fsevents()
     }
+
+    fn check_secrets(&self) -> Result<(), PlatformError> {
+        super::keychain::check_reachable()
+    }
 }
 
 /// The major version from a product version such as `b"15.1.1\0"`: the digits before the first dot (or the end).

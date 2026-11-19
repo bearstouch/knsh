@@ -12,6 +12,7 @@ pub struct FakeSystemProbe {
     // Fixed at construction, so no lock is needed: only the call count changes.
     os_major: Result<u32, PlatformError>,
     file_events: Result<(), PlatformError>,
+    secrets: Result<(), PlatformError>,
     calls: AtomicUsize,
 }
 
@@ -22,6 +23,7 @@ impl FakeSystemProbe {
         Self {
             os_major: Ok(major),
             file_events: Ok(()),
+            secrets: Ok(()),
             calls: AtomicUsize::new(0),
         }
     }
@@ -38,11 +40,16 @@ impl FakeSystemProbe {
                 operation: Operation::FileEvents,
                 errno: libc::EIO,
             }),
+            // `errSecInteractionNotAllowed`: what a keychain that cannot be used without a dialog answers.
+            secrets: Err(PlatformError::Keychain {
+                operation: Operation::KeychainRead,
+                status: -25308,
+            }),
             calls: AtomicUsize::new(0),
         }
     }
 
-    /// How many checks have been run, of either kind.
+    /// How many checks have been run, of any kind.
     #[must_use]
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
@@ -58,5 +65,10 @@ impl SystemProbe for FakeSystemProbe {
     fn check_file_events(&self) -> Result<(), PlatformError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.file_events
+    }
+
+    fn check_secrets(&self) -> Result<(), PlatformError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.secrets
     }
 }

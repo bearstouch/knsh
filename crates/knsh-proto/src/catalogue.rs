@@ -312,7 +312,8 @@ pub struct Catalogue {
 /// KNSH-053), `session.start_agent` (KNSH-056), `policy.read` and `policy.edit` (KNSH-065), `approval.*` (KNSH-066),
 /// `authority.trust` and `authority.register` (KNSH-068), `decision.respond` (KNSH-069), the control service's
 /// `session.*`, `policy.*` and `recording.set` methods (KNSH-071), and `profile.use` (KNSH-072). Phase 3 adds the
-/// `checkpoint.*` methods (KNSH-088); the rest arrive with their stories.
+/// `checkpoint.*` methods (KNSH-088) and `secrets.provide` and `secrets.revoke` (KNSH-089); the rest arrive with
+/// their stories.
 const ENGINE_METHODS: &[MethodSpec] = &[
     // Handshake (specs/06-api/handshake.md).
     MethodSpec::planned("hello", Endpoints::ALL).available(),
@@ -413,8 +414,12 @@ const ENGINE_METHODS: &[MethodSpec] = &[
     MethodSpec::planned("session.release_control", Endpoints::CONTROL).available(),
     MethodSpec::planned("policy.set", Endpoints::CONTROL).available(),
     MethodSpec::planned("policy.get", Endpoints::CONTROL).available(),
-    MethodSpec::planned("secrets.provide", Endpoints::CONTROL).requires(Backend::Secrets),
-    MethodSpec::planned("secrets.revoke", Endpoints::CONTROL).requires(Backend::Secrets),
+    MethodSpec::planned("secrets.provide", Endpoints::CONTROL)
+        .requires(Backend::Secrets)
+        .available(),
+    MethodSpec::planned("secrets.revoke", Endpoints::CONTROL)
+        .requires(Backend::Secrets)
+        .available(),
     MethodSpec::planned("recording.set", Endpoints::CONTROL).available(),
 ];
 

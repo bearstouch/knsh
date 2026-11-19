@@ -134,6 +134,9 @@ mod state;
 // The authority's session and recording methods on the control service (KNSH-071).
 #[cfg(target_os = "macos")]
 mod supervise;
+// The secrets broker (KNSH-089): Keychain secrets and memory-only secrets the authority provides.
+#[cfg(target_os = "macos")]
+mod secrets;
 // Pause, resume and human control (KNSH-054): owned by the session registry.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod holds;
@@ -591,7 +594,8 @@ struct AuthoritySupervision {
     profiles: crate::policy::ProfileLoader,
     /// The live grants, saved in the state store; every line is evaluated with them.
     grants: std::sync::Arc<grants::GrantStore>,
-    /// The control service's `session.*`, `recording.set` and `policy.*` handlers, and `profile.use` (KNSH-072).
+    /// The control service's `session.*`, `recording.set`, `policy.*` and `secrets.*` handlers, and `profile.use`
+    /// (KNSH-072).
     handlers: dispatch::Handlers,
 }
 
@@ -659,11 +663,34 @@ fn authority_supervision(
         })
         .handlers(),
     );
+    // `secrets.provide` and `secrets.revoke` (KNSH-089).
+    handlers.extend(secret_broker(clock, log).handlers());
     AuthoritySupervision {
         profiles,
         grants,
         handlers,
     }
+}
+
+/// The secrets broker (KNSH-089): Keychain items under service `knsh`, and secrets the authority provides, held in
+/// memory only and dropped as they expire (FR-SEC-07).
+#[cfg(target_os = "macos")]
+fn secret_broker(
+    clock: &std::sync::Arc<knsh_platform::macos::SystemClock>,
+    log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+) -> std::sync::Arc<secrets::SecretBroker> {
+    use std::sync::Arc;
+
+    let broker = secrets::SecretBroker::new(Arc::new(knsh_platform::macos::KeychainSecrets::new()), clock.clone());
+    // Without the watcher, expired secrets are still refused; they only stay in memory until the next access.
+    if broker.watch(secrets::PURGE_PERIOD).is_err() {
+        log.log(
+            knsh_platform::Level::Error,
+            "secret expiry watcher unavailable: expired secrets are refused and dropped at the next access",
+            &[],
+        );
+    }
+    broker
 }
 
 /// `policy.read` and `policy.edit` for `knsh policy edit`: knshd shows the Touch ID or password prompt itself before
