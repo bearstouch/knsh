@@ -24,8 +24,9 @@ every build works with `--offline`.
 
 ```sh
 cargo build --workspace --offline --locked              # must be warning-free
-cargo test --workspace --offline                        # all unit and integration tests
-cargo test -p knsh-bash                                 # one crate
+cargo test --workspace --offline --lib --bins          # normal suite: unit tests only (~2 min)
+cargo test --workspace --offline                        # full suite: adds tests/ integration targets (on demand only)
+cargo test -p knsh-bash --lib                           # one crate's unit tests
 cargo fmt --all                                         # format (config: rustfmt.toml)
 cargo fmt --all --check                                 # must print nothing
 cargo clippy --workspace --all-targets -- -D warnings   # lint: must be clean
@@ -33,7 +34,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps   # docs must build w
 cargo +nightly fuzz run <target>                        # fuzz a parser (fuzz/, test-only)
 ```
 
-Run format, lint, build, doc and test before every commit. CI also runs licence, advisory and duplicate-version checks
+**Two test suites.** The **normal suite** (`--lib --bins`, unit tests next to the code) is the default: run it
+while iterating and before every commit; it must finish within 5 minutes. The **full suite** (`cargo test
+--workspace`) also runs each crate's `tests/` integration targets, which drive real APFS, FSEvents and processes
+and take minutes (for example `knsh-checkpoint`'s `watch_macos` and `shadow_macos`). Run the full suite **only when
+the user asks for it**; otherwise record it as not run (pending) in the commit or PR. While iterating, prefer the
+changed crates' unit tests (`cargo test -p <crate> --lib`). Never start two cargo runs at once: they wait on the
+same build lock. Known flake: `knshd` `hooks::tests::timeout_denies_and_kills_hook` can fail under full load;
+rerun it alone before treating it as a regression.
+
+Run format, lint, build, doc and the normal test suite before every commit. CI also runs licence, advisory and duplicate-version checks
 (`cargo deny`). These tools are CI-only and never shipped.
 
 ## Workspace layout
@@ -129,7 +139,7 @@ Every crate is code that runs with the user's privileges inside a security tool.
 1. Read the relevant spec pages. For a behaviour change or a new feature, update the spec first (or alongside the
    code), adding new requirement IDs with acceptance checks.
 2. Implement with tests (observable behaviour and failure safety) and inline docs.
-3. Run format, lint, build, doc and test. All must be clean.
+3. Run format, lint, build, doc and the normal test suite (the full suite only on request). All must be clean.
 4. Launch an independent review agent with fresh eyes. It looks at correctness, spec gaps, security (fail-closed,
    injection, races, leaks), data loss, regressions and missing tests. It fixes crucial issues, then reruns step 3.
 5. Record what was verified and what is still pending in the commit or PR. Update `specs/` when a limit or decision
