@@ -71,12 +71,17 @@ fn standard_descriptors(wanted: &Stdio) -> Result<[std::process::Stdio; 3], Plat
     }
 }
 
-/// Keeps `request.inherit` open in the child under their own numbers: `FD_CLOEXEC` is cleared after the fork, in the
-/// child only, so no other child spawned concurrently by this multithreaded process can inherit them.
+/// Sets up the child's descriptors above stdio, after the fork and in the child only.
+///
+/// 1. Closes every descriptor that is open without `FD_CLOEXEC` and not listed in `request.inherit`. macOS has no
+///    `pipe2` or `accept4`, so std creates pipes and sockets first and sets `FD_CLOEXEC` in a second call. A fork by
+///    another thread between the two calls would hand that descriptor to this child for its whole life: a hook would
+///    hold a stranger's stdout pipe open (its reader never sees end of file) and an agent command would receive a
+///    descriptor from another session. A descriptor that already has `FD_CLOEXEC` (including std's own pipe that
+///    reports a failed `exec`) is left alone; `exec` closes it.
+/// 2. Keeps `request.inherit` open under their own numbers by clearing their `FD_CLOEXEC`, so no other child spawned
+///    concurrently by this multithreaded process can inherit them.
 fn inherit(command: &mut Command, request: &SpawnRequest) -> Result<(), PlatformError> {
-    if request.inherit.is_empty() {
-        return Ok(());
-    }
     let fds: Vec<i32> = request.inherit.iter().map(AsRawFd::as_raw_fd).collect();
     // Stdio is set up by the command itself; a number below 3 here would be silently replaced.
     if fds.iter().any(|&fd| fd < 3) {
@@ -85,11 +90,48 @@ fn inherit(command: &mut Command, request: &SpawnRequest) -> Result<(), Platform
             errno: libc::EBADF,
         });
     }
-    // SAFETY: the closure runs in the forked child before `exec`. It only calls `fcntl`, which is async-signal-safe,
-    // and reads `fds`, allocated before the fork; it allocates nothing and takes no lock. The descriptors are open:
-    // `request` (and so every `SharedFd`) outlives the spawn, and the child inherited them at the fork.
+    // Read before the fork: no descriptor number in the child can reach the table size.
+    // SAFETY: `getdtablesize` has no preconditions and touches no memory.
+    let table_size = unsafe { libc::getdtablesize() };
+    // The child lists the descriptors really open (`PROC_PIDLISTFDS`) rather than probing every number below the
+    // table size, which costs about 10 ms per spawn when the soft limit is high (a terminal or cargo raises it to
+    // `kern.maxfilesperproc`). The buffer is allocated here, before the fork, with room to spare; a list that fills
+    // it may be cut short, and the child then falls back to probing every number.
+    let mut listed = vec![
+        libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0
+        };
+        open_descriptor_capacity()
+    ];
+    let listed_bytes = libc::c_int::try_from(listed.len() * size_of::<libc::proc_fdinfo>()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: the closure runs in the forked child before `exec`. It only calls `getpid`, `proc_pidinfo` (a thin
+    // wrapper of the `proc_info` system call: no lock, no allocation), `fcntl` and `close`, and reads or writes only
+    // memory allocated before the fork (`fds`, `listed`, whose length in bytes `listed_bytes` never exceeds). The
+    // listed descriptors are open: `request` (and so every `SharedFd`) outlives the spawn, and the child inherited
+    // them at the fork.
     unsafe {
         command.pre_exec(move || {
+            let got = libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDLISTFDS,
+                0,
+                listed.as_mut_ptr().cast(),
+                listed_bytes,
+            );
+            match usize::try_from(got) {
+                Ok(bytes) if got > 0 && got < listed_bytes => {
+                    let count = bytes / size_of::<libc::proc_fdinfo>();
+                    for entry in listed.iter().take(count) {
+                        close_if_leaked(entry.proc_fd, &fds);
+                    }
+                }
+                Ok(_) | Err(_) => {
+                    for fd in 3..table_size {
+                        close_if_leaked(fd, &fds);
+                    }
+                }
+            }
             for &fd in &fds {
                 if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
@@ -99,6 +141,30 @@ fn inherit(command: &mut Command, request: &SpawnRequest) -> Result<(), Platform
         });
     }
     Ok(())
+}
+
+/// Entries for the child's list of open descriptors: the parent's count now, plus room for those other threads open
+/// before the fork. At least 1,024.
+fn open_descriptor_capacity() -> usize {
+    // SAFETY: with a null buffer, `proc_pidinfo` writes nothing and returns the bytes a list would need now.
+    let needed = unsafe { libc::proc_pidinfo(libc::getpid(), libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    usize::try_from(needed).unwrap_or(0) / size_of::<libc::proc_fdinfo>() + 1024
+}
+
+/// In the forked child: closes `fd` if it is above stdio, open without `FD_CLOEXEC` and not one of `keep`.
+/// Async-signal-safe: `fcntl` and `close` only, and `keep` was allocated before the fork.
+fn close_if_leaked(fd: i32, keep: &[i32]) {
+    if fd < 3 || keep.contains(&fd) {
+        return;
+    }
+    // SAFETY: `fcntl` and `close` take plain integers and touch no memory; a number that is not open makes `fcntl`
+    // return -1, and nothing is closed.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags != -1 && flags & libc::FD_CLOEXEC == 0 {
+            libc::close(fd);
+        }
+    }
 }
 
 /// Converts the standard status of a reaped child.
@@ -371,6 +437,33 @@ mod tests {
         text.clear();
         extra_read.read_to_string(&mut text).unwrap();
         assert_eq!(text, "extra\n");
+    }
+
+    // CLAUDE.md "Concurrency": a descriptor another thread created without `FD_CLOEXEC` yet (macOS has no `pipe2`,
+    // so std sets the flag in a second step) must not reach the child, or the child holds a stranger's pipe open.
+    #[test]
+    fn does_not_leak_descriptors_caught_without_close_on_exec() {
+        use std::io::Read;
+
+        let (mut out_read, out_write) = std::io::pipe().unwrap();
+        let out = SharedFd::new(out_write.into());
+        let null = SharedFd::new(std::fs::File::open("/dev/null").unwrap().into());
+        let (_raced_read, raced_write) = std::io::pipe().unwrap();
+        let raced_fd = raced_write.as_raw_fd();
+        // SAFETY: `fcntl` on a descriptor this test owns; it touches no memory. This is the state a concurrent
+        // thread's descriptor is in between `pipe()` and setting `FD_CLOEXEC`.
+        assert_eq!(unsafe { libc::fcntl(raced_fd, libc::F_SETFD, 0) }, 0);
+        let mut request = SpawnRequest::new("/bin/sh").arg("-c").arg(format!(
+            "if [ -e /dev/fd/{raced_fd} ]; then echo leaked; else echo closed; fi"
+        ));
+        request.stdio = Stdio::Passed(Box::new([null.clone(), out, null]));
+        let processes = SystemProcesses::new();
+        let group = processes.spawn(&request).unwrap();
+        assert_eq!(processes.wait(group), Ok(ExitStatus::Exited(0)));
+        drop(request);
+        let mut text = String::new();
+        out_read.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "closed\n");
     }
 
     #[test]
