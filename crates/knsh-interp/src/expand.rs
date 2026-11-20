@@ -1,16 +1,25 @@
-//! The expansion engine: tilde, parameter and arithmetic expansion of a word, in bash 5.2's order (KNSH-097;
-//! NFR-COMPAT-02).
+//! The expansion engine: tilde, parameter and arithmetic expansion of a word (KNSH-097), then word splitting,
+//! pathname expansion and quote removal (KNSH-098), in bash 5.2's order (NFR-COMPAT-02).
 //!
 //! A word is first turned into [`Part`]s (by [`crate::word::parts`] from the parser's segments, or by
-//! [`crate::scan`] for the words inside `${…}`). Tilde expansion rewrites the leading literal text. Each part is
-//! then expanded into [`Fields`]: characters marked as quoted or not and as expanded or literal. `"$@"` and the
-//! unquoted `$@` and `$*` start a new field for each positional parameter after the first, as bash does.
+//! [`crate::scan`] for the words inside `${…}`); brace expansion ([`crate::brace`]) has already made one word into
+//! several where it applies. Tilde expansion rewrites the leading literal text. Each part is then expanded into
+//! [`Fields`]: characters marked as quoted or not and as expanded or literal. `"$@"` and the unquoted `$@` and `$*`
+//! start a new field for each positional parameter after the first, as bash does.
 //!
-//! What happens to the fields depends on where the word is ([`Context`]). As arguments, a field that is empty and
-//! was never quoted is removed (an unquoted `$x` with `x` empty passes no argument). Word splitting and pathname
-//! expansion belong to KNSH-098, so an unquoted expanded character of `IFS`, or a field bash would match against
-//! file names, is refused ([`Unsupported::WordSplitting`], [`Unsupported::PathnameExpansion`]): when neither is
-//! present, splitting and matching would leave the field unchanged, so the result is bash's.
+//! What happens to the fields depends on where the word is ([`Context`]). As arguments:
+//!
+//! 1. Word splitting: the unquoted characters an expansion produced that are in `IFS` (space, tab and newline when it
+//!    is unset; nothing splits when it is empty) separate fields. A run of `IFS` white space (space, tab, newline)
+//!    is one separator and is dropped at the start and end; every other `IFS` character is a separator of its own,
+//!    together with the white space around it, so two in a row delimit an empty field. Literal text never splits.
+//! 2. A field that is empty and was never quoted is removed (an unquoted `$x` with `x` empty passes no argument). A
+//!    quoted empty string in a word that is only partly quoted (`""$x`) is dropped before splitting, as bash drops
+//!    it, so it only keeps the word when the word expands to nothing at all.
+//! 3. Pathname expansion ([`crate::glob`]), unless `set -f`: a field with an unquoted `*`, `?`, `[…]` (or, with
+//!    `extglob`, a group) becomes the sorted file names it matches; with none, it stays as written, is removed
+//!    (`nullglob`), or abandons the command with bash's `no match` error (`failglob`).
+//! 4. Quote removal: what is left are the characters themselves.
 //!
 //! Bash's own expansion errors come back as [`ExpandError::Discard`] (bash abandons the command and the rest of its
 //! line: a bad substitution, an arithmetic error, an invalid indirection, `${1:=x}`) or [`ExpandError::Fatal`]
@@ -20,15 +29,16 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 
 use knsh_bash::Span;
-use knsh_platform::UserHomes;
+use knsh_platform::{Collation, Fs, UserHomes};
 
 use crate::arith::{self, Failure};
 use crate::error::{InterpError, Unsupported};
+use crate::glob;
 use crate::param::{self, CaseKind, DefaultKind, Name, Op, Parsed, ReplaceMode};
-use crate::pattern;
+use crate::pattern::{self, Flags, Pattern};
 use crate::scan::{self, Mode, Part};
 use crate::state::{DEFAULT_IFS, ShellState, is_always_unemulated};
-use crate::word::{self, WordChar, assignment_value_start, has_glob};
+use crate::word::{self, WordChar, assignment_value_start};
 
 /// Deepest nesting of `${…}` and `$((…))` inside one another. The parser's own limits keep real scripts far below
 /// it; past it the run fails with [`InterpError::DepthExceeded`] rather than overflowing the stack.
@@ -151,6 +161,10 @@ impl Value {
 pub(crate) struct Expander<'a> {
     state: &'a mut ShellState,
     homes: &'a dyn UserHomes,
+    /// Where pathname expansion reads directories.
+    fs: &'a dyn Fs,
+    /// How pathname expansion results are sorted.
+    collation: &'a dyn Collation,
     /// The text every span indexes.
     source: &'a str,
     /// The assignments of the command being expanded (`a=1 b=$a cmd`), seen before the shell's variables.
@@ -160,16 +174,21 @@ pub(crate) struct Expander<'a> {
 }
 
 impl<'a> Expander<'a> {
-    /// An expander over `state`, reading spans of `source`, with `overlay` as the command's own assignments.
+    /// An expander over `state`, finding home directories through `homes` and file names through `fs`, sorting them
+    /// with `collation`, reading spans of `source`, with `overlay` as the command's own assignments.
     pub(crate) fn new(
         state: &'a mut ShellState,
         homes: &'a dyn UserHomes,
+        fs: &'a dyn Fs,
+        collation: &'a dyn Collation,
         source: &'a str,
         overlay: &'a [(String, OsString)],
     ) -> Self {
         Self {
             state,
             homes,
+            fs,
+            collation,
             source,
             overlay,
             depth: 0,
@@ -178,32 +197,108 @@ impl<'a> Expander<'a> {
 
     // ---- Words, by context ----
 
-    /// The arguments `parts` (a word spanning `span`) expand into: empty unquoted fields removed, a field bash would
-    /// split or match against file names refused.
+    /// The arguments `parts` (one word, after brace expansion, spanning `span`) expand into: split on `IFS`, empty
+    /// unquoted fields removed, matched against file names, quotes removed.
     pub(crate) fn arguments(&mut self, parts: &[Part], span: Span) -> Result<Vec<String>> {
         let parts = self.tilde_word(parts, true, span)?;
         let mut fields = Fields::new();
         self.expand(&parts, false, false, &mut fields)?;
         let ifs = self.ifs();
+        let options = self.state.options().clone();
+        let mut globbing: Option<glob::Options> = None;
         let mut out = Vec::new();
-        for field in fields.list {
+        for mut field in fields.list.into_iter().flat_map(|field| split(field, &ifs)) {
             if field.chars.is_empty() && !field.quoted {
                 continue;
             }
-            let refuse = |feature| ExpandError::Interp(InterpError::Unsupported { feature, span });
-            if field
-                .chars
-                .iter()
-                .any(|c| c.expanded && !c.quoted && ifs.contains(c.ch))
-            {
-                return Err(refuse(Unsupported::WordSplitting));
+            // Bash quotes an unquoted literal character that is in `IFS` as it reads the word (`expand_word_internal`
+            // adds it with `CTLESC`), so with `IFS='*'` a literal `*` matches no file name.
+            for c in &mut field.chars {
+                if !c.expanded && !c.quoted && ifs.contains(c.ch) {
+                    c.quoted = true;
+                }
             }
-            if has_glob(&field.chars) {
-                return Err(refuse(Unsupported::PathnameExpansion));
+            let text: String = field.chars.iter().map(|c| c.ch).collect();
+            if options.noglob || !pattern::has_glob(&field.chars, options.extglob) {
+                out.push(text);
+                continue;
             }
-            out.push(field.chars.iter().map(|c| c.ch).collect());
+            let glob_options = match &globbing {
+                Some(glob_options) => glob_options,
+                None => globbing.insert(self.glob_options(span)?),
+            };
+            let mut matches = glob::glob(self.fs, self.state.cwd(), &field.chars, glob_options, span)?;
+            if !matches.is_empty() {
+                // Bash sorts with `strcoll`; a locale the system lacks leaves the C order, as in bash.
+                let locale = self.collation_locale(span)?;
+                self.collation.sort(&locale, &mut matches);
+                out.extend(matches);
+            } else if options.failglob {
+                return Err(ExpandError::Discard(format!("no match: {text}")));
+            } else if !options.nullglob {
+                out.push(text);
+            }
         }
         Ok(out)
+    }
+
+    /// How pathname expansion matches names: the `shopt` options, and the patterns of a non-empty `GLOBIGNORE`.
+    fn glob_options(&self, span: Span) -> Result<glob::Options> {
+        let options = self.state.options();
+        let ignore = self
+            .variable("GLOBIGNORE")
+            .map_err(|feature| InterpError::Unsupported { feature, span })?
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                let flags = Flags {
+                    extglob: options.extglob,
+                    nocase: options.nocaseglob,
+                };
+                value
+                    .split(':')
+                    .map(|pattern| {
+                        let chars: Vec<WordChar> = pattern
+                            .chars()
+                            .map(|ch| WordChar {
+                                ch,
+                                quoted: false,
+                                expanded: false,
+                            })
+                            .collect();
+                        Pattern::new(&chars, flags)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(glob::Options {
+            dotglob: options.dotglob,
+            nocaseglob: options.nocaseglob,
+            globstar: options.globstar,
+            extglob: options.extglob,
+            ignore,
+        })
+    }
+
+    /// The locale bash collates in: the first of `LC_ALL`, `LC_COLLATE` and `LANG` that is set and not empty, or
+    /// the C locale.
+    fn collation_locale(&self, span: Span) -> Result<String> {
+        for name in ["LC_ALL", "LC_COLLATE", "LANG"] {
+            let value = self
+                .variable(name)
+                .map_err(|feature| InterpError::Unsupported { feature, span })?;
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                return Ok(value);
+            }
+        }
+        Ok("C".to_owned())
+    }
+
+    /// How `case` patterns and the pattern operators of `${…}` are read: with `extglob` when it is on.
+    pub(crate) fn pattern_flags(&self) -> Flags {
+        Flags {
+            extglob: self.state.options().extglob,
+            nocase: false,
+        }
     }
 
     /// The single string `parts` expand into where bash neither splits nor matches file names (a `case` subject, a
@@ -310,12 +405,12 @@ impl<'a> Expander<'a> {
     /// The fields of a word spanning `span` joined into one, where bash does not split: by single spaces. An
     /// unquoted `$*` or `$@` with several parameters is joined there with the first character of `IFS` or a space
     /// depending on the context and bash's version (bash 3.2 joins `x=$*` with `:` but `${x:?$*}` with a space when
-    /// `IFS` is `:`), so unless that character is a space, which every form agrees on, it is refused with word
-    /// splitting (KNSH-098).
+    /// `IFS` is `:`), so unless that character is a space, which every form agrees on, it is refused
+    /// ([`Unsupported::UnsplitJoin`]).
     fn join(&self, fields: Fields, span: Span) -> Result<Vec<WordChar>> {
         if fields.unquoted_breaks && !self.ifs().starts_with(' ') {
             return Err(InterpError::Unsupported {
-                feature: Unsupported::WordSplitting,
+                feature: Unsupported::UnsplitJoin,
                 span,
             }
             .into());
@@ -414,10 +509,14 @@ impl<'a> Expander<'a> {
         })
     }
 
-    /// `$-`: the option letters of a shell started as `bash -c` (`h` hashing, `B` brace expansion, `c`), with `u`
-    /// under `set -u`, in bash's order.
+    /// `$-`: the option letters of a shell started as `bash -c` (`h` hashing, `B` brace expansion, `c`), with `f`
+    /// under `set -f` and `u` under `set -u`, in bash's order.
     fn flags(&self) -> String {
-        let mut flags = String::from("h");
+        let mut flags = String::new();
+        if self.state.options().noglob {
+            flags.push('f');
+        }
+        flags.push('h');
         if self.state.options().nounset {
             flags.push('u');
         }
@@ -534,7 +633,7 @@ impl<'a> Expander<'a> {
                 pattern,
             } => {
                 let value = self.require(value, target, label)?;
-                let pattern = self.pattern_word(*pattern)?;
+                let pattern = Pattern::new(&self.pattern_word(*pattern)?, self.pattern_flags());
                 value
                     .map(|value| value.map(|text| Ok(remove(text, &pattern, *suffix, *longest))))
                     .transpose()?
@@ -545,7 +644,7 @@ impl<'a> Expander<'a> {
                 replacement,
             } => {
                 let value = self.require(value, target, label)?;
-                let pattern = self.pattern_word(*pattern)?;
+                let pattern = Pattern::new(&self.pattern_word(*pattern)?, self.pattern_flags());
                 let replacement = match replacement {
                     Some(span) => self.pattern_word(*span)?,
                     None => Vec::new(),
@@ -556,7 +655,7 @@ impl<'a> Expander<'a> {
             }
             Op::Case { kind, all, pattern } => {
                 let value = self.require(value, target, label)?;
-                let pattern = self.pattern_word(*pattern)?;
+                let pattern = Pattern::new(&self.pattern_word(*pattern)?, self.pattern_flags());
                 value
                     .map(|value| value.map(|text| Ok(modify_case(text, &pattern, *kind, *all))))
                     .transpose()?
@@ -877,6 +976,51 @@ impl arith::Variables for ArithVariables<'_, '_> {
     }
 }
 
+/// Bash's word splitting of one field (`list_string`), on the unquoted characters an expansion produced that are
+/// in `ifs`. A field with no such character comes back unchanged; the fields split from one are never empty unless
+/// a separator other than white space delimits an empty one.
+fn split(field: Field, ifs: &str) -> Vec<Field> {
+    let is_separator = |c: &WordChar| c.expanded && !c.quoted && ifs.contains(c.ch);
+    if !field.chars.iter().any(is_separator) {
+        return vec![field];
+    }
+    let chars = field.chars;
+    let is_blank = |ch: char| matches!(ch, ' ' | '\t' | '\n');
+    let separator = |i: usize| chars.get(i).filter(|c| is_separator(c)).map(|c| c.ch);
+    let skip_blanks = |mut i: usize| {
+        while separator(i).is_some_and(is_blank) {
+            i += 1;
+        }
+        i
+    };
+    let mut out = Vec::new();
+    // Leading `IFS` white space never delimits a field.
+    let mut i = skip_blanks(0);
+    while i < chars.len() {
+        let start = i;
+        while i < chars.len() && separator(i).is_none() {
+            i += 1;
+        }
+        let ended_by = separator(i);
+        // An empty field only before a separator that is not white space (`a::b` with `IFS=:`).
+        if i > start || ended_by.is_some_and(|ch| !is_blank(ch)) {
+            out.push(Field {
+                chars: chars[start..i].to_vec(),
+                quoted: true,
+            });
+        }
+        let Some(ch) = ended_by else {
+            break;
+        };
+        i = skip_blanks(i + 1);
+        // White space then one other separator delimit a single field.
+        if is_blank(ch) && separator(i).is_some_and(|next| !is_blank(next)) {
+            i = skip_blanks(i + 1);
+        }
+    }
+    out
+}
+
 fn to_i64(len: usize) -> i64 {
     i64::try_from(len).unwrap_or(i64::MAX)
 }
@@ -896,7 +1040,7 @@ fn slice<T>(items: &[T], start: i64, end: i64) -> &[T] {
 }
 
 /// `${x#p}`, `${x##p}`, `${x%p}`, `${x%%p}`.
-fn remove(text: &str, pattern: &[WordChar], suffix: bool, longest: bool) -> String {
+fn remove(text: &str, pattern: &Pattern, suffix: bool, longest: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
     let ends: Box<dyn Iterator<Item = usize>> = match (suffix, longest) {
@@ -906,10 +1050,10 @@ fn remove(text: &str, pattern: &[WordChar], suffix: bool, longest: bool) -> Stri
     };
     for at in ends {
         if suffix {
-            if pattern::matches_chars(pattern, &chars[at..]) {
+            if pattern.matches(&chars[at..]) {
                 return chars[..at].iter().collect();
             }
-        } else if pattern::matches_chars(pattern, &chars[..at]) {
+        } else if pattern.matches(&chars[..at]) {
             return chars[at..].iter().collect();
         }
     }
@@ -928,14 +1072,14 @@ fn substitute(replacement: &[WordChar], matched: &[char], out: &mut String) {
 }
 
 /// `${x/p/r}`, `${x//p/r}`, `${x/#p/r}`, `${x/%p/r}`: the longest match at each place, as bash.
-fn replace(text: &str, pattern: &[WordChar], replacement: &[WordChar], mode: ReplaceMode) -> String {
+fn replace(text: &str, pattern: &Pattern, replacement: &[WordChar], mode: ReplaceMode) -> String {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
     let mut out = String::new();
     match mode {
         ReplaceMode::Prefix => {
             for end in (0..=n).rev() {
-                if pattern::matches_chars(pattern, &chars[..end]) {
+                if pattern.matches(&chars[..end]) {
                     substitute(replacement, &chars[..end], &mut out);
                     out.extend(&chars[end..]);
                     return out;
@@ -944,7 +1088,7 @@ fn replace(text: &str, pattern: &[WordChar], replacement: &[WordChar], mode: Rep
         }
         ReplaceMode::Suffix => {
             for start in 0..=n {
-                if pattern::matches_chars(pattern, &chars[start..]) {
+                if pattern.matches(&chars[start..]) {
                     out.extend(&chars[..start]);
                     substitute(replacement, &chars[start..], &mut out);
                     return out;
@@ -963,10 +1107,7 @@ fn replace(text: &str, pattern: &[WordChar], replacement: &[WordChar], mode: Rep
                     out.extend(&chars[i..]);
                     return out;
                 }
-                if let Some(end) = ((i + 1)..=n)
-                    .rev()
-                    .find(|&end| pattern::matches_chars(pattern, &chars[i..end]))
-                {
+                if let Some(end) = ((i + 1)..=n).rev().find(|&end| pattern.matches(&chars[i..end])) {
                     substitute(replacement, &chars[i..end], &mut out);
                     i = end;
                     replaced = true;
@@ -983,10 +1124,10 @@ fn replace(text: &str, pattern: &[WordChar], replacement: &[WordChar], mode: Rep
 
 /// `${x^p}`, `${x^^p}`, `${x,p}`, `${x,,p}`, `${x~p}`, `${x~~p}`: the first character (or each) that matches `pattern`
 /// (any character when it is empty) changes case.
-fn modify_case(text: &str, pattern: &[WordChar], kind: CaseKind, all: bool) -> String {
+fn modify_case(text: &str, pattern: &Pattern, kind: CaseKind, all: bool) -> String {
     let mut out = String::with_capacity(text.len());
     for (i, ch) in text.chars().enumerate() {
-        let applies = (all || i == 0) && (pattern.is_empty() || pattern::matches_chars(pattern, &[ch]));
+        let applies = (all || i == 0) && (pattern.is_empty() || pattern.matches(&[ch]));
         if !applies {
             out.push(ch);
             continue;
@@ -1062,6 +1203,16 @@ pub(crate) fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
+/// The text of `$'…'` (its body `body`): the backslash escapes decoded, and cut at the first NUL character, as bash
+/// keeps strings (KNSH-098).
+pub(crate) fn decode_ansi_c(body: &str) -> String {
+    let mut decoded = decode_escapes(body);
+    if let Some(nul) = decoded.find('\0') {
+        decoded.truncate(nul);
+    }
+    decoded
+}
+
 /// `${x@E}`: the backslash escapes `$'…'` decodes.
 fn decode_escapes(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -1122,7 +1273,9 @@ fn decode_escapes(text: &str) -> String {
                     out.push(char::from_u32(value).unwrap_or('\u{fffd}'));
                 }
             }
+            // Bash's `TOCTRL`: `\c?` is DEL, anything else its control character.
             'c' => match chars.next() {
+                Some('?') => out.push('\x7f'),
                 Some(control) => out.push(char::from(u8::try_from(u32::from(control) & 0x1f).unwrap_or(0))),
                 None => out.push_str("\\c"),
             },

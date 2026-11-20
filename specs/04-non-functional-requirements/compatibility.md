@@ -43,6 +43,16 @@ tests (`crates/knsh-interp/src/expand/tests.rs`, `src/arith/tests.rs`); forms bo
 | `set -u` with an unset parameter, `${x?}` | Shell exits with status 127 | Shell exits with status 1 |
 | `${x?}` with `x` unset | `x: parameter null or not set` | `x: parameter not set` (`${x:?}` keeps the longer message) |
 | `${!x}` with `x` unset or empty | Expands to nothing | Error `x: invalid indirect expansion` or `: invalid variable name`, line abandoned |
+| `{01..03}`, `{1..9..2}`, `{a..e..2}` (KNSH-098) | No padding (`1 2 3`); a step leaves the word as written | Zero padding to the widest end; steps |
+| `**` with `globstar` (KNSH-098) | No such option: `**` is `*` | Any depth of directories |
+| `.*` (KNSH-098) | Also matches `.` and `..` | Never matches `.` and `..` (`globskipdots`, on by default) |
+
+Known differences of the native interpreter from bash 5.2 (KNSH-098): in the C locale bash matches `?` and bracket
+expressions against bytes and the interpreter against characters, so they differ for non-ASCII text only (`?`
+matches `é` here, `??` does in bash); the `failglob` error names the word after quote removal; a pattern starting
+with an `extglob` group matches a hidden name when one of the group's alternatives starts with `.` (bash 5.2 looks
+deeper); `GLOBIGNORE` implies `dotglob` only while it is set and not empty. Glob results are sorted with the system's
+`strcoll` (macOS); glibc's collation is checked with the Linux port (KNSH-110).
 | Messages under `bash -c` | `bash: message` (no line number on one-line scripts) | `bash: line n: message` |
 | Arithmetic error token after trailing blanks (`$(( 1 + ))`) | `error token is " "` | The last token read: `error token is "+ "` |
 | `base#` with no digits (`$((2#))`) | 0 | Error `invalid integer constant` |

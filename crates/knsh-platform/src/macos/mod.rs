@@ -6,6 +6,7 @@
 
 mod ancestry;
 mod clock;
+mod collation;
 mod denials;
 mod descriptors;
 mod digest;
@@ -30,6 +31,7 @@ mod xpc;
 
 pub use ancestry::SystemProcessTree;
 pub use clock::SystemClock;
+pub use collation::SystemCollation;
 pub use denials::UnifiedLogDenials;
 pub use descriptors::{MAX_PASSED_DESCRIPTORS, peer_closed, recv_with_descriptors, send_with_descriptors};
 pub use digest::{SHA256_LEN, hmac_sha256, sha256, sha256_reader};

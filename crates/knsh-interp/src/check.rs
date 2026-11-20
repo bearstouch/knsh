@@ -1,10 +1,11 @@
-//! The check of a whole script before it runs (KNSH-096, KNSH-097): every construct a later story implements is
-//! refused here, with its span, so a script the interpreter cannot evaluate runs none of its commands.
+//! The check of a whole script before it runs (KNSH-096, KNSH-097, KNSH-098): every construct a later story
+//! implements is refused here, with its span, so a script the interpreter cannot evaluate runs none of its commands.
 //!
 //! Expansions are read but not performed: each `${…}` body is parsed, and the words and expressions inside it are
 //! scanned, so an array, a command substitution or a variable bash maintains itself is refused wherever it is
-//! written. What depends on a value (a variable named only at run time, a command name produced by an expansion, a
-//! value bash would split) is refused when the expansion happens instead.
+//! written. Brace expansion, which depends only on the text, is performed, so a word past its bounds runs nothing.
+//! What depends on a value or the filesystem (a variable named only at run time, a command name produced by an
+//! expansion or a pattern) is refused when the expansion happens instead.
 //!
 //! The walk mirrors [`crate::eval`] and counts nesting the same way, under the same limit, so a tree nested deeper
 //! than the limit is refused before evaluation and the check itself never overflows the stack.
@@ -14,13 +15,15 @@ use knsh_bash::{
     Span, UnsupportedCommand,
 };
 
+use crate::brace;
 use crate::error::{InterpError, Unsupported};
 use crate::eval::{external_builtin_differs, is_refused_builtin, trailing_redirection};
 use crate::expand::MAX_EXPANSION_DEPTH;
 use crate::param::{self, Name, Op, Parsed};
+use crate::pattern;
 use crate::scan::{self, Mode, Part};
 use crate::state::{is_always_unemulated, lists_always_unemulated};
-use crate::word::{self, Context, has_brace_expansion, has_glob, literal_view};
+use crate::word::{self, Context, WordChar};
 
 /// Checks `items` (a script's top-level list) against `source`, nesting at most `max_depth` lists.
 ///
@@ -122,7 +125,7 @@ impl Checker<'_> {
         }
         let mut literals = Vec::with_capacity(simple.words.len());
         for command_word in &simple.words {
-            literals.push(word::literal(&self.word(command_word, Context::Argument)?));
+            literals.push(self.literal_argument(command_word)?);
         }
         // A builtin named literally is refused now; one produced by an expansion when it runs.
         if let (Some(Some(name)), Some(first)) = (literals.first(), simple.words.first()) {
@@ -169,21 +172,28 @@ impl Checker<'_> {
         }
     }
 
-    /// Checks a word in `context` and returns its parts. Brace expansion and literal pathname patterns are refused
-    /// in arguments.
+    /// Checks a word in `context` (only arguments are brace-expanded, which is checked here too, so a word past
+    /// the brace expansion limits runs nothing) and returns its parts.
     fn word(&self, command_word: &CommandWord, context: Context) -> Result<Vec<Part>, InterpError> {
-        let parts = word::parts(&command_word.word.segments, self.source, 0)?;
+        let pieces = word::pieces(&command_word.word.segments, self.source, 0)?;
+        let parts: Vec<Part> = pieces.iter().map(|piece| piece.part.clone()).collect();
         self.parts(&parts, false, 0)?;
         if context == Context::Argument {
-            let view = literal_view(&parts);
-            if has_brace_expansion(&view) {
-                return Err(refuse(Unsupported::BraceExpansion, command_word.span));
-            }
-            if has_glob(&view) {
-                return Err(refuse(Unsupported::PathnameExpansion, command_word.span));
-            }
+            brace::expand(&pieces, command_word.span)?;
         }
         Ok(parts)
+    }
+
+    /// Checks an argument word and returns the single word it spells when nothing can change it: no expansion, no
+    /// brace expansion and no pattern bash would match against file names (with any option). A builtin named that
+    /// way is refused before anything runs; any other is found when the command runs.
+    fn literal_argument(&self, command_word: &CommandWord) -> Result<Option<String>, InterpError> {
+        let parts = self.word(command_word, Context::Argument)?;
+        let pieces = word::pieces(&command_word.word.segments, self.source, 0)?;
+        if brace::expand(&pieces, command_word.span)?.len() != 1 || has_pattern(&parts) {
+            return Ok(None);
+        }
+        Ok(word::literal(&parts))
     }
 
     /// An arithmetic expression spanning `expression` (of a construct at `span`).
@@ -259,6 +269,32 @@ impl Checker<'_> {
             }
         }
     }
+}
+
+/// Whether `parts` (a word without expansions) is a pattern bash would match against file names, with `extglob`
+/// on or off: its literal text read with bash's test, its quoted text never a pattern.
+fn has_pattern(parts: &[Part]) -> bool {
+    fn chars(parts: &[Part], quoted: bool, out: &mut Vec<WordChar>) {
+        for part in parts {
+            match part {
+                Part::Text(text) => out.extend(text.chars().map(|ch| WordChar {
+                    ch,
+                    quoted,
+                    expanded: false,
+                })),
+                Part::Quoted(text) => out.extend(text.chars().map(|ch| WordChar {
+                    ch,
+                    quoted: true,
+                    expanded: false,
+                })),
+                Part::Double(inner) => chars(inner, true, out),
+                Part::Param { .. } | Part::Brace { .. } | Part::Arith { .. } => {}
+            }
+        }
+    }
+    let mut view = Vec::new();
+    chars(parts, false, &mut view);
+    pattern::has_glob(&view, true)
 }
 
 /// `error`, with a refusal placed at `span` when the scanner could only place it within its own text.

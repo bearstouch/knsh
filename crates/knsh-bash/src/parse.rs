@@ -102,6 +102,35 @@ use crate::token::{
 /// assert!(call.function_call.is_some());
 /// ```
 pub fn parse(input: &str) -> Result<Script, ParseError> {
+    parse_with(input, ParseOptions::default())
+}
+
+/// Shell options that change how bash reads a line, set before it is read (bash reads a whole line before running
+/// any of it, so a `shopt` on the line itself never changes how that line is read).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ParseOptions {
+    /// `shopt -s extglob`: `?(…)`, `*(…)`, `+(…)`, `@(…)` and `!(…)` are read as part of a word, with nothing inside
+    /// the parentheses ending it, instead of being a syntax error (KNSH-098). Off by default, as in bash.
+    pub extglob: bool,
+}
+
+impl ParseOptions {
+    /// These options with `extglob` set to `on`.
+    #[must_use]
+    pub const fn with_extglob(mut self, on: bool) -> Self {
+        self.extglob = on;
+        self
+    }
+}
+
+/// [`parse`], with the shell options `options` that change how a line is read.
+///
+/// # Errors
+///
+/// As [`parse`]; with [`ParseOptions::extglob`], an extended glob group still open at the end of the input is
+/// [`LexError::Unterminated`].
+pub fn parse_with(input: &str, options: ParseOptions) -> Result<Script, ParseError> {
     // Checked before anything is read, as `lex` does (nested sources skip the check: they lie inside this one).
     if input.len() > MAX_INPUT_LEN {
         return Err(LexError::InputTooLarge {
@@ -113,7 +142,11 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
     // One token budget for the line and every substitution body in it: each body is lexed again when it is parsed,
     // and a per-lex limit alone would let a line of many substitutions hold many times the limit (KNSH-032).
     let tokens_left = Cell::new(MAX_TOKENS);
-    let mut script = parse_source(input, Span::new(0, input.len()), LexContext::default(), 0, &tokens_left)?;
+    let context = LexContext {
+        extglob: options.extglob,
+        ..LexContext::default()
+    };
+    let mut script = parse_source(input, Span::new(0, input.len()), context, 0, &tokens_left)?;
     mark_function_calls(&mut script, input);
     Ok(script)
 }
@@ -705,6 +738,7 @@ impl Parser<'_> {
             depth: self.context.depth + quotes + 1,
             substitutions: self.context.substitutions + 1,
             process_substitutions: self.context.process_substitutions + usize::from(process),
+            extglob: self.context.extglob,
         };
         let script = parse_source(self.input, segment.body, context, self.depth + 1, self.tokens_left)?;
         Ok(Substitution {
@@ -725,6 +759,7 @@ impl Parser<'_> {
             depth: self.context.depth + quotes + 1,
             substitutions: 0,
             process_substitutions: 0,
+            extglob: self.context.extglob,
         };
         let body = segment.body.text(self.input).unwrap_or_default();
         let (text, script) = match unescape_backtick(body, in_double_quotes, None) {
@@ -3479,5 +3514,55 @@ mod tests {
         let text = unescape_backtick(r"a\$b", false, Some(&mut origins));
         assert_eq!(text, "a$b");
         assert_eq!(origins, [0, 2, 3]);
+    }
+
+    /// The text of each word of the single simple command `line`, read with `extglob` on.
+    fn extglob_words(line: &str) -> Vec<String> {
+        let script = parse_with(line, ParseOptions::default().with_extglob(true)).unwrap();
+        let command = script.simple_commands().next().unwrap();
+        command
+            .words
+            .iter()
+            .map(|word| line[word.span.range()].to_owned())
+            .collect()
+    }
+
+    // KNSH-098: with `extglob` on, a group is part of its word, as in `bash -O extglob`; off, it is bash's syntax
+    // error.
+    #[test]
+    fn extglob_groups_are_words_only_when_the_option_is_on() {
+        assert_eq!(
+            extglob_words("ls @(a|b).rs !(*.o) x+(1|2)y ?(a) *(b|'c d')"),
+            ["ls", "@(a|b).rs", "!(*.o)", "x+(1|2)y", "?(a)", "*(b|'c d')"]
+        );
+        // Nested groups, blanks and operators inside a group, and a group in a `case` pattern.
+        assert_eq!(extglob_words("ls @(a|@(b c;d))"), ["ls", "@(a|@(b c;d))"]);
+        let script = parse_with("case x in @(a|b)) y;; esac", ParseOptions::default().with_extglob(true)).unwrap();
+        assert_eq!(script.simple_commands().count(), 1);
+        // A `(` after anything else still ends the word.
+        assert!(parse_with("ls a(b)", ParseOptions::default().with_extglob(true)).is_err());
+        assert!(parse("ls @(a|b)").is_err());
+        assert!(matches!(
+            parse_with("ls @(a|b", ParseOptions::default().with_extglob(true)),
+            Err(ParseError::Lex(LexError::Unterminated {
+                construct: crate::error::Construct::ExtglobGroup,
+                ..
+            }))
+        ));
+        // `(( … ))` still closes where bash closes it when a `*(` or `!(` in it reads as a group.
+        for line in [
+            "(( 2*(3+1) ))",
+            "(( !(0) ))",
+            "(( (1)*(2) ))",
+            "for ((i=0; i<2*(3); i++)); do x; done",
+        ] {
+            let script = parse_with(line, ParseOptions::default().with_extglob(true)).unwrap();
+            assert!(
+                matches!(&script.items[0].and_or.first.first, Command::Unsupported(u) if u.arithmetic.is_some()),
+                "{line}"
+            );
+        }
+        // Inside a command substitution the option still applies.
+        assert!(parse_with("echo $(ls @(a|b))", ParseOptions::default().with_extglob(true)).is_ok());
     }
 }

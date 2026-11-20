@@ -1,11 +1,13 @@
-//! KNSH-096 and KNSH-097 integration tests: scripts run under the native interpreter (real processes through
-//! `SystemProcesses`, real lookups through `RealFs`) and under `/bin/bash`; standard output and exit status must match
-//! (NFR-COMPAT-01, NFR-COMPAT-02).
+//! KNSH-096, KNSH-097 and KNSH-098 integration tests: scripts run under the native interpreter (real processes
+//! through `SystemProcesses`, real lookups and directory listings through `RealFs`, the system's collation) and under
+//! `/bin/bash`; standard output and exit status must match (NFR-COMPAT-01, NFR-COMPAT-02).
 //!
 //! The first script uses only what KNSH-096 evaluates: literal words, external commands and the builtins that run as
 //! their programs (`echo`, `printf`, `test`, `true`, `false`). The second exercises parameter and arithmetic
-//! expansion (KNSH-097) with forms bash 3.2 (the `/bin/bash` here) and 5.2 agree on. Each run gets its own temporary
-//! directory as working directory and a fixed `PATH`.
+//! expansion (KNSH-097), the third brace expansion, word splitting, pathname expansion and quote removal (KNSH-098),
+//! with forms bash 3.2 (the `/bin/bash` here) and 5.2 agree on; the glob options are compared one by one, and the
+//! order of matches in the C and UTF-8 locales. Each run gets its own temporary directory as working directory and a
+//! fixed `PATH`.
 
 #![cfg(target_os = "macos")]
 #![allow(clippy::unwrap_used)]
@@ -18,8 +20,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use knsh_interp::{Interpreter, ShellState};
-use knsh_platform::macos::{RealFs, SystemProcesses, SystemUserHomes};
+use knsh_interp::{Interpreter, ShellOptions, ShellState};
+use knsh_platform::macos::{RealFs, SystemCollation, SystemProcesses, SystemUserHomes};
 use knsh_platform::{ProcessCommandSpawner, SharedFd, Stdio};
 
 /// Fifty lines; the last command fails, so the scripts' status is 1.
@@ -95,7 +97,13 @@ fn run_bash(script: &str, dir: &Path) -> (String, u8) {
 
 /// Runs `script` under `/bin/bash -c script knsh args…` in `dir`: (stdout, status).
 fn run_bash_with(script: &str, dir: &Path, args: &[&str]) -> (String, u8) {
+    run_bash_full(script, dir, args, &[], &[])
+}
+
+/// Runs `script` under `/bin/bash flags… -c script knsh args…` in `dir` with `PATH` and `env`: (stdout, status).
+fn run_bash_full(script: &str, dir: &Path, args: &[&str], flags: &[&str], env: &[(&str, &str)]) -> (String, u8) {
     let output = Command::new("/bin/bash")
+        .args(flags)
         .arg("-c")
         .arg(script)
         .arg("knsh")
@@ -103,6 +111,7 @@ fn run_bash_with(script: &str, dir: &Path, args: &[&str]) -> (String, u8) {
         .current_dir(dir)
         .env_clear()
         .env("PATH", PATH)
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     let status = u8::try_from(output.status.code().unwrap()).unwrap();
@@ -116,22 +125,40 @@ fn run_knsh(script: &str, dir: &Path) -> (String, u8) {
 
 /// Runs `script` under the native interpreter in `dir` with positional parameters `args`: (stdout, status).
 fn run_knsh_with(script: &str, dir: &Path, args: &[&str]) -> (String, u8) {
+    run_knsh_full(script, dir, args, |_| {}, &[])
+}
+
+/// Runs `script` under the native interpreter in `dir` with positional parameters `args`, the options `options`
+/// sets (the line parsed with `extglob` when it is on) and `PATH` and `env` in the environment: (stdout, status).
+fn run_knsh_full(
+    script: &str,
+    dir: &Path,
+    args: &[&str],
+    options: impl FnOnce(&mut ShellOptions),
+    env: &[(&str, &str)],
+) -> (String, u8) {
     let (mut reader, writer) = std::io::pipe().unwrap();
     let null = || SharedFd::new(OwnedFd::from(std::fs::File::open("/dev/null").unwrap()));
     let stdio = Stdio::Passed(Box::new([null(), SharedFd::new(OwnedFd::from(writer)), null()]));
     let spawner = ProcessCommandSpawner::new(Arc::new(SystemProcesses::new()), stdio);
-    let state = ShellState::new("knsh", dir)
+    let environment = std::iter::once(("PATH", PATH))
+        .chain(env.iter().copied())
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)));
+    let mut state = ShellState::new("knsh", dir)
         .unwrap()
-        .with_environment([(OsString::from("PATH"), OsString::from(PATH))])
+        .with_environment(environment)
         .with_positional(args.iter().map(|arg| (*arg).to_owned()).collect());
+    options(state.options_mut());
+    let extglob = state.options().extglob;
     let mut interpreter = Interpreter::new(
         state,
         Arc::new(RealFs::new()),
         Arc::new(spawner),
         Arc::new(SystemUserHomes::new()),
+        Arc::new(SystemCollation::new()),
         Box::new(std::io::sink()),
     );
-    let parsed = knsh_bash::parse(script).unwrap();
+    let parsed = knsh_bash::parse_with(script, knsh_bash::ParseOptions::default().with_extglob(extglob)).unwrap();
     let status = interpreter.run(&parsed, script).unwrap();
     // The interpreter holds the spawner, which holds the pipe's write end: drop it so the read sees end of file.
     drop(interpreter);
@@ -210,4 +237,109 @@ fn expansion_script_matches_bash() {
     assert!(bash.0.contains("next-line-runs 1"), "bash output: {}", bash.0);
     assert_eq!(bash.1, 1);
     assert_eq!(knsh, bash);
+}
+
+/// Brace expansion, word splitting, pathname expansion and quote removal in forms bash 3.2 and 5.2 agree on (no
+/// `{01..03}` or `{1..9..2}`, which bash 3.2 lacks, no `.*`, which bash 3.2 matches against `.` and `..`, and no `?`
+/// against a multibyte name in the C locale, where bash matches bytes). `printf '[%s]'` shows word boundaries.
+const WORDS: &str = r#"touch B a _x 'a b' Zed .hid c.rs d.rs 'e f.rs' é
+mkdir -p dir/sub dir/.h
+touch dir/f.rs dir/sub/g.rs dir/.h/i.rs
+printf '[%s]' {a,b}{1,2} x{a,b,}y {1..4} {c..a} {5..1} {-1..2} {a} {} '{a,b}' \{a,b} {a,'b c'} {a,{b,c}d}e; echo
+n=2; a1=one; a2=two; printf '[%s]' {1..$n} $a{1,2} ~/{x,y} a={b,c}; echo
+v='  one  two	three  '
+printf '[%s]' $v; echo
+printf '[%s]' "$v" x$v"y"; echo
+IFS=:; w='a::b:'; printf '[%s]' $w x$w; echo
+IFS=': '; m=' a : b  ::c '; printf '[%s]' $m; echo
+IFS=; printf '[%s]' $v; echo
+IFS=' '; e=; printf '[%s]' $e "" ""$v $v"" "$e"; echo
+IFS=1; printf '[%s]' $((11 + 1)) x$((10 + 1))y; echo
+IFS='*?'; g='a*b'; printf '[%s]' $g * *.rs ?; echo
+IFS=$' \t\n'
+printf '[%s]' *; echo
+printf '[%s]' *.rs dir/*.rs */*.rs */ d*/s*/; echo
+printf '[%s]' *.zig 'a'* [ab]* [!a-z]* \*.rs "*".rs [[:upper:]]*; echo
+g='*.rs'; s='e f'; printf '[%s]' $g "$g" $s*; echo
+printf '[%s]' .h* dir/.h* dir/*/; echo
+printf '[%s]' $'a\tb' $'\x41\101' $'it\'s'; echo
+for f in *.rs; do printf '<%s>' "$f"; done; echo
+case 'a b' in a\ *) echo escaped-pattern;; esac
+"#;
+
+// NFR-COMPAT-02 (KNSH-098): brace expansion, splitting, globbing and quote removal match bash.
+#[test]
+fn words_script_matches_bash() {
+    let bash_dir = temp_dir("bash-words");
+    let knsh_dir = temp_dir("knsh-words");
+    let home = [("HOME", "/Users/nobody-knsh")];
+    let bash = run_bash_full(WORDS, &bash_dir, &[], &[], &home);
+    let knsh = run_knsh_full(WORDS, &knsh_dir, &[], |_| {}, &home);
+    std::fs::remove_dir_all(&bash_dir).unwrap();
+    std::fs::remove_dir_all(&knsh_dir).unwrap();
+    assert!(bash.0.contains("escaped-pattern"), "bash output: {}", bash.0);
+    assert_eq!(knsh, bash);
+}
+
+/// One script per glob option, run with the option on in both shells.
+const OPTION_SCRIPTS: &[(&str, &str)] = &[
+    ("dotglob", "printf '[%s]' * dir/*; echo"),
+    (
+        "nullglob",
+        "printf '[%s]' x *.zig y *.rs; echo; for f in *.zig; do echo never; done; echo done",
+    ),
+    (
+        "failglob",
+        "echo before; printf '[%s]' *.zig; echo same-line\necho next-line $?",
+    ),
+    ("nocaseglob", "printf '[%s]' b* Z* [a-c]*; echo"),
+    (
+        "extglob",
+        "printf '[%s]' !(*.rs) @(a|B) +([a-z]).rs *(x)a ?(d).rs; echo; p=main.test.rs; printf '[%s]' ${p%%.+([a-z])} ${p##+([a-z]).}; case $p in *.@(rs|c)) echo ext;; esac",
+    ),
+];
+
+// NFR-COMPAT-02 (KNSH-098): each glob option bash 3.2 and 5.2 share behaves as bash's.
+#[test]
+fn glob_options_match_bash() {
+    let setup = "touch B a .hid c.rs d.rs; mkdir dir; touch dir/.x dir/y\n";
+    for (option, script) in OPTION_SCRIPTS {
+        let script = format!("{setup}{script}\n");
+        let bash_dir = temp_dir("bash-option");
+        let knsh_dir = temp_dir("knsh-option");
+        let bash = run_bash_full(&script, &bash_dir, &[], &["-O", option], &[]);
+        let knsh = run_knsh_full(
+            &script,
+            &knsh_dir,
+            &[],
+            |options| match *option {
+                "dotglob" => options.dotglob = true,
+                "nullglob" => options.nullglob = true,
+                "failglob" => options.failglob = true,
+                "nocaseglob" => options.nocaseglob = true,
+                "extglob" => options.extglob = true,
+                other => panic!("{other}"),
+            },
+            &[],
+        );
+        std::fs::remove_dir_all(&bash_dir).unwrap();
+        std::fs::remove_dir_all(&knsh_dir).unwrap();
+        assert_eq!(knsh, bash, "{option}: {script}");
+    }
+}
+
+// NFR-COMPAT-02 (KNSH-098): matches are sorted as bash sorts them (`strcoll`) in the C locale and the UTF-8 locales.
+#[test]
+fn glob_order_matches_bash_in_c_and_utf8_locales() {
+    let script = "touch B a _x 'a b' Zed '#h' '~t' 0 ' sp' é Ab-x\nprintf '[%s]' *; echo\n";
+    for locale in ["C", "C.UTF-8", "en_US.UTF-8"] {
+        let env = [("LANG", locale)];
+        let bash_dir = temp_dir("bash-order");
+        let knsh_dir = temp_dir("knsh-order");
+        let bash = run_bash_full(script, &bash_dir, &[], &[], &env);
+        let knsh = run_knsh_full(script, &knsh_dir, &[], |_| {}, &env);
+        std::fs::remove_dir_all(&bash_dir).unwrap();
+        std::fs::remove_dir_all(&knsh_dir).unwrap();
+        assert_eq!(knsh, bash, "LANG={locale}");
+    }
 }

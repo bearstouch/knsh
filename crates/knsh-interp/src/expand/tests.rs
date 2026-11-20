@@ -5,7 +5,8 @@
 use std::ffi::OsStr;
 
 use knsh_bash::{Command, CommandWord, parse};
-use knsh_platform::testing::FakeUserHomes;
+use knsh_platform::ByteCollation;
+use knsh_platform::testing::{FakeUserHomes, MemFs};
 
 use super::*;
 use crate::status::Status;
@@ -21,6 +22,13 @@ fn state(args: &[&str], vars: &[(&str, &str)]) -> ShellState {
         state.set_variable(name, *value);
     }
     state
+}
+
+/// An empty working directory `/work`, where pathname expansion matches nothing.
+fn files() -> MemFs {
+    let fs = MemFs::new();
+    fs.add_dir_all(std::path::Path::new("/work")).unwrap();
+    fs
 }
 
 fn homes() -> FakeUserHomes {
@@ -45,7 +53,8 @@ fn expand_in(state: &mut ShellState, args: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for command_word in words(&line) {
         let parts = word::parts(&command_word.word.segments, &line, 0)?;
-        let mut expander = Expander::new(state, &homes, &line, &[]);
+        let fs = files();
+        let mut expander = Expander::new(state, &homes, &fs, &ByteCollation, &line, &[]);
         out.extend(expander.arguments(&parts, command_word.span)?);
     }
     Ok(out)
@@ -151,8 +160,8 @@ fn default_and_assign_operators_match_bash() {
             ("${#:-x} ${#-x}", &["0", "0"]),
         ],
     );
-    // An unquoted default holding blanks would be split: refused until KNSH-098.
-    assert_eq!(refusal(&[], "${u:-a b}"), Unsupported::WordSplitting);
+    // An unquoted default is split like an expansion (KNSH-098).
+    assert_eq!(expand(&[], "${u:-a b}"), ["a", "b"]);
 
     let mut state = state(&[], &[("e", "")]);
     assert_eq!(
@@ -483,7 +492,8 @@ fn tilde_with_a_home_that_is_not_utf8_is_refused() {
     let parts = word::parts(&command_word.word.segments, line, 0).unwrap();
     let homes = FakeUserHomes::new().with_user("bob", OsStr::from_bytes(b"/Users/b\xffb"));
     let mut state = state(&[], &[]);
-    let found = Expander::new(&mut state, &homes, line, &[]).arguments(&parts, command_word.span);
+    let fs = files();
+    let found = Expander::new(&mut state, &homes, &fs, &ByteCollation, line, &[]).arguments(&parts, command_word.span);
     assert!(
         matches!(
             found,
@@ -507,7 +517,8 @@ fn assignment_values_expand_tilde_after_colons() {
     let parts = word::parts(&assignment.word.segments, line, assignment.value.start).unwrap();
     let mut state = state(&[], &[("X", "x")]);
     let homes = homes();
-    let value = Expander::new(&mut state, &homes, line, &[])
+    let fs = files();
+    let value = Expander::new(&mut state, &homes, &fs, &ByteCollation, line, &[])
         .assignment_value(&parts, assignment.span)
         .unwrap();
     assert_eq!(value, "/Users/me/bin:/Users/alice/bin:x:/Users/me");
@@ -516,7 +527,7 @@ fn assignment_values_expand_tilde_after_colons() {
 // ---- Fields, splitting and refusals ----
 
 #[test]
-fn unquoted_expansions_are_removed_when_empty_and_refused_when_split() {
+fn unquoted_expansions_are_removed_when_empty_and_split_on_ifs() {
     let vars = [
         ("e", ""),
         ("one", "word"),
@@ -535,12 +546,10 @@ fn unquoted_expansions_are_removed_when_empty_and_refused_when_split() {
             ("$colon", &["a:b"]),
         ],
     );
-    assert_eq!(refusal(&vars, "$two"), Unsupported::WordSplitting);
-    assert_eq!(refusal(&vars, "$glob"), Unsupported::PathnameExpansion);
-    assert_eq!(
-        refusal(&[("IFS", ":"), ("colon", "a:b")], "$colon"),
-        Unsupported::WordSplitting
-    );
+    assert_eq!(expand(&vars, "$two"), ["a", "b"]);
+    // Nothing matches in the empty working directory: the pattern stays.
+    assert_eq!(expand(&vars, "$glob"), ["*.rs"]);
+    assert_eq!(expand(&[("IFS", ":"), ("colon", "a:b")], "$colon"), ["a", "b"]);
     // With an empty IFS nothing splits.
     assert_eq!(expand(&[("IFS", ""), ("two", "a b")], "$two"), ["a b"]);
 }
@@ -593,7 +602,8 @@ fn the_command_s_own_assignments_are_seen_first() {
     let mut state = state(&[], &[("a", "shell")]);
     let homes = homes();
     let overlay = [("a".to_owned(), OsString::from("temporary"))];
-    let found = Expander::new(&mut state, &homes, line, &overlay)
+    let fs = files();
+    let found = Expander::new(&mut state, &homes, &fs, &ByteCollation, line, &overlay)
         .arguments(&parts, command_word.span)
         .unwrap();
     assert_eq!(found, ["temporary"]);
@@ -614,11 +624,13 @@ fn deeply_nested_expansions_are_bounded() {
         let parts = word::parts(&command_word.word.segments, &line, 0).unwrap();
         let mut state = state(&[], &[]);
         let homes = homes();
+        let fs = files();
         let result = std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .stack_size(crate::EVAL_STACK_SIZE)
                 .spawn_scoped(scope, || {
-                    Expander::new(&mut state, &homes, &line, &[]).arguments(&parts, command_word.span)
+                    Expander::new(&mut state, &homes, &fs, &ByteCollation, &line, &[])
+                        .arguments(&parts, command_word.span)
                 })
                 .unwrap()
                 .join()

@@ -34,6 +34,8 @@ pub enum Construct {
     /// A here-document (`<<` or `<<-`) whose body never ends: no line matches the delimiter. Bash runs such a line
     /// with a warning; this lexer refuses it (KNSH-031).
     HereDocument,
+    /// An extended glob group (`@(…)` and the like) read with `extglob` on ([`ParseOptions`](crate::ParseOptions)).
+    ExtglobGroup,
 }
 
 impl fmt::Display for Construct {
@@ -49,6 +51,7 @@ impl fmt::Display for Construct {
             Self::ParameterExpansion => "parameter expansion",
             Self::ArithmeticExpansion => "arithmetic expansion",
             Self::HereDocument => "here-document",
+            Self::ExtglobGroup => "extended glob group",
         })
     }
 }

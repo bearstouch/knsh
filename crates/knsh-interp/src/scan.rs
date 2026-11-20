@@ -12,6 +12,7 @@
 use knsh_bash::Span;
 
 use crate::error::{InterpError, Unsupported};
+use crate::expand::decode_ansi_c;
 
 /// One piece of a word, after the quoting structure has been read and before anything is expanded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +65,7 @@ pub(crate) enum Mode {
 ///
 /// # Errors
 ///
-/// [`InterpError::Unsupported`] for a command substitution or `$'…'` (which would be ANSI-C quoting), and
+/// [`InterpError::Unsupported`] for a command substitution, and
 /// [`InterpError::SourceMismatch`] if `span` does not index `source`.
 pub(crate) fn scan(source: &str, span: Span, mode: Mode) -> Result<Vec<Part>, InterpError> {
     let text = span.text(source).ok_or(InterpError::SourceMismatch { span })?;
@@ -328,7 +329,20 @@ impl Scanner<'_> {
                     span: self.span(start, close + 1),
                 }
             }
-            b'\'' if unquoted => return Err(self.refuse(Unsupported::AnsiCQuoting, start)),
+            b'\'' if unquoted => {
+                // `$'…'`: up to the first `'` not escaped by a backslash, its escapes decoded.
+                let mut end = start + 2;
+                while let Some(&byte) = bytes.get(end) {
+                    match byte {
+                        b'\\' => end += 2,
+                        b'\'' => break,
+                        _ => end += 1,
+                    }
+                }
+                let end = end.min(bytes.len());
+                self.pos = (end + 1).min(bytes.len());
+                Part::Quoted(decode_ansi_c(self.slice(start + 2, end)))
+            }
             b'"' if unquoted => {
                 // `$"…"`: in the C locale, plain double quotes.
                 self.pos = start + 2;
@@ -448,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_command_substitution_and_ansi_c_quotes() {
+    fn refuses_command_substitution_and_decodes_ansi_c_quotes() {
         for input in ["$(ls)", "`ls`", "$( (a) )"] {
             assert!(matches!(
                 scan(input, Span::new(0, input.len()), Mode::Unquoted),
@@ -458,13 +472,8 @@ mod tests {
                 })
             ));
         }
-        assert!(matches!(
-            scan("$'a'", Span::new(0, 4), Mode::Unquoted),
-            Err(InterpError::Unsupported {
-                feature: Unsupported::AnsiCQuoting,
-                ..
-            })
-        ));
+        // `$'…'` is quoted text with its escapes decoded (KNSH-098).
+        assert_eq!(parts(r"$'a\tb\'c'd", Mode::Unquoted), [quoted("a\tb'c"), text("d")]);
         // Inside double quotes `$'` is a literal dollar and quote.
         assert_eq!(parts("$'a'", Mode::Double), [quoted("$'a'")]);
     }

@@ -2,9 +2,9 @@
 //!
 //! An error stops the whole run: nothing after it is evaluated. Constructs later stories implement are refused by a
 //! check of the whole script before its first command runs, so a script this story cannot evaluate runs nothing at
-//! all rather than part of itself. What only an expansion's value reveals (a value bash would split into words, a
-//! command name that turns out to be a builtin, a variable reached through indirection) is refused when it is
-//! found, which stops the script there (KNSH-097).
+//! all rather than part of itself. What only an expansion's value reveals (a command name that turns out to be a
+//! builtin, a variable reached through indirection, a file name that is not UTF-8) is refused when it is found,
+//! which stops the script there (KNSH-097, KNSH-098).
 //!
 //! Bash's own expansion errors (a bad substitution, division by zero, an unset variable under `set -u`) are not
 //! errors of this type: they are reported on the diagnostics writer and change the exit status, as in bash.
@@ -37,6 +37,15 @@ pub enum InterpError {
         /// The span.
         span: Span,
     },
+    /// A brace or pathname expansion grew past one of the interpreter's bounds (words or bytes produced, work spent
+    /// looking for braces, entries of one directory or of one word's walk): an explicit error rather than unbounded
+    /// memory or time on untrusted input (KNSH-098).
+    ExpansionLimit {
+        /// What was bounded.
+        what: &'static str,
+        /// The bound that was reached.
+        limit: usize,
+    },
     /// The working directory given to the shell state is not absolute.
     RelativeWorkingDirectory,
     /// Starting or waiting for a command failed for a reason that is not the command's (no process could be
@@ -55,6 +64,7 @@ impl fmt::Display for InterpError {
                 span.start, span.end
             ),
             Self::DepthExceeded { limit } => write!(f, "maximum evaluation depth exceeded ({limit})"),
+            Self::ExpansionLimit { what, limit } => write!(f, "expansion limit exceeded: {what} (limit {limit})"),
             Self::SourceMismatch { span } => {
                 write!(
                     f,
@@ -75,6 +85,7 @@ impl std::error::Error for InterpError {
             Self::Platform(error) => Some(error),
             Self::Unsupported { .. }
             | Self::DepthExceeded { .. }
+            | Self::ExpansionLimit { .. }
             | Self::SourceMismatch { .. }
             | Self::RelativeWorkingDirectory
             | Self::EvaluationThread => None,
@@ -95,15 +106,14 @@ pub enum Unsupported {
     CommandSubstitution,
     /// `<(…)`, `>(…)` (KNSH-105).
     ProcessSubstitution,
-    /// An unquoted expansion whose value holds a character of `IFS`, which bash would split into several words
-    /// (KNSH-098).
-    WordSplitting,
-    /// An unquoted `*`, `?` or `[…]` in a word that bash would match against file names (KNSH-098).
-    PathnameExpansion,
-    /// An unquoted `{a,b}` or `{1..3}` (KNSH-098).
-    BraceExpansion,
-    /// `$'…'` quoting, whose escapes are decoded (KNSH-098).
-    AnsiCQuoting,
+    /// An unquoted `$*` or `$@` of several parameters where bash does not split (an assignment, a `case` word, the
+    /// word of `${x:=…}`), with an `IFS` whose first character is not a space: bash joins the parameters there with
+    /// a separator that depends on the context and its version, which is not emulated (KNSH-109 settles it against
+    /// bash 5.2).
+    UnsplitJoin,
+    /// A brace expansion whose pieces, brought together, would form `${…}`, `$(…)` or `$[…]` (`{$,}{a}`), which bash
+    /// would then expand. Not emulated: such a word is refused rather than read differently.
+    BraceBuiltExpansion,
     /// An array: `${a[0]}`, `${a[@]}`, `${!a[@]}`, `a[1]` in arithmetic (KNSH-103).
     Array,
     /// A variable bash maintains itself (`RANDOM`, `LINENO`, `BASH_VERSION`, `$_` …), which the interpreter does not
@@ -115,6 +125,8 @@ pub enum Unsupported {
     DirectoryStack,
     /// A variable whose value is not UTF-8, used in an expansion. Passing it on unchanged needs byte-level words.
     NonUtf8Value,
+    /// A file name that is not UTF-8, matched by pathname expansion. Passing it on unchanged needs byte-level words.
+    NonUtf8FileName,
     /// A redirection, on a simple or compound command (KNSH-099).
     Redirection,
     /// A pipeline of more than one command (KNSH-100).
@@ -139,15 +151,16 @@ impl fmt::Display for Unsupported {
         match self {
             Self::CommandSubstitution => f.write_str("command substitution (KNSH-100)"),
             Self::ProcessSubstitution => f.write_str("process substitution (KNSH-105)"),
-            Self::WordSplitting => f.write_str("word splitting (KNSH-098)"),
-            Self::PathnameExpansion => f.write_str("pathname expansion (KNSH-098)"),
-            Self::BraceExpansion => f.write_str("brace expansion (KNSH-098)"),
-            Self::AnsiCQuoting => f.write_str("ANSI-C quoting (KNSH-098)"),
+            Self::BraceBuiltExpansion => f.write_str("an expansion formed by brace expansion"),
+            Self::UnsplitJoin => {
+                f.write_str("joining $* or $@ with a non-space IFS where bash does not split (KNSH-109)")
+            }
             Self::Array => f.write_str("arrays (KNSH-103)"),
             Self::ShellVariable => f.write_str("a variable bash maintains itself (KNSH-101)"),
             Self::PromptExpansion => f.write_str("prompt expansion (KNSH-107)"),
             Self::DirectoryStack => f.write_str("the directory stack and OLDPWD (KNSH-101)"),
             Self::NonUtf8Value => f.write_str("a variable value that is not UTF-8"),
+            Self::NonUtf8FileName => f.write_str("a file name that is not UTF-8"),
             Self::Redirection => f.write_str("redirection (KNSH-099)"),
             Self::Pipeline => f.write_str("pipeline (KNSH-100)"),
             Self::Background => f.write_str("background list (KNSH-100)"),

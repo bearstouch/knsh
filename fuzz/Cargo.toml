@@ -26,7 +26,8 @@ knsh-toml = { path = "../crates/knsh-toml" }
 knsh-bash = { path = "../crates/knsh-bash" }
 knsh-interp = { path = "../crates/knsh-interp" }
 knsh-core = { path = "../crates/knsh-core" }
-knsh-platform = { path = "../crates/knsh-platform" }
+# `testing`: the in-memory filesystem and scripted commands the `word_expansion` target runs the interpreter over.
+knsh-platform = { path = "../crates/knsh-platform", features = ["testing"] }
 knsh-proxy = { path = "../crates/knsh-proxy" }
 
 [[bin]]
@@ -105,6 +106,13 @@ debug = 1
 [[bin]]
 name = "arith_expr"
 path = "fuzz_targets/arith_expr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "word_expansion"
+path = "fuzz_targets/word_expansion.rs"
 test = false
 doc = false
 bench = false

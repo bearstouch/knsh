@@ -56,6 +56,7 @@
 
 mod ancestry;
 mod clock;
+mod collation;
 mod command;
 mod control;
 mod denials;
@@ -77,6 +78,7 @@ mod volumes;
 
 pub use ancestry::FakeProcessTree;
 pub use clock::FakeClock;
+pub use collation::FakeCollation;
 pub use command::ScriptedCommands;
 pub use control::FakeCodeSigning;
 pub use denials::{ScriptedDenialLog, kernel_entry};
