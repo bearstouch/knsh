@@ -24,7 +24,7 @@
 //! | `network.hosts`, `network.loopback`, `network.non_tls_hosts` | a subset of the parent's |
 //! | `network.approval_hosts` | a subset of the parent's hosts and approval hosts |
 //! | `network.class_hosts` | per class, a subset of the parent's hosts and of the parent's hosts for that class |
-//! | `approvals.irreversible_commands` | a superset of the parent's |
+//! | `approvals.irreversible_commands`, `approvals.upload_hosts` | a superset of the parent's |
 //! | `checkpoints` | `required` kept, every parent root kept, excludes a subset of the parent's |
 //! | `recording` | commands and output recorded where the parent records them, kept at least as long |
 //! | `secrets.env` | every child injection is the parent's, unchanged |
@@ -143,13 +143,15 @@ fn network_no_looser(child: &NetworkPolicy, parent: &NetworkPolicy) -> bool {
         })
 }
 
-/// `[approvals]`: irreversible lines treated at least as strictly, and every pattern the parent flags still flagged.
+/// `[approvals]`: irreversible lines treated at least as strictly, and every pattern and upload host the parent flags
+/// still flagged.
 fn approvals_no_looser(child: &ApprovalsPolicy, parent: &ApprovalsPolicy) -> bool {
     child.irreversible >= parent.irreversible
         && parent
             .irreversible_commands
             .iter()
             .all(|pattern| child.irreversible_commands.contains(pattern))
+        && parent.upload_hosts.iter().all(|host| child.upload_hosts.contains(host))
 }
 
 /// `[checkpoints]`: at least the parent's protection. Fewer roots, more excludes or an optional checkpoint would
@@ -313,6 +315,19 @@ loopback = [3000]
             change(&mut child);
             assert!(!at_least_as_strict(&child, &parent), "change {index} must be looser");
         }
+    }
+
+    // KNSH-093: a child keeps every upload host the parent marks, and may add more.
+    #[test]
+    fn upload_hosts_must_be_kept() {
+        let mut parent = parent();
+        parent.approvals.upload_hosts.push("drop.example.org".to_owned());
+        let mut more = parent.clone();
+        more.approvals.upload_hosts.push("paste.example.org".to_owned());
+        assert!(at_least_as_strict(&more, &parent));
+        let mut fewer = parent.clone();
+        fewer.approvals.upload_hosts.clear();
+        assert!(!at_least_as_strict(&fewer, &parent));
     }
 
     // A deny above the parent's covers it; a deny below it does not.

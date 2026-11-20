@@ -301,6 +301,9 @@ impl ToJson for RecordEntry<'_> {
             // The paths the line changed under its checkpoint roots, with post-image identities (KNSH-082), or null
             // for a line that touched no protected root.
             object.insert("files_changed", details.files_changed.to_json()?)?;
+            // Whether the line is irreversible and why (KNSH-093, FR-IRR-04): `{"value", "reasons"}`, or null for a
+            // line refused before it was classified and for records written before KNSH-093.
+            object.insert("irreversible", details.irreversible.to_json()?)?;
         }
         object.insert("stdout", self.stdout.as_ref().map(output_info).transpose()?.to_json()?)?;
         object.insert("stderr", self.stderr.as_ref().map(output_info).transpose()?.to_json()?)?;

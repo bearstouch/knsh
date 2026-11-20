@@ -60,11 +60,11 @@ use knsh_bash::{Classification, ParseOutcome, classify, parse_line, reserialise}
 use crate::id::{RequestId, SessionId};
 use crate::path::CanonicalPath;
 use crate::policy::{
-    DecisionSource, GrantSet, LineCapabilities, LineDecision, LineResolver, Profile, UNATTENDED_PROFILE, evaluate_line,
-    evaluate_line_with_grants,
+    DecisionSource, GrantSet, LineCapabilities, LineDecision, LineResolver, Profile, UNATTENDED_PROFILE,
+    classify_irreversible, evaluate_line, evaluate_line_with_grants,
 };
 use crate::ratelimit::LineKey;
-use crate::record::{DecisionVerdict, HookRun, RecordDecision};
+use crate::record::{DecisionVerdict, HookRun, Irreversibility, RecordDecision};
 use crate::redacted::{Redacted, holds_redaction_marker};
 use crate::redaction::Redactor;
 use crate::resolve::BinaryLookup;
@@ -194,6 +194,9 @@ pub struct AskRequest<'a> {
     pub hook: Option<&'a str>,
     /// The session's profile: what a `profile`-scoped grant made from the answer applies to (KNSH-069).
     pub profile: &'a ProfileName,
+    /// Whether the line is classified irreversible, and why: `decision.requested`'s `irreversible` (FR-IRR-05,
+    /// FR-AUTH-20, KNSH-093).
+    pub irreversible: &'a Irreversibility,
 }
 
 /// How an ask ended.
@@ -395,6 +398,9 @@ pub struct Allowed {
     pub classification: Classification,
     /// Its profile.
     pub profile: LineProfile,
+    /// Whether the allowed line is classified irreversible, and why (FR-IRR-01, FR-IRR-04): the start of its record's
+    /// `irreversible`, to which what it is seen doing is added after it runs (FR-IRR-03).
+    pub irreversible: Irreversibility,
 }
 
 /// Why a refused line was refused, beyond its decision.
@@ -433,6 +439,9 @@ pub struct Refusal {
     /// The refused line's normalised form (`crate::ratelimit`), the key its denial is counted under for rate limiting
     /// (FR-HOOK-20); `None` when it was refused before it was parsed.
     pub line_key: Option<LineKey>,
+    /// Whether the refused line is classified irreversible, and why, for its record (FR-IRR-04, KNSH-093); `None`
+    /// when it was refused before it was classified.
+    pub irreversible: Option<Irreversibility>,
 }
 
 /// What [`decide`] returns.
@@ -469,6 +478,7 @@ pub fn decide(input: &LineInput<'_>, effects: &Effects<'_>) -> Outcome {
             // Nothing of the pipeline's work survives a panic.
             classification: None,
             line_key: None,
+            irreversible: None,
         }))
     })
 }
@@ -485,6 +495,9 @@ struct Pass {
     classification: Classification,
     /// The normalised line, for rate limiting (FR-HOOK-20).
     key: LineKey,
+    /// Whether the line is classified irreversible, and why (KNSH-093): for its record whatever happens to it, and for
+    /// the ask.
+    irreversible: Irreversibility,
 }
 
 /// Who asked to rewrite a line.
@@ -505,6 +518,8 @@ enum Step {
         classification: Classification,
         /// `from`'s normalised line: the key its denial is counted under if the rewrite is refused.
         key: LineKey,
+        /// Whether `from` is irreversible: its record's if the rewrite is refused.
+        irreversible: Irreversibility,
         to: String,
         rewriter: Rewriter,
     },
@@ -552,9 +567,10 @@ impl<'i, 'e> Pipeline<'i, 'e> {
                     from,
                     classification,
                     key,
+                    irreversible,
                     to,
                     rewriter,
-                } => match self.accept_rewrite(from, classification, key, to, &rewriter) {
+                } => match self.accept_rewrite(from, (classification, key, irreversible), to, &rewriter) {
                     Ok(next) => line = next,
                     Err(refusal) => return refusal,
                 },
@@ -615,6 +631,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
                     from: pass.command.clone(),
                     classification: pass.classification.clone(),
                     key: pass.key,
+                    irreversible: pass.irreversible.clone(),
                     to: command,
                     rewriter,
                 };
@@ -676,8 +693,11 @@ impl<'i, 'e> Pipeline<'i, 'e> {
         // re-serialised (`crate::ratelimit`, "The normalised line").
         let key = reserialise(&command, &outcome, &classification)
             .map_or_else(|_| LineKey::of(&command), |line| LineKey::of(&line));
+        // FR-IRR-01 (KNSH-093): the same classification policy evaluates, so the record and the ask agree with it.
+        let irreversible = classify_irreversible(profile, &classification);
         Pass {
             key,
+            irreversible,
             redacted: self.input.redactor.redact_text(&command),
             command,
             outcome,
@@ -715,6 +735,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
             rule_id: rule_id.as_deref(),
             hook: hook.as_deref(),
             profile: &self.input.profile.name,
+            irreversible: &pass.irreversible,
         };
         // `answered_by` is the source of an answer: the authority, or the user through `knsh approve`.
         // `unanswered` is the source of a deny nobody gave (a timeout or a failed ask): the authority's when it was
@@ -747,6 +768,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
                 from: pass.command.clone(),
                 classification: pass.classification.clone(),
                 key: pass.key,
+                irreversible: pass.irreversible.clone(),
                 to: command,
                 rewriter: Rewriter {
                     source: answered_by,
@@ -773,8 +795,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
     fn accept_rewrite(
         &mut self,
         from: String,
-        classification: Classification,
-        key: LineKey,
+        (classification, key, irreversible): (Classification, LineKey, Irreversibility),
         to: String,
         rewriter: &Rewriter,
     ) -> Result<String, Outcome> {
@@ -801,6 +822,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
                 kind: RefusalKind::Denied,
                 classification: Some(classification),
                 line_key: Some(key),
+                irreversible: Some(irreversible),
             })));
         }
         // Only the first rewrite gets here, so `from` is the received line.
@@ -834,6 +856,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
                 capabilities,
                 approved,
             },
+            irreversible: pass.irreversible.clone(),
         }))
     }
 
@@ -871,6 +894,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
             kind,
             classification: Some(pass.classification.clone()),
             line_key: Some(pass.key),
+            irreversible: Some(pass.irreversible.clone()),
         }))
     }
 }

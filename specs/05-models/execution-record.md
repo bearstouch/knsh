@@ -25,7 +25,7 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 | `network` | array | Hosts contacted or refused, as reported by the proxy ([below](#network)) |
 | `unprotected` | array | Checkpoint roots the line touched whose changes were not protected: `{root, reason}`, `reason` one of `shadow_building` (the root's shadow was not complete yet, with `checkpoints.required = false`), `shadow_failed`, `no_shadow`. Empty when every root it touched was protected (KNSH-079, FR-CKP-02). Stored from record schema version 2 |
 | `checkpoint_id` | ID or null | Checkpoint holding the pre-images; null when the line changed nothing in a protected root and none of them was uncertain (KNSH-082) |
-| `irreversible` | bool + reasons | From classification and observed behaviour |
+| `irreversible` | object or null | `{"value", "reasons"}`: from classification before the line runs, and for a line that ran also from what it was seen doing ([irreversible actions](../03-functional-requirements/irreversible-actions.md#reasons)). `value` is `true` exactly when there is a reason; at most 64 reasons. Null for a line refused before it was classified and for records written before KNSH-093 |
 | `sandbox_violations` | array | Denials the system reported for this command, best effort |
 
 ## `decision`

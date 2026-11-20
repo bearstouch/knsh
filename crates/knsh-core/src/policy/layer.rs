@@ -77,6 +77,8 @@ pub(crate) struct Layer {
     pub(crate) network_non_tls_hosts: Option<Vec<String>>,
     pub(crate) approvals_irreversible: Option<RuleAction>,
     pub(crate) approvals_irreversible_commands: Option<Vec<String>>,
+    /// `approvals.upload_hosts` (KNSH-093): hosts the profile adds to the built-in upload-capable list.
+    pub(crate) approvals_upload_hosts: Option<Vec<String>>,
     pub(crate) checkpoints_roots: Option<Vec<PathTemplate>>,
     pub(crate) checkpoints_required: Option<bool>,
     pub(crate) checkpoints_exclude: Option<Vec<String>>,
@@ -131,9 +133,10 @@ impl Layer {
             layer.read_network(&network)?;
         }
         if let Some(approvals) = root.section("approvals")? {
-            approvals.check_keys(&["irreversible", "irreversible_commands"])?;
+            approvals.check_keys(&["irreversible", "irreversible_commands", "upload_hosts"])?;
             layer.approvals_irreversible = approvals.optional("irreversible", rule_action)?;
             layer.approvals_irreversible_commands = approvals.list("irreversible_commands", pattern)?;
+            layer.approvals_upload_hosts = approvals.list("upload_hosts", host)?;
         }
         if let Some(checkpoints) = root.section("checkpoints")? {
             checkpoints.check_keys(&["roots", "required", "exclude"])?;
@@ -282,6 +285,7 @@ impl Layer {
                 "approvals.irreversible_commands",
                 self.approvals_irreversible_commands.is_some(),
             ),
+            ("approvals.upload_hosts", self.approvals_upload_hosts.is_some()),
             ("checkpoints.required", self.checkpoints_required.is_some()),
             ("checkpoints.exclude", self.checkpoints_exclude.is_some()),
             ("recording.commands", self.recording_commands.is_some()),

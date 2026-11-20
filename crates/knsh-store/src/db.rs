@@ -15,9 +15,9 @@ use knsh_core::{
     Actor, ActorKind, AgentId, ArgvEntry, Attribution, CanonicalPath, CappedOutput, CheckpointId, ExecutionRecord,
     MAX_NETWORK_ENTRIES, MAX_RECORD_FILES_CHANGED, NetworkEntry, OutputInfo, OutputStream, RecordDecision,
     RecordDetails, RecordId, Redacted, SandboxViolation, Session, SessionId, Timestamp, UnprotectedRoot, decode_argv,
-    decode_decision, decode_files_changed, decode_network, decode_unprotected, decode_violations, encode_argv,
-    encode_decision, encode_files_changed, encode_network, encode_unprotected, encode_violations, merge_into,
-    merge_network,
+    decode_decision, decode_files_changed, decode_irreversible, decode_network, decode_unprotected, decode_violations,
+    encode_argv, encode_decision, encode_files_changed, encode_irreversible, encode_network, encode_unprotected,
+    encode_violations, merge_into, merge_network,
 };
 use knsh_platform::sqlite::{Connection, DATABASE_MODE, DEFAULT_BUSY_TIMEOUT, Statement, Step, Value};
 use knsh_platform::{FileKind, Fs};
@@ -59,7 +59,7 @@ impl RecordedOutput {
 /// The columns [`read_record`] expects, in order.
 const RECORD_COLUMNS: &str = "record_id, session_id, actor_kind, agent_id, command, rewritten_from, cwd, started_at, \
      ended_at, exit_code, pipestatus, signal, sandbox_profile, secrets_injected, checkpoint_id, sandbox_violations, \
-     decision, argv, network, unprotected, attribution, files_changed";
+     decision, argv, network, unprotected, attribution, files_changed, irreversible";
 
 /// The most distinct sandbox violations one record keeps (FR-SBX-08). Repeats of a kept one only add to its count;
 /// further distinct ones are dropped, so one noisy command cannot grow its record without bound.
@@ -147,7 +147,7 @@ impl Database {
         transaction.execute(
             &format!(
                 "INSERT INTO records ({RECORD_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)"
             ),
             &encoded.values(&record),
         )?;
@@ -489,6 +489,7 @@ struct Encoded {
     network: Option<String>,
     unprotected: Option<String>,
     files_changed: Option<String>,
+    irreversible: Option<String>,
     started_at: i64,
     ended_at: Option<i64>,
 }
@@ -556,6 +557,14 @@ impl Encoded {
             .map(|files| encode_files_changed(&files[..files.len().min(MAX_RECORD_FILES_CHANGED)]))
             .transpose()
             .map_err(|_| StoreError::InvalidRecord("files_changed"))?;
+        // The `irreversible` object as JSON text (KNSH-093, FR-IRR-04; the column has been in the schema since
+        // version 1, always NULL before). `None` stays NULL: a line refused before it was classified.
+        let irreversible = details
+            .irreversible
+            .as_ref()
+            .map(encode_irreversible)
+            .transpose()
+            .map_err(|_| StoreError::InvalidRecord("irreversible"))?;
         Ok(Self {
             record_id: record.record_id.to_string(),
             session_id: record.session_id.to_string(),
@@ -568,13 +577,14 @@ impl Encoded {
             network,
             unprotected,
             files_changed,
+            irreversible,
             started_at: micros(record.started_at)?,
             ended_at: record.ended_at.map(micros).transpose()?,
         })
     }
 
     /// The bound values, in [`RECORD_COLUMNS`] order.
-    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 22] {
+    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 23] {
         let details = &record.details;
         [
             Value::Text(&self.record_id),
@@ -602,6 +612,7 @@ impl Encoded {
             // KNSH-081: the column has been in the schema since version 1, always NULL before.
             optional_text(details.attribution.map(Attribution::as_str)),
             optional_text(self.files_changed.as_deref()),
+            optional_text(self.irreversible.as_deref()),
         ]
     }
 }
@@ -665,6 +676,11 @@ fn read_record(statement: &Statement<'_>) -> Result<ExecutionRecord, StoreError>
             files_changed: statement
                 .column_text(21)?
                 .map(|text| decode_files_changed(&text))
+                .transpose()
+                .map_err(corrupt)?,
+            irreversible: statement
+                .column_text(22)?
+                .map(|text| decode_irreversible(&text))
                 .transpose()
                 .map_err(corrupt)?,
         },

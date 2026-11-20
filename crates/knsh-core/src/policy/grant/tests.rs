@@ -523,9 +523,13 @@ fn matching_line_asks_without_grant() {
     let decision = decide(&p, &GrantSet::new(), session_id(1), 10, "npm install");
     assert_eq!(decision.verdict, RuleAction::Allow);
     assert!(decision.capabilities.secrets.is_empty() && decision.capabilities.secret_hosts.is_empty());
-    // FR-SEC-04: dynamic code receives no secret, so it does not ask for one either.
+    // FR-SEC-04: dynamic code receives no secret, so it does not ask for one either. It still asks as irreversible
+    // (FR-IRR-05, KNSH-093): `npm publish` is on the built-in list.
     let decision = decide(&p, &GrantSet::new(), session_id(1), 10, "npm publish && python3 -c 'x'");
-    assert_eq!(decision.verdict, RuleAction::Allow);
+    assert_eq!(
+        (decision.verdict, decision.rule_id),
+        (RuleAction::Ask, Some(RuleId::Irreversible))
+    );
     assert!(decision.capabilities.secrets.is_empty() && decision.capabilities.secret_hosts.is_empty());
     // A deny stays a deny.
     let p = profile(&SECRET_RULES.replace("[network]", "deny = [\"npm publish\"]\n[network]"));

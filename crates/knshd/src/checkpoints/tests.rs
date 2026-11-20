@@ -495,6 +495,39 @@ fn user_undoes_and_redoes_any_sessions_change_inside_a_window() {
     assert_eq!(reason(fixture.user("checkpoint.undo", &by_record(7))), "unknown");
 }
 
+// FR-IRR-06, FR-CKP-36 (KNSH-093): a line's irreversible marks reach its checkpoint through the history's queue, and
+// its undo still restores its files and lists what cannot be undone, in `checkpoint.undo`'s `irreversible`.
+#[test]
+fn undo_result_lists_irreversible_effects() {
+    let fixture = Fixture::new();
+    let (_, agent) = fixture.agent();
+    fixture.tree.add_file(live("a.txt"), b"old");
+    let id = fixture.line(1, agent, "a.txt", b"new");
+    let reasons = ["git push".to_owned(), "network".to_owned(), "github.com".to_owned()];
+    crate::supervisor::IrreversibleMarks::mark(&*fixture.service, id, &reasons);
+
+    let undone = object(fixture.user("checkpoint.undo", &by_record(1)));
+    assert_eq!(undone.get("files_restored").and_then(Value::as_i64), Some(1));
+    assert_eq!(fixture.contents("a.txt").as_deref(), Some(&b"old"[..]));
+    let listed: Vec<&str> = undone
+        .get("irreversible")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(listed, ["git push", "github.com", "network"]);
+
+    // A change that is not flagged lists nothing.
+    fixture.tree.add_file(live("b.txt"), b"old");
+    fixture.line(2, agent, "b.txt", b"new");
+    let undone = object(fixture.user("checkpoint.undo", &by_record(2)));
+    assert_eq!(
+        undone.get("irreversible").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+}
+
 // FR-CKP-20: an edit the engine did not record conflicts, as -32004 with the path; nothing changes.
 #[test]
 fn conflicting_undo_is_minus_32004_with_the_path() {

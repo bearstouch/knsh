@@ -182,6 +182,7 @@ fn ask_rewritten(
             rule_id: Some("exec.ask[0]"),
             hook: None,
             profile: &profile,
+            irreversible: &flag_of(&line),
         };
         decisions.ask(&request, caller.as_ref())
     });
@@ -306,6 +307,41 @@ fn sends_rewritten_from_with_second_ask() {
     assert_eq!(asking.join().unwrap().reply, AskReply::Allow);
 }
 
+// FR-IRR-05 (KNSH-093): the authority sees a flagged line's `irreversible.reasons` before it runs, and an unflagged
+// line's `{"value": false, "reasons": []}`, never `null` once lines are classified.
+#[test]
+fn decision_request_includes_irreversible_reasons() {
+    let harness = Harness::new();
+    harness.decisions.registered(AUTHORITY);
+    let asking = harness.ask(LINE, Arc::new(StillWaiting));
+    let id = harness.pending_id();
+    let sent = harness.wire.wait_for(1);
+    let (_, params) = parts(&sent[0].1);
+    let irreversible = params.as_object().unwrap().get("irreversible").unwrap();
+    assert_eq!(
+        knsh_json::write(irreversible).unwrap(),
+        r#"{"value":true,"reasons":["git push"]}"#
+    );
+    harness.respond(AUTHORITY, &format!(r#"{{"request_id":"{id}","verdict":"deny"}}"#));
+    asking.join().unwrap();
+
+    let harness = Harness::new();
+    harness.decisions.registered(AUTHORITY);
+    let asking = harness.ask("ls -l", Arc::new(StillWaiting));
+    let id = harness.pending_id();
+    let sent = harness.wire.wait_for(1);
+    let request = requested(&sent[0].1);
+    assert_eq!(
+        request.irreversible,
+        Some(knsh_proto::Irreversible {
+            value: false,
+            reasons: Vec::new(),
+        })
+    );
+    harness.respond(AUTHORITY, &format!(r#"{{"request_id":"{id}","verdict":"deny"}}"#));
+    asking.join().unwrap();
+}
+
 // FR-AUTH-20, FR-EVT-06: `decision.requested` carries the request ID, session, actor, redacted command, working
 // directory, matched rule, irreversibility and `timeout_at`, and goes only to the registered authority's connection.
 #[test]
@@ -328,9 +364,14 @@ fn sends_request_with_all_fields() {
     assert_eq!(request.cwd, CWD);
     assert_eq!(request.matched_rule.as_deref(), Some("exec.ask[0]"));
     assert_eq!(request.hook, None);
-    // Present, as `null`, until lines are classified for irreversibility (KNSH-093).
-    let (_, params) = parts(&sent[0].1);
-    assert_eq!(params.as_object().unwrap().get("irreversible"), Some(&Json::Null));
+    // FR-IRR-05 (KNSH-093): the line's irreversibility, with its reasons.
+    assert_eq!(
+        request.irreversible,
+        Some(knsh_proto::Irreversible {
+            value: true,
+            reasons: vec!["git push".to_owned()],
+        })
+    );
     // 90 s after the request was made, on the wall clock (FR-AUTH-23).
     assert_eq!(request.timeout_at.as_unix_micros(), START_MICROS + 90_000_000);
 
@@ -637,4 +678,13 @@ fn refuses_answers_not_from_the_authority() {
     assert!(!asking.is_finished());
     assert!(harness.respond(AUTHORITY, &allow).applied);
     assert_eq!(asking.join().unwrap().reply, AskReply::Allow);
+}
+
+/// The irreversible flag the pipeline gives `line` in these tests: `git push` for a push, none otherwise (KNSH-093).
+fn flag_of(line: &str) -> knsh_core::Irreversibility {
+    let mut flag = knsh_core::Irreversibility::none();
+    if line.starts_with("git push") {
+        flag.add("git push");
+    }
+    flag
 }

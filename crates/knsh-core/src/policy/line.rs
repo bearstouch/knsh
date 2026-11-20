@@ -26,6 +26,17 @@
 //! once approved, or allowed by a grant covering that command. A line holding dynamic code receives no secret
 //! (FR-SEC-04), so none of its commands asks for this reason.
 //!
+//! # Irreversible commands (KNSH-093)
+//!
+//! A command classified irreversible ([`super::irreversible`]: the built-in list, the profile's
+//! `approvals.irreversible_commands`, `curl` with a write method, `rsync` to a remote host) is treated at least as
+//! strictly as `approvals.irreversible` says, named [`RuleId::Irreversible`] (FR-IRR-05): with `"ask"`, a command the
+//! rules allow asks, so the line is approved before it runs whatever `exec.allow` says; with `"deny"` it is refused;
+//! with `"allow"` the rules alone decide. The line's [`LineDecision::irreversible`] holds every reason, whatever the
+//! verdict, for the record (FR-IRR-04) and for `decision.requested`.
+//!
+//! # Dynamic code
+//!
 //! If **any** part of the line is dynamic, the whole line is clamped (FR-POL-20, FR-POL-21): network is limited to
 //! `network.hosts` (and the loopback ports, which are open to every command alike), no approval hosts, no secrets and
 //! no classes, even if the line is later approved. The proxy identifies a line, not a command within it, so one
@@ -67,10 +78,12 @@ use knsh_bash::{
 };
 
 use super::grant::GrantSet;
+use super::irreversible::command_reasons;
 use super::model::{NetworkMode, Profile, RuleAction};
 use super::rules::{RuleId, evaluate_command, matches_certainly};
 use super::unattended::UNATTENDED_PROFILE;
 use crate::id::{GrantId, SessionId};
+use crate::record::Irreversibility;
 use crate::session::ProfileName;
 use crate::time::Timestamp;
 
@@ -218,6 +231,9 @@ pub struct LineDecision {
     pub matched_rules: Vec<MatchedRule>,
     /// What the line may receive; nothing when it is denied.
     pub capabilities: LineCapabilities,
+    /// Whether the line is classified irreversible before it runs, and why (FR-IRR-01, FR-IRR-04): every reason of
+    /// every command, whatever the verdict. None for a failed evaluation.
+    pub irreversible: Irreversibility,
 }
 
 impl LineDecision {
@@ -231,6 +247,7 @@ impl LineDecision {
             reason: Some(LineReason::EvaluationFailed),
             matched_rules: Vec::new(),
             capabilities: LineCapabilities::default(),
+            irreversible: Irreversibility::none(),
         }
     }
 }
@@ -322,6 +339,7 @@ fn decide(
             }
         }
     }
+    let irreversible = apply_irreversible(profile, commands, &mut matched_rules);
     // FR-POL-20: dynamic code nothing else decides is "allowed or asked as the profile says": its default.
     if has_dynamic_part_without_entry(classification) {
         matched_rules.push(MatchedRule {
@@ -390,7 +408,35 @@ fn decide(
         reason,
         matched_rules,
         capabilities,
+        irreversible,
     })
+}
+
+/// FR-IRR-05 (KNSH-093): treats each irreversible command at least as strictly as `approvals.irreversible` says, so
+/// with `ask` every flagged line asks before it runs, whatever the rules allowed. Returns every reason of the line.
+fn apply_irreversible(
+    profile: &Profile,
+    commands: &[ClassifiedCommand],
+    matched_rules: &mut [MatchedRule],
+) -> Irreversibility {
+    let mut irreversible = Irreversibility::none();
+    for part in matched_rules {
+        let Some(command) = part.command.and_then(|index| commands.get(index)) else {
+            continue;
+        };
+        let reasons = command_reasons(profile, command);
+        if reasons.is_empty() {
+            continue;
+        }
+        for reason in reasons {
+            irreversible.add(reason);
+        }
+        if part.verdict < profile.approvals.irreversible {
+            part.verdict = profile.approvals.irreversible;
+            part.rule_id = RuleId::Irreversible;
+        }
+    }
+    irreversible
 }
 
 /// The grant covering the first part that asks, if a live grant covers **every** part that asks; `None` as soon as

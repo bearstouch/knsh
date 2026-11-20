@@ -270,6 +270,7 @@ fn evaluation_error_denies() {
         reason: Some(LineReason::EvaluationFailed),
         matched_rules: Vec::new(),
         capabilities: LineCapabilities::default(),
+        irreversible: Irreversibility::none(),
     };
     assert_eq!(fail_closed(|| Err(EvaluationError::InconsistentClassification)), failed);
     assert_eq!(fail_closed(|| panic!("a bug in matching")), failed);

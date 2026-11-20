@@ -2359,3 +2359,54 @@ fn unavailable_secret_denies_line() {
     };
     assert!(reason.as_ref().unwrap().expose().contains("gh-token"));
 }
+
+/// `git` allowed outright: only the irreversible classification can make a push ask (KNSH-093).
+const GIT_ALLOWED: &str = "name = \"web\"\n[exec]\nallow = [\"git\", \"ls\"]\n";
+
+// FR-IRR-05, FR-IRR-04 (KNSH-093): with `approvals.irreversible = "ask"` (the default) a flagged line asks even though
+// `exec.allow` allows it, the ask carries its reasons, and the record holds them whatever the answer.
+#[test]
+fn irreversible_line_asks_and_is_recorded_with_reasons() {
+    struct Reasons(Mutex<Vec<Vec<String>>>);
+    impl Authority for Reasons {
+        fn connected(&self) -> bool {
+            true
+        }
+
+        fn ask(&self, request: &AskRequest<'_>, _caller: &dyn Caller) -> AskAnswer {
+            self.0.lock().unwrap().push(request.irreversible.reasons().to_vec());
+            AskAnswer {
+                request_id: Some(RequestId::from_ulid(Ulid::from_u128(78))),
+                reply: AskReply::Deny { reason: None },
+                decided_by: Some("Example Authority".to_owned()),
+            }
+        }
+    }
+    let daemon = Daemon::new();
+    let asked = Arc::new(Reasons(Mutex::new(Vec::new())));
+    let lifecycle = daemon.lifecycle(Setup {
+        profiles: Some(vec![("web", GIT_ALLOWED)]),
+        authority_service: Some(Arc::clone(&asked) as Arc<dyn Authority + Send + Sync>),
+        ..Setup::default()
+    });
+    lifecycle
+        .run(daemon.line("git -c core.pager=cat push origin main"), &StillWaiting)
+        .unwrap_err();
+    assert_eq!(*asked.0.lock().unwrap(), [vec!["git push".to_owned()]]);
+    let record = daemon.records().pop().unwrap();
+    let decision = record.details.decision.unwrap();
+    assert_eq!(decision.source, DecisionSource::Authority);
+    assert_eq!(decision.rule_id.as_deref(), Some("approvals.irreversible"));
+    let flag = record.details.irreversible.unwrap();
+    assert_eq!(flag.reasons(), ["git push"]);
+
+    // An unflagged line runs without asking, recorded `{"value": false}`.
+    lifecycle.run(daemon.line("git status"), &StillWaiting).unwrap();
+    assert_eq!(asked.0.lock().unwrap().len(), 1);
+    let record = daemon
+        .records()
+        .into_iter()
+        .find(|record| record.command.expose() == "git status")
+        .unwrap();
+    assert_eq!(record.details.irreversible, Some(knsh_core::Irreversibility::none()));
+}

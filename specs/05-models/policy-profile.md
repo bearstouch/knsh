@@ -82,7 +82,8 @@ Outside the subset, and rejected as such: dates and times, floats (including `in
 | `network.loopback` | list of ports | Loopback ports allowed |
 | `network.non_tls_hosts` | list | Hosts whose tunnels may carry anything, not only TLS naming the host: the proxy skips the server-name check for them ([FR-NET-06](../03-functional-requirements/network-proxy.md#tls-server-name-check-knsh-061)). Matched like `network.hosts` entries; never makes a host reachable. Not allowed in presets. **Proposed** (KNSH-061) |
 | `approvals.irreversible` | `allow` \| `ask` \| `deny` | Treatment of irreversible lines |
-| `approvals.irreversible_commands` | list of patterns | Commands the profile adds to the irreversible list. **Proposed** (KNSH-039) |
+| `approvals.irreversible_commands` | list of patterns | Commands the profile adds to the built-in irreversible list ([irreversible actions](../03-functional-requirements/irreversible-actions.md)); matched like `exec.ask` patterns. **Proposed** (KNSH-039) |
+| `approvals.upload_hosts` | list | Hosts the profile adds to the built-in upload-capable list: a line that reached one is marked irreversible after it runs (FR-IRR-03). Matched like `network.hosts` entries; never makes a host reachable. Not allowed in presets. **Proposed** (KNSH-093) |
 | `checkpoints.roots` | list of paths | Protected roots |
 | `checkpoints.required` | bool | Lines touching a root wait for its shadow |
 | `checkpoints.exclude` | list | Default `node_modules`, `target`, `.venv`, `dist`, `build` |
@@ -135,7 +136,8 @@ Every key is optional except `name`. An unset key takes its default:
 | `network.mode` | `none` |
 | `network.hosts`, `network.approval_hosts`, `network.loopback` | none |
 | `approvals.irreversible` | `ask` |
-| `approvals.irreversible_commands` | none |
+| `approvals.irreversible_commands` | none (the built-in list always applies) |
+| `approvals.upload_hosts` | none (the built-in list always applies) |
 | `checkpoints.roots` | none |
 | `checkpoints.required` | `false` |
 | `checkpoints.exclude` | `node_modules`, `target`, `.venv`, `dist`, `build` (a profile's list replaces it) |
@@ -190,4 +192,6 @@ if `web-app` sets `exec.ask` and extends `base`, `exec.ask[0]` is `web-app`'s fi
 `exec.ask` unset, it is `base`'s. A decision made by a setting rather than a rule has the setting's key as its ID:
 `exec.project_executables` (a binary outside the trusted folders, FR-POL-14) or `exec.default` (no rule matched,
 FR-POL-17). A command the rules allow that would receive a secret asks with `secrets.env[N]`, the `N`-th
-`[secrets.env]` variable in name order (FR-SEC-02, KNSH-092). Matching is described in [policy](../03-functional-requirements/policy.md#resolution-and-matching).
+`[secrets.env]` variable in name order (FR-SEC-02, KNSH-092). A command classified irreversible that the rules treat
+less strictly than `approvals.irreversible` takes that setting, with the ID `approvals.irreversible` (FR-IRR-05,
+KNSH-093). Matching is described in [policy](../03-functional-requirements/policy.md#resolution-and-matching).
