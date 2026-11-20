@@ -23,3 +23,10 @@ knsh-platform = { path = "../knsh-platform", features = ["testing"] }
 
 [lints]
 workspace = true
+
+# Phase 3 performance qualification (KNSH-095, NFR-PERF-05, NFR-PERF-06): run with `scripts/qualify-phase3.sh`.
+# Its own `main` (no test harness, no third-party bench crate); macOS only.
+[[bench]]
+name = "phase3"
+path = "benches/phase3/main.rs"
+harness = false

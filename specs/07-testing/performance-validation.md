@@ -68,6 +68,56 @@ agent lines only for signed profiles), and machines other than this one.
 
 Related verification claims: per-file copy-on-write cloning speed, and FSEvents flushing ([verification-claims.md](verification-claims.md)).
 
+## Phase 3 qualification (NFR-PERF-05, -06; KNSH-095)
+
+`scripts/qualify-phase3.sh` runs `knsh-checkpoint`'s `phase3` benchmark (`crates/knsh-checkpoint/benches/phase3/`,
+`cargo bench`, release profile, offline) on the real platform services: `FSEvents`, APFS clones, the process table.
+It works in `.build/phase3-work/`, so it measures the volume the checkout is on, which must be APFS
+(`KNSH_BENCH_DIR` names another folder). `knshd` is a binary without a library, so the benchmark wires the
+checkpoint parts the way `knshd`'s `shadows` module does: the watcher, the attribution ledger, the captures and the
+history, with the same lock order. Left out, as cheap in-memory work or not exercised by one session: publishing
+`file.changed` and `checkpoint.created`, irreversible marks (KNSH-093), retention, and flushing other sessions'
+watchers on the same root.
+
+| Target | How it is measured |
+| --- | --- |
+| Checkpoint work after a line (NFR-PERF-05) | A root of 10,000 files (100 folders of 100) is shadowed and watched. Each line is a `/bin/sh` process in its own process group that appends to 0, 1, 100 or 10,000 of its files. The clock starts once the line has been reaped and stops when its end is done, as in `knshd`'s `close_lines`: the marker flush and the worker settling (decision 16), the held-file scan of its process group (decision 17), the ledger ending the line, and its checkpoint finishing and being recorded in the history (KNSH-088). That is the work the line's answer waits for. Lines are interleaved by size after one discarded warm-up line of each, and the watcher is allowed to settle (flushed until certain) between lines, outside the measurement. A sample is **valid** only if the line closed certain, the held-file scan checked its processes, and its checkpoint holds exactly the changed files (each pre-image kept, none possibly torn), is not uncertain, and is in the history; an invalid sample is reported with its figure and why. Run twice: with the production flush deadline (1 s, judged) and with a 60 s deadline (diagnostic: the cost when nothing is cut short; not judged) |
+| Initial shadow (NFR-PERF-06) | A root of 100,000 files in 4,000 folders of 25 is shadowed by the real builder (4 threads at QoS utility, decision 15), timed by the builder's own monotonic clock. With `KNSH_BENCH_PURGE=1` (and a cached `sudo` ticket) each run is preceded by one after `sudo -n /usr/sbin/purge` (cold cache); otherwise the cold cache is **not measured**. The time to remove each shadow is a diagnostic series |
+
+The requirements name no percentile, so a target holds only when **every** sample is valid and the largest is under
+it (20 ms + 1 ms per changed file; 10 s). Settings: `KNSH_BENCH_ROUNDS` (lines per size, default 20),
+`KNSH_BENCH_ROUNDS_LARGE` (lines of 10,000 files, default 5), `KNSH_BENCH_SHADOW_RUNS` (default 3). The report
+(`phase-3-performance.md`: date, machine, macOS version, commit, build, volume, every series' n/min/p50/p95/p99/max,
+the invalid samples and open items) and the raw samples (`phase-3-performance-samples.csv`) go to
+`.build/qualification/<UTC stamp>/`; the release's copy is stored in [qualification/](qualification/). A miss or an
+unmeasured target is listed as an open item and the script exits non-zero.
+
+| Date | Machine | Commit | 0 files | 1 file | 100 files | 10,000 files | Shadow, warm | Shadow, cold | Report |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-11-20 | MacBookPro18,3, Apple M1 Pro (8 CPUs, 16 GiB), macOS 26.6.2 (25G83), internal SSD (APFS data volume), release build | 9abf2b1 + KNSH-095 (uncommitted) | max 39.10 ms (p50 14.48, p95 31.45): **missed** (< 20 ms) | max 164.49 ms (p50 15.52, p95 57.75): **missed** (< 21 ms) | max 64.47 ms (p50 41.62): **met** (< 120 ms) | 5 of 5 lines invalid, about 1.0 s each: **missed** | 10.37 to 12.61 s: **missed** (< 10 s) | **not measured** | [qualification/](qualification/phase-3-performance-2026-11-20.md) (machine under load, see below) |
+
+**Open: NFR-PERF-05 is missed** (follow-up [KNSH-126](../00-stories/KNSH-126-certain-checkpoints-for-large-lines.md)).
+- *10,000 files:* every line makes `FSEvents` report a drop (`MustScanSubDirs`), so it closes uncertain
+  (`events_dropped`) and the root is rescanned. At the 1 s flush deadline the answer is ready after about 1.0 s, but
+  its checkpoint holds only 4,980 to 5,311 of the 10,000 changed files; the rest land after the line. With a 60 s
+  deadline (diagnostic) the checkpoint is complete after 3.3 to 4.5 s, inside the 10.02 s budget, but still uncertain.
+  The fixed 1 s deadline is itself shorter than the budget for any line over about 980 files.
+- *0 and 1 file:* the typical line is well inside the budget (p50 14.5 and 15.5 ms; the diagnostic run's p95 18.5
+  and 20.5 ms), but single lines took up to 39 ms and 164 ms. Most of a small line's cost is the marker flush
+  (decision 16: 6.6 to 9.3 ms at p50 in the spike); the tail is not broken down yet,
+  and the same machine load (below) may explain part of it.
+
+**Open: NFR-PERF-06 is missed** (follow-up [KNSH-127](../00-stories/KNSH-127-faster-initial-shadow.md)). Three warm
+runs took 10.37, 12.19 and 12.61 s for 100,000 files in 4,101 folders, against 7.4 to 7.7 s in the KNSH-077 spike
+(decision 15) and 9.72 to 9.88 s in this benchmark's shorter trial runs the same day. The machine was not idle:
+the 1-minute load average read 96 right after the run (a browser, an editor and an Xcode `swift` build were busy),
+and both misses may shrink on an idle machine; the 4-thread pool at QoS utility yields to such load by design.
+The cold cache was not measured (needs `KNSH_BENCH_PURGE=1` with a `sudo` ticket). Removing a shadow took 6.1 to
+6.9 s (diagnostic).
+
+Not measured: other machines and macOS 14 and 15, external or slower disks, roots of other shapes (deep trees, large
+files).
+
 ## Redaction throughput (FR-SEC-10, KNSH-090)
 
 `knsh-core`'s ignored test `redaction::tests::redaction_throughput` streams 16 MiB through one `RedactStream` in

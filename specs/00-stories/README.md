@@ -213,6 +213,7 @@ Critical path: [KNSH-077](KNSH-077-spike-file-system-behaviour-copy-on-write-clo
 | 7 | [KNSH-084](KNSH-084-undo-and-redo.md), [KNSH-087](KNSH-087-exclusions-retention-and-sensitive-files.md) | 11 |
 | 8 | [KNSH-085](KNSH-085-possibly-torn-detection.md), [KNSH-086](KNSH-086-checkpoint-restore-and-checkpoint-diff.md), [KNSH-093](KNSH-093-irreversible-actions-classification-post-run-marking.md), [KNSH-095](KNSH-095-phase-3-performance-qualification.md) | 19 |
 | 9 | [KNSH-088](KNSH-088-checkpoint-api-and-cli.md) | 3 |
+| 10 | [KNSH-126](KNSH-126-certain-checkpoints-for-large-lines.md), [KNSH-127](KNSH-127-faster-initial-shadow.md) (follow-ups of the KNSH-095 misses) | 8 |
 
 ### Phase 4 — Native interpreter
 
@@ -376,7 +377,9 @@ Critical path: [KNSH-110](KNSH-110-portable-platform-split-and-linux-ci.md) → 
 | [KNSH-092](KNSH-092-secret-injection-and-network-narrowing.md) | Secret injection and network narrowing | Secrets | L (5) | [KNSH-042](KNSH-042-grants.md), [KNSH-060](KNSH-060-proxy-connection-rules-host-rules-address-checks-and.md), [KNSH-089](KNSH-089-secret-stores-keychain-and-authority-supplied-secrets.md), [KNSH-091](KNSH-091-redaction-on-every-output-path.md) | Done |
 | [KNSH-093](KNSH-093-irreversible-actions-classification-post-run-marking.md) | Irreversible actions: classification, post-run marking, approvals and undo reporting | Irreversible | XL (8) | [KNSH-037](KNSH-037-subcommand-normalisation-and-network-intent-classes.md), [KNSH-060](KNSH-060-proxy-connection-rules-host-rules-address-checks-and.md), [KNSH-082](KNSH-082-capture-pre-images-and-post-image-identity.md), [KNSH-084](KNSH-084-undo-and-redo.md) | Not started |
 | [KNSH-094](KNSH-094-endpoint-security-descendant-client-macos-27-entitlement.md) | Endpoint Security descendant client (macOS 27+, entitlement-gated) | Endpoint Security | XL (8) | [KNSH-057](KNSH-057-envelope-profile-and-launch.md) | Mechanism done; blocked on the entitlement |
-| [KNSH-095](KNSH-095-phase-3-performance-qualification.md) | Phase 3 performance qualification | Qualification | M (3) | [KNSH-084](KNSH-084-undo-and-redo.md) | Not started |
+| [KNSH-095](KNSH-095-phase-3-performance-qualification.md) | Phase 3 performance qualification | Qualification | M (3) | [KNSH-084](KNSH-084-undo-and-redo.md) | Done; NFR-PERF-05 and NFR-PERF-06 missed (KNSH-126, KNSH-127) |
+| [KNSH-126](KNSH-126-certain-checkpoints-for-large-lines.md) | Certain checkpoints for lines that change thousands of files | Checkpoints | L (5) | [KNSH-095](KNSH-095-phase-3-performance-qualification.md) | Not started |
+| [KNSH-127](KNSH-127-faster-initial-shadow.md) | Initial shadow of 100,000 files under 10 s | Checkpoints | M (3) | [KNSH-095](KNSH-095-phase-3-performance-qualification.md) | Not started |
 
 ### Phase 4 — Native interpreter
 
