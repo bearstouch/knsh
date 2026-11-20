@@ -510,7 +510,7 @@ impl<'a> Expander<'a> {
     }
 
     /// `$-`: the option letters of a shell started as `bash -c` (`h` hashing, `B` brace expansion, `c`), with `f`
-    /// under `set -f` and `u` under `set -u`, in bash's order.
+    /// under `set -f`, `u` under `set -u` and `C` under `set -C`, in bash's order.
     fn flags(&self) -> String {
         let mut flags = String::new();
         if self.state.options().noglob {
@@ -520,7 +520,11 @@ impl<'a> Expander<'a> {
         if self.state.options().nounset {
             flags.push('u');
         }
-        flags.push_str("Bc");
+        flags.push('B');
+        if self.state.options().noclobber {
+            flags.push('C');
+        }
+        flags.push('c');
         flags
     }
 

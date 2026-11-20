@@ -37,7 +37,9 @@ use knsh_bash::{
     CompoundKind, ForCommand, IfCommand, ListItem, LoopBody, LoopCommand, Pipeline, Script, SimpleCommand, Span,
     UnsupportedCommand,
 };
-use knsh_platform::{Collation, CommandOutcome, CommandRequest, CommandSpawner, ExitStatus, Fs, UserHomes};
+use knsh_platform::{
+    Collation, CommandOutcome, CommandRequest, CommandSpawner, Descriptors, ExitStatus, Fs, UserHomes,
+};
 
 use crate::arith::Failure;
 use crate::brace;
@@ -50,6 +52,11 @@ use crate::scan;
 use crate::state::{ShellState, is_name};
 use crate::status::Status;
 use crate::word;
+
+mod redirect;
+
+use redirect::FdTable;
+pub(crate) use redirect::here_document;
 
 /// Deepest nesting of lists the evaluator follows: compound command bodies, conditions and case arms today, and
 /// function calls, `source` and `eval` once later stories add them. Past it the run fails with
@@ -87,8 +94,14 @@ pub(crate) fn is_refused_builtin(name: &str) -> bool {
         || LATER_BUILTINS.contains(&name)
 }
 
-/// Builtins the interpreter runs itself: `let` (KNSH-097).
-const NATIVE_BUILTINS: &[&str] = &["let"];
+/// Builtins the interpreter runs itself: `let` (KNSH-097), `:` and `exec` with redirections only (KNSH-099).
+const NATIVE_BUILTINS: &[&str] = &["let", ":", "exec"];
+
+/// Whether `exec` with `args` only changes the shell's descriptors (no arguments, or only `--`): the form the
+/// interpreter runs. `exec cmd` replaces the shell and is refused until KNSH-101.
+pub(crate) fn exec_redirects_only(args: &[String]) -> bool {
+    matches!(args, [] | [_]) && args.first().is_none_or(|arg| arg == "--")
+}
 
 /// Whether running the builtin `name` (one of [`EXTERNAL_BUILTINS`]) as its program with `args` could do something
 /// other than bash's builtin, so it must be refused until the builtin is implemented. Conservative: it refuses every
@@ -176,8 +189,16 @@ pub struct Interpreter {
     homes: Arc<dyn UserHomes>,
     /// The order of pathname expansion results.
     collation: Arc<dyn Collation>,
-    /// The shell's own error messages (bash's standard error).
+    /// Where redirections open their files (KNSH-099).
+    descriptors: Arc<dyn Descriptors>,
+    /// The spawner's standard error, for the shell's own messages while its descriptor 2 is that (bash's standard
+    /// error).
     diagnostics: Box<dyn Write + Send>,
+    /// The spawner's standard output, for what the shell itself writes there (its messages after `2>&1`).
+    output: Box<dyn Write + Send>,
+    /// The shell's descriptor table: what each number holds for the script (KNSH-099). Kept across runs, so
+    /// `exec 3>file` lasts as long as the shell.
+    fds: FdTable,
     /// The nesting limit.
     max_depth: usize,
     /// Lists currently entered.
@@ -196,8 +217,12 @@ impl fmt::Debug for Interpreter {
 impl Interpreter {
     /// An interpreter over `state` that looks commands up and matches file names through `fs`, runs commands through
     /// `spawner`, finds home directories for `~name` through `homes`, sorts file names with `collation` (bash's
-    /// `strcoll` order in the shell's locale) and writes its own error messages to `diagnostics`, with the default
-    /// nesting limit [`MAX_EVAL_DEPTH`].
+    /// `strcoll` order in the shell's locale), opens redirection files through `descriptors` and writes its own
+    /// error messages to `diagnostics` (the spawner's standard error, while the shell's descriptor 2 is that), with
+    /// the default nesting limit [`MAX_EVAL_DEPTH`]. What the shell writes to the spawner's standard output is
+    /// discarded unless [`Interpreter::with_output`] says where it goes.
+    ///
+    /// The shell starts with descriptors 0, 1 and 2 as the spawner's own and nothing else open.
     #[must_use]
     pub fn new(
         state: ShellState,
@@ -205,6 +230,7 @@ impl Interpreter {
         spawner: Arc<dyn CommandSpawner>,
         homes: Arc<dyn UserHomes>,
         collation: Arc<dyn Collation>,
+        descriptors: Arc<dyn Descriptors>,
         diagnostics: Box<dyn Write + Send>,
     ) -> Self {
         Self {
@@ -213,10 +239,21 @@ impl Interpreter {
             spawner,
             homes,
             collation,
+            descriptors,
             diagnostics,
+            output: Box::new(std::io::sink()),
+            fds: FdTable::standard(),
             max_depth: MAX_EVAL_DEPTH,
             depth: 0,
         }
+    }
+
+    /// The same interpreter writing what the shell itself sends to the spawner's standard output to `output` (its
+    /// messages after `2>&1`), so they land where commands' output does.
+    #[must_use]
+    pub fn with_output(mut self, output: Box<dyn Write + Send>) -> Self {
+        self.output = output;
+        self
     }
 
     /// The same interpreter with nesting limit `max_depth` instead of [`MAX_EVAL_DEPTH`]. A limit above
@@ -280,14 +317,15 @@ impl Interpreter {
         }
     }
 
-    /// Writes one of the shell's own error messages, as bash 5 does: `name: line n: message`. A failed write is
-    /// ignored, as bash ignores it.
+    /// Writes one of the shell's own error messages, as bash 5 does: `name: line n: message`, to the shell's
+    /// descriptor 2 as the redirections in force leave it (KNSH-099). A failed write is ignored, as bash ignores it.
     fn report(&mut self, span: Span, run: &Run<'_>, message: fmt::Arguments<'_>) {
         let line = run
             .source
             .get(..span.start)
             .map_or(1, |before| before.matches('\n').count() + 1);
-        let _ = writeln!(self.diagnostics, "{}: line {line}: {message}", self.state.name());
+        let text = format!("{}: line {line}: {message}\n", self.state.name());
+        self.write_shell(2, text.as_bytes());
     }
 
     /// Enters one more list, or fails past the nesting limit.
@@ -473,10 +511,17 @@ impl Interpreter {
         match command {
             Command::Simple(simple) => self.simple(simple, run),
             Command::Compound(compound) => {
-                if let Some(redirect) = compound.redirections.first() {
-                    return Err(unsupported(Unsupported::Redirection, redirect.span).into());
+                if let CompoundKind::Subshell(_) = compound.kind {
+                    return Err(unsupported(Unsupported::Subshell, compound.span).into());
                 }
-                match &compound.kind {
+                if let Some(span) = here_document(&compound.redirections) {
+                    return Err(unsupported(Unsupported::HereDocument, span).into());
+                }
+                // The redirections hold for the whole body and are undone after it, however it ends.
+                let Some(saved) = self.redirect(&compound.redirections, run)? else {
+                    return Ok(Status::FAILURE);
+                };
+                let result = match &compound.kind {
                     CompoundKind::Group(group) => self.list(&group.body, run),
                     CompoundKind::Subshell(_) => Err(unsupported(Unsupported::Subshell, compound.span).into()),
                     CompoundKind::If(command) => self.if_command(command, run),
@@ -484,7 +529,9 @@ impl Interpreter {
                     CompoundKind::While(command) => self.loop_command(command, true, run),
                     CompoundKind::Until(command) => self.loop_command(command, false, run),
                     CompoundKind::Case(command) => self.case_command(command, run),
-                }
+                };
+                self.restore(saved);
+                result
             }
             Command::FunctionDefinition(definition) => {
                 Err(unsupported(Unsupported::FunctionDefinition, definition.span).into())
@@ -653,11 +700,12 @@ impl Interpreter {
         Ok(if last == 0 { Status::FAILURE } else { Status::SUCCESS })
     }
 
-    /// A simple command: its words are expanded, then its assignments; assignments alone set shell variables;
-    /// otherwise the command runs with them in its environment.
+    /// A simple command: its words are expanded, then its assignments, then its redirections are applied (left to
+    /// right); assignments alone set shell variables; otherwise the command runs with them in its environment and
+    /// the redirected descriptors. The redirections are undone afterwards, except for `exec` without a command.
     fn simple(&mut self, simple: &SimpleCommand, run: &Run<'_>) -> Flow<Status> {
-        if let Some(redirect) = simple.redirections.first() {
-            return Err(unsupported(Unsupported::Redirection, redirect.span).into());
+        if let Some(span) = here_document(&simple.redirections) {
+            return Err(unsupported(Unsupported::HereDocument, span).into());
         }
         let words = self.arguments(&simple.words, run)?;
         let mut assignments: Vec<(String, OsString)> = Vec::with_capacity(simple.assignments.len());
@@ -688,9 +736,38 @@ impl Interpreter {
                 assignments.push((assignment.name.clone(), value));
             }
         }
+        if let [name, args @ ..] = words.as_slice()
+            && name == "exec"
+            && !exec_redirects_only(args)
+        {
+            return Err(unsupported(Unsupported::Builtin, simple.span).into());
+        }
+        let Some(saved) = self.redirect(&simple.redirections, run)? else {
+            return Ok(Status::FAILURE);
+        };
+        let result = self.simple_body(simple, &words, &assignments, run);
+        match words.first() {
+            // `exec` without a command: its redirections are the shell's from now on.
+            Some(name) if name == "exec" && result.is_ok() => drop(saved),
+            Some(_) | None => self.restore(saved),
+        }
+        result
+    }
+
+    /// The command of a simple command once its words, assignments and redirections are done.
+    fn simple_body(
+        &mut self,
+        simple: &SimpleCommand,
+        words: &[String],
+        assignments: &[(String, OsString)],
+        run: &Run<'_>,
+    ) -> Flow<Status> {
         let Some((name, args)) = words.split_first() else {
             return Ok(Status::SUCCESS);
         };
+        if name == ":" || name == "exec" {
+            return Ok(Status::SUCCESS);
+        }
         if name == "let" {
             // `a=1 let …` gives `let` a temporary scope bash's arithmetic reads and assigns in, and restores after:
             // not emulated, so refused rather than evaluated against the wrong variables.
@@ -720,8 +797,9 @@ impl Interpreter {
                     program,
                     argv0: name.into(),
                     args: args.iter().map(OsString::from).collect(),
-                    env: self.state.environment(&assignments),
+                    env: self.state.environment(assignments),
                     cwd: self.state.cwd().to_path_buf(),
+                    descriptors: self.fds.child_table(),
                 };
                 let outcome = self.spawner.run(&request).map_err(InterpError::from)?;
                 Ok(self.outcome_status(outcome, name, simple.span, run))

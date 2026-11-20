@@ -52,6 +52,9 @@
 //!
 //! - [`FakeUserHomes`]: a user database of home directories the test fills in (KNSH-097).
 //!
+//! - [`FakeDescriptors`]: redirection files opened in a [`MemFs`], each descriptor telling what it stands for
+//!   (KNSH-099).
+//!
 //! Locks in the fakes are independent (one per fake) and never held across calls into another fake.
 
 mod ancestry;
@@ -60,6 +63,7 @@ mod collation;
 mod command;
 mod control;
 mod denials;
+mod descriptor;
 mod endpoint_security;
 mod file_events;
 mod fs;
@@ -82,6 +86,7 @@ pub use collation::FakeCollation;
 pub use command::ScriptedCommands;
 pub use control::FakeCodeSigning;
 pub use denials::{ScriptedDenialLog, kernel_entry};
+pub use descriptor::{FakeDescriptors, FakeOpened};
 pub use endpoint_security::ScriptedDescendantClients;
 pub use file_events::{FlushHook, ScriptedFileEvents, watch_failure};
 pub use fs::{DEFAULT_UID, MemFs};

@@ -219,6 +219,7 @@ mod clock;
 mod collation;
 mod command;
 mod control;
+mod descriptor;
 mod endpoint_security;
 pub mod engine_dirs;
 mod error;
@@ -256,12 +257,15 @@ pub mod testing;
 pub use ancestry::{AuditToken, ProcessIdentity, ProcessKey, ProcessTree};
 pub use clock::{Clock, Monotonic};
 pub use collation::{ByteCollation, Collation, is_c_locale, tie_break};
-pub use command::{CommandOutcome, CommandRequest, CommandSpawner, ProcessCommandSpawner};
+pub use command::{
+    ChildDescriptor, CommandOutcome, CommandRequest, CommandSpawner, ProcessCommandSpawner, StandardStream,
+};
 pub use control::{
     AfterMessage, BYTES_KEY, BundleVersion, CodeSigning, ConnectionId, ControlHandler, ControlPeer, JSON_KEY,
     MAX_CONTROL_PAYLOAD, PeerGate, PeerRejection, SignatureFacts, SigningIdentifier, TeamId, TrustError, TrustStore,
     TrustedAuthority, peer_requirement,
 };
+pub use descriptor::{Descriptors, OpenMode, reaches_descriptor_table};
 pub use endpoint_security::{
     DescendantClient, DescendantClients, ENDPOINT_SECURITY_MIN_MAJOR, ExecEvent, ExecHandler, ExecVerdict,
 };
@@ -275,7 +279,10 @@ pub use log::{Field, Level, SystemLog, Value, render};
 pub use policy_source::{EditableProfile, FileState, PolicyDirectory};
 pub use presence::{Authenticated, NotAuthenticated, PromptReason, UserPresence};
 pub use probe::{ProbeFailure, SystemProbe};
-pub use process::{ExitStatus, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest, Stdio};
+pub use process::{
+    ExitStatus, MAX_PLACED_FD, Placement, PlacementSource, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest,
+    Stdio,
+};
 pub use random::Random;
 pub use resolver::{MAX_ADDRESSES, Resolver};
 pub use secret::{SecretStore, SecretValue};

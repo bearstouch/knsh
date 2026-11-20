@@ -52,6 +52,9 @@ pub struct ShellOptions {
     /// `shopt -s extglob`: the groups `?(…)`, `*(…)`, `+(…)`, `@(…)` and `!(…)` in pathname expansion, `case`
     /// patterns and the pattern operators of `${…}` (KNSH-098).
     pub extglob: bool,
+    /// `set -C` (`set -o noclobber`): `>` and `&>` refuse to overwrite an existing regular file; `>|` still does
+    /// (KNSH-099).
+    pub noclobber: bool,
 }
 
 /// `IFS` as bash sets it at start-up: space, tab, newline.

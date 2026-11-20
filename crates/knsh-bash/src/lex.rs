@@ -91,6 +91,9 @@ pub(crate) struct LexContext {
     /// Whether bash's `extglob` option is on: `?(…)`, `*(…)`, `+(…)`, `@(…)` and `!(…)` are then part of a word
     /// ([`ParseOptions::extglob`](crate::ParseOptions::extglob)).
     pub(crate) extglob: bool,
+    /// Whether `{name}>file` is a redirection storing a descriptor in `name`, as in bash 4.1 and later
+    /// ([`ParseOptions::redirection_variables`](crate::ParseOptions::redirection_variables)). Read by the parser.
+    pub(crate) redirection_variables: bool,
 }
 
 /// Lexes the part of `input` at `range`, in `context`. Spans are offsets into `input`, and the lexer never reads past
@@ -566,6 +569,8 @@ impl<'a> Lexer<'a> {
             substitutions: self.substitutions,
             process_substitutions: self.process_substitutions,
             extglob: self.extglob,
+            // A body holds no commands of its own: its substitutions are parsed by the parser, with its options.
+            redirection_variables: false,
         };
         let mut lexer = Lexer::new(self.src.get(..body.end).unwrap_or(self.src), body.start, context);
         lexer.enter(operator)?;

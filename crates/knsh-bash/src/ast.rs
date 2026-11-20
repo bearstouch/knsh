@@ -832,7 +832,22 @@ pub struct Redirect {
     /// built from an expansion, a compound command holding such a command). Its text is then code, which the caller
     /// classifies as dynamic (decision 6, FR-LC-05, KNSH-031). Never set on other redirections.
     pub feeds_interpreter: bool,
-    /// From the descriptor number (or operator) to the end of the target. A here-document's body lies elsewhere.
+    /// `{name}` before the operator (`{fd}>file`), read only with
+    /// [`ParseOptions::redirection_variables`](crate::ParseOptions::redirection_variables): the redirection opens a
+    /// new descriptor (10 or above) and stores its number in `name`, or, for `{name}>&-`, closes the descriptor whose
+    /// number `name` holds (KNSH-099). `None` otherwise, and always when [`fd`](Self::fd) is set.
+    pub variable: Option<RedirectionVariable>,
+    /// From the descriptor number, variable or operator to the end of the target. A here-document's body lies
+    /// elsewhere.
+    pub span: Span,
+}
+
+/// The `{name}` of a redirection that stores its descriptor in a variable (bash 4.1 and later).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedirectionVariable {
+    /// The variable name, without the braces (`[A-Za-z_][A-Za-z0-9_]*`).
+    pub name: String,
+    /// The `{name}` word, braces included.
     pub span: Span,
 }
 
