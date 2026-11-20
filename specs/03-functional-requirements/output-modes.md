@@ -24,5 +24,5 @@ The default mode comes from the profile's `output.mode` (`full` unless set).
 | FR-OUT-06 | Output returned to callers must be redacted ([secrets](secrets.md#redaction)). |
 
 Status (KNSH-053): FR-OUT-01 to FR-OUT-05 are implemented for `exec.run`, `exec.start` and `exec.wait`. FR-OUT-06 is
-implemented as a hook every captured chunk passes through before it is kept, returned, stored or emitted; it does
-nothing until secret redaction arrives (KNSH-091).
+implemented as a hook every captured chunk passes through before it is kept, returned, stored or emitted; it redacts
+the session's secrets since KNSH-091 ([secrets](secrets.md#redaction-on-every-output-path-knsh-091)).

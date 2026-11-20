@@ -44,8 +44,9 @@
 //!
 //! # Redaction
 //!
-//! Hooks, the authority and events see one redacted text of the line ([`redact`], FR-REC-05). The spawned line is
-//! the real one.
+//! Hooks, the authority and events see one redacted text of the line, made by the session's [`Redactor`]
+//! ([`LineInput::redactor`], FR-REC-05, FR-SEC-11): the driver records the same text with the same instance, so every
+//! path sees the same secret set (KNSH-091). The spawned line is the real one.
 
 mod combine;
 #[cfg(test)]
@@ -65,6 +66,7 @@ use crate::policy::{
 use crate::ratelimit::LineKey;
 use crate::record::{DecisionVerdict, HookRun, RecordDecision};
 use crate::redacted::{Redacted, holds_redaction_marker};
+use crate::redaction::Redactor;
 use crate::resolve::BinaryLookup;
 use crate::session::{Actor, ProfileName};
 use crate::time::Timestamp;
@@ -116,6 +118,9 @@ pub struct Proposal<'a> {
     pub rewritten_from: Option<&'a Redacted<String>>,
     /// How the line was classified: resolved binaries, wrappers and dynamic parts, for hook matches.
     pub classification: &'a Classification,
+    /// The session's redactor, which made `command` and `rewritten_from`: anything else taken from the line for the
+    /// authority (a grant's rule) goes through it too (FR-REC-05, KNSH-091).
+    pub redactor: &'a Redactor,
 }
 
 /// The combined verdict of a hook chain (`specs/03-functional-requirements/hooks.md#verdicts`). `annotate` decides
@@ -295,6 +300,9 @@ pub struct LineInput<'a> {
     pub cwd: &'a CanonicalPath,
     /// The `PATH` names resolve on (without the shims, FR-LC-16).
     pub env_path: &'a str,
+    /// The session's redactor (KNSH-091): the one place the line becomes the text hooks, the authority and events
+    /// see (FR-REC-05). The driver uses the same instance for the record and the output.
+    pub redactor: &'a Redactor,
 }
 
 /// The effects the pipeline reaches through traits, so it is tested with fakes.
@@ -447,14 +455,6 @@ impl Outcome {
     }
 }
 
-/// The one place the line becomes the text hooks, the authority and events see (FR-REC-05).
-///
-/// The redaction engine (KNSH-090) plugs in here; until it exists the text is passed on as it is.
-#[must_use]
-pub fn redact(line: &str) -> Redacted<String> {
-    Redacted::new(line.to_owned())
-}
-
 /// Decides `input` (module documentation). Total: every failure, panics included, is a [`Outcome::Refused`].
 #[must_use]
 pub fn decide(input: &LineInput<'_>, effects: &Effects<'_>) -> Outcome {
@@ -571,7 +571,10 @@ impl<'i, 'e> Pipeline<'i, 'e> {
             let reason = Some(RATE_LIMITED.to_owned());
             return Step::Done(self.refuse(&pass, DecisionSource::RateLimit, None, None, reason));
         }
-        let redacted_from = self.rewritten_from.as_deref().map(redact);
+        let redacted_from = self
+            .rewritten_from
+            .as_deref()
+            .map(|from| self.input.redactor.redact_text(from));
         let proposal = Proposal {
             session_id: self.input.session_id,
             actor: self.input.actor,
@@ -579,6 +582,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
             cwd: self.input.cwd,
             rewritten_from: redacted_from.as_ref(),
             classification: &pass.classification,
+            redactor: self.input.redactor,
         };
 
         // Step 3, before any hook sees the line (FR-LC-07).
@@ -674,7 +678,7 @@ impl<'i, 'e> Pipeline<'i, 'e> {
             .map_or_else(|_| LineKey::of(&command), |line| LineKey::of(&line));
         Pass {
             key,
-            redacted: redact(&command),
+            redacted: self.input.redactor.redact_text(&command),
             command,
             outcome,
             classification,
@@ -776,7 +780,8 @@ impl<'i, 'e> Pipeline<'i, 'e> {
     ) -> Result<String, Outcome> {
         let refused = if self.rewritten_from.is_some() {
             Some(SECOND_REWRITE)
-        } else if holds_redaction_marker(redact(&from).expose()) || holds_redaction_marker(&to) {
+        } else if holds_redaction_marker(self.input.redactor.redact_text(&from).expose()) || holds_redaction_marker(&to)
+        {
             // FR-AUTH-32: the rewriter saw a marker (`«redacted»` or `«redacted:<name>»`) in place of a value, so its
             // line cannot hold the real one; running it would pass the marker text on as the value. A line that held
             // a marker as received is refused the same way: what was redacted cannot be told from what was typed.

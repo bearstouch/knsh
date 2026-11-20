@@ -11,11 +11,11 @@ the authority, so that secrets never leak through the engine's own outputs. Scop
 `exec.run` output, hook input, `decision.requested`, and refusal to rewrite lines containing a marker.
 
 **Acceptance criteria**
-- [ ] Record `command`, stored output and `rewritten_from` are redacted before writing (FR-REC-05).
-- [ ] Events and `exec.run` output are redacted before sending (FR-EVT-07, FR-OUT-06).
-- [ ] Hooks and the authority receive the same redacted text as the record (FR-REC-05).
-- [ ] A rewrite of a line that contains a redaction marker is refused and the line denied (FR-AUTH-32).
-- [ ] A single shared redactor instance per session is used, so all paths see the same secret set.
+- [x] Record `command`, stored output and `rewritten_from` are redacted before writing (FR-REC-05).
+- [x] Events and `exec.run` output are redacted before sending (FR-EVT-07, FR-OUT-06).
+- [x] Hooks and the authority receive the same redacted text as the record (FR-REC-05).
+- [x] A rewrite of a line that contains a redaction marker is refused and the line denied (FR-AUTH-32).
+- [x] A single shared redactor instance per session is used, so all paths see the same secret set.
 
 **Unit tests**
 - `record_command_is_redacted_before_write` (FR-REC-05)

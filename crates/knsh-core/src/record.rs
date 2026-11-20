@@ -390,8 +390,9 @@ pub struct ArgvEntry {
 /// The record's `argv` for a classified line (FR-LC-05, KNSH-052): one entry per classified command, in source
 /// order. A line the parser could not read has no commands, and is recorded as a single dynamic entry carrying the
 /// parser's whole-line reason, so the record never shows an empty `argv` for a line that was dynamic as a whole.
+/// Each name goes through `redactor`, the session's, which also made the record's `command` (FR-REC-05, KNSH-091).
 #[must_use]
-pub fn argv_of(classification: &knsh_bash::Classification) -> Vec<ArgvEntry> {
+pub fn argv_of(classification: &knsh_bash::Classification, redactor: &crate::Redactor) -> Vec<ArgvEntry> {
     if classification.is_whole_line() {
         // The parser always gives a whole-line rejection a reason; `syntax_error` covers the impossible case without
         // ever presenting the line as anything but dynamic.
@@ -415,7 +416,7 @@ pub fn argv_of(classification: &knsh_bash::Classification) -> Vec<ArgvEntry> {
         .map(|command| ArgvEntry {
             // Through the same redaction as `command` (FR-REC-04, FR-REC-11): a name is line text, and must never
             // show what the redacted line hides.
-            name: command.name.as_deref().map(crate::lifecycle::redact),
+            name: command.name.as_deref().map(|name| redactor.redact_text(name)),
             path: command
                 .program
                 .as_ref()
@@ -1472,12 +1473,10 @@ mod tests {
 
     fn argv_for(line: &str) -> Vec<ArgvEntry> {
         let parsed = knsh_bash::parse_line(line);
-        argv_of(&knsh_bash::classify(
-            &parsed,
-            line,
-            &Resolver,
-            &knsh_bash::Interpreters::defaults(),
-        ))
+        argv_of(
+            &knsh_bash::classify(&parsed, line, &Resolver, &knsh_bash::Interpreters::defaults()),
+            &crate::Redactor::default(),
+        )
     }
 
     /// `(name, path, class, wrapper)` of one entry.

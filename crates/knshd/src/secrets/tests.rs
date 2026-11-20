@@ -263,3 +263,35 @@ fn invalid_params_store_nothing() {
     }
     assert_eq!(value_of(&fixture, "x"), Err(Unavailable::NotFound));
 }
+
+// KNSH-091: a session redacts every live provided secret and the named Keychain secrets it can read; one that cannot
+// be read, or is not named, is left out, and a provided secret takes the place of a Keychain item of its name.
+#[test]
+fn redaction_set_holds_provided_and_readable_named_secrets() {
+    let fixture = fixture();
+    fixture.keychain.insert(&name("npm-token"), b"from-keychain");
+    fixture.keychain.insert(&name("gh-token"), b"keychain-gh");
+    fixture.keychain.insert(&name("unnamed"), b"never-read");
+    fixture.keychain.insert(&name("locked"), b"v");
+    fixture.keychain.deny(&name("locked"), -25293);
+    provide(&fixture, "gh-token", "provided-gh", 60);
+    provide(&fixture, "api-key", "provided-key", 60);
+    let set = fixture
+        .broker
+        .redaction_set(&[name("npm-token"), name("gh-token"), name("locked"), name("missing")]);
+    let set: Vec<(String, Vec<u8>)> = set
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.expose().to_vec()))
+        .collect();
+    assert_eq!(
+        set,
+        vec![
+            ("api-key".to_owned(), b"provided-key".to_vec()),
+            ("gh-token".to_owned(), b"provided-gh".to_vec()),
+            ("npm-token".to_owned(), b"from-keychain".to_vec()),
+        ]
+    );
+    // Expired: no longer redacted (nor injectable).
+    fixture.clock.advance(Duration::from_secs(61));
+    assert!(fixture.broker.redaction_set(&[]).is_empty());
+}

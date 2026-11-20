@@ -114,6 +114,7 @@ fn run_for(actor: &Actor, config: &HookConfig, line: &str, executor: &Scripted) 
         cwd: &cwd,
         rewritten_from: None,
         classification: &classification,
+        redactor: &crate::Redactor::default(),
     };
     run_hooks(config, &proposal, Some(b"{}"), executor)
 }
@@ -466,6 +467,7 @@ fn failures_deny_and_durations_are_recorded() {
         cwd: &cwd,
         rewritten_from: None,
         classification: &classification,
+        redactor: &crate::Redactor::default(),
     };
     let outcome = run_hooks(&one, &proposal, None, &executor);
     assert_eq!(outcome.verdict, HookVerdict::Failed);

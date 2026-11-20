@@ -83,7 +83,7 @@ impl Rig {
             approvals: crate::approvals::tests::unanswered(Duration::from_millis(50)),
             grants: crate::grants::GrantStore::new(),
             spawner: spawner(Arc::clone(&journal), file_events),
-            redaction: Arc::new(knsh_core::NoOutputRedaction),
+            redactors: crate::redaction::Redactors::none(),
         });
         Self {
             session_id: opened.session_id,

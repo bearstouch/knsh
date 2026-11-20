@@ -63,8 +63,8 @@
 //!
 //! [`OutputCapture`] keeps a stream's head and tail within a cap as it is read, with its size and line count
 //! (FR-REC-06); [`CappedOutput`] is what is kept. [`shape`] selects what an `exec.run` caller gets back in each
-//! [`OutputMode`] (FR-OUT-01) without ever rewriting it (FR-OUT-05). Every chunk passes through the
-//! [`OutputRedaction`] hook first (FR-EVT-07), a pass-through until secret redaction arrives (KNSH-091).
+//! [`OutputMode`] (FR-OUT-01) without ever rewriting it (FR-OUT-05). Every chunk passes through the session's
+//! [`RedactStream`] first (FR-EVT-07, FR-OUT-06, KNSH-091), so what is kept is already redacted.
 //!
 //! # Secret redaction (KNSH-090)
 //!
@@ -72,6 +72,11 @@
 //! `«redacted:<name>»` ([`redaction_marker`], FR-SEC-10). [`RedactStream`] does it across chunk boundaries, holding
 //! back only bytes that could still begin a match ([`Redactor::max_held_back`]), and never emits part of a secret
 //! when a stream ends mid-match. Everything it returns is [`Redacted`].
+//!
+//! KNSH-091 puts one redactor per session on every output path: the pipeline's text for hooks, the authority and
+//! `command.proposed` ([`LineInput::redactor`]), the record's `command`, `rewritten_from` and `argv` names
+//! ([`argv_of`]), grant rules ([`line_grant_rule`]), and captured output. A rewrite of a line whose redacted text holds
+//! a marker is denied (FR-AUTH-32).
 //!
 //! # Binary resolution (KNSH-035)
 //!
@@ -214,12 +219,12 @@ pub use knsh_bash::NetworkClass;
 pub use lifecycle::{
     Allowed, AskAnswer, AskReply, AskRequest, Authority, Caller, Decision, Effects, HookOutcome, HookVerdict, Hooks,
     INTERNAL_ERROR, LineInput, LineProfile, LocalApprovals, MAX_LINE_LEN, MAX_REWRITES, NoAuthority, NoHooks,
-    NoRateLimits, Observer, Outcome, Proposal, RateLimits, Refusal, RefusalKind, StillWaiting, decide, redact,
+    NoRateLimits, Observer, Outcome, Proposal, RateLimits, Refusal, RefusalKind, StillWaiting, decide,
 };
 pub use output::{
     CappedOutput, CapturedStream, DEFAULT_HEAD_TAIL_LINES, DEFAULT_OUTPUT_CAP, DEFAULT_TRUNCATE_BYTES,
-    ERRORS_ONLY_STDOUT_LINES, Excerpt, HeadTail, MAX_HEAD_TAIL_LINES, MAX_TRUNCATE_BYTES, NoOutputRedaction,
-    OutputCapture, OutputRedaction, OutputRequest, ShapedOutput, shape,
+    ERRORS_ONLY_STDOUT_LINES, Excerpt, HeadTail, MAX_HEAD_TAIL_LINES, MAX_TRUNCATE_BYTES, OutputCapture, OutputRequest,
+    ShapedOutput, shape,
 };
 pub use path::CanonicalPath;
 pub use policy::{

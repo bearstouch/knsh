@@ -113,7 +113,7 @@ impl Running {
             approvals: crate::approvals::tests::unanswered(ask_timeout),
             grants: crate::grants::GrantStore::new(),
             spawner: Arc::new(FakeSpawner::new(Arc::clone(&journal))),
-            redaction: Arc::new(knsh_core::NoOutputRedaction),
+            redactors: crate::redaction::Redactors::none(),
         });
         let shims = knsh_platform::EnginePaths::for_home(std::path::Path::new(HOME))
             .unwrap()

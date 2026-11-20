@@ -55,3 +55,30 @@ later match can reach are emitted at once, and the output is the same however th
   about 110 MB, and about 400 MB briefly while it is built.
 - **Cost.** Linear in the output, except that output made of a secret's own hex-digit text in `%HH` escapes (which
   needs the secret) can cost up to the longest decoded form per byte.
+
+### Redaction on every output path (KNSH-091)
+
+- **The secret set.** A session redacts the secrets its profile names under `[secrets.env]` that `knshd` can read
+  (as injection would read them, KNSH-089), and every live secret the authority provided with `secrets.provide`. A
+  secret that cannot be read (not found, access denied) is left out: the engine never holds its value. A human
+  session redacts the provided secrets.
+- **One instance per session.** `knshd` keeps one redactor per session and reads the session's secrets again for
+  each line: while they read the same, the same instance is used; a value provided, revoked, expired or changed in the
+  Keychain gives a new one at once. The supervisor takes it once per line and uses that one instance on every path of
+  the line, so hooks and the authority see exactly the text the record keeps (FR-REC-05). It is dropped when the
+  session ends.
+- **Paths.** The line text the pipeline gives hooks (their stdin), the authority (`decision.requested`), standalone
+  approvals and `command.proposed`; the record's `command`, `rewritten_from`, `argv` names and `network` hosts; every
+  lifecycle event (`command.started`, `command.long_running`, `command.finished`, `command.denied` with its rule and
+  reason, `command.denied_repeatedly`, `proxy.denied`); `executed_command`; grant rules (a line holding a secret gets
+  no grant); human records (`telemetry.command`). Captured output passes one redaction stream per output stream, so a
+  secret split across two pipe reads is still replaced; the bytes a stream holds back are released, redacted, at end
+  of file or when the capture is sealed. `command.output` chunks stay at most 8 KiB: a marker longer than what it
+  replaced is split across chunks.
+- **Rewrites (FR-AUTH-32).** A rewrite of a line whose redacted text holds a marker is refused and the line denied.
+- **Fail closed.** A secret set the engine cannot redact (over the size limits above) denies every agent line of the
+  session; what is recorded and published of the line is the plain `«redacted»` marker, nothing of its text. A human
+  command is still recorded, as the marker, and never blocked. A line refused before its profile is loaded is
+  redacted of the provided secrets only.
+- **Not covered.** The caller's own descriptors under `knsh -c` get the line's raw output (FR-OUT-04: it never
+  crosses the API). Reasons a hook or the authority write are redacted, but a `-32001` answer carries them as given.

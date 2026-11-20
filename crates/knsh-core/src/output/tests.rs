@@ -250,9 +250,3 @@ fn last_lines_counts_edges() {
     assert_eq!(first_lines(b"a\nb", 5).bytes, b"a\nb");
     assert_eq!(first_lines(b"a\nb", 5).lines, 2);
 }
-
-// FR-EVT-07: the phase 2 hook passes chunks through unchanged.
-#[test]
-fn no_redaction_passes_chunks_through() {
-    assert_eq!(NoOutputRedaction.redact_chunk(b"\x00abc\xff").expose(), b"\x00abc\xff");
-}

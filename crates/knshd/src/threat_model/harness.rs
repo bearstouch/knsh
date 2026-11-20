@@ -265,7 +265,7 @@ impl Stack {
             approvals: crate::approvals::tests::unanswered(ASK_TIMEOUT),
             grants: Arc::clone(&grants),
             spawner,
-            redaction: Arc::new(knsh_core::NoOutputRedaction),
+            redactors: crate::redaction::Redactors::none(),
         });
         let launcher = TrampolineLauncher {
             processes: Arc::new(SystemProcesses::new()),
@@ -506,7 +506,11 @@ pub(crate) fn compile_c(source: &str, program: &Path) {
 fn start_proxy(log: &Arc<dyn SystemLog>, fixture: &Fixture) -> (Arc<FakeResolver>, Arc<dyn ProxyIssuer>) {
     let resolver = Arc::new(FakeResolver::new());
     let rules = Arc::new(HostRules::new(resolver.clone()));
-    let report = NetworkReport::new(Arc::clone(log), Arc::clone(&fixture.hub));
+    let report = NetworkReport::new(
+        Arc::clone(log),
+        Arc::clone(&fixture.hub),
+        crate::redaction::Redactors::none(),
+    );
     let proxy = Proxy::start(
         Config::DEFAULT,
         ProxyParts {
