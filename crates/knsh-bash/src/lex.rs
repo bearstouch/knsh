@@ -88,6 +88,9 @@ pub(crate) struct LexContext {
     pub(crate) substitutions: usize,
     /// Of those, the process substitutions.
     pub(crate) process_substitutions: usize,
+    /// Whether bash's `extglob` option is on: `?(…)`, `*(…)`, `+(…)`, `@(…)` and `!(…)` are then part of a word
+    /// ([`ParseOptions::extglob`](crate::ParseOptions::extglob)).
+    pub(crate) extglob: bool,
 }
 
 /// Lexes the part of `input` at `range`, in `context`. Spans are offsets into `input`, and the lexer never reads past
@@ -148,6 +151,8 @@ struct Lexer<'a> {
     /// substitutions. Comments in them are read differently by bash 3.2 (see [`Lexer::comment`]).
     substitutions: usize,
     process_substitutions: usize,
+    /// Whether extended glob patterns are part of words ([`LexContext::extglob`]).
+    extglob: bool,
 }
 
 /// A `<<` or `<<-` whose body is still to be read.
@@ -187,6 +192,7 @@ impl<'a> Lexer<'a> {
             not_arithmetic: HashSet::new(),
             substitutions: context.substitutions,
             process_substitutions: context.process_substitutions,
+            extglob: context.extglob,
         }
     }
 
@@ -559,6 +565,7 @@ impl<'a> Lexer<'a> {
             depth: self.depth,
             substitutions: self.substitutions,
             process_substitutions: self.process_substitutions,
+            extglob: self.extglob,
         };
         let mut lexer = Lexer::new(self.src.get(..body.end).unwrap_or(self.src), body.start, context);
         lexer.enter(operator)?;
@@ -760,8 +767,25 @@ impl<'a> Lexer<'a> {
     /// A word: segments up to the first unquoted metacharacter. The caller guarantees the first byte is not one.
     fn word(&mut self) -> Result<Word, LexError> {
         let mut segments = SegmentList::default();
+        // With `extglob`, the parentheses of `@(…)` and the like nest, and nothing inside them ends the word: bash
+        // reads the group as `parse_matched_pair` does. The start of the outermost open group, if any.
+        let mut groups: Vec<usize> = Vec::new();
         while let Some(byte) = self.peek() {
             let at = self.pos;
+            if self.extglob && byte == b'(' && (!groups.is_empty() || self.opens_extglob_group(at)) {
+                groups.push(at);
+                segments.literal_byte(at);
+                self.pos += 1;
+                continue;
+            }
+            if !groups.is_empty() && matches!(byte, b')' | b' ' | b'\t' | b'\n' | b'|' | b'&' | b';' | b'<' | b'>') {
+                if byte == b')' {
+                    groups.pop();
+                }
+                segments.literal_byte(at);
+                self.pos += 1;
+                continue;
+            }
             let segment = match byte {
                 b'\\' if self.is_continuation(at) => Some(self.line_continuation()),
                 b'\\' => {
@@ -784,9 +808,18 @@ impl<'a> Lexer<'a> {
             };
             self.push_segment_or_literal(&mut segments, segment);
         }
+        if let Some(&open) = groups.first() {
+            return Err(self.unterminated(Construct::ExtglobGroup, open));
+        }
         let segments = segments.finish(self.pos);
         let reserved = self.reserved_word(&segments);
         Ok(Word { segments, reserved })
+    }
+
+    /// Whether the `(` at `at` opens an extended glob group: it follows an unquoted `?`, `*`, `+`, `@` or `!` of the
+    /// word being read (bash's `extglob` test in `read_token_word`).
+    fn opens_extglob_group(&self, at: usize) -> bool {
+        at > 0 && matches!(self.byte(at - 1), Some(b'?' | b'*' | b'+' | b'@' | b'!'))
     }
 
     /// Appends `segment`, or, when there is none, takes the byte at `pos` as literal text.
@@ -1040,7 +1073,8 @@ impl<'a> Lexer<'a> {
             | Construct::CommandSubstitution
             | Construct::ParameterExpansion
             | Construct::ArithmeticExpansion
-            | Construct::HereDocument => SegmentKind::CommandSubstitution,
+            | Construct::HereDocument
+            | Construct::ExtglobGroup => SegmentKind::CommandSubstitution,
         };
         Ok(Segment {
             kind,

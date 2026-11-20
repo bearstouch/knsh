@@ -72,11 +72,20 @@ version = "0.0.0"
 dependencies = [
  "knsh-bash",
  "knsh-core",
+ "knsh-interp",
  "knsh-json",
  "knsh-platform",
  "knsh-proxy",
  "knsh-toml",
  "libfuzzer-sys",
+]
+
+[[package]]
+name = "knsh-interp"
+version = "0.0.0"
+dependencies = [
+ "knsh-bash",
+ "knsh-platform",
 ]
 
 [[package]]

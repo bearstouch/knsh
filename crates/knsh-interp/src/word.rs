@@ -1,14 +1,11 @@
-//! Words as the expansion engine reads them (KNSH-096, KNSH-097): the parser's segments turned into [`Part`]s, the
-//! characters an expansion produces ([`WordChar`]), and the checks for expansions later stories implement.
-//!
-//! Brace expansion and pathname expansion (KNSH-098) are still refused. Brace expansion only ever applies to the
-//! literal text of a word, so a word that could hold one is refused before anything runs. Pathname expansion also
-//! applies to the unquoted result of an expansion, so it is refused before anything runs for literal text, and when
-//! the expansion happens for anything else.
+//! Words as the expansion engine reads them (KNSH-096, KNSH-097, KNSH-098): the parser's segments turned into
+//! [`Part`]s (with their source text, which brace expansion reads), and the characters an expansion produces
+//! ([`WordChar`]).
 
 use knsh_bash::{Segment, SegmentKind, Span};
 
 use crate::error::{InterpError, Unsupported};
+use crate::expand::decode_ansi_c;
 use crate::scan::Part;
 use crate::state::is_name;
 
@@ -35,61 +32,95 @@ pub(crate) enum Context {
     Pattern,
 }
 
+/// One top-level piece of a word: its part, and the text it was written as, which brace expansion reads as bash
+/// does (bash brace-expands the word's text before anything else).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Piece {
+    /// What it is.
+    pub(crate) part: Part,
+    /// How it was written.
+    pub(crate) raw: String,
+}
+
 /// The parts of a word made of `segments`, skipping text before `from` (the name and `=` of an assignment, which
 /// share its first literal segment).
 ///
 /// # Errors
 ///
-/// [`InterpError::Unsupported`] for a command or process substitution or `$'…'`; [`InterpError::SourceMismatch`] if
-/// a span does not index `source`.
+/// As [`pieces`].
 pub(crate) fn parts(segments: &[Segment], source: &str, from: usize) -> Result<Vec<Part>, InterpError> {
+    Ok(pieces(segments, source, from)?
+        .into_iter()
+        .map(|piece| piece.part)
+        .collect())
+}
+
+/// The pieces of a word made of `segments`, skipping text before `from`. Line continuations are dropped, as bash
+/// removes them before reading the line.
+///
+/// # Errors
+///
+/// [`InterpError::Unsupported`] for a command or process substitution; [`InterpError::SourceMismatch`] if a span
+/// does not index `source`.
+pub(crate) fn pieces(segments: &[Segment], source: &str, from: usize) -> Result<Vec<Piece>, InterpError> {
     let mut out = Vec::new();
     for segment in segments.iter().filter(|segment| segment.span.end > from) {
-        let refuse = |feature| {
-            Err(InterpError::Unsupported {
-                feature,
-                span: segment.span,
-            })
+        let span = Span::new(segment.span.start.max(from), segment.span.end);
+        let Some(part) = segment_part(segment, source, from)? else {
+            continue;
         };
-        let part = match &segment.kind {
-            SegmentKind::Literal => {
-                let span = Span::new(segment.span.start.max(from), segment.span.end);
-                Part::Text(text(span, source)?.to_owned())
-            }
-            SegmentKind::Escape => match text(segment.body, source)? {
-                // A backslash at the very end of the input quotes nothing and stays, as in bash.
-                "" => Part::Quoted("\\".to_owned()),
-                escaped => Part::Quoted(escaped.to_owned()),
-            },
-            SegmentKind::LineContinuation => continue,
-            SegmentKind::SingleQuoted => Part::Quoted(text(segment.body, source)?.to_owned()),
-            // In the C locale `$"…"` is plain double quoting; translation catalogues are not supported by design.
-            SegmentKind::DoubleQuoted(inner) | SegmentKind::Locale(inner) => {
-                Part::Double(quoted_parts(parts(inner, source, from)?))
-            }
-            SegmentKind::AnsiC => return refuse(Unsupported::AnsiCQuoting),
-            SegmentKind::Parameter => Part::Param {
-                name: text(segment.body, source)?.to_owned(),
-                span: segment.span,
-            },
-            SegmentKind::ParameterExpansion => Part::Brace {
-                body: segment.body,
-                span: segment.span,
-            },
-            SegmentKind::Arithmetic => Part::Arith {
-                body: segment.body,
-                span: segment.span,
-            },
-            SegmentKind::CommandSubstitution | SegmentKind::Backtick => {
-                return refuse(Unsupported::CommandSubstitution);
-            }
-            SegmentKind::InputProcessSubstitution | SegmentKind::OutputProcessSubstitution => {
-                return refuse(Unsupported::ProcessSubstitution);
-            }
-        };
-        out.push(part);
+        out.push(Piece {
+            part,
+            raw: text(span, source)?.to_owned(),
+        });
     }
     Ok(out)
+}
+
+/// The part one segment is, or `None` for a line continuation.
+fn segment_part(segment: &Segment, source: &str, from: usize) -> Result<Option<Part>, InterpError> {
+    let refuse = |feature| {
+        Err(InterpError::Unsupported {
+            feature,
+            span: segment.span,
+        })
+    };
+    Ok(Some(match &segment.kind {
+        SegmentKind::Literal => {
+            let span = Span::new(segment.span.start.max(from), segment.span.end);
+            Part::Text(text(span, source)?.to_owned())
+        }
+        SegmentKind::Escape => match text(segment.body, source)? {
+            // A backslash at the very end of the input quotes nothing and stays, as in bash.
+            "" => Part::Quoted("\\".to_owned()),
+            escaped => Part::Quoted(escaped.to_owned()),
+        },
+        SegmentKind::LineContinuation => return Ok(None),
+        SegmentKind::SingleQuoted => Part::Quoted(text(segment.body, source)?.to_owned()),
+        // In the C locale `$"…"` is plain double quoting; translation catalogues are not supported by design.
+        SegmentKind::DoubleQuoted(inner) | SegmentKind::Locale(inner) => {
+            Part::Double(quoted_parts(parts(inner, source, from)?))
+        }
+        SegmentKind::AnsiC => Part::Quoted(decode_ansi_c(text(segment.body, source)?)),
+        SegmentKind::Parameter => Part::Param {
+            name: text(segment.body, source)?.to_owned(),
+            span: segment.span,
+        },
+        SegmentKind::ParameterExpansion => Part::Brace {
+            body: segment.body,
+            span: segment.span,
+        },
+        SegmentKind::Arithmetic => Part::Arith {
+            body: segment.body,
+            span: segment.span,
+        },
+        SegmentKind::CommandSubstitution | SegmentKind::Backtick => {
+            return refuse(Unsupported::CommandSubstitution);
+        }
+        SegmentKind::InputProcessSubstitution | SegmentKind::OutputProcessSubstitution => {
+            return refuse(Unsupported::ProcessSubstitution);
+        }
+    }))
 }
 
 /// Inside double quotes, literal text is quoted.
@@ -112,33 +143,6 @@ pub(crate) fn text(span: Span, source: &str) -> Result<&str, InterpError> {
     span.text(source).ok_or(InterpError::SourceMismatch { span })
 }
 
-/// The characters of `parts` as far as they are known before expansion: literal text as written, and one quoted
-/// placeholder for each expansion. Enough to find brace and pathname expansion in literal text.
-pub(crate) fn literal_view(parts: &[Part]) -> Vec<WordChar> {
-    let mut out = Vec::new();
-    for part in parts {
-        match part {
-            Part::Text(text) => out.extend(text.chars().map(|ch| WordChar {
-                ch,
-                quoted: false,
-                expanded: false,
-            })),
-            Part::Quoted(text) => out.extend(text.chars().map(|ch| WordChar {
-                ch,
-                quoted: true,
-                expanded: false,
-            })),
-            Part::Double(inner) => out.extend(literal_view(inner).into_iter().map(|c| WordChar { quoted: true, ..c })),
-            Part::Param { .. } | Part::Brace { .. } | Part::Arith { .. } => out.push(WordChar {
-                ch: '\0',
-                quoted: true,
-                expanded: true,
-            }),
-        }
-    }
-    out
-}
-
 /// The word `parts` spell when they hold no expansion at all, after quote removal.
 pub(crate) fn literal(parts: &[Part]) -> Option<String> {
     let mut out = String::new();
@@ -159,37 +163,6 @@ pub(crate) fn assignment_value_start(text: &str) -> Option<usize> {
     let name = text.get(..equals)?;
     let name = name.strip_suffix('+').unwrap_or(name);
     is_name(name).then_some(equals + 1)
-}
-
-/// Whether bash could match the word against file names: an unquoted `*` or `?`, or an unquoted `[` with an unquoted
-/// `]` after it. Conservative: a word that matches nothing would stay as written in bash too, but which words match
-/// depends on the filesystem, so any candidate is refused.
-pub(crate) fn has_glob(chars: &[WordChar]) -> bool {
-    let mut open = false;
-    for c in chars.iter().filter(|c| !c.quoted) {
-        match c.ch {
-            '*' | '?' => return true,
-            '[' => open = true,
-            ']' if open => return true,
-            _ => {}
-        }
-    }
-    false
-}
-
-/// Whether the word could hold a brace expansion: an unquoted `{` followed by an unquoted `,` or `..` and then an
-/// unquoted `}`. Conservative, like [`has_glob`]: `{}` and `{x}` stay as written, as in bash.
-pub(crate) fn has_brace_expansion(chars: &[WordChar]) -> bool {
-    let unquoted: Vec<char> = chars.iter().filter(|c| !c.quoted).map(|c| c.ch).collect();
-    let Some(open) = unquoted.iter().position(|&ch| ch == '{') else {
-        return false;
-    };
-    let rest = &unquoted[open + 1..];
-    let Some(close) = rest.iter().rposition(|&ch| ch == '}') else {
-        return false;
-    };
-    let inside = &rest[..close];
-    inside.contains(&',') || inside.windows(2).any(|pair| pair == ['.', '.'])
 }
 
 #[cfg(test)]
@@ -250,24 +223,27 @@ h "" $"loc""#;
         assert_eq!(refused("echo `ls`", 1), Unsupported::CommandSubstitution);
         assert_eq!(refused(r#"echo "$(ls)""#, 1), Unsupported::CommandSubstitution);
         assert_eq!(refused("cat <(ls)", 1), Unsupported::ProcessSubstitution);
-        assert_eq!(refused("echo $'a'", 1), Unsupported::AnsiCQuoting);
     }
 
+    // KNSH-098: `$'…'` is quoted text with its escapes decoded, cut at a NUL as bash keeps strings.
     #[test]
-    fn literal_view_finds_globs_and_braces_only_in_literal_text() {
-        let view = |line: &str| literal_view(&word_parts(line, 1).unwrap());
-        for line in ["ls *.rs", "ls a?", "ls [ab]", "ls $x*"] {
-            assert!(has_glob(&view(line)), "{line}");
-        }
-        for line in ["ls '*'", "ls \\[a]", "ls $x", r#"ls "${x}*""#, "ls a]"] {
-            assert!(!has_glob(&view(line)), "{line}");
-        }
-        for line in ["echo {a,b}", "echo {1..3}", "echo {$x,b}"] {
-            assert!(has_brace_expansion(&view(line)), "{line}");
-        }
-        for line in ["echo {}", "echo {x}", "echo '{a,b}'", "echo ${x}"] {
-            assert!(!has_brace_expansion(&view(line)), "{line}");
-        }
+    fn ansi_c_quotes_decode_their_escapes() {
+        let decoded = |line: &str| literal(&word_parts(line, 1).unwrap()).unwrap();
+        assert_eq!(decoded(r"echo $'a\tb\n'"), "a\tb\n");
+        assert_eq!(decoded(r"echo $'it\'s'"), "it's");
+        assert_eq!(decoded(r"echo $'\x41\101\u00e9'"), "AAé");
+        assert_eq!(decoded(r"echo $'a\0b'"), "a");
+        assert_eq!(decoded(r"echo $'\c?\cA'"), "\x7f\x01");
+        assert_eq!(word_parts(r"echo $'*'", 1).unwrap(), [Part::Quoted("*".into())]);
+    }
+
+    // Brace expansion reads the text each piece was written as.
+    #[test]
+    fn pieces_keep_their_source_text() {
+        let line = r#"echo a\,'b'"c$x"${y}$((1))"#;
+        let found = pieces(&words(line)[1].word.segments, line, 0).unwrap();
+        let raw: Vec<&str> = found.iter().map(|piece| piece.raw.as_str()).collect();
+        assert_eq!(raw, ["a", "\\,", "'b'", "\"c$x\"", "${y}", "$((1))"]);
     }
 
     #[test]

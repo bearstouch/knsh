@@ -155,6 +155,13 @@
 //! | --- | --- | --- | --- |
 //! | [`UserHomes`] | Home directory of a user, or of the current user | `SystemUserHomes` (`getpwnam_r`) | `FakeUserHomes` |
 //!
+//! The `collation` module (KNSH-098) orders strings in a locale's collation, for the order of the interpreter's
+//! pathname expansion results (bash sorts them with `strcoll`).
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`Collation`] | Sort strings as `strcoll` does in a locale | `SystemCollation` (`newlocale`, `strcoll_l`); [`ByteCollation`] for the C locale anywhere | `FakeCollation` |
+//!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
 //! in a fake. All failures use the single crate error, [`PlatformError`], whose messages never echo paths or other
 //! input (NFR-PRIV-02).
@@ -209,6 +216,7 @@
 
 mod ancestry;
 mod clock;
+mod collation;
 mod command;
 mod control;
 mod endpoint_security;
@@ -247,6 +255,7 @@ pub mod testing;
 
 pub use ancestry::{AuditToken, ProcessIdentity, ProcessKey, ProcessTree};
 pub use clock::{Clock, Monotonic};
+pub use collation::{ByteCollation, Collation, is_c_locale, tie_break};
 pub use command::{CommandOutcome, CommandRequest, CommandSpawner, ProcessCommandSpawner};
 pub use control::{
     AfterMessage, BYTES_KEY, BundleVersion, CodeSigning, ConnectionId, ControlHandler, ControlPeer, JSON_KEY,

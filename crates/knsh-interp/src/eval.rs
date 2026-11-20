@@ -17,7 +17,8 @@
 //! - `(( expression ))` is 0 when the expression is not zero, 1 when it is zero or fails; `let` likewise for its
 //!   last argument. An arithmetic error there is reported and the script goes on, as in bash.
 //!
-//! Words are expanded when the command runs ([`crate::expand`]): the command's words first, then its assignments
+//! Words are expanded when the command runs ([`crate::expand`]): the command's words first (each brace-expanded
+//! into its words by [`crate::brace`], then expanded, split and matched against file names), then its assignments
 //! left to right, each seeing the ones before it. An expansion error bash treats as fatal (`set -u`, `${x?}`) ends
 //! the script with status 1; any other (a bad substitution, `$((1/0))`) abandons the command and the rest of its
 //! line, sets `$?` to 1, and the script goes on with the next line, as `bash -c` does.
@@ -36,14 +37,15 @@ use knsh_bash::{
     CompoundKind, ForCommand, IfCommand, ListItem, LoopBody, LoopCommand, Pipeline, Script, SimpleCommand, Span,
     UnsupportedCommand,
 };
-use knsh_platform::{CommandOutcome, CommandRequest, CommandSpawner, ExitStatus, Fs, UserHomes};
+use knsh_platform::{Collation, CommandOutcome, CommandRequest, CommandSpawner, ExitStatus, Fs, UserHomes};
 
 use crate::arith::Failure;
+use crate::brace;
 use crate::check;
 use crate::error::{InterpError, Unsupported};
 use crate::expand::{ExpandError, Expander};
 use crate::lookup::{self, Missing, Refusal, Resolved};
-use crate::pattern;
+use crate::pattern::Pattern;
 use crate::scan;
 use crate::state::{ShellState, is_name};
 use crate::status::Status;
@@ -172,6 +174,8 @@ pub struct Interpreter {
     spawner: Arc<dyn CommandSpawner>,
     /// Home directories for `~name`.
     homes: Arc<dyn UserHomes>,
+    /// The order of pathname expansion results.
+    collation: Arc<dyn Collation>,
     /// The shell's own error messages (bash's standard error).
     diagnostics: Box<dyn Write + Send>,
     /// The nesting limit.
@@ -190,8 +194,9 @@ impl fmt::Debug for Interpreter {
 }
 
 impl Interpreter {
-    /// An interpreter over `state` that looks commands up through `fs`, runs them through `spawner`, finds home
-    /// directories for `~name` through `homes` and writes its own error messages to `diagnostics`, with the default
+    /// An interpreter over `state` that looks commands up and matches file names through `fs`, runs commands through
+    /// `spawner`, finds home directories for `~name` through `homes`, sorts file names with `collation` (bash's
+    /// `strcoll` order in the shell's locale) and writes its own error messages to `diagnostics`, with the default
     /// nesting limit [`MAX_EVAL_DEPTH`].
     #[must_use]
     pub fn new(
@@ -199,6 +204,7 @@ impl Interpreter {
         fs: Arc<dyn Fs>,
         spawner: Arc<dyn CommandSpawner>,
         homes: Arc<dyn UserHomes>,
+        collation: Arc<dyn Collation>,
         diagnostics: Box<dyn Write + Send>,
     ) -> Self {
         Self {
@@ -206,6 +212,7 @@ impl Interpreter {
             fs,
             spawner,
             homes,
+            collation,
             diagnostics,
             max_depth: MAX_EVAL_DEPTH,
             depth: 0,
@@ -313,16 +320,25 @@ impl Interpreter {
 
     /// An expander over the shell state, with the command's own assignments `overlay`.
     fn expander<'s>(&'s mut self, run: &Run<'s>, overlay: &'s [(String, OsString)]) -> Expander<'s> {
-        Expander::new(&mut self.state, &*self.homes, run.source, overlay)
+        Expander::new(
+            &mut self.state,
+            &*self.homes,
+            &*self.fs,
+            &*self.collation,
+            run.source,
+            overlay,
+        )
     }
 
-    /// The arguments `words` expand into.
+    /// The arguments `words` expand into: each brace-expanded, then each resulting word expanded in turn.
     fn arguments(&mut self, words: &[CommandWord], run: &Run<'_>) -> Flow<Vec<String>> {
         let mut out = Vec::with_capacity(words.len());
         for command_word in words {
-            let parts = word::parts(&command_word.word.segments, run.source, 0)?;
-            let result = self.expander(run, &[]).arguments(&parts, command_word.span);
-            out.extend(self.expanded(result, command_word.span, run)?);
+            let pieces = word::pieces(&command_word.word.segments, run.source, 0)?;
+            for parts in brace::expand(&pieces, command_word.span)? {
+                let result = self.expander(run, &[]).arguments(&parts, command_word.span);
+                out.extend(self.expanded(result, command_word.span, run)?);
+            }
         }
         Ok(out)
     }
@@ -556,9 +572,11 @@ impl Interpreter {
     fn clause_matches(&mut self, clause: &CaseClause, subject: &str, run: &Run<'_>) -> Flow<bool> {
         for pattern_word in &clause.patterns {
             let parts = word::parts(&pattern_word.word.segments, run.source, 0)?;
-            let result = self.expander(run, &[]).pattern(&parts, pattern_word.span);
+            let mut expander = self.expander(run, &[]);
+            let flags = expander.pattern_flags();
+            let result = expander.pattern(&parts, pattern_word.span);
             let chars = self.expanded(result, pattern_word.span, run)?;
-            if pattern::matches(&chars, subject) {
+            if Pattern::new(&chars, flags).matches_str(subject) {
                 return Ok(true);
             }
         }

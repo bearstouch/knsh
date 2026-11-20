@@ -1,0 +1,1 @@
+@(a|B).rs !(*.rs) +([a-z]).rs *(x)a.rs ?(d) @(.env|a.rs)

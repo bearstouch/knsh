@@ -137,7 +137,7 @@ pub use irreversible::{BUILTIN_IRREVERSIBLE, curl_reason, rsync_reason};
 pub use lex::lex;
 pub use limits::{MAX_FUNCTION_DEFINITIONS, MAX_INPUT_LEN, MAX_NESTING_DEPTH, MAX_TOKENS};
 pub use outcome::{Dynamic, DynamicPart, DynamicReason, Exact, ParseOutcome, parse_line};
-pub use parse::parse;
+pub use parse::{ParseOptions, parse, parse_with};
 pub use reserialise::reserialise;
 pub use subcommand_table::SUBCOMMAND_TABLE;
 pub use subcommands::{

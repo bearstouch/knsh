@@ -26,13 +26,32 @@ struct Variable {
 
 /// Shell options set by `set` and `shopt`.
 ///
-/// Each has bash's default for a non-interactive shell until set. The `set` builtin itself arrives with KNSH-104;
-/// until then an embedder sets them as `bash -u` would, through [`ShellState::options_mut`].
+/// Each has bash's default for a non-interactive shell until set (all off). The `set` and `shopt` builtins arrive
+/// with KNSH-104; until then an embedder sets them as `bash -u` or `bash -O extglob` would, through
+/// [`ShellState::options_mut`]. A script using `extglob` patterns in its own text must also be parsed with them on
+/// ([`knsh_bash::parse_with`]), as bash reads a line with the options set before it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ShellOptions {
     /// `set -u`: expanding an unset parameter is an error that ends the script with status 1 (KNSH-097).
     pub nounset: bool,
+    /// `set -f`: no pathname expansion (KNSH-098).
+    pub noglob: bool,
+    /// `shopt -s dotglob`: patterns match names starting with `.` (never `.` and `..`) (KNSH-098).
+    pub dotglob: bool,
+    /// `shopt -s nullglob`: a pattern that matches no file name is removed instead of kept as written (KNSH-098).
+    pub nullglob: bool,
+    /// `shopt -s failglob`: a pattern that matches no file name is bash's `no match` error, which abandons the
+    /// command and the rest of its line with status 1; it wins over `nullglob`, as in bash (KNSH-098).
+    pub failglob: bool,
+    /// `shopt -s nocaseglob`: file names match patterns regardless of case (KNSH-098).
+    pub nocaseglob: bool,
+    /// `shopt -s globstar`: `**` as a whole path component matches any depth of directories (KNSH-098).
+    pub globstar: bool,
+    /// `shopt -s extglob`: the groups `?(…)`, `*(…)`, `+(…)`, `@(…)` and `!(…)` in pathname expansion, `case`
+    /// patterns and the pattern operators of `${…}` (KNSH-098).
+    pub extglob: bool,
 }
 
 /// `IFS` as bash sets it at start-up: space, tab, newline.

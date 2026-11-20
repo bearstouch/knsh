@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use knsh_bash::{AndOr, CompoundCommand, Group, ListItem, Pipeline, parse};
 use knsh_platform::PlatformError;
-use knsh_platform::testing::{FakeUserHomes, MemFs, ScriptedCommands};
+use knsh_platform::testing::{FakeCollation, FakeUserHomes, MemFs, ScriptedCommands};
 
 use super::*;
 
@@ -67,6 +67,7 @@ impl Harness {
             fs.clone(),
             commands.clone(),
             homes,
+            Arc::new(FakeCollation::new().with_locale("en_US.UTF-8")),
             Box::new(diagnostics.clone()),
         );
         Self {
@@ -451,7 +452,6 @@ fn unsupported_constructs_are_refused_before_anything_runs() {
         ("true; echo ${a[0]}", Unsupported::Array),
         ("true; echo ${x@P}", Unsupported::PromptExpansion),
         ("true; (( x )) > out", Unsupported::Redirection),
-        ("true; ls *.rs", Unsupported::PathnameExpansion),
         ("true > out", Unsupported::Redirection),
         ("{ true; } 2>&1", Unsupported::Redirection),
         ("true | true", Unsupported::Pipeline),
@@ -462,8 +462,6 @@ fn unsupported_constructs_are_refused_before_anything_runs() {
         ("true; cd /", Unsupported::Builtin),
         ("if true; then export X; fi", Unsupported::Builtin),
         ("mapfile x", Unsupported::Builtin),
-        ("for v in *; do true; done", Unsupported::PathnameExpansion),
-        ("echo {a,$x}", Unsupported::BraceExpansion),
     ];
     for (line, feature) in cases {
         assert_eq!(refused(h.run(line)), *feature, "{line}");
@@ -675,16 +673,16 @@ fn nounset_ends_the_script_with_status_one() {
     assert!(h.diagnostics.text().ends_with("knsh: line 1: missing: gone\n"));
 }
 
-// Fail closed: a builtin or a split word that only an expansion reveals is refused when it is found.
+// Fail closed: a builtin that only an expansion reveals is refused when it is found.
 #[test]
 fn refusals_found_by_expansion_stop_the_script_there() {
     let mut h = Harness::new();
     h.on("tool", &[exited(0)]);
     h.interpreter.state_mut().set_variable("cmd", "cd");
-    h.interpreter.state_mut().set_variable("words", "a b");
     assert_eq!(refused(h.run("tool; $cmd /; tool")), Unsupported::Builtin);
-    assert_eq!(refused(h.run("tool $words")), Unsupported::WordSplitting);
     assert_eq!(refused(h.run("echo -e${cmd:+n} x")), Unsupported::Builtin);
+    // A builtin produced by brace or pathname expansion too (KNSH-098).
+    assert_eq!(refused(h.run("{c,x}d /")), Unsupported::Builtin);
     assert_eq!(h.ran(), ["tool"]);
 }
 
@@ -710,7 +708,7 @@ fn unquoted_lists_joined_without_splitting_follow_ifs_or_are_refused() {
         "IFS=:; case $* in *) ;; esac",
         "IFS=:; x=${u:=$@}",
     ] {
-        assert_eq!(refused(h.run(line)), Unsupported::WordSplitting, "{line}");
+        assert_eq!(refused(h.run(line)), Unsupported::UnsplitJoin, "{line}");
     }
     // Quoted, the join is bash's in every context: `"$*"` with the first character of `IFS`, `"$@"` with spaces.
     assert_eq!(h.status("IFS=:; x=\"$*\" y=\"$@\"; IFS=' '; tool \"$x\" \"$y\""), 0);
@@ -730,4 +728,250 @@ fn case_and_for_words_expand() {
         0
     );
     assert_eq!(args(&h), [vec!["pattern"], vec!["main.rs"], vec!["main"]]);
+}
+
+// ---- KNSH-098: brace expansion, word splitting, pathname expansion, quote removal ----
+
+/// A harness whose working directory `/work` holds `files` (a name ending in `/` is a directory), with `tool`
+/// scripted to succeed.
+fn with_files(files: &[&str]) -> Harness {
+    let h = Harness::new();
+    for file in files {
+        let path = Path::new("/work").join(file.trim_end_matches('/'));
+        if file.ends_with('/') {
+            h.fs.add_dir_all(&path).unwrap();
+        } else {
+            h.fs.write(&path, b"", 0o644).unwrap();
+        }
+    }
+    h.on("tool", &[exited(0)]);
+    h
+}
+
+// NFR-COMPAT-02: bash's order is brace, tilde, parameter and arithmetic, splitting, pathname, quote removal.
+#[test]
+fn expansion_order_matches_bash() {
+    let mut h = with_files(&["a b.rs", "c.rs", "x1"]);
+    let state = h.interpreter.state_mut();
+    state.set_variable("a1", "one");
+    state.set_variable("a2", "two");
+    state.set_variable("braces", "{p,q}");
+    state.set_variable("both", "*.rs z");
+    state.set_variable("n", "2");
+    let line = concat!(
+        // Brace expansion comes first, so it builds the names expanded next; a value never brace-expands.
+        "tool $a{1,2} $braces;",
+        // Tilde expansion follows brace expansion.
+        "tool ~{alice,nobody};",
+        // Splitting before matching; matched names are never split; quoted results never match.
+        "tool $both \"$both\";",
+        // A sequence of literal bounds only; arithmetic inside a pattern; quotes removed last.
+        "tool {1..$n} x$((n-1))* 'q'\"r\"\\s"
+    );
+    assert_eq!(h.status(line), 0);
+    assert_eq!(
+        args(&h),
+        [
+            vec!["one", "two", "{p,q}"],
+            vec!["/Users/alice", "~nobody"],
+            vec!["a b.rs", "c.rs", "z", "*.rs z"],
+            vec!["{1..2}", "x1", "qrs"],
+        ]
+    );
+}
+
+// KNSH-098 unit test named by the story: `IFS` white space collapses and is trimmed; every other `IFS` character
+// delimits a field of its own, so consecutive ones delimit empty fields.
+#[test]
+fn ifs_whitespace_and_nonwhitespace_delimiters() {
+    let mut h = with_files(&[]);
+    let state = h.interpreter.state_mut();
+    state.set_variable("v", "  a  b\t\nc  ");
+    state.set_variable("w", "a::b:");
+    state.set_variable("m", " a : b  ::c ");
+    state.set_variable("lead", ":a");
+    state.set_variable("e", "");
+    let line = concat!(
+        "tool $v;",
+        "IFS=:; tool $w;",
+        "IFS=': '; tool $m;",
+        "IFS=:; tool $lead x$lead;",
+        // Literal text never splits; a quoted empty string in a partly quoted word is dropped (bash); tab and newline
+        // are not separators when IFS is only a space.
+        "IFS=' '; tool a:b \"\"$v $v\"\";",
+        // Unset IFS splits on space, tab and newline.
+        "unset_ifs_marker"
+    );
+    let line = line.replace(";unset_ifs_marker", "");
+    assert_eq!(h.status(&line), 0);
+    assert_eq!(
+        args(&h),
+        [
+            vec!["a", "b", "c"],
+            vec!["a", "", "b"],
+            vec!["a", "b", "", "c"],
+            vec!["", "a", "x", "a"],
+            vec!["a:b", "a", "b\t\nc", "a", "b\t\nc"],
+        ]
+    );
+}
+
+// KNSH-098: bash quotes an unquoted literal character of `IFS` as it reads the word, so it never matches as a
+// pattern character; the same character from an expansion splits instead (observed with `/bin/bash`).
+#[test]
+fn literal_ifs_characters_are_not_pattern_characters() {
+    let mut h = with_files(&["a.rs", "b"]);
+    h.interpreter.state_mut().set_variable("x", "a*b");
+    assert_eq!(h.status("IFS='*'; tool $x * *.rs"), 0);
+    assert_eq!(args(&h), [vec!["a", "b", "*", "*.rs"]]);
+    assert_eq!(h.status("IFS='.?'; tool *.rs ? ?.rs"), 0);
+    assert_eq!(args(&h)[1], ["a.rs", "?", "?.rs"]);
+}
+
+// KNSH-098 unit test named by the story.
+#[test]
+fn empty_ifs_disables_splitting() {
+    let mut h = with_files(&[]);
+    h.interpreter.state_mut().set_variable("v", " a b ");
+    h.interpreter.state_mut().set_variable("e", "");
+    assert_eq!(h.status("IFS=; tool $v $e \"$e\" ${e:- x y }"), 0);
+    // Nothing splits, but an unquoted empty expansion still vanishes.
+    assert_eq!(args(&h), [vec![" a b ", "", " x y "]]);
+    // Unset, IFS is bash's default.
+    h.interpreter.state_mut().unset_variable("IFS");
+    assert_eq!(h.status("tool $v"), 0);
+    assert_eq!(args(&h)[1], ["a", "b"]);
+}
+
+// KNSH-098 unit test named by the story, through the evaluator.
+#[test]
+fn unmatched_glob_stays_literal_as_an_argument() {
+    let mut h = with_files(&["a.rs"]);
+    h.interpreter.state_mut().set_variable("p", "*.zig");
+    assert_eq!(h.status("tool *.zig $p '*'.rs [ab].rs \\*.rs"), 0);
+    assert_eq!(args(&h), [vec!["*.zig", "*.zig", "*.rs", "a.rs", "*.rs"]]);
+    // `set -f` turns pathname expansion off.
+    h.interpreter.state_mut().options_mut().noglob = true;
+    assert_eq!(h.status("tool *.rs"), 0);
+    assert_eq!(args(&h)[1], ["*.rs"]);
+}
+
+// KNSH-098 unit test named by the story.
+#[test]
+fn nullglob_removes_unmatched_word() {
+    let mut h = with_files(&["a.rs"]);
+    h.interpreter.state_mut().options_mut().nullglob = true;
+    assert_eq!(h.status("tool x *.zig y *.rs; for f in *.zig; do tool never; done"), 0);
+    assert_eq!(args(&h), [vec!["x", "y", "a.rs"]]);
+}
+
+// KNSH-098 unit test named by the story: bash's `no match` error abandons the command and the rest of its line
+// with status 1, and wins over nullglob.
+#[test]
+fn failglob_reports_error() {
+    let mut h = with_files(&["a.rs"]);
+    let options = h.interpreter.state_mut().options_mut();
+    options.failglob = true;
+    options.nullglob = true;
+    assert_eq!(h.status("tool *.rs; tool *.zig; tool same-line\ntool next-line"), 0);
+    assert_eq!(args(&h), [vec!["a.rs"], vec!["next-line"]]);
+    assert_eq!(h.diagnostics.text(), "knsh: line 1: no match: *.zig\n");
+    assert_eq!(h.status("tool *.zig"), 1);
+    assert_eq!(h.interpreter.state().last_status(), Status::FAILURE);
+}
+
+#[test]
+fn dotglob_and_globstar_options_reach_pathname_expansion() {
+    let mut h = with_files(&[".env", "src/", "src/a.rs", "src/deep/", "src/deep/b.rs"]);
+    assert_eq!(h.status("tool * **/*.rs"), 0);
+    let options = h.interpreter.state_mut().options_mut();
+    options.dotglob = true;
+    options.globstar = true;
+    assert_eq!(h.status("tool * **/*.rs"), 0);
+    assert_eq!(
+        args(&h),
+        [
+            vec!["src", "src/a.rs"],
+            vec![".env", "src", "src/a.rs", "src/deep/b.rs"]
+        ]
+    );
+}
+
+// With extglob on (and the line parsed with it), groups work in words, `case` patterns and `${…}` operators.
+#[test]
+fn extglob_patterns_match_in_words_case_and_parameter_operators() {
+    let mut h = with_files(&["a.rs", "b.c", "c.o"]);
+    h.interpreter.state_mut().options_mut().extglob = true;
+    h.interpreter.state_mut().set_variable("f", "main.test.rs");
+    let line = "tool !(*.o) @(a|b).*; case $f in *.@(rs|c)) tool rust;; esac; tool ${f##+([a-z]).} ${f%%.+([a-z])}";
+    let script = knsh_bash::parse_with(line, knsh_bash::ParseOptions::default().with_extglob(true)).unwrap();
+    assert_eq!(h.interpreter.run(&script, line).unwrap().code(), 0);
+    assert_eq!(
+        args(&h),
+        [
+            vec!["a.rs", "b.c", "a.rs", "b.c"],
+            vec!["rust"],
+            vec!["test.rs", "main.test"]
+        ]
+    );
+}
+
+// CLAUDE.md "Untrusted input": a brace expansion past its bound runs nothing.
+#[test]
+fn oversized_brace_expansion_is_refused_before_anything_runs() {
+    let mut h = with_files(&[]);
+    assert!(matches!(
+        h.run("tool; tool {1..99999999999}"),
+        Err(InterpError::ExpansionLimit { .. })
+    ));
+    assert_eq!(h.ran(), Vec::<String>::new());
+    assert_eq!(h.status("tool {a,b}{1..2}"), 0);
+    assert_eq!(args(&h), [vec!["a1", "a2", "b1", "b2"]]);
+}
+
+// `$-` shows `f` under `set -f`, in bash's order.
+#[test]
+fn dollar_dash_shows_noglob() {
+    let mut h = with_files(&[]);
+    h.interpreter.state_mut().options_mut().noglob = true;
+    assert_eq!(h.status("tool $-"), 0);
+    assert_eq!(args(&h), [vec!["fhBc"]]);
+}
+
+// Bash sorts matches with `strcoll` in its locale: `LC_ALL`, else `LC_COLLATE`, else `LANG`, else C; a locale the
+// system lacks leaves the C order. (The fake collation folds case in `en_US.UTF-8`; the macOS tables are tested in
+// `knsh-platform`.)
+#[test]
+fn glob_results_are_sorted_in_the_shell_s_locale() {
+    let mut h = with_files(&["B", "a", "_x"]);
+    let line = concat!(
+        "tool *;",
+        "LANG=en_US.UTF-8; tool *;",
+        "LC_COLLATE=C; tool *;",
+        "LC_ALL=en_US.UTF-8; tool *;",
+        "LC_ALL=xx_NOPE.UTF-8; tool *"
+    );
+    assert_eq!(h.status(line), 0);
+    assert_eq!(
+        args(&h),
+        [
+            vec!["B", "_x", "a"],
+            vec!["_x", "a", "B"],
+            vec!["B", "_x", "a"],
+            vec!["_x", "a", "B"],
+            vec!["B", "_x", "a"],
+        ]
+    );
+}
+
+// Bash drops a quoted empty string in a partly quoted word before splitting; it keeps the word only when the word
+// expands to nothing at all.
+#[test]
+fn quoted_empty_strings_in_partly_quoted_words() {
+    let mut h = with_files(&[]);
+    h.interpreter.state_mut().set_variable("e", "");
+    h.interpreter.state_mut().set_variable("blank", "   ");
+    h.interpreter.state_mut().set_variable("v", " a ");
+    assert_eq!(h.status("tool \"\"$e x ''$blank y $v\"\" \"$e\"$v"), 0);
+    assert_eq!(args(&h), [vec!["", "x", "y", "a", "a"]]);
 }

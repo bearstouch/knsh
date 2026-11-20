@@ -7,25 +7,31 @@
 //! run external programs, `;` and newline lists, `&&`, `||`, `!`, `if`, `for`, `while`, `until`, `case` and `{ }`
 //! groups, with bash's exit statuses ([`Status`]). KNSH-097 adds tilde, parameter and arithmetic expansion (every
 //! `${…}` operator of bash 5.2 but arrays and `@P`), `(( ))`, arithmetic `for` and `let`, and `set -u`
-//! ([`ShellOptions::nounset`]); [`evaluate_arithmetic`] evaluates one arithmetic expression on its own.
+//! ([`ShellOptions::nounset`]); [`evaluate_arithmetic`] evaluates one arithmetic expression on its own. KNSH-098
+//! adds brace expansion, `IFS` word splitting, pathname expansion (with `set -f` and the `dotglob`, `nullglob`,
+//! `failglob`, `nocaseglob`, `globstar` and `extglob` options of [`ShellOptions`]), `$'…'` and quote removal, in
+//! bash's order.
 //!
 //! # Boundaries
 //!
 //! - The tree is consumed unchanged: there is no second parser of commands. Words are expanded from the parser's
 //!   segments; only the bodies the parser keeps whole (`${…}`, `$((…))`, `(( … ))`) are read again, as bash reads
-//!   them when it expands them. `case` patterns and the pattern operators match with bash's `*`, `?` and bracket
-//!   rules.
-//! - Every effect goes through an injected trait from `knsh-platform`: commands are looked up through
-//!   [`knsh_platform::Fs`] and run through [`knsh_platform::CommandSpawner`], so tests run without processes. That
-//!   spawner is where KNSH-108 inserts a decision before each command.
-//! - What later stories implement (command substitution, word splitting and globbing, redirections, pipelines and
-//!   subshells, functions, arrays, most builtins) is refused with [`InterpError::Unsupported`] by a check of the
+//!   them when it expands them. `case` patterns, the pattern operators and pathname expansion match with bash's
+//!   `*`, `?`, bracket and (with `extglob`) group rules. A script using `extglob` groups in its own text is parsed
+//!   with [`knsh_bash::parse_with`].
+//! - Every effect goes through an injected trait from `knsh-platform`: commands are looked up and directories read
+//!   for pathname expansion through [`knsh_platform::Fs`], file names sorted through [`knsh_platform::Collation`]
+//!   (bash's `strcoll` order), and commands run through [`knsh_platform::CommandSpawner`], so tests run without
+//!   processes or a real filesystem. That spawner is where KNSH-108 inserts a decision before each command.
+//! - What later stories implement (command substitution, redirections, pipelines and subshells, functions, arrays,
+//!   most builtins) is refused with [`InterpError::Unsupported`] by a check of the
 //!   whole script before anything runs, or, when only an expansion's value reveals it, when that expansion runs. Builtins whose
 //!   external program behaves the same for literal arguments (`echo`, `printf`, `true`, `false`, `test`, `[`) run as
 //!   that program until KNSH-101 and KNSH-102.
 //! - Nesting is bounded by an explicit, documented limit ([`MAX_EVAL_DEPTH`]) that fails with
 //!   [`InterpError::DepthExceeded`], on an evaluation thread whose stack ([`EVAL_STACK_SIZE`]) holds that many
-//!   levels. Loops have no iteration limit, as in bash.
+//!   levels. Loops have no iteration limit, as in bash. Brace and pathname expansion are bounded in words, size and
+//!   directory entries read, failing with [`InterpError::ExpansionLimit`].
 //! - No `unsafe`, no I/O of its own beyond the injected traits and the diagnostics writer, no third-party crates.
 //!
 //! # Specification
@@ -35,17 +41,21 @@
 //!   behaviour; NFR-COMPAT-09: 126 and 127)
 //! - `specs/00-stories/KNSH-097-parameter-variable-and-arithmetic-expansion.md`
 //! - `specs/04-non-functional-requirements/compatibility.md` (NFR-COMPAT-05: the bash 3.2 and 5.2 differences)
-//! - `specs/09-reference/defaults-and-limits.md` (the evaluation, arithmetic and expansion depth limits)
+//! - `specs/00-stories/KNSH-098-word-splitting-quote-removal-and-pathname-expansion.md`
+//! - `specs/09-reference/defaults-and-limits.md` (the evaluation, arithmetic and expansion depth limits, and the
+//!   brace and pathname expansion bounds)
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 #![forbid(unsafe_code)]
 
 mod arith;
+mod brace;
 mod check;
 mod error;
 mod eval;
 mod expand;
+mod glob;
 mod lookup;
 mod param;
 mod pattern;
