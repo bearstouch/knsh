@@ -18,7 +18,9 @@ use knsh_store::{PageSize, RecordQuery, Scope};
 use knsh_core::ProfileName;
 
 use super::*;
+use crate::endpoint_security::{ExecGate, ExecRequest};
 use crate::events::Subscriber;
+use crate::sessions::StateChange;
 use crate::sessions::tests::{Fixture, fixture};
 
 const HOME: &str = "/Users/u";
@@ -2409,4 +2411,208 @@ fn irreversible_line_asks_and_is_recorded_with_reasons() {
         .find(|record| record.command.expose() == "git status")
         .unwrap();
     assert_eq!(record.details.irreversible, Some(knsh_core::Irreversibility::none()));
+}
+
+/// An exec request in the daemon's session, from the project.
+fn exec_request(daemon: &Daemon, command: &str) -> ExecRequest {
+    ExecRequest {
+        session_id: daemon.session_id,
+        command: command.to_owned(),
+        cwd: CanonicalPath::new(PROJECT).unwrap(),
+        path: "/usr/bin:/bin".to_owned(),
+    }
+}
+
+/// A gate due `after` from now on the daemon's clock.
+fn gate_in(daemon: &Daemon, after: Duration) -> ExecGate {
+    let clock: Arc<dyn Clock> = daemon.clock.clone();
+    let answer_by = clock.monotonic().checked_add(after).unwrap();
+    ExecGate::new(clock, answer_by)
+}
+
+// FR-AGT-13 (KNSH-094): an exec inside an envelope goes through the supervisor's own pipeline (hooks, rules, the
+// authority), is never spawned by it, and is recorded like a supervised line with source `endpoint_security`.
+// `/bin/bash -c 'git push'` by absolute path is decided on what it runs.
+#[test]
+fn exec_event_uses_supervisor_policy_path() {
+    let daemon = Daemon::new();
+    daemon.events();
+    let lifecycle = daemon.lifecycle(Setup {
+        authority: Some(vec![AskReply::Deny { reason: None }]),
+        ..Setup::default()
+    });
+    let decide = |command: &str| {
+        lifecycle.decide_exec(
+            &exec_request(&daemon, command),
+            &gate_in(&daemon, Duration::from_secs(5)),
+        )
+    };
+    assert_eq!(decide("/usr/bin/git status"), ExecVerdict::Allow);
+    assert_eq!(decide("/bin/bash -c 'git push'"), ExecVerdict::Deny);
+    assert_eq!(decide("/bin/rm -rf build"), ExecVerdict::Deny);
+
+    // The same hooks and authority as a forwarded line; nothing spawned by the supervisor.
+    let journal = daemon.journal.entries();
+    assert!(
+        journal.contains(&"hooks /usr/bin/git status after 0 proposed".to_owned()),
+        "{journal:?}"
+    );
+    assert!(
+        journal.contains(&"ask /bin/bash -c 'git push'".to_owned()),
+        "{journal:?}"
+    );
+    assert_eq!(daemon.spawns(), Vec::<String>::new());
+
+    let records = daemon.records();
+    assert_eq!(records.len(), 3);
+    let by_command = |command: &str| {
+        records
+            .iter()
+            .find(|record| record.command.expose() == command)
+            .unwrap_or_else(|| panic!("no record of {command}"))
+            .clone()
+    };
+    let allowed = by_command("/usr/bin/git status");
+    let decision = allowed.details.decision.clone().unwrap();
+    assert_eq!(decision.verdict, DecisionVerdict::Allow);
+    assert_eq!(decision.source, DecisionSource::EndpointSecurity);
+    assert_eq!(decision.rule_id.as_deref(), Some("exec.allow[0]"));
+    assert_eq!(allowed.exit_code, None, "the exec runs in the agent's process");
+    assert!(allowed.ended_at.is_some());
+    assert_eq!(allowed.details.argv.len(), 1);
+
+    let asked = by_command("/bin/bash -c 'git push'").details.decision.unwrap();
+    assert_eq!(asked.verdict, DecisionVerdict::Deny);
+    assert_eq!(asked.source, DecisionSource::EndpointSecurity);
+    assert_eq!(asked.decided_by.as_deref(), Some("Example Authority"));
+
+    let denied = by_command("/bin/rm -rf build").details.decision.unwrap();
+    assert_eq!(denied.source, DecisionSource::EndpointSecurity);
+    assert_eq!(denied.rule_id.as_deref(), Some("exec.deny[0]"));
+
+    // Denials are reported as for supervised lines, with the Endpoint Security source.
+    let events = daemon.events();
+    let denied_sources: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.data {
+            EventData::CommandDenied { source, .. } => Some(*source),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(denied_sources, [DecisionSource::EndpointSecurity; 2]);
+    assert_eq!(
+        names(&events)
+            .iter()
+            .filter(|name| **name == "command.proposed")
+            .count(),
+        3
+    );
+}
+
+// KNSH-094 (fail closed): the gate is the decision's caller, so an ask still waiting at the Endpoint Security deadline
+// is cancelled and the exec denied; it is recorded as a deny, never as the allow that came too late.
+#[test]
+fn exec_decided_after_its_deadline_is_denied() {
+    let daemon = Daemon::new();
+    // The authority takes 25 ms to allow; the deadline is 10 ms away.
+    let lifecycle = daemon.lifecycle(Setup {
+        authority: Some(vec![AskReply::Allow]),
+        ..Setup::default()
+    });
+    let verdict = lifecycle.decide_exec(
+        &exec_request(&daemon, "/usr/bin/git push"),
+        &gate_in(&daemon, Duration::from_millis(10)),
+    );
+    assert_eq!(verdict, ExecVerdict::Deny);
+    let [record] = <[ExecutionRecord; 1]>::try_from(daemon.records()).unwrap();
+    let decision = record.details.decision.unwrap();
+    assert_eq!(decision.verdict, DecisionVerdict::Deny);
+    assert_eq!(decision.source, DecisionSource::EndpointSecurity);
+}
+
+// KNSH-094: a rewrite cannot be applied to an exec already under way, so it is denied; a paused session's execs are
+// denied and nothing is recorded for them, as for its held lines.
+#[test]
+fn exec_rewrites_and_held_sessions_are_denied() {
+    let daemon = Daemon::new();
+    let rewriting = daemon.lifecycle(Setup {
+        hooks: vec![HookVerdict::Rewrite {
+            command: "git status".to_owned(),
+        }],
+        ..Setup::default()
+    });
+    let gate = gate_in(&daemon, Duration::from_secs(5));
+    assert_eq!(
+        rewriting.decide_exec(&exec_request(&daemon, "/bin/ls"), &gate),
+        ExecVerdict::Deny
+    );
+    let [record] = <[ExecutionRecord; 1]>::try_from(daemon.records()).unwrap();
+    assert_eq!(
+        record.details.decision.unwrap().source,
+        DecisionSource::EndpointSecurity
+    );
+
+    daemon
+        .fixture
+        .sessions
+        .change_state(daemon.session_id, StateChange::Pause)
+        .unwrap();
+    let lifecycle = daemon.lifecycle(Setup::default());
+    let gate = gate_in(&daemon, Duration::from_secs(5));
+    assert_eq!(
+        lifecycle.decide_exec(&exec_request(&daemon, "/bin/ls"), &gate),
+        ExecVerdict::Deny
+    );
+    assert_eq!(daemon.records().len(), 1, "nothing recorded for a held session");
+}
+
+// KNSH-094, integration shape (the real check on macOS 27 is pending the entitlement): `/bin/bash -c 'rm -rf build'`
+// run by absolute path inside an envelope reaches the supervisor through the descendant client and is denied; the
+// envelope's own launch is not decided.
+#[test]
+fn absolute_path_bash_in_envelope_is_decided() {
+    use knsh_platform::testing::ScriptedDescendantClients;
+
+    use crate::endpoint_security::tests::{BASH, CLI, KNSH, SHIMS, TRAMPOLINE, event};
+    use crate::endpoint_security::{ExecAuthoriser, ExecLayer};
+
+    let daemon = Daemon::new();
+    let lifecycle = daemon.lifecycle(Setup::default());
+    let clock: Arc<dyn Clock> = daemon.clock.clone();
+    let clients = Arc::new(ScriptedDescendantClients::new());
+    let layer = ExecLayer::new(
+        clients.clone(),
+        Arc::new(ExecAuthoriser::new(lifecycle, Arc::clone(&clock))),
+        CanonicalPath::new(TRAMPOLINE).unwrap(),
+        CanonicalPath::new(KNSH).unwrap(),
+        SHIMS.into(),
+    );
+    let bash = CanonicalPath::new(BASH).unwrap();
+    let client = layer
+        .watch(daemon.session_id, &bash, &CanonicalPath::new(CLI).unwrap())
+        .unwrap();
+    for step in [TRAMPOLINE, knsh_platform::probe::SANDBOX_EXEC, BASH, CLI] {
+        assert_eq!(
+            clients.deliver(0, event(clock.as_ref(), 300, 300, &[step])),
+            ExecVerdict::Allow
+        );
+    }
+    let mut exec = event(clock.as_ref(), 301, 300, &[BASH, "-c", "rm -rf build"]);
+    exec.cwd = Some(PROJECT.into());
+    assert_eq!(clients.deliver(0, exec), ExecVerdict::Deny);
+    let mut exec = event(clock.as_ref(), 302, 300, &["/usr/bin/git", "status"]);
+    exec.cwd = Some(PROJECT.into());
+    assert_eq!(clients.deliver(0, exec), ExecVerdict::Allow);
+    drop(client);
+    let records = daemon.records();
+    assert_eq!(records.len(), 2, "only the agent's execs are recorded");
+    let denied = records
+        .iter()
+        .find(|record| record.command.expose() == "/bin/bash -c 'rm -rf build'")
+        .unwrap();
+    let decision = denied.details.decision.clone().unwrap();
+    // Denied by the profile's rules (here `bash` itself is not allowed), recorded with the Endpoint Security source.
+    assert_eq!(decision.verdict, DecisionVerdict::Deny);
+    assert!(decision.rule_id.is_some());
+    assert_eq!(decision.source, DecisionSource::EndpointSecurity);
 }

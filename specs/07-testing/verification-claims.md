@@ -634,3 +634,10 @@ Before relying on the descendant client:
 
 - Which events it can authorise beyond exec (file opens, network).
 - What happens to pending and later operations if `knshd` exits.
+- KNSH-094, before the macOS binding is written: the exact `es_new_descendants_client` signature and entitlement
+  name; which subtree a client covers (only the envelope it is created for, or every later descendant of `knshd`,
+  which would also cover supervised lines); whether the envelope's launch execs (`knsh-exec`, `sandbox-exec`, bash,
+  the CLI) are reported, and with which pid and process group; the deadline Endpoint Security gives an exec and what
+  happens to a client that misses it; whether the exec message carries the working directory and the environment.
+- KNSH-094 integration check: `/bin/bash -c 'git push'` run by absolute path inside an envelope is decided by the
+  supervisor (pending the entitlement and macOS 27 hardware).

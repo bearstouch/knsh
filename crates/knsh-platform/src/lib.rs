@@ -132,6 +132,15 @@
 //! | --- | --- | --- | --- |
 //! | [`WriteHolders`] | Process table; files a process holds for writing | `SystemWriteHolders` (`proc_pidinfo`, `proc_pidfdinfo`) | `FakeWriteHolders` |
 //!
+//! The `endpoint_security` module (KNSH-094) carries the execs an Endpoint Security descendant client sees inside an
+//! envelope to `knshd`, and its answers back (macOS 27 and later, with Apple's entitlement; decision 3). The macOS
+//! backend is not bound yet and reports itself unavailable, so the capability is never claimed before it is
+//! verified.
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`DescendantClients`] | Check a client can be created; one client per envelope, execs to an [`ExecHandler`] | `SystemDescendantClients` (unavailable) | `ScriptedDescendantClients` |
+//!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
 //! in a fake. All failures use the single crate error, [`PlatformError`], whose messages never echo paths or other
 //! input (NFR-PRIV-02).
@@ -175,6 +184,7 @@
 //!   `specs/06-api/wire-format.md#control-service-xpc` (XPC control service with peer verification, KNSH-067)
 //! - FR-SEC-01, decision 11, `specs/05-models/secret.md` (Keychain secret store and zeroed secret values, KNSH-089)
 //! - FR-CKP-01, FR-CKP-09, FR-CKP-35, decision 17 (clones, volumes, file identity and streamed hashes, KNSH-078)
+//! - FR-AGT-13, decision 3 (Endpoint Security descendant client, KNSH-094)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
@@ -184,6 +194,7 @@
 mod ancestry;
 mod clock;
 mod control;
+mod endpoint_security;
 pub mod engine_dirs;
 mod error;
 mod file_events;
@@ -222,6 +233,9 @@ pub use control::{
     AfterMessage, BYTES_KEY, BundleVersion, CodeSigning, ConnectionId, ControlHandler, ControlPeer, JSON_KEY,
     MAX_CONTROL_PAYLOAD, PeerGate, PeerRejection, SignatureFacts, SigningIdentifier, TeamId, TrustError, TrustStore,
     TrustedAuthority, peer_requirement,
+};
+pub use endpoint_security::{
+    DescendantClient, DescendantClients, ENDPOINT_SECURITY_MIN_MAJOR, ExecEvent, ExecHandler, ExecVerdict,
 };
 pub use engine_dirs::{EnginePaths, ensure_engine_dirs};
 pub use error::{Operation, PlatformError, SqliteCode};

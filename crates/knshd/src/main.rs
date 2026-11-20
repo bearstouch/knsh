@@ -171,6 +171,9 @@ mod profiles;
 mod proxy;
 #[cfg(target_os = "macos")]
 mod supervisor;
+// Exec decisions through the Endpoint Security descendant client (KNSH-094), by the orchestrator, per envelope.
+#[cfg(target_os = "macos")]
+mod endpoint_security;
 // The spawner behind the orchestrator (KNSH-051): lines through `knsh-exec`, process groups, timeouts.
 #[cfg(target_os = "macos")]
 mod spawn;
@@ -360,7 +363,7 @@ fn start() -> Result<(), StartError> {
             history: &history,
             redactors: authority.redactors,
         };
-        handlers.extend(supervision.handlers());
+        handlers.extend(supervision.handlers(probed.capabilities.sandbox));
         let violation_status = reader.as_ref().map_or_else(ReaderStatus::stopped, Reader::status);
         let dispatcher = hello::dispatcher_with_violations(probed, handlers, violation_status, Arc::clone(&sessions));
         let dispatcher = Arc::new(dispatcher.map_err(StartError::Dispatch)?);
@@ -524,6 +527,8 @@ fn probe_this_machine(
             fs: Arc::new(RealFs::new()),
             random: Arc::new(SystemRandom::new()),
         },
+        // KNSH-094: the backend `session.start_agent` creates each envelope's client with (stateless).
+        descendants: Arc::new(knsh_platform::macos::SystemDescendantClients::new()),
     })
 }
 
@@ -879,7 +884,10 @@ impl Supervision<'_> {
     /// waits for `knsh approve` or `knsh deny` ([`approvals::Approvals`], KNSH-066); either way it is denied at the
     /// timeout. When `knsh-exec` or a canonical home cannot be found it is logged, and every call is `-32005`
     /// ([`exec::unserved_handlers`]).
-    fn exec_run_handlers(self, proxy: std::sync::Arc<dyn proxy::ProxyIssuer>) -> dispatch::Handlers {
+    fn exec_run_handlers(
+        &self,
+        proxy: std::sync::Arc<dyn proxy::ProxyIssuer>,
+    ) -> (dispatch::Handlers, Option<std::sync::Arc<supervisor::Lifecycle>>) {
         use std::sync::Arc;
 
         use knsh_core::CanonicalPath;
@@ -901,7 +909,7 @@ impl Supervision<'_> {
                 "supervisor unavailable: exec.run not served",
                 &[],
             );
-            return exec::unserved_handlers();
+            return (exec::unserved_handlers(), None);
         };
         // KNSH-062: the user's hooks, read from the configuration file for every agent line.
         let hook_runner = hooks::HookRunner::new(
@@ -924,30 +932,36 @@ impl Supervision<'_> {
         };
         let lifecycle = Lifecycle::new(Parts {
             sessions: Arc::clone(self.sessions),
-            profiles: self.profiles,
+            profiles: self.profiles.clone(),
             events: Arc::clone(self.events),
-            store: self.store,
-            clock: self.clock,
-            random: self.random,
+            store: self.store.clone(),
+            clock: self.clock.clone(),
+            random: self.random.clone(),
             hooks: Arc::new(hook_runner),
             grants: self.decisions.grants(),
-            authority: self.decisions,
-            approvals: self.approvals,
+            authority: Arc::clone(&self.decisions) as Arc<dyn knsh_core::Authority + Send + Sync>,
+            approvals: Arc::clone(&self.approvals) as Arc<dyn knsh_core::LocalApprovals + Send + Sync>,
             spawner: Arc::new(spawner),
             // KNSH-091: every path of every line is redacted with its session's redactor.
-            redactors: self.redactors,
+            redactors: Arc::clone(&self.redactors),
         });
         // KNSH-093: an irreversible line's marks go to its checkpoint, so its undo lists what it cannot take back.
         lifecycle.attach_marks(Arc::clone(self.history) as Arc<dyn supervisor::IrreversibleMarks>);
-        exec::ExecRun::new(lifecycle, self.paths.shim_dir()).handlers()
+        let handlers = exec::ExecRun::new(
+            Arc::clone(&lifecycle) as Arc<dyn exec::Supervisor>,
+            self.paths.shim_dir(),
+        )
+        .handlers();
+        (handlers, Some(lifecycle))
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Supervision<'_> {
     /// `session.start_agent` (KNSH-056) and `exec.*` (KNSH-050 to KNSH-053), over the same paths, sessions,
-    /// profiles and clock.
-    fn handlers(self) -> dispatch::Handlers {
+    /// profiles and clock. `sandbox` is what the probe found: with `seatbelt+endpoint_security`, every envelope gets a
+    /// descendant client deciding its execs through the orchestrator (KNSH-094).
+    fn handlers(self, sandbox: knsh_proto::Sandbox) -> dispatch::Handlers {
         // Lines wait on, and envelopes start, the checkpoint shadows of their sessions (KNSH-079). Their finished
         // checkpoints go to the history, and the history's restores are bracketed by them (KNSH-088).
         let shadows = checkpoint_shadows(
@@ -971,15 +985,23 @@ impl Supervision<'_> {
             &self.redactors,
         );
         let mut handlers = self.history.handlers();
-        handlers.extend(self.start_agent_handlers(&proxy));
-        handlers.extend(self.exec_run_handlers(proxy));
+        // The orchestrator first: with the Endpoint Security layer it also decides every exec inside the envelopes
+        // `session.start_agent` starts (KNSH-094).
+        let (exec_handlers, lifecycle) = self.exec_run_handlers(std::sync::Arc::clone(&proxy));
+        handlers.extend(self.start_agent_handlers(&proxy, lifecycle, sandbox));
+        handlers.extend(exec_handlers);
         handlers
     }
 
     /// The `session.start_agent` handler (KNSH-056), launching envelopes through the `knsh-exec` beside `knshd`
     /// with the `knsh` beside it as their `SHELL`. Without either binary or a canonical home it is logged, and every
     /// call is `-32005` for the sandbox ([`start_agent::unserved_handlers`]).
-    fn start_agent_handlers(&self, proxy: &std::sync::Arc<dyn proxy::ProxyIssuer>) -> dispatch::Handlers {
+    fn start_agent_handlers(
+        &self,
+        proxy: &std::sync::Arc<dyn proxy::ProxyIssuer>,
+        lifecycle: Option<std::sync::Arc<supervisor::Lifecycle>>,
+        sandbox: knsh_proto::Sandbox,
+    ) -> dispatch::Handlers {
         use std::sync::Arc;
 
         use knsh_core::CanonicalPath;
@@ -1015,7 +1037,38 @@ impl Supervision<'_> {
             home,
             knsh: knsh.clone(),
         };
-        AgentStarter::new(
+        // KNSH-094: with the Endpoint Security layer reported, every envelope gets a descendant client deciding its
+        // execs through the orchestrator. If the layer cannot be built (no orchestrator, no canonical trampoline),
+        // no envelope starts: `hello` promised it (fail closed).
+        let exec_layer = if sandbox.decides_execs() {
+            let layer = lifecycle
+                .zip(canonical(&launcher.trampoline))
+                .map(|(lifecycle, trampoline)| {
+                    let authoriser = endpoint_security::ExecAuthoriser::new(
+                        lifecycle as Arc<dyn endpoint_security::ExecPolicy>,
+                        self.clock.clone(),
+                    );
+                    Arc::new(endpoint_security::ExecLayer::new(
+                        Arc::new(knsh_platform::macos::SystemDescendantClients::new()),
+                        Arc::new(authoriser),
+                        trampoline,
+                        knsh.clone(),
+                        self.paths.shim_dir(),
+                    ))
+                });
+            let Some(layer) = layer else {
+                self.log.log(
+                    knsh_platform::Level::Error,
+                    "endpoint security layer unavailable: session.start_agent not served",
+                    &[],
+                );
+                return start_agent::unserved_handlers();
+            };
+            Some(layer)
+        } else {
+            None
+        };
+        let starter = AgentStarter::new(
             Arc::clone(self.sessions),
             self.profiles.clone(),
             Arc::new(launcher),
@@ -1023,8 +1076,11 @@ impl Supervision<'_> {
             self.clock.clone(),
             self.paths.shim_dir(),
             knsh.into_path_buf(),
-        )
-        .handlers()
+        );
+        if let Some(layer) = exec_layer {
+            starter.attach_exec_layer(layer);
+        }
+        starter.handlers()
     }
 }
 

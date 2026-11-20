@@ -35,6 +35,14 @@ should already be in (decision 3). Without the entitlement, the story stays open
 - Run `/bin/bash -c 'git push'` by absolute path inside an envelope on macOS 27 and confirm it is decided (pending
   until the entitlement and macOS 27 hardware are available).
 
+**Status (mechanism implemented; gated).** The capability value (`seatbelt+endpoint_security`), the probe, one
+client per envelope, exec decisions through the supervisor's pipeline with source `endpoint_security`, and deny at
+the deadline are implemented and unit-tested against a scripted client
+([agent integration](../03-functional-requirements/agent-integration.md#exec-decisions-through-endpoint-security-knsh-094)).
+The macOS binding of `es_new_descendants_client` is not written: it always reports unavailable, so `hello` keeps
+`seatbelt` everywhere today. Every acceptance check above stays **pending** until the entitlement is granted and the
+binding is verified on macOS 27 ([verification claims](../07-testing/verification-claims.md#endpoint-security-macos-27)).
+
 **Notes**
 - Still open (see [../09-reference/decisions.md](../09-reference/decisions.md)):
   1. Whether Apple grants the entitlement to a broadly distributed developer tool.

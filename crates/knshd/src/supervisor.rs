@@ -97,11 +97,12 @@ use knsh_core::{
     UnprotectedRoot, argv_of, decide, mark_observed,
 };
 use knsh_json::{Object, ToJson, Value};
-use knsh_platform::{Clock, ProcessGroupId, Processes, Random};
+use knsh_platform::{Clock, ExecVerdict, ProcessGroupId, Processes, Random};
 use knsh_proto::{Denial, ErrorCode, LineStatus, RpcError};
 use knsh_store::{RecordStore, RecordedOutput};
 
 use crate::capture::{CapturePlan, LineOutput, OutputSink};
+use crate::endpoint_security::{ExecGate, ExecPolicy, ExecRequest};
 use crate::events::EventHub;
 use crate::exec::{Finished, ForwardedLine, Supervisor};
 use crate::grants::GrantStore;
@@ -137,6 +138,15 @@ const GONE_BEFORE_SPAWN: &str = "the caller disconnected before the line started
 /// Reason for a line refused because a checkpoint root it touches has no shadow, or its shadow failed, while the
 /// profile requires checkpoints (FR-CKP-02, KNSH-079): it would have run unprotected.
 const NO_SHADOW: &str = "checkpoints are required but a checkpoint root the line touches cannot be protected, so it was denied (fail closed)";
+/// Reason for an exec seen through Endpoint Security whose decision rewrote it (KNSH-094): the exec is already under
+/// way with its own arguments, so a rewrite cannot be applied.
+const EXEC_REWRITE: &str = "a rewrite cannot be applied to a program the agent runs directly, so it was denied";
+/// Reason for an allowed exec whose session was paused, taken over or ended while it was decided (KNSH-094).
+const EXEC_HELD: &str = "the session was paused, taken over or ended while the program was decided, so it was denied";
+/// Reason for an exec whose decision allowed it after the Endpoint Security deadline (KNSH-094): the kernel was
+/// already told to deny it (fail closed).
+const EXEC_DEADLINE: &str =
+    "the decision was not made before the Endpoint Security deadline, so the program was denied";
 /// Reason recorded for a line answered `-32010`: a root's shadow was still being built and the caller did not wait.
 const SHADOW_NOT_READY: &str =
     "a checkpoint root the line touches is still being shadowed and the caller did not wait, so it did not start";
@@ -423,6 +433,41 @@ enum Blocked {
     Secret(String),
 }
 
+/// What the pipeline decided for one line, with what its record needs ([`Lifecycle::evaluate`]).
+struct Evaluated {
+    record_id: RecordId,
+    /// When the line was received.
+    received_at: Timestamp,
+    /// From receipt to the decision.
+    latency_ms: u64,
+    actor: Actor,
+    /// The session's profile the line was decided with.
+    profile: Profile,
+    /// The session's redactor the line was decided with (KNSH-091).
+    redactor: Redactor,
+    outcome: Outcome,
+}
+
+/// Where a decided line came from: what the record's `decision.source` says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// A line forwarded over `agent.sock`: the source is whoever decided.
+    Line,
+    /// An exec inside an envelope, seen by the Endpoint Security descendant client (KNSH-094): always
+    /// `endpoint_security`, with the rule and who decided kept in `rule_id` and `decided_by`.
+    EndpointSecurity,
+}
+
+impl Origin {
+    /// The recorded source of a decision made by `source`.
+    const fn source(self, source: DecisionSource) -> DecisionSource {
+        match self {
+            Self::Line => source,
+            Self::EndpointSecurity => DecisionSource::EndpointSecurity,
+        }
+    }
+}
+
 impl Lifecycle {
     /// The orchestrator over `parts`.
     pub(crate) fn new(parts: Parts) -> Arc<Self> {
@@ -443,63 +488,15 @@ impl Lifecycle {
     fn prepare(&self, line: &ForwardedLine, caller: &dyn Caller) -> Result<Ready, RpcError> {
         let parts = &self.parts;
         let session_id = line.session_id;
-        // The session ended under the call: there is no one to record for, and nothing runs. A session that holds its
-        // lines answers `-32007` here, before anything is recorded (module documentation, "Held lines").
-        let (actor, profile_name) = parts.sessions.runnable(session_id)?;
-        // Before the profile is loaded, a refusal is redacted of the provided secrets, or hidden entirely if even
-        // those cannot be redacted (module documentation, "Redaction").
-        let early = || parts.redactors.for_session(session_id, None).ok();
-        let Some((received_at, record_id)) = self.record_id() else {
-            return Err(self.refuse_early(line, &actor, None, early().as_ref(), NO_CLOCK));
-        };
-        let record = Some((record_id, received_at));
-        // A line that cannot be recorded must not run (NFR-REL-05, FR-REC-02).
-        if parts.store.is_none() {
-            return Err(self.refuse_early(line, &actor, record, early().as_ref(), NO_STORE));
-        }
-        let profile = self
-            .load_profile(line, &actor, &profile_name)
-            .map_err(|reason| self.refuse_early(line, &actor, record, early().as_ref(), reason))?;
-        // KNSH-091: the one redactor of every path of this line. A set that cannot be redacted denies it, and nothing
-        // of the line is kept or published but the marker.
-        let Ok(redactor) = parts.redactors.for_session(session_id, Some(&profile)) else {
-            return Err(self.refuse_early(line, &actor, record, None, NO_REDACTION));
-        };
-
-        let observer = ProposedEvents {
-            events: &parts.events,
-            session_id,
-            actor: &actor,
-        };
-        let lookup = FsLookup(parts.profiles.fs());
-        let effects = Effects {
-            lookup: &lookup,
-            observer: &observer,
-            hooks: &*parts.hooks,
-            authority: &*parts.authority,
-            approvals: &*parts.approvals,
-            caller,
-            limits: &Limits {
-                limiter: &self.limiter,
-                clock: &*parts.clock,
-                received_at,
-            },
-        };
-        // A copy, so no lock is held while the decision waits on an ask. Without a clock no grant applies (fail
-        // closed: an ask stays an ask).
-        let grants = parts.grants.snapshot();
-        let input = LineInput {
-            session_id,
-            actor: &actor,
-            profile: &profile,
-            grants: parts.clock.now().ok().map(|now| (&grants, now)),
-            command: &line.proposal.command,
-            cwd: &line.proposal.cwd,
-            env_path: &line.proposal.path,
-            redactor: &redactor,
-        };
-        let outcome = decide(&input, &effects);
-        let latency_ms = self.since(received_at);
+        let Evaluated {
+            record_id,
+            received_at,
+            latency_ms,
+            actor,
+            profile,
+            redactor,
+            outcome,
+        } = self.evaluate(line, caller, Origin::Line)?;
         let refusal = match outcome {
             // FR-LC-41: the caller left after the decision but before the spawn: the line still never runs. Nobody
             // decided this, so it is recorded like a cancellation inside the pipeline: a deny by standalone rules.
@@ -556,6 +553,80 @@ impl Lifecycle {
         };
         let record = (record_id, received_at, latency_ms);
         Err(self.refused(line, &actor, Some(&redactor), record, &refusal))
+    }
+
+    /// The decision itself, shared by forwarded lines and execs seen through Endpoint Security (KNSH-094): the
+    /// session's actor and profile, a record ID, the session's redactor, then the pipeline ([`decide`]). A deny made
+    /// before the pipeline runs is recorded and reported here, with `origin`'s source, and returned as its answer.
+    fn evaluate(&self, line: &ForwardedLine, caller: &dyn Caller, origin: Origin) -> Result<Evaluated, RpcError> {
+        let parts = &self.parts;
+        let session_id = line.session_id;
+        // The session ended under the call: there is no one to record for, and nothing runs. A session that holds its
+        // lines answers `-32007` here, before anything is recorded (module documentation, "Held lines").
+        let (actor, profile_name) = parts.sessions.runnable(session_id)?;
+        // Before the profile is loaded, a refusal is redacted of the provided secrets, or hidden entirely if even
+        // those cannot be redacted (module documentation, "Redaction").
+        let early = || parts.redactors.for_session(session_id, None).ok();
+        let Some((received_at, record_id)) = self.record_id() else {
+            return Err(self.refuse_early(line, &actor, None, early().as_ref(), NO_CLOCK, origin));
+        };
+        let record = Some((record_id, received_at));
+        // A line that cannot be recorded must not run (NFR-REL-05, FR-REC-02).
+        if parts.store.is_none() {
+            return Err(self.refuse_early(line, &actor, record, early().as_ref(), NO_STORE, origin));
+        }
+        let profile = self
+            .load_profile(line, &actor, &profile_name)
+            .map_err(|reason| self.refuse_early(line, &actor, record, early().as_ref(), reason, origin))?;
+        // KNSH-091: the one redactor of every path of this line. A set that cannot be redacted denies it, and nothing
+        // of the line is kept or published but the marker.
+        let Ok(redactor) = parts.redactors.for_session(session_id, Some(&profile)) else {
+            return Err(self.refuse_early(line, &actor, record, None, NO_REDACTION, origin));
+        };
+
+        let observer = ProposedEvents {
+            events: &parts.events,
+            session_id,
+            actor: &actor,
+        };
+        let lookup = FsLookup(parts.profiles.fs());
+        let effects = Effects {
+            lookup: &lookup,
+            observer: &observer,
+            hooks: &*parts.hooks,
+            authority: &*parts.authority,
+            approvals: &*parts.approvals,
+            caller,
+            limits: &Limits {
+                limiter: &self.limiter,
+                clock: &*parts.clock,
+                received_at,
+            },
+        };
+        // A copy, so no lock is held while the decision waits on an ask. Without a clock no grant applies (fail
+        // closed: an ask stays an ask).
+        let grants = parts.grants.snapshot();
+        let input = LineInput {
+            session_id,
+            actor: &actor,
+            profile: &profile,
+            grants: parts.clock.now().ok().map(|now| (&grants, now)),
+            command: &line.proposal.command,
+            cwd: &line.proposal.cwd,
+            env_path: &line.proposal.path,
+            redactor: &redactor,
+        };
+        let outcome = decide(&input, &effects);
+        let latency_ms = self.since(received_at);
+        Ok(Evaluated {
+            record_id,
+            received_at,
+            latency_ms,
+            actor,
+            profile,
+            redactor,
+            outcome,
+        })
     }
 
     /// The checkpoint gate, then the secrets for an allowed line (KNSH-092): last, so a line that waited on a shadow
@@ -757,9 +828,10 @@ impl Lifecycle {
         record: Option<(RecordId, Timestamp)>,
         redactor: Option<&Redactor>,
         reason: &str,
+        origin: Origin,
     ) -> RpcError {
         let refusal = Refusal {
-            decision: Decision::deny(DecisionSource::Rule, None, None),
+            decision: Decision::deny(origin.source(DecisionSource::Rule), None, None),
             command: line.proposal.command.clone(),
             rewritten_from: None,
             reason: Some(reason.to_owned()),
@@ -1194,6 +1266,123 @@ impl Supervisor for Lifecycle {
 
     fn session_live(&self, session_id: SessionId) -> bool {
         self.parts.sessions.agent_of(session_id).is_ok()
+    }
+}
+
+impl ExecPolicy for Lifecycle {
+    /// An exec inside an envelope (KNSH-094, `crate::endpoint_security`): decided by the same steps as a forwarded
+    /// line ([`Lifecycle::evaluate`]: hooks, rules, grants, asks, rate limits), with `gate` as its caller so an ask
+    /// ends at the Endpoint Security deadline. Its record has source `endpoint_security`. Unlike a forwarded line,
+    /// nothing is spawned and no checkpoint gate or secret applies: the exec runs in the agent's own process, inside
+    /// its envelope, with what it already has.
+    fn decide_exec(&self, request: &ExecRequest, gate: &ExecGate) -> ExecVerdict {
+        let line = exec_line(request);
+        // A deny before the pipeline ran was recorded there; a held or ended session records nothing.
+        let Ok(Evaluated {
+            record_id,
+            received_at,
+            latency_ms,
+            actor,
+            redactor,
+            outcome,
+            ..
+        }) = self.evaluate(&line, gate, Origin::EndpointSecurity)
+        else {
+            return ExecVerdict::Deny;
+        };
+        let record = (record_id, received_at, latency_ms);
+        let deny = |allowed: Box<Allowed>, reason: &str, kind: RefusalKind| Refusal {
+            decision: Decision::deny(DecisionSource::EndpointSecurity, None, None),
+            command: allowed.command,
+            rewritten_from: allowed.rewritten_from,
+            reason: Some(reason.to_owned()),
+            kind,
+            classification: Some(allowed.classification),
+            line_key: None,
+            irreversible: Some(allowed.irreversible),
+        };
+        let refusal = match outcome {
+            // The exec is already under way with its own arguments: a rewrite cannot be applied to it.
+            Outcome::Run(allowed) if allowed.rewritten_from.is_some() => {
+                deny(allowed, EXEC_REWRITE, RefusalKind::Denied)
+            }
+            Outcome::Run(allowed) if self.parts.sessions.runnable(request.session_id).is_err() => {
+                deny(allowed, EXEC_HELD, RefusalKind::Denied)
+            }
+            Outcome::Run(allowed) => {
+                if gate.claim_allow() {
+                    self.exec_allowed(&line, &actor, &redactor, record, &allowed);
+                    return ExecVerdict::Allow;
+                }
+                deny(allowed, EXEC_DEADLINE, RefusalKind::Cancelled { request_id: None })
+            }
+            Outcome::Refused(refusal) => {
+                let mut refusal = *refusal;
+                // A denial by the rate limit itself is never counted again (FR-HOOK-20); its source is replaced below.
+                if refusal.decision.source == DecisionSource::RateLimit {
+                    refusal.line_key = None;
+                }
+                refusal.decision.source = DecisionSource::EndpointSecurity;
+                refusal
+            }
+        };
+        self.refused(&line, &actor, Some(&redactor), record, &refusal);
+        ExecVerdict::Deny
+    }
+}
+
+impl Lifecycle {
+    /// Records an allowed exec (KNSH-094): its decision with source `endpoint_security`, what it resolved to and
+    /// whether it is irreversible. It runs in the agent's process, so the record has no exit code; it ends when it
+    /// was decided. Written after the allow was claimed, which cannot wait: a failed write leaves the exec allowed and
+    /// unrecorded, as the deadline leaves no time to undo it (`specs/03-functional-requirements/agent-integration.md`).
+    fn exec_allowed(
+        &self,
+        line: &ForwardedLine,
+        actor: &Actor,
+        redactor: &Redactor,
+        (record_id, received_at, latency_ms): (RecordId, Timestamp, u64),
+        allowed: &Allowed,
+    ) {
+        let mut decision = allowed.decision.clone();
+        decision.source = DecisionSource::EndpointSecurity;
+        let record = ExecutionRecord {
+            record_id,
+            session_id: line.session_id,
+            actor: actor.clone(),
+            command: redactor.redact_text(&allowed.command),
+            cwd: line.proposal.cwd.clone(),
+            started_at: received_at,
+            ended_at: Some(self.parts.clock.now().unwrap_or(received_at)),
+            exit_code: None,
+            details: RecordDetails {
+                decision: Some(decision.to_record(latency_ms)),
+                argv: argv_of(&allowed.classification, redactor),
+                irreversible: Some(allowed.irreversible.clone()),
+                ..RecordDetails::default()
+            },
+        };
+        let _ = self.write(record, RecordedOutput::default());
+    }
+}
+
+/// `request` as a forwarded line, so it goes through the same steps. The interpreter is never an input to a decision
+/// (FR-LC-14) and nothing is spawned, so the line's run fields are empty.
+fn exec_line(request: &ExecRequest) -> ForwardedLine {
+    ForwardedLine {
+        session_id: request.session_id,
+        proposal: crate::exec::Proposal {
+            command: request.command.clone(),
+            cwd: request.cwd.clone(),
+            path: request.path.clone(),
+        },
+        interpreter: knsh_proto::Interpreter::Bash,
+        args: Vec::new(),
+        env: Vec::new(),
+        stdio: None,
+        timeout_s: None,
+        checkpoint_wait: false,
+        control: LineControl::new(),
     }
 }
 

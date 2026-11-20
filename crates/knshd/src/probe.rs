@@ -6,7 +6,7 @@
 //!
 //! | Capability | Check |
 //! | --- | --- |
-//! | `sandbox` | `knsh-exec` applies a deny-write profile and a line's write is observed to fail ([`check_sandbox`]) |
+//! | `sandbox` | `knsh-exec` applies a deny-write profile and a line's write is observed to fail ([`check_sandbox`]); on macOS 27 and later an Endpoint Security descendant client is created and deleted as well ([`with_endpoint_security`], KNSH-094) |
 //! | `file_events` | An `FSEvents` stream is created, started and stopped |
 //! | `platform` | The OS major version from `sysctl` |
 //! | `network_filter` | No backend exists yet: always `none` |
@@ -15,6 +15,12 @@
 //!
 //! Every check is real, bounded by [`PROBE_TIMEOUT`], and any failure (an error, a bad exit, a timeout) reports the
 //! backend as `none` (NFR-SEC-10, NFR-REL-08). Failures are logged with fixed reasons only.
+//!
+//! `sandbox: "seatbelt+endpoint_security"` is reported exactly when Seatbelt passed, the OS major version is 27 or
+//! later and a descendant client could be created: every exec inside an envelope is then decided by `knshd`
+//! (FR-AGT-13). Otherwise the value is unchanged (`seatbelt` or `none`), and envelopes alone confine direct
+//! execution. An unavailable client is the normal case until Apple grants the entitlement, so it is logged as a
+//! notice, never as a failure.
 //!
 //! `sandbox: "seatbelt"` is reported exactly when the trampoline agent lines will use can apply and enforce a
 //! profile on this machine; with `none`, every method that needs the sandbox is unlisted and answered `-32005`
@@ -28,15 +34,15 @@ use std::time::Duration;
 use knsh_platform::engine_dirs::FILE_MODE;
 use knsh_platform::probe::{run_bounded, run_to_exit};
 use knsh_platform::{
-    Clock, ExitStatus, Field, Fs, Level, PlatformError, ProbeFailure, Processes, Random, SpawnRequest, SystemLog,
-    SystemProbe, Value,
+    Clock, DescendantClients, ENDPOINT_SECURITY_MIN_MAJOR, ExitStatus, Field, Fs, Level, PlatformError, ProbeFailure,
+    Processes, Random, SpawnRequest, SystemLog, SystemProbe, Value,
 };
 use knsh_proto::{Capabilities, FileEvents, NetworkFilter, Platform, Sandbox, SandboxViolations, Secrets};
 
 /// How long each check may take. A working check takes milliseconds; the bound only matters when something hangs.
 /// The checks run one after another, and a hung `knsh-exec` gets one more bound to be reaped after it is killed,
-/// so the worst case delays start-up by five times this (sandbox, its reaping, file events, secrets and platform;
-/// KNSH-089 added the secrets check).
+/// so the worst case delays start-up by six times this (sandbox, its reaping, file events, secrets, platform and, on
+/// macOS 27 and later, Endpoint Security; KNSH-089 added the secrets check, KNSH-094 the Endpoint Security one).
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The probe's profile: everything allowed except writing files. Constant text, no path in it: the probe asks only
@@ -77,6 +83,8 @@ pub(crate) struct Probes {
     pub(crate) timeout: Duration,
     /// What the sandbox check needs besides processes.
     pub(crate) sandbox: SandboxProbe,
+    /// Endpoint Security descendant clients, checked on macOS 27 and later (KNSH-094).
+    pub(crate) descendants: Arc<dyn DescendantClients>,
 }
 
 /// The sandbox check's own inputs.
@@ -132,6 +140,7 @@ pub(crate) fn probe(probes: &Probes) -> Probed {
         None => Secrets::None,
     };
     let major = bounded_check(probes, "platform", |system| system.os_major_version());
+    let sandbox = with_endpoint_security(probes, sandbox, major);
 
     let capabilities = Capabilities {
         sandbox,
@@ -155,6 +164,35 @@ pub(crate) fn probe(probes: &Probes) -> Probed {
     Probed {
         platform: Platform::this_build(major),
         capabilities: Arc::new(capabilities),
+    }
+}
+
+/// The sandbox value once Endpoint Security is considered (KNSH-094, decision 3): `seatbelt+endpoint_security` only
+/// when `sandbox` is Seatbelt, `major` is known and at least [`ENDPOINT_SECURITY_MIN_MAJOR`], and a descendant client
+/// was created and deleted within the probe's bound. Before macOS 27, or with an unreadable version, the client is
+/// never tried. Anything else leaves `sandbox` as it was: the layer is reported only when it is active.
+pub(crate) fn with_endpoint_security(probes: &Probes, sandbox: Sandbox, major: Option<u32>) -> Sandbox {
+    match sandbox {
+        Sandbox::Seatbelt => {}
+        // Only Seatbelt is extended: without it agent sessions refuse to start whatever else works.
+        Sandbox::SeatbeltEndpointSecurity | Sandbox::None => return sandbox,
+    }
+    if major.is_none_or(|major| major < ENDPOINT_SECURITY_MIN_MAJOR) {
+        return sandbox;
+    }
+    let descendants = Arc::clone(&probes.descendants);
+    let answer = run_bounded(probes.clock.as_ref(), probes.timeout, move || descendants.check());
+    match answer.and_then(|result| result.map_err(ProbeFailure::Platform)) {
+        Ok(()) => Sandbox::SeatbeltEndpointSecurity,
+        Err(failure) => {
+            // Expected until the entitlement is granted: a notice, so it never reads as a broken machine.
+            probes.log.log(
+                Level::Notice,
+                "endpoint security unavailable: envelopes alone confine direct execution",
+                &[Field::new("reason", Value::Static(failure.kind()))],
+            );
+            sandbox
+        }
     }
 }
 
@@ -320,7 +358,8 @@ pub(crate) mod tests {
 
     use knsh_core::Timestamp;
     use knsh_platform::testing::{
-        FakeClock, FakeSystemProbe, MemFs, RecordingLog, Script, ScriptedProcesses, SeededRandom,
+        FakeClock, FakeSystemProbe, MemFs, RecordingLog, Script, ScriptedDescendantClients, ScriptedProcesses,
+        SeededRandom,
     };
     use knsh_platform::{Operation, ProcessGroupId, Signal};
 
@@ -383,6 +422,8 @@ pub(crate) mod tests {
         pub(crate) clock: Arc<FakeClock>,
         pub(crate) log: Arc<RecordingLog>,
         pub(crate) trampoline: Option<PathBuf>,
+        /// Descendant clients that can be created by default (KNSH-094); tried only on macOS 27 and later.
+        pub(crate) descendants: Arc<ScriptedDescendantClients>,
     }
 
     impl Machine {
@@ -404,6 +445,7 @@ pub(crate) mod tests {
                 clock: Arc::new(FakeClock::new(Timestamp::UNIX_EPOCH)),
                 log: Arc::new(RecordingLog::new()),
                 trampoline: Some(PathBuf::from(TRAMPOLINE_PATH)),
+                descendants: Arc::new(ScriptedDescendantClients::new()),
             }
         }
 
@@ -435,6 +477,7 @@ pub(crate) mod tests {
                     fs: self.fs.clone(),
                     random: Arc::new(SeededRandom::new(7)),
                 },
+                descendants: self.descendants.clone(),
             }
         }
 
@@ -675,6 +718,109 @@ pub(crate) mod tests {
         // The hung knsh-exec was killed, not left running, and its files removed.
         assert_eq!(machine.processes.scripted.signals().len(), 1);
         machine.assert_clean();
+        drop(release);
+    }
+
+    /// A machine whose checks all pass on OS major version `major`.
+    fn working_on(major: u32) -> Machine {
+        Machine::new(
+            Script::Exits(PROBE_DENIED_EXIT),
+            Arc::new(FakeSystemProbe::working(major)),
+        )
+    }
+
+    // KNSH-094 (FR-AGT-13): the Endpoint Security layer is reported only when it is active: Seatbelt works, the OS is
+    // macOS 27 or later, and a descendant client was created. Otherwise the sandbox value is unchanged.
+    #[test]
+    fn es_capability_reported_only_when_active() {
+        let active = working_on(27);
+        assert_eq!(active.sandbox(), Sandbox::SeatbeltEndpointSecurity);
+        assert_eq!(active.descendants.checks(), 1);
+        assert_eq!(active.descendants.live(), 0, "the probe's client is deleted");
+        assert_eq!(working_on(28).sandbox(), Sandbox::SeatbeltEndpointSecurity);
+
+        // No entitlement (or a backend not bound yet): seatbelt, logged as a notice and not as a failed probe.
+        let mut refused = working_on(27);
+        refused.descendants = Arc::new(ScriptedDescendantClients::failing(
+            PlatformError::EndpointSecurityUnavailable,
+        ));
+        assert_eq!(refused.sandbox(), Sandbox::Seatbelt);
+        assert!(refused.failure_reasons().is_empty(), "{:?}", refused.failure_reasons());
+        let notice = refused
+            .log
+            .entries()
+            .into_iter()
+            .find(|entry| entry.message.starts_with("endpoint security unavailable"))
+            .unwrap();
+        assert_eq!(notice.level, Level::Notice);
+
+        // Without Seatbelt there is no sandbox at all, whatever Endpoint Security could do (FR-AGT-06).
+        let mut no_seatbelt = Machine::new(Script::Exits(1), Arc::new(FakeSystemProbe::working(27)));
+        no_seatbelt.descendants = Arc::new(ScriptedDescendantClients::new());
+        assert_eq!(no_seatbelt.sandbox(), Sandbox::None);
+        assert_eq!(no_seatbelt.descendants.checks(), 0);
+    }
+
+    // KNSH-094 (decision 3): on macOS 14 to 26, or when the version cannot be read, no client is ever tried and the
+    // envelope alone confines direct execution: `seatbelt`, with nothing logged about Endpoint Security.
+    #[test]
+    fn older_macos_falls_back_to_envelope_only() {
+        for major in [14, 15, 26] {
+            let machine = working_on(major);
+            assert_eq!(machine.sandbox(), Sandbox::Seatbelt, "macOS {major}");
+            assert_eq!(machine.descendants.checks(), 0, "macOS {major}");
+            assert!(
+                machine
+                    .log
+                    .entries()
+                    .iter()
+                    .all(|entry| !entry.message.contains("endpoint security")),
+                "macOS {major}"
+            );
+        }
+        let unknown = Machine::new(
+            Script::Exits(PROBE_DENIED_EXIT),
+            Arc::new(FakeSystemProbe::without_version()),
+        );
+        assert_eq!(unknown.sandbox(), Sandbox::Seatbelt);
+        assert_eq!(unknown.descendants.checks(), 0);
+    }
+
+    /// Descendant clients whose check never returns within the bound.
+    struct HangingClients {
+        clock: Arc<FakeClock>,
+        blocked: std::sync::Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl DescendantClients for HangingClients {
+        fn check(&self) -> Result<(), PlatformError> {
+            self.clock.advance(PROBE_TIMEOUT * 2);
+            let _ = self.blocked.lock().unwrap().recv();
+            Ok(())
+        }
+
+        fn watch(
+            &self,
+            _handler: Arc<dyn knsh_platform::ExecHandler>,
+        ) -> Result<Box<dyn knsh_platform::DescendantClient>, PlatformError> {
+            Err(PlatformError::EndpointSecurityUnavailable)
+        }
+    }
+
+    // KNSH-094: a client check that hangs is abandoned at the bound, and the layer is not claimed.
+    #[test]
+    fn hanging_endpoint_security_check_keeps_seatbelt() {
+        let machine = working_on(27);
+        let (release, blocked) = mpsc::channel();
+        let clients = HangingClients {
+            clock: Arc::clone(&machine.clock),
+            blocked: std::sync::Mutex::new(blocked),
+        };
+        let probes = Probes {
+            descendants: Arc::new(clients),
+            ..machine.probes()
+        };
+        assert_eq!(probe(&probes).capabilities.sandbox, Sandbox::Seatbelt);
         drop(release);
     }
 }
