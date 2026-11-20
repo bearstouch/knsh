@@ -10,7 +10,9 @@
 //! 1. **Loopback ports.** A loopback address, or the name `localhost` (or a name below it, RFC 6761), on a port of
 //!    `network.loopback` is allowed whatever the mode: the sandbox profile lets the command reach that port anyway,
 //!    so the proxy adds nothing by refusing it (FR-NET-04). `localhost` is never resolved: it is `127.0.0.1` and
-//!    `::1`.
+//!    `::1`. Not for a line that receives secrets: it may reach only its secrets' hosts (FR-SEC-03), so its
+//!    loopback destinations go through the host rules like any other (`knshd` also compiles its sandbox profile
+//!    without loopback ports).
 //! 2. **IP literals** are refused unless allowlisted: listed in a host rule the requester may use (FR-NET-05).
 //! 3. **Names** go through the host rules ([`knsh_core::check_host`]): `network.hosts`, `network.approval_hosts`
 //!    with the line's classes and approval, dynamic code limited to `network.hosts` (FR-NET-02, FR-NET-03,
@@ -60,7 +62,14 @@ pub struct Scope {
 impl Scope {
     /// Step 1: a loopback address on a `network.loopback` port.
     fn loopback_port(&self, ip: IpAddr, port: NonZeroU16) -> bool {
-        is_loopback(ip) && self.network.loopback.contains(&port.get())
+        is_loopback(ip) && self.opens_loopback(port)
+    }
+
+    /// Whether `port` is one of step 1's loopback ports for this requester: never for a line narrowed to its
+    /// secrets' hosts (FR-SEC-03).
+    fn opens_loopback(&self, port: NonZeroU16) -> bool {
+        let narrowed = matches!(&self.requester, Requester::Line(line) if !line.secret_hosts.is_empty());
+        !narrowed && self.network.loopback.contains(&port.get())
     }
 
     /// Whether the address `ip` is listed in a host rule the requester may use (FR-NET-05, FR-NET-07).
@@ -82,8 +91,7 @@ impl Scope {
         let exempt = match &target.host {
             Host::Ip(ip) => self.loopback_port(*ip, port) || is_non_tls_host(&self.network, &ip.to_string()),
             Host::Name(name) => {
-                (is_localhost(name) && self.network.loopback.contains(&port.get()))
-                    || is_non_tls_host(&self.network, name)
+                (is_localhost(name) && self.opens_loopback(port)) || is_non_tls_host(&self.network, name)
             }
         };
         !exempt
@@ -102,6 +110,7 @@ fn refusal(refused: HostRefusal) -> Refusal {
         HostRefusal::NotListed => Refusal::HostNotAllowed,
         HostRefusal::ApprovalRequired => Refusal::ApprovalRequired,
         HostRefusal::DynamicCode => Refusal::DynamicCode,
+        HostRefusal::SecretHosts => Refusal::SecretHosts,
     }
 }
 
@@ -128,7 +137,7 @@ pub fn decide(
         Host::Ip(_) => return Err(Refusal::IpLiteral),
         Host::Name(name) => name,
     };
-    if is_localhost(name) && scope.network.loopback.contains(&port.get()) {
+    if is_localhost(name) && scope.opens_loopback(port) {
         let loopback = [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)];
         return Ok(loopback.map(|ip| SocketAddr::new(ip, port.get())).to_vec());
     }
@@ -251,6 +260,7 @@ mod tests {
                 classes: classes.to_vec(),
                 dynamic,
                 approved,
+                secret_hosts: Vec::new(),
             }),
         }
     }
@@ -464,6 +474,37 @@ mod tests {
         );
         // A loopback port does not open other internal addresses.
         assert_eq!(decide(&scope, &target("10.0.0.1:3000"), never), Err(Refusal::IpLiteral));
+    }
+
+    // KNSH-092 network_narrowed_to_secret_hosts (FR-SEC-03, FR-NET-10): a line that receives a secret reaches only
+    // the secret's hosts; other open hosts, allowlisted addresses and the loopback ports are refused to it.
+    #[test]
+    fn network_narrowed_to_secret_hosts() {
+        let mut scope = plain(NetworkMode::Allowlist);
+        if let Requester::Line(line) = &mut scope.requester {
+            line.secret_hosts = vec![vec!["registry.npmjs.org".to_owned()]];
+        }
+        assert_eq!(
+            decide(&scope, &target("registry.npmjs.org:443"), answering(&["104.16.0.1"])),
+            Ok(vec![addr("104.16.0.1:443")])
+        );
+        assert_eq!(
+            decide(&scope, &target("git.corp:443"), never),
+            Err(Refusal::SecretHosts)
+        );
+        assert_eq!(decide(&scope, &target("10.1.2.3:443"), never), Err(Refusal::IpLiteral));
+        assert!(!scope.allows_ip_literal(ip("10.1.2.3"), NonZeroU16::new(443).unwrap()));
+        // No loopback port: `localhost` and loopback addresses go through the host rules, which do not list them.
+        assert_eq!(
+            decide(&scope, &target("127.0.0.1:3000"), never),
+            Err(Refusal::IpLiteral)
+        );
+        assert_eq!(
+            decide(&scope, &target("localhost:3000"), never),
+            Err(Refusal::HostNotAllowed)
+        );
+        assert!(scope.checks_server_name(&target("localhost:3000")));
+        assert_eq!(Refusal::SecretHosts.reason(), "secret_hosts");
     }
 
     // KNSH-060 connects_to_checked_address_without_reresolving (FR-NET-07): the gate resolves once and returns the

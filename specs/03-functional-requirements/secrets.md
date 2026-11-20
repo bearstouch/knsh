@@ -14,6 +14,32 @@ A **secret** is a named value stored in the Keychain (service `knsh`), or suppli
 | FR-SEC-06 | `secret.injected` must report the secret's name and the command, never the value; the record's `secrets_injected` lists names only. |
 | FR-SEC-07 | Authority-supplied secrets must be held only in memory, for the time given, and must be lost when `knshd` exits. `secrets.revoke` must remove them at once. |
 
+### Injection (KNSH-092)
+
+- **Which lines.** A command certainly matching an entry's `inject_for` (as an allow rule matches, FR-POL-16) makes
+  the line receive that entry's secret as the entry's variable (FR-SEC-01). A line holding any dynamic code receives
+  none, even approved or granted, and is not asked about one (FR-SEC-04).
+- **Ask.** Such a command asks even when the rules allow it, with rule ID `secrets.env[N]` (the `N`-th variable in
+  name order, zero-based): it runs with the secret only once the authority or the user approves it, or a grant covers
+  it (FR-SEC-02). A command the rules deny stays denied. Under the `unattended` profile nobody can answer, so the line
+  is denied unless a grant covers it.
+- **Lookup.** After the decision and the checkpoint gate, each secret is looked up as KNSH-089 describes. The line
+  is denied (`-32001`, source `standalone`, recorded) with a reason naming the secret when one is not found or
+  cannot be read; when the entry's variable is one the engine sets (proxy settings, `DYLD_*`); when a value holds a
+  NUL byte; or when the session's secrets changed since the line's redactor was taken, so the value would not be
+  redacted from its output (the client sends the line again). A line never runs with some of its secrets missing.
+- **Environment.** Each variable replaces any inherited one of the same name.
+- **Network (FR-SEC-03, FR-NET-10).** The line reaches only a host the host rules open to it **and** that the
+  `hosts` of every secret it receives list (matched like every host entry); any other is refused with
+  `secret_hosts`. An entry with no `hosts` leaves the line no host. The narrowing applies to IP literals and
+  internal addresses too (an address must also be listed in the secret's `hosts`), and the line gets no
+  `network.loopback` ports, neither in its sandbox profile nor at the proxy.
+- **Process information (FR-SEC-05).** Every line's profile limits process information to its own sandbox
+  (decision 8), so no other process can read the injected environment.
+- **Reporting (FR-SEC-06).** Once the line is spawned, `secret.injected` is published for each secret, after
+  `command.started`, naming the secret and the line; its record's `secrets_injected` lists the secret names, sorted,
+  each once. A line that was not spawned lists none.
+
 Anything an injected line runs can read the secret, including npm lifecycle scripts. Prefer short-lived, narrowly scoped tokens supplied by the authority; presets can rewrite publishing commands to skip lifecycle scripts where the tool allows it.
 
 ## Redaction

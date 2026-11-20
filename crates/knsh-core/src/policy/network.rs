@@ -20,6 +20,9 @@
 //!
 //!    Otherwise [`HostRefusal::ApprovalRequired`].
 //! 4. Any other host: [`HostRefusal::NotListed`].
+//! 5. A line that receives secrets reaches a host the rules above open only if it is also listed in the `hosts` of
+//!    **every** secret it receives ([`HostRefusal::SecretHosts`], FR-SEC-03, FR-NET-10): the value can only be sent
+//!    where it is meant to go. A secret with no `hosts` leaves the line no host at all.
 //!
 //! # Matching
 //!
@@ -56,6 +59,9 @@ pub struct LineAccess {
     /// Whether the line was approved (by the authority or the user), or allowed by a grant that answered the rules'
     /// ask (FR-NET-03, `specs/05-models/grant.md`).
     pub approved: bool,
+    /// The `hosts` of each secret the line receives (`LineCapabilities::secret_hosts`): a host must be matched by an
+    /// entry of every list (rule 5, FR-SEC-03). Empty when it receives none.
+    pub secret_hosts: Vec<Vec<String>>,
 }
 
 impl LineAccess {
@@ -68,6 +74,7 @@ impl LineAccess {
             classes: capabilities.classes.clone(),
             dynamic: capabilities.dynamic,
             approved: allowed.profile.approved || allowed.decision.source == DecisionSource::Grant,
+            secret_hosts: capabilities.secret_hosts.clone(),
         }
     }
 }
@@ -104,10 +111,13 @@ pub enum HostRefusal {
     ApprovalRequired,
     /// An approval host, and the line holds dynamic code, which never reaches one (FR-NET-11, FR-POL-21).
     DynamicCode,
+    /// The line receives a secret whose `hosts` do not list the host (FR-SEC-03, FR-NET-10).
+    SecretHosts,
 }
 
 impl HostRefusal {
-    /// A fixed name for reports: `network_off`, `host_not_allowed`, `approval_required` or `dynamic_code`.
+    /// A fixed name for reports: `network_off`, `host_not_allowed`, `approval_required`, `dynamic_code` or
+    /// `secret_hosts`.
     #[must_use]
     pub const fn reason(self) -> &'static str {
         match self {
@@ -115,6 +125,7 @@ impl HostRefusal {
             Self::NotListed => "host_not_allowed",
             Self::ApprovalRequired => "approval_required",
             Self::DynamicCode => "dynamic_code",
+            Self::SecretHosts => "secret_hosts",
         }
     }
 }
@@ -131,6 +142,18 @@ impl fmt::Display for HostRefusal {
 ///
 /// The [`HostRefusal`] when the host is not open to the requester.
 pub fn check_host(network: &NetworkPolicy, requester: &Requester, host: &str) -> Result<HostAccess, HostRefusal> {
+    let access = host_rules(network, requester, host)?;
+    // Rule 5 (FR-SEC-03, FR-NET-10): narrows whatever the rules above opened, never widens it.
+    if let Requester::Line(line) = requester
+        && !line.secret_hosts.iter().all(|hosts| listed(hosts, host))
+    {
+        return Err(HostRefusal::SecretHosts);
+    }
+    Ok(access)
+}
+
+/// Rules 1 to 4 of the module documentation.
+fn host_rules(network: &NetworkPolicy, requester: &Requester, host: &str) -> Result<HostAccess, HostRefusal> {
     match network.mode {
         NetworkMode::None => return Err(HostRefusal::NetworkOff),
         NetworkMode::Allowlist => {}
@@ -258,6 +281,7 @@ mod tests {
             classes: classes.to_vec(),
             dynamic,
             approved,
+            secret_hosts: Vec::new(),
         })
     }
 
@@ -425,6 +449,63 @@ mod tests {
         assert_eq!(
             check_host(&network, &Requester::Envelope, "git.corp.example"),
             Err(HostRefusal::NotListed)
+        );
+    }
+
+    // KNSH-092 network_narrowed_to_secret_hosts (FR-SEC-03, FR-NET-10): a line that receives secrets reaches only
+    // hosts every secret lists, among those the rules open; the narrowing never opens a host the rules refuse.
+    #[test]
+    fn network_narrowed_to_secret_hosts() {
+        let network = policy(NetworkMode::Allowlist);
+        let narrowed = |secret_hosts: &[&[&str]], approved| {
+            Requester::Line(LineAccess {
+                classes: Vec::new(),
+                dynamic: false,
+                approved,
+                secret_hosts: secret_hosts
+                    .iter()
+                    .map(|hosts| hosts.iter().map(|host| (*host).to_owned()).collect())
+                    .collect(),
+            })
+        };
+        let npm = narrowed(&[&["registry.npmjs.org"]], true);
+        assert_eq!(check_host(&network, &npm, "registry.npmjs.org"), Ok(HostAccess::Open));
+        // Open to every other command, approved, or an allowlisted address: refused to this line all the same.
+        for host in ["files.pythonhosted.org", "github.com", "10.0.0.5"] {
+            assert_eq!(
+                check_host(&network, &npm, host),
+                Err(HostRefusal::SecretHosts),
+                "{host}"
+            );
+        }
+        // The rules still decide first: a secret listing a host the profile does not open never opens it.
+        let wide = narrowed(&[&["evil.example", "github.com"]], false);
+        assert_eq!(check_host(&network, &wide, "evil.example"), Err(HostRefusal::NotListed));
+        assert_eq!(
+            check_host(&network, &wide, "github.com"),
+            Err(HostRefusal::ApprovalRequired)
+        );
+        // Two secrets: only a host both list.
+        let both = narrowed(
+            &[&["*.pythonhosted.org", "registry.npmjs.org"], &["registry.npmjs.org"]],
+            false,
+        );
+        assert_eq!(check_host(&network, &both, "registry.npmjs.org"), Ok(HostAccess::Open));
+        assert_eq!(
+            check_host(&network, &both, "files.pythonhosted.org"),
+            Err(HostRefusal::SecretHosts)
+        );
+        // A secret with no hosts leaves the line none.
+        let none = narrowed(&[&[]], true);
+        assert_eq!(
+            check_host(&network, &none, "registry.npmjs.org"),
+            Err(HostRefusal::SecretHosts)
+        );
+        assert_eq!(HostRefusal::SecretHosts.reason(), "secret_hosts");
+        // A line that receives no secret is not narrowed.
+        assert_eq!(
+            check_host(&network, &plain_line(), "files.pythonhosted.org"),
+            Ok(HostAccess::Open)
         );
     }
 }

@@ -17,6 +17,13 @@
 //! `rewritten_from`, `argv` names, network hosts), the lifecycle events, the captured output and what `exec.run`
 //! returns. So hooks and the authority see exactly the text the record keeps (FR-REC-05).
 //!
+//! # Injection (KNSH-092)
+//!
+//! [`Redactors::inject`] looks up the secrets a line is to receive, through the same source, and checks that the
+//! redactor the line was decided with holds each value it returns: the session's cached redactor must still be that
+//! instance, built from those very values. Otherwise the session's secrets changed under the line, and it is denied
+//! rather than run with a value its output would show.
+//!
 //! # Failing closed
 //!
 //! A set the engine cannot redact (a value over the engine's size limits) is an error: an agent line is then denied,
@@ -33,6 +40,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use knsh_core::{CoreError, Profile, REDACTED_MARKER, Redacted, Redactor, SecretName, SessionId};
 use knsh_platform::SecretValue;
 
+use crate::injection::{InjectionError, Missing, Unavailable};
+
 #[cfg(target_os = "macos")]
 use crate::secrets::SecretBroker;
 
@@ -41,12 +50,24 @@ pub(crate) trait RedactionSecrets: Send + Sync {
     /// The secrets to redact for a session whose profile names `names`: each of them that can be read, and every
     /// live provided secret, each once, in name order. Secrets that cannot be had are left out.
     fn redaction_secrets(&self, names: &[SecretName]) -> Vec<(SecretName, SecretValue)>;
+
+    /// The value of each of `names`, in order, as a line receiving them is given them (KNSH-089): all of them, or the
+    /// first that cannot be had.
+    ///
+    /// # Errors
+    ///
+    /// [`Missing`] naming the first secret that is unavailable, and why.
+    fn injection_secrets(&self, names: &[SecretName]) -> Result<Vec<(SecretName, SecretValue)>, Missing>;
 }
 
 #[cfg(target_os = "macos")]
 impl RedactionSecrets for SecretBroker {
     fn redaction_secrets(&self, names: &[SecretName]) -> Vec<(SecretName, SecretValue)> {
         self.redaction_set(names)
+    }
+
+    fn injection_secrets(&self, names: &[SecretName]) -> Result<Vec<(SecretName, SecretValue)>, Missing> {
+        self.resolve(names)
     }
 }
 
@@ -144,6 +165,48 @@ impl Redactors {
         build(&source.redaction_secrets(&[]))
     }
 
+    /// The values of `names` for a line of `session_id` decided with `redactor` (module documentation, "Injection").
+    /// Nothing to look up is always fine.
+    ///
+    /// # Errors
+    ///
+    /// [`InjectionError::Unavailable`] when a secret cannot be had (without a secret source, every one is not
+    /// found); [`InjectionError::NotRedacted`] when `redactor` is no longer the session's or does not hold a value.
+    pub(crate) fn inject(
+        &self,
+        session_id: SessionId,
+        redactor: &Redactor,
+        names: &[SecretName],
+    ) -> Result<Vec<(SecretName, SecretValue)>, InjectionError> {
+        let Some(first) = names.first() else {
+            return Ok(Vec::new());
+        };
+        let Some(source) = &self.secrets else {
+            return Err(InjectionError::Unavailable(Missing {
+                name: first.clone(),
+                reason: Unavailable::NotFound,
+            }));
+        };
+        // Read outside the lock, as the redaction set is.
+        let values = source.injection_secrets(names).map_err(InjectionError::Unavailable)?;
+        let cache = self.lock();
+        let covered = cache.get(&session_id).is_some_and(|cached| {
+            cached.redactor.is_same_instance(redactor)
+                && values.iter().all(|(name, value)| {
+                    cached
+                        .secrets
+                        .iter()
+                        .any(|(held, held_value)| held == name && held_value.expose() == value.expose())
+                })
+        });
+        drop(cache);
+        if covered {
+            Ok(values)
+        } else {
+            Err(InjectionError::NotRedacted)
+        }
+    }
+
     /// Drops the cached redactor of a session that ended, and with it the values it held.
     pub(crate) fn forget(&self, session_id: SessionId) {
         self.lock().remove(&session_id);
@@ -225,6 +288,22 @@ pub(crate) mod tests {
             }
             set.sort_by(|a, b| a.0.cmp(&b.0));
             set
+        }
+
+        fn injection_secrets(&self, names: &[SecretName]) -> Result<Vec<(SecretName, SecretValue)>, Missing> {
+            let set = self.redaction_secrets(names);
+            names
+                .iter()
+                .map(|name| {
+                    set.iter()
+                        .find(|(held, _)| held == name)
+                        .map(|(_, value)| (name.clone(), value.duplicate()))
+                        .ok_or_else(|| Missing {
+                            name: name.clone(),
+                            reason: Unavailable::NotFound,
+                        })
+                })
+                .collect()
         }
     }
 
@@ -330,5 +409,61 @@ pub(crate) mod tests {
             Some(CoreError::RedactionTooLarge)
         );
         assert_eq!(redact_or_hide(None, "anything").expose(), REDACTED_MARKER);
+    }
+
+    // KNSH-092: the values a line receives come with the redactor it was decided with; a secret that changed since,
+    // or a redactor that is not the session's, denies it, and a secret that cannot be had is named.
+    #[test]
+    fn inject_checks_the_line_redactor_holds_the_values() {
+        let fake = Arc::new(FakeSecrets::default());
+        fake.stored.lock().unwrap().push(("npm-token", "npm_abcdefgh123"));
+        let redactors = Redactors::new(fake.clone());
+        let web = profile(
+            "name = \"web\"\n[secrets.env]\nNPM_TOKEN = { secret = \"npm-token\", inject_for = [\"npm publish\"] }\n",
+        );
+        let token = SecretName::new("npm-token").unwrap();
+        let redactor = redactors.for_session(session(5), Some(&web)).unwrap();
+        let values = redactors
+            .inject(session(5), &redactor, std::slice::from_ref(&token))
+            .unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].1.expose(), b"npm_abcdefgh123");
+        assert!(redactors.inject(session(5), &redactor, &[]).unwrap().is_empty());
+
+        // Another instance holding the same names is not the line's redactor.
+        let other = build(&[(token.clone(), SecretValue::from_vec(b"npm_abcdefgh123".to_vec()))]).unwrap();
+        assert_eq!(
+            redactors.inject(session(5), &other, std::slice::from_ref(&token)).err(),
+            Some(InjectionError::NotRedacted)
+        );
+        // The value changed after the line's redactor was taken.
+        fake.stored.lock().unwrap()[0].1 = "npm_changed_9876";
+        assert_eq!(
+            redactors
+                .inject(session(5), &redactor, std::slice::from_ref(&token))
+                .err(),
+            Some(InjectionError::NotRedacted)
+        );
+        // A secret that cannot be had is named.
+        let missing = SecretName::new("gone").unwrap();
+        assert_eq!(
+            redactors
+                .inject(session(5), &redactor, std::slice::from_ref(&missing))
+                .err(),
+            Some(InjectionError::Unavailable(Missing {
+                name: missing.clone(),
+                reason: Unavailable::NotFound,
+            }))
+        );
+        // Without a secret source nothing can be injected.
+        assert_eq!(
+            Redactors::none()
+                .inject(session(5), &Redactor::default(), std::slice::from_ref(&missing))
+                .err(),
+            Some(InjectionError::Unavailable(Missing {
+                name: missing,
+                reason: Unavailable::NotFound,
+            }))
+        );
     }
 }

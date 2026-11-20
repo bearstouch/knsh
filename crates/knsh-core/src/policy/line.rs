@@ -16,8 +16,15 @@
 //! What the line may receive when it runs ([`LineCapabilities`]): the hosts open to it, the approval hosts it may
 //! reach once its classes or an approval allow (KNSH-060 decides each connection), the approval hosts its classes
 //! alone open under `network.class_hosts` (FR-NET-03, KNSH-058), the loopback ports, the network classes it may
-//! present to host rules, and the secrets it is eligible for (KNSH-092 asks and injects). A denied line receives
-//! nothing.
+//! present to host rules, the secrets it is eligible for, and those secrets' hosts, to which the proxy narrows its
+//! network (FR-SEC-03, FR-NET-10). A denied line receives nothing.
+//!
+//! # Secrets (KNSH-092)
+//!
+//! A command that certainly matches a `[secrets.env]` variable's `inject_for` would receive that secret (FR-SEC-01).
+//! If the rules allow it, it asks instead, named [`RuleId::Secret`] (FR-SEC-02): the line runs with the secret only
+//! once approved, or allowed by a grant covering that command. A line holding dynamic code receives no secret
+//! (FR-SEC-04), so none of its commands asks for this reason.
 //!
 //! If **any** part of the line is dynamic, the whole line is clamped (FR-POL-20, FR-POL-21): network is limited to
 //! `network.hosts` (and the loopback ports, which are open to every command alike), no approval hosts, no secrets and
@@ -179,8 +186,12 @@ pub struct LineCapabilities {
     /// (FR-POL-20) or when any command that can connect has none.
     pub classes: Vec<NetworkClass>,
     /// The `secrets.env` variables whose `inject_for` patterns certainly match a command of the line, sorted; none for
-    /// dynamic code (FR-POL-21, FR-SEC-04). An upper bound: KNSH-092 asks before injecting (FR-SEC-02).
+    /// dynamic code (FR-POL-21, FR-SEC-04). Each command that matches asks (FR-SEC-02, [`RuleId::Secret`]), so the
+    /// line receives them only once approved or granted.
     pub secrets: Vec<String>,
+    /// The `hosts` of each secret in [`secrets`](Self::secrets), in its order: the line may reach only a host that
+    /// an entry of **every** list matches (FR-SEC-03, FR-NET-10). Empty when the line receives no secret.
+    pub secret_hosts: Vec<Vec<String>>,
     /// Whether any part of the line is dynamic code, so the limits above are clamped.
     pub dynamic: bool,
 }
@@ -282,7 +293,7 @@ fn decide(
     grants: Option<GrantContext<'_>>,
 ) -> Result<LineDecision, EvaluationError> {
     let commands = classification.commands();
-    let mut matched_rules = Vec::with_capacity(commands.len() + 1);
+    let mut matched_rules: Vec<MatchedRule> = Vec::with_capacity(commands.len() + 1);
     for (index, command) in commands.iter().enumerate() {
         // The classifier records each wrapper before the command it runs.
         if command.wrapper.is_some_and(|wrapper| wrapper >= index) {
@@ -294,6 +305,22 @@ fn decide(
             verdict: verdict.verdict,
             rule_id: verdict.rule_id,
         });
+    }
+    // FR-SEC-02 (KNSH-092): a command that would receive a secret asks even when the rules allow it, so only an
+    // approval or a grant covering it lets the secret out. A line holding dynamic code receives none (FR-SEC-04), so
+    // nothing of it asks for this reason.
+    if !is_dynamic(classification) {
+        for part in &mut matched_rules {
+            let Some(command) = part.command.and_then(|index| commands.get(index)) else {
+                continue;
+            };
+            if part.verdict == RuleAction::Allow
+                && let Some(index) = secret_of(profile, command)
+            {
+                part.verdict = RuleAction::Ask;
+                part.rule_id = RuleId::Secret(index);
+            }
+        }
     }
     // FR-POL-20: dynamic code nothing else decides is "allowed or asked as the profile says": its default.
     if has_dynamic_part_without_entry(classification) {
@@ -435,7 +462,7 @@ fn contains(outer: Span, inner: Span) -> bool {
 /// The capabilities of a line that may run (module documentation, "Capabilities").
 fn capabilities(profile: &Profile, classification: &Classification) -> LineCapabilities {
     let commands = classification.commands();
-    let dynamic = classification.is_dynamic() || commands.iter().any(|command| command.class.is_dynamic());
+    let dynamic = is_dynamic(classification);
     let network = &profile.network;
     let (hosts, approval_hosts) = match network.mode {
         NetworkMode::None => (Vec::new(), Vec::new()),
@@ -449,6 +476,17 @@ fn capabilities(profile: &Profile, classification: &Classification) -> LineCapab
     } else {
         (line_classes(commands), eligible_secrets(profile, commands))
     };
+    // FR-SEC-03, FR-NET-10: each secret's `hosts`, which the proxy narrows the line's network to.
+    let secret_hosts = secrets
+        .iter()
+        .map(|variable| {
+            profile
+                .secrets
+                .get(variable)
+                .map(|injection| injection.hosts.clone())
+                .unwrap_or_default()
+        })
+        .collect();
     // FR-NET-03: dynamic code has no approval hosts and no classes above, so it never reaches one by class.
     let class_hosts = approval_hosts
         .iter()
@@ -462,8 +500,29 @@ fn capabilities(profile: &Profile, classification: &Classification) -> LineCapab
         loopback: network.loopback.clone(),
         classes,
         secrets,
+        secret_hosts,
         dynamic,
     }
+}
+
+/// Whether any part of the line is dynamic code, so its capabilities are clamped (FR-POL-20, FR-POL-21).
+fn is_dynamic(classification: &Classification) -> bool {
+    classification.is_dynamic()
+        || classification
+            .commands()
+            .iter()
+            .any(|command| command.class.is_dynamic())
+}
+
+/// The index, in variable order, of the first `[secrets.env]` variable `command` certainly matches through
+/// `inject_for`: the command would receive it (FR-SEC-01).
+fn secret_of(profile: &Profile, command: &ClassifiedCommand) -> Option<usize> {
+    profile.secrets.values().position(|injection| {
+        injection
+            .inject_for
+            .iter()
+            .any(|pattern| matches_certainly(pattern, command))
+    })
 }
 
 /// The classes of the line's commands, or none if a command that can connect has none (module documentation).

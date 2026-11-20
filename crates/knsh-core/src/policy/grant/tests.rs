@@ -482,3 +482,75 @@ fn answer_grant_rule_refuses_lines_holding_a_secret() {
         Some("npm publish --token=tok-123456")
     );
 }
+
+/// Allows npm and curl, and injects `NPM_TOKEN` into `npm publish` (KNSH-092).
+const SECRET_RULES: &str = "[exec]
+allow = [\"npm\", \"curl\", \"ls\", \"python3\"]
+[network]
+mode = \"allowlist\"
+hosts = [\"registry.npmjs.org\"]
+[secrets.env]
+NPM_TOKEN = { secret = \"npm-token\", inject_for = [\"npm publish\"], hosts = [\"registry.npmjs.org\"] }
+";
+
+// KNSH-092 matching_line_asks_without_grant (FR-SEC-02): a command the rules allow asks when it would receive a
+// secret, named by `secrets.env[N]`; the rest of the line, and lines that receive nothing, are not touched.
+#[test]
+fn matching_line_asks_without_grant() {
+    let p = profile(SECRET_RULES);
+    let decision = decide(
+        &p,
+        &GrantSet::new(),
+        session_id(1),
+        10,
+        "ls && npm publish --access public",
+    );
+    assert_eq!(
+        (decision.verdict, decision.source, decision.rule_id),
+        (RuleAction::Ask, DecisionSource::Rule, Some(RuleId::Secret(0)))
+    );
+    assert_eq!(
+        decision.rule_id.map(|rule| rule.to_string()).as_deref(),
+        Some("secrets.env[0]")
+    );
+    assert_eq!(decision.matched_rules[0].verdict, RuleAction::Allow);
+    assert_eq!(decision.capabilities.secrets, ["NPM_TOKEN"]);
+    assert_eq!(
+        decision.capabilities.secret_hosts,
+        [vec!["registry.npmjs.org".to_owned()]]
+    );
+    // No secret, no ask, and nothing to narrow to.
+    let decision = decide(&p, &GrantSet::new(), session_id(1), 10, "npm install");
+    assert_eq!(decision.verdict, RuleAction::Allow);
+    assert!(decision.capabilities.secrets.is_empty() && decision.capabilities.secret_hosts.is_empty());
+    // FR-SEC-04: dynamic code receives no secret, so it does not ask for one either.
+    let decision = decide(&p, &GrantSet::new(), session_id(1), 10, "npm publish && python3 -c 'x'");
+    assert_eq!(decision.verdict, RuleAction::Allow);
+    assert!(decision.capabilities.secrets.is_empty() && decision.capabilities.secret_hosts.is_empty());
+    // A deny stays a deny.
+    let p = profile(&SECRET_RULES.replace("[network]", "deny = [\"npm publish\"]\n[network]"));
+    let decision = decide(&p, &GrantSet::new(), session_id(1), 10, "npm publish");
+    assert_eq!(decision.verdict, RuleAction::Deny);
+}
+
+// KNSH-092 grant_allows_injection_without_ask (FR-SEC-02): a grant covering the command answers the secret's ask;
+// the line keeps its secret and its narrowing.
+#[test]
+fn grant_allows_injection_without_ask() {
+    let p = profile(SECRET_RULES);
+    let grants = set_of([session_grant(1, "npm publish")]);
+    let decision = decide(&p, &grants, session_id(1), 10, "npm publish");
+    assert_eq!(
+        (decision.verdict, decision.source, decision.grant),
+        (RuleAction::Allow, DecisionSource::Grant, Some(grant_id(1)))
+    );
+    assert_eq!(decision.rule_id, Some(RuleId::Secret(0)));
+    assert_eq!(decision.capabilities.secrets, ["NPM_TOKEN"]);
+    assert_eq!(
+        decision.capabilities.secret_hosts,
+        [vec!["registry.npmjs.org".to_owned()]]
+    );
+    // Another session's grant does not cover it.
+    let decision = decide(&p, &grants, session_id(2), 10, "npm publish");
+    assert_eq!(decision.verdict, RuleAction::Ask);
+}

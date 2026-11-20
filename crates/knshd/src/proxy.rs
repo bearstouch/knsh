@@ -457,6 +457,8 @@ pub(crate) mod tests {
         pub(crate) revoked: Mutex<Vec<SessionId>>,
         pub(crate) lines: Mutex<Vec<RecordId>>,
         pub(crate) accesses: Mutex<Vec<LineAccess>>,
+        /// The network policy each line's credentials were scoped by.
+        pub(crate) networks: Mutex<Vec<NetworkPolicy>>,
         pub(crate) revoked_lines: Mutex<Vec<RecordId>>,
         pub(crate) network: Mutex<Vec<NetworkEntry>>,
     }
@@ -474,6 +476,7 @@ pub(crate) mod tests {
                 revoked: Mutex::new(Vec::new()),
                 lines: Mutex::new(Vec::new()),
                 accesses: Mutex::new(Vec::new()),
+                networks: Mutex::new(Vec::new()),
                 revoked_lines: Mutex::new(Vec::new()),
                 network: Mutex::new(Vec::new()),
             }
@@ -503,13 +506,14 @@ pub(crate) mod tests {
             &self,
             _session: SessionId,
             record: RecordId,
-            _network: &NetworkPolicy,
+            network: &NetworkPolicy,
             access: LineAccess,
         ) -> Result<Option<ProxyCredential>, ProxyUnavailable> {
             if self.broken {
                 return Err(ProxyUnavailable);
             }
             self.accesses.lock().unwrap().push(access);
+            self.networks.lock().unwrap().push(network.clone());
             let mut lines = self.lines.lock().unwrap();
             lines.push(record);
             let id = format!("line{}", lines.len());

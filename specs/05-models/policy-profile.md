@@ -189,4 +189,5 @@ preset never adds command rules, it is the entry's position in the nearest profi
 if `web-app` sets `exec.ask` and extends `base`, `exec.ask[0]` is `web-app`'s first entry; if `web-app` leaves
 `exec.ask` unset, it is `base`'s. A decision made by a setting rather than a rule has the setting's key as its ID:
 `exec.project_executables` (a binary outside the trusted folders, FR-POL-14) or `exec.default` (no rule matched,
-FR-POL-17). Matching is described in [policy](../03-functional-requirements/policy.md#resolution-and-matching).
+FR-POL-17). A command the rules allow that would receive a secret asks with `secrets.env[N]`, the `N`-th
+`[secrets.env]` variable in name order (FR-SEC-02, KNSH-092). Matching is described in [policy](../03-functional-requirements/policy.md#resolution-and-matching).

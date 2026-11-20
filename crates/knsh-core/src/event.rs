@@ -158,6 +158,16 @@ pub enum EventData {
         /// When it was spawned.
         started_at: Timestamp,
     },
+    /// `secret.injected`: a secret was given to a line as an environment variable (FR-SEC-06, KNSH-092). Names the
+    /// secret and the line, never the value. Published once per secret, right after the line's `command.started`.
+    SecretInjected {
+        /// The line's record.
+        record_id: RecordId,
+        /// The secret's name (`[secrets.env]`'s `secret`).
+        name: crate::SecretName,
+        /// The line that receives it, redacted.
+        command: Redacted<String>,
+    },
     /// `command.long_running`: a line is still running after the long-running threshold, 30 s by default
     /// (FR-LC-17, KNSH-051). Published at most once per line.
     CommandLongRunning {
@@ -414,6 +424,7 @@ impl EventData {
             | Self::PolicyInvalid { .. }
             | Self::CommandStarted { .. }
             | Self::CommandLongRunning { .. }
+            | Self::SecretInjected { .. }
             | Self::FileChanged { .. }
             | Self::AgentEdit { .. }
             | Self::CheckpointUncertain { .. }
@@ -440,6 +451,7 @@ impl EventData {
             Self::DecisionCancelled { .. } => "decision.cancelled",
             Self::CommandStarted { .. } => "command.started",
             Self::CommandLongRunning { .. } => "command.long_running",
+            Self::SecretInjected { .. } => "secret.injected",
             Self::CommandOutput { .. } => "command.output",
             Self::PolicyInvalid { .. } => "policy.invalid",
             Self::FileChanged { .. } => "file.changed",

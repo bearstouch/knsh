@@ -62,7 +62,7 @@ impl Row {
 }
 
 /// Every case of the suite and the row it covers. Each name is a `#[test]` in `cases.rs`.
-pub(super) const CASES: [(&str, Row); 12] = [
+pub(super) const CASES: [(&str, Row); 13] = [
     ("agent_cannot_approve_own_request", Row::ApproveOwnRequest),
     (
         "python_subprocess_git_push_cannot_reach_approval_host",
@@ -88,6 +88,7 @@ pub(super) const CASES: [(&str, Row); 12] = [
     ),
     ("impostor_authority_refused", Row::Impostor),
     ("secret_not_visible_to_other_process_groups", Row::LeakSecret),
+    ("injected_secret_reaches_only_its_hosts", Row::LeakSecret),
     ("exfiltration_blocked_by_host_name_and_address_checks", Row::SendDataOut),
     (
         "repeated_denials_rate_limited_and_grants_reduce_asks",

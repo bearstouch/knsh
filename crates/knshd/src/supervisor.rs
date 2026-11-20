@@ -40,6 +40,17 @@
 //! cannot be redacted denies the line (fail closed), and what is recorded and published of it is the plain marker,
 //! as for a line refused before its profile was loaded when even the provided secrets cannot be redacted.
 //!
+//! # Secrets (KNSH-092)
+//!
+//! An allowed line whose commands match `[secrets.env]` entries (the decision asked for it unless a grant covered it,
+//! FR-SEC-02) is given those secrets as environment variables (FR-SEC-01). After the checkpoint gate, they are looked
+//! up through the session's redactors ([`crate::injection`], [`Redactors::inject`]), which checks that the line's
+//! redactor holds every value; a secret that cannot be had, a variable the engine reserves, or a set that changed
+//! under the line denies it, recorded like a held line, with a reason naming the secret (fail closed). The spawner
+//! sets the variables and narrows the line's network to the secrets' hosts (FR-SEC-03). Once the line is spawned,
+//! `secret.injected` names each secret and the line, and the record's `secrets_injected` lists the names (FR-SEC-06).
+//! Dynamic code never receives one (FR-SEC-04).
+//!
 //! # Held lines (KNSH-054)
 //!
 //! A line for a session that is paused or under human control is answered `-32007` with `data.state` before anything
@@ -64,6 +75,7 @@
 
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -85,6 +97,7 @@ use crate::events::EventHub;
 use crate::exec::{Finished, ForwardedLine, Supervisor};
 use crate::grants::GrantStore;
 use crate::holds::{GroupKind, Kept};
+use crate::injection::{self, Injected, InjectionError};
 use crate::jobs::LineControl;
 use crate::policy::ProfileLoader;
 use crate::redaction::{Redactors, redact_or_hide};
@@ -154,6 +167,9 @@ pub(crate) struct SpawnPlan {
     /// How its output is captured, or `None` when it goes straight to the caller's descriptors (module
     /// documentation, "Output").
     pub(crate) capture: Option<CapturePlan>,
+    /// The secrets it receives as environment variables, already looked up and covered by its redactor (module
+    /// documentation, "Secrets"); its network is narrowed to their hosts by its decision's capabilities.
+    pub(crate) secrets: Vec<Injected>,
 }
 
 /// How a spawn went.
@@ -251,12 +267,27 @@ struct RunningEvents<'a> {
     /// The line's process group once spawned: at its end, members still alive are asked which files they hold for
     /// writing (FR-CKP-24, KNSH-085).
     group: Mutex<Option<ProcessGroupId>>,
+    /// The names of the secrets the line receives, each once: `secret.injected` names each once it is spawned
+    /// (FR-SEC-06).
+    secrets: Vec<String>,
+    /// Whether the line was spawned: only then was it given its secrets, and its record names them.
+    spawned: AtomicBool,
 }
 
 impl RunningEvents<'_> {
     /// Best effort (FR-EVT-04): an event that cannot be published never changes how the line runs.
     fn publish(&self, data: EventData) {
         let _ = self.events.publish(self.session_id, self.actor, data);
+    }
+
+    /// The record's `secrets_injected`: the names of the line's secrets once it was spawned; a line that never
+    /// started was given nothing (FR-SEC-06, FR-REC-11).
+    fn secrets_injected(&self) -> Vec<String> {
+        if self.spawned.load(Ordering::SeqCst) {
+            self.secrets.clone()
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -268,6 +299,7 @@ impl LineEvents for RunningEvents<'_> {
     }
 
     fn started(&self) {
+        self.spawned.store(true, Ordering::SeqCst);
         self.control.mark_started(self.record_id);
         self.publish(EventData::CommandStarted {
             record_id: self.record_id,
@@ -275,6 +307,18 @@ impl LineEvents for RunningEvents<'_> {
             cwd: self.cwd.clone(),
             started_at: self.started_at,
         });
+        // FR-SEC-06: the name and the line, never the value.
+        for name in self
+            .secrets
+            .iter()
+            .filter_map(|name| knsh_core::SecretName::new(name).ok())
+        {
+            self.publish(EventData::SecretInjected {
+                record_id: self.record_id,
+                name,
+                command: self.command.clone(),
+            });
+        }
     }
 
     fn long_running(&self) {
@@ -328,11 +372,19 @@ struct Ready {
     latency_ms: u64,
     /// When the line was received: the record's start if the clock cannot be read at the spawn.
     received_at: Timestamp,
+    /// What the checkpoint gate and the secrets let it start with.
+    admitted: Admitted,
+}
+
+/// What [`Lifecycle::admit`] lets an allowed line start with.
+struct Admitted {
     /// Checkpoint roots it touches whose changes are not protected: the record's `unprotected` (KNSH-079).
     unprotected: Vec<UnprotectedRoot>,
     /// Checkpoint roots it touches whose shadow is ready: their watchers mark its start and run the line-end flush
     /// (KNSH-080).
     protected: Vec<CanonicalPath>,
+    /// The secrets it receives (KNSH-092).
+    secrets: Vec<Injected>,
 }
 
 /// Why the checkpoint gate stopped an allowed line (FR-CKP-02).
@@ -348,6 +400,8 @@ enum Blocked {
     CallerGone,
     /// The session was paused, taken over or ended while it waited: the hold (`-32007`) or `-32006`.
     Held(RpcError),
+    /// It cannot be given the secrets it needs (KNSH-092): denied, with this reason naming the secret.
+    Secret(String),
 }
 
 impl Lifecycle {
@@ -447,8 +501,8 @@ impl Lifecycle {
             // FR-CKP-02: an allowed line touching a checkpoint root whose shadow is not ready waits, fails with
             // `-32010`, or is denied, as `checkpoints.required` and the caller ask. Recorded as a deny when stopped,
             // like a held line, so the decision is not lost.
-            Outcome::Run(allowed) => match self.checkpoint_gate(line, &profile, caller) {
-                Ok((unprotected, protected)) => {
+            Outcome::Run(allowed) => match self.admit(line, &profile, caller, &allowed, &redactor) {
+                Ok(admitted) => {
                     return Ok(Ready {
                         record_id,
                         redactor,
@@ -457,8 +511,7 @@ impl Lifecycle {
                         profile: Box::new(profile),
                         latency_ms,
                         received_at,
-                        unprotected,
-                        protected,
+                        admitted,
                     });
                 }
                 Err(blocked) => {
@@ -476,6 +529,50 @@ impl Lifecycle {
         };
         let record = (record_id, received_at, latency_ms);
         Err(self.refused(line, &actor, Some(&redactor), record, &refusal))
+    }
+
+    /// The checkpoint gate, then the secrets for an allowed line (KNSH-092): last, so a line that waited on a shadow
+    /// gets its secrets as they are when it starts.
+    fn admit(
+        &self,
+        line: &ForwardedLine,
+        profile: &Profile,
+        caller: &dyn Caller,
+        allowed: &Allowed,
+        redactor: &Redactor,
+    ) -> Result<Admitted, Blocked> {
+        let (unprotected, protected) = self.checkpoint_gate(line, profile, caller)?;
+        let secrets = self.secrets_for(line.session_id, allowed, profile, redactor)?;
+        Ok(Admitted {
+            unprotected,
+            protected,
+            secrets,
+        })
+    }
+
+    /// The secrets `allowed` receives, looked up for its session with the redactor it was decided with (module
+    /// documentation, "Secrets"), or why it is denied.
+    fn secrets_for(
+        &self,
+        session_id: SessionId,
+        allowed: &Allowed,
+        profile: &Profile,
+        redactor: &Redactor,
+    ) -> Result<Vec<Injected>, Blocked> {
+        let blocked = |error: InjectionError| Blocked::Secret(injection::denial_reason(&error));
+        let reserved =
+            |variable: &str| crate::proxy::is_proxy_var(variable) || crate::spawn::read_by_dynamic_linker(variable);
+        let needed = injection::needed(allowed, profile, reserved).map_err(blocked)?;
+        if needed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names: Vec<_> = needed.iter().map(|secret| secret.name.clone()).collect();
+        let values = self
+            .parts
+            .redactors
+            .inject(session_id, redactor, &names)
+            .map_err(blocked)?;
+        injection::pair(needed, values).map_err(blocked)
     }
 
     /// The session's profile for `line`, or the reason to deny it. FR-POL-42: a policy file with a missing or bad
@@ -519,6 +616,7 @@ impl Lifecycle {
             Blocked::CallerGone => (GONE_BEFORE_SPAWN, RefusalKind::Cancelled { request_id: None }),
             Blocked::Held(hold) if hold.code == ErrorCode::SessionHeld => (HELD_AFTER_DECISION, RefusalKind::Denied),
             Blocked::Held(_) => (ENDED_AFTER_DECISION, RefusalKind::Denied),
+            Blocked::Secret(reason) => (reason.as_str(), RefusalKind::Denied),
         };
         let refusal = Refusal {
             decision: Decision::deny(DecisionSource::Standalone, None, None),
@@ -533,7 +631,7 @@ impl Lifecycle {
         match blocked {
             Blocked::NotReady { root, progress } => not_ready(&root, progress),
             Blocked::Held(hold) => hold,
-            Blocked::NoShadow | Blocked::CallerGone => error,
+            Blocked::NoShadow | Blocked::CallerGone | Blocked::Secret(_) => error,
         }
     }
 
@@ -782,7 +880,8 @@ impl Lifecycle {
     /// that did not run to its end is recorded too, with neither exit code nor signal (NFR-REL-08). Its file changes
     /// are recorded from `closed`: how they were attributed (`attribution`, KNSH-081), and their checkpoint
     /// (`checkpoint_id`, `files_changed` with post-image identities, KNSH-082); roots whose changes were not protected
-    /// are listed too (`unprotected`, KNSH-079).
+    /// are listed too (`unprotected`, KNSH-079), and the names of the secrets it was given (`secrets_injected`,
+    /// FR-SEC-06).
     #[allow(clippy::too_many_arguments)]
     fn finished(
         &self,
@@ -798,6 +897,7 @@ impl Lifecycle {
         record_output: bool,
         unprotected: Vec<UnprotectedRoot>,
         closed: &ClosedLine,
+        secrets_injected: Vec<String>,
     ) -> (bool, Timestamp) {
         let ended_at = self.parts.clock.now().unwrap_or(started_at);
         let ran = report.outcome.as_ref().ok();
@@ -848,8 +948,10 @@ impl Lifecycle {
                         .map(|checkpoint| checkpoint.files.clone())
                         .unwrap_or_default()
                 }),
+                // FR-SEC-06, FR-REC-11: names only, never a value.
+                secrets_injected,
                 // `pipestatus` stays empty: the line runs in a separate bash whose `PIPESTATUS` is not reported back
-                // yet (KNSH-100). `secrets_injected` stays empty: no secret is injected in phase 2 (FR-REC-11).
+                // yet (KNSH-100).
                 ..RecordDetails::default()
             },
         };
@@ -922,8 +1024,7 @@ impl Supervisor for Lifecycle {
             profile,
             latency_ms,
             received_at,
-            unprotected,
-            protected,
+            admitted,
         } = panic::catch_unwind(AssertUnwindSafe(|| self.prepare(&line, caller)))
             .unwrap_or_else(|_| Err(denial(None, Some(INTERNAL_ERROR.to_owned()), DecisionSource::Rule)))?;
         let session_id = line.session_id;
@@ -951,6 +1052,8 @@ impl Supervisor for Lifecycle {
             control: &control,
             sessions: &self.parts.sessions,
             group: Mutex::new(None),
+            secrets: injection::injected_names(&admitted.secrets),
+            spawned: AtomicBool::new(false),
         };
         let plan = SpawnPlan {
             record_id,
@@ -958,13 +1061,14 @@ impl Supervisor for Lifecycle {
             allowed: (*allowed).clone(),
             profile: *profile,
             capture,
+            secrets: admitted.secrets,
         };
         // KNSH-080, KNSH-081: the start of the line's window in each protected root it touches; changes there are the
         // line's from now on. Never waits.
         let checkpoint_line = self
             .parts
             .sessions
-            .open_checkpoint_lines(session_id, record_id, &protected);
+            .open_checkpoint_lines(session_id, record_id, &admitted.protected);
         let report = self.parts.spawner.spawn(plan, &events);
         // Decision 16: the line has been reaped; its file events are flushed with a marker before it is recorded, the
         // one place the decision path waits for the watcher (bounded per root). Only then is its attribution read,
@@ -972,6 +1076,7 @@ impl Supervisor for Lifecycle {
         // FR-CKP-24 (decision 17): the group's members that outlive the line, and the session's envelopes, are asked
         // which files they still hold for writing; those files are possibly torn.
         let group = *events.group.lock().unwrap_or_else(PoisonError::into_inner);
+
         let processes = self.parts.sessions.line_processes(session_id, group);
         let closed = Sessions::close_checkpoint_lines(checkpoint_line, &processes);
         // KNSH-082: counted when the line touched a protected root, null otherwise. Read before `closed.uncertain` is
@@ -991,8 +1096,9 @@ impl Supervisor for Lifecycle {
             latency_ms,
             &report,
             record_output,
-            unprotected,
+            admitted.unprotected,
             &closed,
+            events.secrets_injected(),
         );
         let record_id = written.then_some(record_id);
         // FR-CKP-04: the line's checkpoints in these roots are uncertain (the roots were rescanned).

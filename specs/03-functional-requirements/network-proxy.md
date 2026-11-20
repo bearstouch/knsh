@@ -65,6 +65,10 @@ whose credentials have no scope is refused (`no_host_rules`). For each connectio
      it under `network.class_hosts`, or that was approved (by the authority or the user) or allowed by a grant;
      otherwise refused (`approval_required`, FR-NET-03).
    - Any other host: refused (`host_not_allowed`).
+   - A line that receives secrets: a host the rules above open is refused unless the `hosts` of every secret it
+     receives list it (`secret_hosts`, FR-SEC-03, FR-NET-10). Since step 4 allowlists an internal address through
+     these same rules, an address must be listed there too. Such a line has no loopback ports (step 1), in its
+     sandbox profile or here (KNSH-092).
 4. **Resolution.** An allowed name is resolved by the proxy itself (`getaddrinfo` in `knshd`; commands never
    resolve, FR-NET-08). No address, or a resolver error, is `unresolved`. If **any** address is internal (below) and
    not allowlisted, the name is refused (`address_not_allowed`, FR-NET-07). An internal address is allowlisted when it
