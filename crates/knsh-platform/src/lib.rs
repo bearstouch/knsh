@@ -141,6 +141,14 @@
 //! | --- | --- | --- | --- |
 //! | [`DescendantClients`] | Check a client can be created; one client per envelope, execs to an [`ExecHandler`] | `SystemDescendantClients` (unavailable) | `ScriptedDescendantClients` |
 //!
+//! The `command` module (KNSH-096) runs one external command for the native interpreter (`knsh-interp`) and reports
+//! how it ended, so the interpreter maps it to bash's exit status (126, 127, `128 + n`). It is the single seam every
+//! external command of a script passes through, which KNSH-108 wraps to decide on each one before it starts.
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`CommandSpawner`] | Run a resolved command to completion | [`ProcessCommandSpawner`] (over [`Processes`]) | `ScriptedCommands` |
+//!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
 //! in a fake. All failures use the single crate error, [`PlatformError`], whose messages never echo paths or other
 //! input (NFR-PRIV-02).
@@ -185,6 +193,7 @@
 //! - FR-SEC-01, decision 11, `specs/05-models/secret.md` (Keychain secret store and zeroed secret values, KNSH-089)
 //! - FR-CKP-01, FR-CKP-09, FR-CKP-35, decision 17 (clones, volumes, file identity and streamed hashes, KNSH-078)
 //! - FR-AGT-13, decision 3 (Endpoint Security descendant client, KNSH-094)
+//! - NFR-COMPAT-01, NFR-COMPAT-09 (external commands of the native interpreter and their exit statuses, KNSH-096)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
@@ -193,6 +202,7 @@
 
 mod ancestry;
 mod clock;
+mod command;
 mod control;
 mod endpoint_security;
 pub mod engine_dirs;
@@ -229,6 +239,7 @@ pub mod testing;
 
 pub use ancestry::{AuditToken, ProcessIdentity, ProcessKey, ProcessTree};
 pub use clock::{Clock, Monotonic};
+pub use command::{CommandOutcome, CommandRequest, CommandSpawner, ProcessCommandSpawner};
 pub use control::{
     AfterMessage, BYTES_KEY, BundleVersion, CodeSigning, ConnectionId, ControlHandler, ControlPeer, JSON_KEY,
     MAX_CONTROL_PAYLOAD, PeerGate, PeerRejection, SignatureFacts, SigningIdentifier, TeamId, TrustError, TrustStore,

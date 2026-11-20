@@ -17,13 +17,13 @@ External commands are spawned through a `knsh-platform` trait so tests run witho
 Out of scope: expansions (402–404), redirections (405), pipelines and subshells (406), builtins (407–408).
 
 **Acceptance criteria**
-- [ ] The parser's AST is consumed unchanged; the evaluator adds no second parser.
-- [ ] `$?` and exit status follow bash for lists, `!`, `if`, loops and `case` (no-match is 0).
-- [ ] Command not found returns 127; found but not executable returns 126 (NFR-COMPAT-09).
-- [ ] A command killed by signal n yields 128+n.
-- [ ] Evaluation depth and loop iteration have no hidden limits beyond bash's own behaviour, but recursion is bounded
+- [x] The parser's AST is consumed unchanged; the evaluator adds no second parser.
+- [x] `$?` and exit status follow bash for lists, `!`, `if`, loops and `case` (no-match is 0).
+- [x] Command not found returns 127; found but not executable returns 126 (NFR-COMPAT-09).
+- [x] A command killed by signal n yields 128+n.
+- [x] Evaluation depth and loop iteration have no hidden limits beyond bash's own behaviour, but recursion is bounded
       by an explicit, documented limit that fails with an error rather than a stack overflow.
-- [ ] All process effects go through injected traits; the crate has `#![forbid(unsafe_code)]`.
+- [x] All process effects go through injected traits; the crate has `#![forbid(unsafe_code)]`.
 
 **Unit tests**
 - `and_or_lists_short_circuit_like_bash` — `false && x; true || x` never runs `x`.
@@ -39,3 +39,14 @@ Out of scope: expansions (402–404), redirections (405), pipelines and subshell
 
 **Notes.** Crate placement is a spec gap (see phase intro). The process-spawn trait must allow KNSH-108 to insert a
 decision before each spawn.
+
+**Implementation notes (KNSH-096).** The crate is `knsh-interp`; external commands run through
+`knsh_platform::CommandSpawner` (the KNSH-108 seam) and are looked up through `knsh_platform::Fs`. A check of the whole
+script refuses everything later stories implement before any command runs (expansions, tilde including after `NAME=`
+in any word, brace and pathname expansion, `$'…'`, redirections, pipelines, `&`, subshells, `time`, functions,
+builtins). Until KNSH-101 and KNSH-102, `echo`, `printf`, `true`, `false`, `test` and `[` run as their programs,
+looked up in `/bin:/usr/bin` only, never the user's `PATH`. Forms where those programs differ from bash's builtins are
+refused: `echo` with any backslash or with option words other than a single `-n`; `printf` with a format starting
+with `-` or using `%q`, `%Q` or `%(…)T`; `test` and `[` with `-N`, `-v`, `-R`, `-a` or `-o`. KNSH-101 and KNSH-102
+lift these refusals. The evaluation depth limit is in
+[defaults and limits](../09-reference/defaults-and-limits.md).

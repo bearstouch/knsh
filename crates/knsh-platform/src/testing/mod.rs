@@ -47,10 +47,14 @@
 //! - [`ScriptedDescendantClients`]: Endpoint Security descendant clients that can or cannot be created, whose exec
 //!   events the test delivers to the watched handler; counts checks and live clients (KNSH-094).
 //!
+//! - [`ScriptedCommands`]: external commands of the native interpreter answering with outcomes scripted per
+//!   program, the last one repeated; records every run (KNSH-096).
+//!
 //! Locks in the fakes are independent (one per fake) and never held across calls into another fake.
 
 mod ancestry;
 mod clock;
+mod command;
 mod control;
 mod denials;
 mod endpoint_security;
@@ -70,6 +74,7 @@ mod volumes;
 
 pub use ancestry::FakeProcessTree;
 pub use clock::FakeClock;
+pub use command::ScriptedCommands;
 pub use control::FakeCodeSigning;
 pub use denials::{ScriptedDenialLog, kernel_entry};
 pub use endpoint_security::ScriptedDescendantClients;

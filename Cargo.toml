@@ -17,6 +17,8 @@ members = [
     "crates/knshd",
     "crates/knsh",
     "crates/knsh-exec",
+    # Native bash interpreter (phase 4, KNSH-096).
+    "crates/knsh-interp",
     "xtask",
     # Dev-only agent-command corpus tool (KNSH-033); never shipped.
     "tools/corpus",

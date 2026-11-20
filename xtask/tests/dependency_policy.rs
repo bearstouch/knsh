@@ -60,6 +60,8 @@ const LAYOUT: &[(&str, &[&str])] = &[
         &["knsh-proto", "knsh-json", "knsh-core", "knsh-platform", "knsh-toml"],
     ),
     ("knsh-exec", &[]),
+    // The native interpreter walks the parser's tree and runs commands through platform traits (KNSH-096).
+    ("knsh-interp", &["knsh-bash", "knsh-platform"]),
     // Dev-only checks crate: depends on nothing, and nothing may depend on it.
     ("xtask", &[]),
     // Dev-only corpus tool (KNSH-033): reads trajectory JSON; nothing may depend on it.
