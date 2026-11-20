@@ -149,6 +149,12 @@
 //! | --- | --- | --- | --- |
 //! | [`CommandSpawner`] | Run a resolved command to completion | [`ProcessCommandSpawner`] (over [`Processes`]) | `ScriptedCommands` |
 //!
+//! The `users` module (KNSH-097) looks up home directories in the user database, for the interpreter's `~name`.
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`UserHomes`] | Home directory of a user, or of the current user | `SystemUserHomes` (`getpwnam_r`) | `FakeUserHomes` |
+//!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
 //! in a fake. All failures use the single crate error, [`PlatformError`], whose messages never echo paths or other
 //! input (NFR-PRIV-02).
@@ -194,6 +200,7 @@
 //! - FR-CKP-01, FR-CKP-09, FR-CKP-35, decision 17 (clones, volumes, file identity and streamed hashes, KNSH-078)
 //! - FR-AGT-13, decision 3 (Endpoint Security descendant client, KNSH-094)
 //! - NFR-COMPAT-01, NFR-COMPAT-09 (external commands of the native interpreter and their exit statuses, KNSH-096)
+//! - NFR-COMPAT-02 (home directories for the interpreter's tilde expansion, KNSH-097)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
@@ -221,6 +228,7 @@ mod random;
 mod resolver;
 mod secret;
 mod signing;
+mod users;
 pub mod violation;
 mod volume;
 
@@ -266,6 +274,7 @@ pub use signing::{
     Mac, PolicySigner, SIGNATURE_LINE_LEN, SIGNATURE_PREFIX, SIGNING_KEY_LEN, SignatureFault, SigningKey,
     SigningKeyStore, constant_time_eq, split_signed, strip_signature,
 };
+pub use users::UserHomes;
 pub use violation::{CanaryNonce, DenialLog, DenialStream, LogEntry, StreamStopper};
 pub use volume::{
     CONTENT_HASH_LEN, ContentHash, FileIdentity, FileSystemKind, HASH_CHUNK, ModifiedTime, Volume, VolumeId, Volumes,

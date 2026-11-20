@@ -1,5 +1,5 @@
-//! Bash pattern matching for `case` (KNSH-096): `*`, `?` and bracket expressions, with quoted characters matching
-//! only themselves.
+//! Bash pattern matching for `case` (KNSH-096) and the pattern operators of parameter expansion (KNSH-097): `*`,
+//! `?` and bracket expressions, with quoted characters matching only themselves.
 //!
 //! The matcher is iterative, with one remembered `*` to backtrack to, so a hostile pattern costs at most
 //! `O(pattern × text)` steps and no recursion. `extglob` patterns are not read (that option is off by default and
@@ -10,6 +10,11 @@ use crate::word::WordChar;
 /// Whether `text` matches `pattern` as a whole.
 pub(crate) fn matches(pattern: &[WordChar], text: &str) -> bool {
     let text: Vec<char> = text.chars().collect();
+    matches_chars(pattern, &text)
+}
+
+/// Whether the characters `text` match `pattern` as a whole.
+pub(crate) fn matches_chars(pattern: &[WordChar], text: &[char]) -> bool {
     let (mut p, mut t) = (0, 0);
     // The position after the last `*` seen, and the text position it is currently made to swallow up to.
     let mut star: Option<(usize, usize)> = None;
@@ -209,9 +214,17 @@ mod tests {
             if ch == '\\'
                 && let Some(next) = chars.next()
             {
-                out.push(WordChar { ch: next, quoted: true });
+                out.push(WordChar {
+                    ch: next,
+                    quoted: true,
+                    expanded: false,
+                });
             } else {
-                out.push(WordChar { ch, quoted: false });
+                out.push(WordChar {
+                    ch,
+                    quoted: false,
+                    expanded: false,
+                });
             }
         }
         out

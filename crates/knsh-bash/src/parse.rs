@@ -56,11 +56,11 @@ use std::collections::BTreeMap;
 use std::mem;
 
 use crate::ast::{
-    AndOr, AndOrOperator, AndOrPart, Assignment, CaseClause, CaseCommand, CaseTerminator, CaseTerminatorKind, Command,
-    CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems, FunctionDefinition, Group,
-    HereDocument, IfClause, IfCommand, ListItem, LoopBody, LoopCommand, PipeOperator, Pipeline, PipelinePart, Redirect,
-    Script, Separator, SeparatorKind, SimpleCommand, Subshell, Substitution, SubstitutionKind, TimeKeyword,
-    UnsupportedCommand,
+    AndOr, AndOrOperator, AndOrPart, ArithmeticParts, Assignment, CaseClause, CaseCommand, CaseTerminator,
+    CaseTerminatorKind, Command, CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems,
+    FunctionDefinition, Group, HereDocument, IfClause, IfCommand, ListItem, LoopBody, LoopCommand, PipeOperator,
+    Pipeline, PipelinePart, Redirect, Script, Separator, SeparatorKind, SimpleCommand, Subshell, Substitution,
+    SubstitutionKind, TimeKeyword, UnsupportedCommand,
 };
 use crate::error::{CompoundStart, LexError, ParseError, Unexpected, UnsupportedConstruct};
 use crate::functions::mark_function_calls;
@@ -260,8 +260,8 @@ impl Compound {
 enum CompoundCore {
     /// An exact compound command.
     Exact(CompoundKind, Span),
-    /// An unsupported construct.
-    Unsupported(UnsupportedConstruct, Span),
+    /// An unsupported construct, with the parts of an arithmetic command or loop.
+    Unsupported(UnsupportedConstruct, Span, Option<Box<ArithmeticParts>>),
 }
 
 impl Parser<'_> {
@@ -796,7 +796,7 @@ impl Parser<'_> {
             CompoundStartToken::Conditional => self.conditional()?,
         };
         let redirections = self.trailing_redirections()?;
-        let (CompoundCore::Exact(_, close) | CompoundCore::Unsupported(_, close)) = core;
+        let (CompoundCore::Exact(_, close) | CompoundCore::Unsupported(_, close, _)) = core;
         let end = redirections.last().map_or(close.end, |redirect| redirect.span.end);
         let span = Span::new(opener.start, end);
         Ok(match core {
@@ -806,7 +806,11 @@ impl Parser<'_> {
                 span,
             }),
             // The redirections of an unsupported construct stay inside its opaque span.
-            CompoundCore::Unsupported(construct, _) => Compound::Unsupported(UnsupportedCommand { construct, span }),
+            CompoundCore::Unsupported(construct, _, arithmetic) => Compound::Unsupported(UnsupportedCommand {
+                construct,
+                span,
+                arithmetic,
+            }),
         })
     }
 
@@ -814,9 +818,12 @@ impl Parser<'_> {
     fn subshell(&mut self, depth: usize) -> Result<CompoundCore, ParseError> {
         let open = self.advance_span();
         if let Some(close) = self.arithmetic_close(open)? {
+            // `close` is the second `)`; the expression lies between the second `(` and the first `)`.
+            let expression = Span::new(open.end + 1, close.start - 1);
             return Ok(CompoundCore::Unsupported(
                 UnsupportedConstruct::Compound(CompoundStart::Arithmetic),
                 close,
+                Some(Box::new(ArithmeticParts::Command { expression, close })),
             ));
         }
         let body = self.compound_list(depth, open)?;
@@ -937,18 +944,21 @@ impl Parser<'_> {
         {
             let open = self.advance_span();
             // Bash accepts only `((` here; a lone `(` or nested parens are syntax errors.
-            if self.arithmetic_close(open)?.is_none() {
+            let Some(close) = self.arithmetic_close(open)? else {
                 return Err(ParseError::UnexpectedToken {
                     token: Unexpected::Operator(Operator::LeftParen),
                     span: open,
                 });
-            }
+            };
+            let expressions = Span::new(open.end + 1, close.start - 1);
             self.next_if(|kind| is_operator(kind, Operator::Semicolon));
             self.skip_newlines();
             let body = self.loop_body(depth, keyword, true)?;
+            let close = body.close;
             return Ok(CompoundCore::Unsupported(
                 UnsupportedConstruct::Compound(CompoundStart::ArithmeticFor),
-                body.close,
+                close,
+                Some(Box::new(ArithmeticParts::For { expressions, body })),
             ));
         }
         let (variable, items, body) = self.for_header_and_body(depth, keyword)?;
@@ -972,6 +982,7 @@ impl Parser<'_> {
         Ok(CompoundCore::Unsupported(
             UnsupportedConstruct::Compound(CompoundStart::ReservedWord(ReservedWord::Select)),
             body.close,
+            None,
         ))
     }
 
@@ -1155,6 +1166,7 @@ impl Parser<'_> {
         Ok(CompoundCore::Unsupported(
             UnsupportedConstruct::Compound(CompoundStart::ReservedWord(ReservedWord::DoubleLeftBracket)),
             close,
+            None,
         ))
     }
 
@@ -1215,9 +1227,11 @@ impl Parser<'_> {
                 body,
                 span,
             }),
+            // The parts of an arithmetic body are not the definition's: the node stands for the whole definition.
             Compound::Unsupported(body) => Command::Unsupported(UnsupportedCommand {
                 construct: body.construct,
                 span,
+                arithmetic: None,
             }),
         })
     }
@@ -2555,7 +2569,7 @@ mod tests {
                         span: Span::new(0, input.len()),
                     };
                     match script.commands().next() {
-                        Some(Command::Unsupported(unsupported)) => *unsupported,
+                        Some(Command::Unsupported(unsupported)) => unsupported.clone(),
                         other => panic!("{input:?} gave {other:?}"),
                     }
                 }
@@ -2573,6 +2587,40 @@ mod tests {
         // The rest of the line is still read exactly.
         assert_eq!(names("[[ -d x ]] && rm -r x"), [Some("rm")]);
         assert_eq!(names("(( n > 2 )) || { echo small; }"), [Some("echo")]);
+    }
+
+    // KNSH-097: the evaluator reads the expression and the loop body from the node instead of parsing them again.
+    #[test]
+    fn arithmetic_nodes_keep_their_expression_and_loop_body() {
+        let input = "((a > (b))) >f";
+        let Command::Unsupported(unsupported) = only(input) else {
+            panic!("not unsupported");
+        };
+        let Some(ArithmeticParts::Command { expression, close }) = unsupported.arithmetic.as_deref() else {
+            panic!("no arithmetic parts: {unsupported:?}");
+        };
+        assert_eq!(text(input, *expression), "a > (b)");
+        assert_eq!(text(input, *close), ")");
+        assert_eq!(&input[close.end..], " >f");
+
+        let input = "for (( i = 0; i < 3; i++ )); do a; b; done";
+        let Command::Unsupported(unsupported) = only(input) else {
+            panic!("not unsupported");
+        };
+        let Some(ArithmeticParts::For { expressions, body }) = unsupported.arithmetic.as_deref() else {
+            panic!("no arithmetic parts: {unsupported:?}");
+        };
+        assert_eq!(text(input, *expressions), " i = 0; i < 3; i++ ");
+        assert_eq!(body.body.len(), 2);
+        assert_eq!(text(input, body.close), "done");
+
+        // Other opaque nodes, and a function whose body is arithmetic, carry no parts.
+        for input in ["[[ -n x ]]", "f() (( 1 ))", "select x; do a; done"] {
+            let Command::Unsupported(unsupported) = only(input) else {
+                panic!("{input}: not unsupported");
+            };
+            assert_eq!(unsupported.arithmetic, None, "{input}");
+        }
     }
 
     #[test]

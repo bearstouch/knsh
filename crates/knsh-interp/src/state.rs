@@ -1,7 +1,12 @@
-//! Shell state: variables, positional parameters, `$?`, options and the working directory (KNSH-096).
+//! Shell state: variables, positional parameters, `$?`, options and the working directory (KNSH-096, KNSH-097).
 //!
 //! Values are kept as [`OsString`]: an inherited environment value need not be UTF-8, and the shell passes it on to
 //! commands unchanged.
+//!
+//! At start-up bash sets a few variables itself, and this state does the same: `IFS` is space, tab and newline
+//! (never taken from the environment), `PWD` names the working directory and `SHLVL` is one more than inherited,
+//! both exported. Variables bash keeps up to date itself (`RANDOM`, `LINENO`, `BASH_VERSION`, `$_` …) are not
+//! emulated: reading one is refused ([`is_unemulated`]) rather than answered with a value bash would never give.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -21,11 +26,87 @@ struct Variable {
 
 /// Shell options set by `set` and `shopt`.
 ///
-/// A placeholder: none is implemented yet, so every option has bash's default for a non-interactive shell. KNSH-104
-/// adds `set -e`, `set -u`, `pipefail` and the rest here.
+/// Each has bash's default for a non-interactive shell until set. The `set` builtin itself arrives with KNSH-104;
+/// until then an embedder sets them as `bash -u` would, through [`ShellState::options_mut`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ShellOptions {}
+pub struct ShellOptions {
+    /// `set -u`: expanding an unset parameter is an error that ends the script with status 1 (KNSH-097).
+    pub nounset: bool,
+}
+
+/// `IFS` as bash sets it at start-up: space, tab, newline.
+pub(crate) const DEFAULT_IFS: &str = " \t\n";
+
+/// Variables bash computes or sets itself whatever the environment says. Reading one is refused: the interpreter
+/// does not keep them up to date yet (KNSH-101 and later), and any value it gave would differ from bash's.
+const UNEMULATED: &[&str] = &[
+    "_",
+    "BASH",
+    "BASHOPTS",
+    "BASHPID",
+    "BASH_ALIASES",
+    "BASH_ARGC",
+    "BASH_ARGV",
+    "BASH_ARGV0",
+    "BASH_CMDS",
+    "BASH_COMMAND",
+    "BASH_EXECUTION_STRING",
+    "BASH_LINENO",
+    "BASH_REMATCH",
+    "BASH_SOURCE",
+    "BASH_SUBSHELL",
+    "BASH_VERSINFO",
+    "BASH_VERSION",
+    // A dynamic variable in bash 4 and later, set even in a non-interactive shell.
+    "COMP_WORDBREAKS",
+    "DIRSTACK",
+    "EPOCHREALTIME",
+    "EPOCHSECONDS",
+    "EUID",
+    "FUNCNAME",
+    "GROUPS",
+    "HISTCMD",
+    "LINENO",
+    "OLDPWD",
+    "OPTERR",
+    "OPTIND",
+    "PIPESTATUS",
+    "PPID",
+    "RANDOM",
+    "SECONDS",
+    "SHELLOPTS",
+    "SRANDOM",
+    "UID",
+];
+
+/// Variables bash sets at start-up only when the environment does not: refused while unset, for the same reason.
+const UNEMULATED_WHEN_UNSET: &[&str] = &[
+    "HISTFILE",
+    "HISTFILESIZE",
+    "HISTSIZE",
+    "HOSTNAME",
+    "HOSTTYPE",
+    "MACHTYPE",
+    "MAILCHECK",
+    "OSTYPE",
+    // Bash's default search path (`DEFAULT_PATH_VALUE`) when the environment has none.
+    "PATH",
+    "PS2",
+    "PS4",
+    "SHELL",
+    "TERM",
+];
+
+/// Whether `name` is always one of the variables bash maintains itself, whatever the state.
+pub(crate) fn is_always_unemulated(name: &str) -> bool {
+    UNEMULATED.contains(&name)
+}
+
+/// Whether `${!prefix*}` could list one of the variables bash always maintains itself, whatever the state.
+pub(crate) fn lists_always_unemulated(prefix: &str) -> bool {
+    UNEMULATED.iter().any(|name| name.starts_with(prefix))
+}
 
 /// Everything a script reads and changes besides the filesystem and processes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +126,8 @@ pub struct ShellState {
     options: ShellOptions,
     /// The working directory, absolute.
     cwd: PathBuf,
+    /// `$$`.
+    pid: u32,
 }
 
 impl ShellState {
@@ -60,7 +143,7 @@ impl ShellState {
         if !cwd.is_absolute() {
             return Err(InterpError::RelativeWorkingDirectory);
         }
-        Ok(Self {
+        let mut state = Self {
             name: name.into(),
             positional: Vec::new(),
             variables: BTreeMap::new(),
@@ -68,23 +151,75 @@ impl ShellState {
             last_status: Status::SUCCESS,
             options: ShellOptions::default(),
             cwd,
-        })
+            pid: std::process::id(),
+        };
+        state.start_up(None);
+        Ok(state)
     }
 
     /// Imports `environment` as bash does at start-up: each entry whose name is a valid identifier becomes an
-    /// exported variable (a later duplicate wins); the others are passed to commands unchanged.
+    /// exported variable (a later duplicate wins); the others are passed to commands unchanged. Then `IFS`, `PWD`
+    /// and `SHLVL` are set again as bash sets them: `IFS` is never imported, `PWD` is kept only if it names the
+    /// working directory, and `SHLVL` is the inherited level plus one.
     #[must_use]
     pub fn with_environment(mut self, environment: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
+        let mut inherited_level = None;
         for (name, value) in environment {
             match name.to_str().filter(|name| is_name(name)) {
                 Some(valid) => {
+                    if valid == "SHLVL" {
+                        inherited_level = Some(value.clone());
+                    }
                     self.variables
                         .insert(valid.to_owned(), Variable { value, exported: true });
                 }
                 None => self.passthrough.push((name, value)),
             }
         }
+        self.start_up(inherited_level.as_deref());
         self
+    }
+
+    /// Sets the variables bash sets at start-up, given the inherited `SHLVL` if any.
+    fn start_up(&mut self, inherited_level: Option<&OsStr>) {
+        self.set_variable("IFS", DEFAULT_IFS);
+        let cwd = self.cwd.clone().into_os_string();
+        if self.variable("PWD") != Some(cwd.as_os_str()) {
+            self.set_exported("PWD", cwd);
+        }
+        // Bash: a level that is not a number counts as 0; past 1000 it starts again from 1.
+        let level = inherited_level
+            .and_then(OsStr::to_str)
+            .and_then(|level| level.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .saturating_add(1);
+        let level = if (0..1000).contains(&level) { level } else { 1 };
+        self.set_exported("SHLVL", level.to_string());
+    }
+
+    /// Sets `name` to `value` and exports it.
+    fn set_exported(&mut self, name: &str, value: impl Into<OsString>) {
+        self.variables.insert(
+            name.to_owned(),
+            Variable {
+                value: value.into(),
+                exported: true,
+            },
+        );
+    }
+
+    /// Sets `$$` to `pid` instead of this process's id: the interpreter stands for a shell whose process id may be
+    /// another one.
+    #[must_use]
+    pub fn with_pid(mut self, pid: u32) -> Self {
+        self.pid = pid;
+        self
+    }
+
+    /// `$$`.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.pid
     }
 
     /// Sets the positional parameters `$1`, `$2`, … to `parameters`.
@@ -132,6 +267,12 @@ impl ShellState {
         true
     }
 
+    /// Removes variable `name` (the `unset` builtin arrives with KNSH-101).
+    #[cfg(test)]
+    pub(crate) fn unset_variable(&mut self, name: &str) {
+        self.variables.remove(name);
+    }
+
     /// `$?`: the status of the last pipeline run.
     #[must_use]
     pub fn last_status(&self) -> Status {
@@ -147,6 +288,31 @@ impl ShellState {
     #[must_use]
     pub fn options(&self) -> &ShellOptions {
         &self.options
+    }
+
+    /// The `set` and `shopt` options, to change (as `bash -u` would before running a script).
+    pub fn options_mut(&mut self) -> &mut ShellOptions {
+        &mut self.options
+    }
+
+    /// The names of the set variables, sorted as bash sorts them for `${!prefix*}` (byte order).
+    pub(crate) fn variable_names(&self) -> impl Iterator<Item = &str> {
+        self.variables.keys().map(String::as_str)
+    }
+
+    /// Whether reading variable `name` must be refused because bash would answer with a value it maintains itself
+    /// ([`Unsupported::ShellVariable`](crate::Unsupported::ShellVariable)).
+    pub(crate) fn is_unemulated(&self, name: &str) -> bool {
+        is_always_unemulated(name) || (UNEMULATED_WHEN_UNSET.contains(&name) && !self.variables.contains_key(name))
+    }
+
+    /// Whether `${!prefix*}` could list a variable whose reading [`ShellState::is_unemulated`] refuses: bash would
+    /// list it, this state does not hold it.
+    pub(crate) fn lists_unemulated(&self, prefix: &str) -> bool {
+        lists_always_unemulated(prefix)
+            || UNEMULATED_WHEN_UNSET
+                .iter()
+                .any(|name| name.starts_with(prefix) && self.is_unemulated(name))
     }
 
     /// The working directory, absolute.
@@ -208,7 +374,12 @@ mod tests {
         assert_eq!(state.variable("a-b"), None);
         assert_eq!(
             state.environment(&[]),
-            vec![("a-b".into(), "1".into()), ("HOME".into(), "/Users/me".into())]
+            vec![
+                ("a-b".into(), "1".into()),
+                ("HOME".into(), "/Users/me".into()),
+                ("PWD".into(), "/work".into()),
+                ("SHLVL".into(), "1".into()),
+            ]
         );
     }
 
@@ -221,7 +392,50 @@ mod tests {
         assert!(!state.is_exported("Y"));
         assert!(!state.set_variable("1x", "bad"));
         let env = state.environment(&[("X".into(), "4".into()), ("Z".into(), "5".into())]);
-        assert_eq!(env, vec![("X".into(), "4".into()), ("Z".into(), "5".into())]);
+        assert_eq!(
+            env,
+            vec![
+                ("PWD".into(), "/work".into()),
+                ("SHLVL".into(), "1".into()),
+                ("X".into(), "4".into()),
+                ("Z".into(), "5".into()),
+            ]
+        );
+    }
+
+    // KNSH-097, environment import: bash never imports IFS, keeps PWD only when it names the working directory, and
+    // raises SHLVL by one.
+    #[test]
+    fn start_up_sets_ifs_pwd_and_shlvl_like_bash() {
+        let fresh = state();
+        assert_eq!(fresh.variable("IFS"), Some(OsStr::new(" \t\n")));
+        assert!(!fresh.is_exported("IFS"));
+        assert_eq!(fresh.variable("PWD"), Some(OsStr::new("/work")));
+        assert_eq!(fresh.variable("SHLVL"), Some(OsStr::new("1")));
+        let imported = state().with_environment([
+            ("IFS".into(), ":".into()),
+            ("PWD".into(), "/elsewhere".into()),
+            ("SHLVL".into(), "2".into()),
+        ]);
+        assert_eq!(imported.variable("IFS"), Some(OsStr::new(" \t\n")));
+        assert_eq!(imported.variable("PWD"), Some(OsStr::new("/work")));
+        assert_eq!(imported.variable("SHLVL"), Some(OsStr::new("3")));
+        let odd = state().with_environment([("SHLVL".into(), "x".into())]);
+        assert_eq!(odd.variable("SHLVL"), Some(OsStr::new("1")));
+        let deep = state().with_environment([("SHLVL".into(), "999".into())]);
+        assert_eq!(deep.variable("SHLVL"), Some(OsStr::new("1")));
+    }
+
+    #[test]
+    fn variables_bash_maintains_are_not_emulated() {
+        let state = state().with_environment([("TERM".into(), "xterm".into())]);
+        for name in ["RANDOM", "LINENO", "BASH_VERSION", "_", "PPID", "OLDPWD"] {
+            assert!(state.is_unemulated(name), "{name}");
+        }
+        assert!(state.is_unemulated("HOSTNAME"));
+        assert!(!state.is_unemulated("TERM"));
+        assert!(!state.is_unemulated("HOME"));
+        assert!(!state.is_unemulated("PWD"));
     }
 
     #[test]
