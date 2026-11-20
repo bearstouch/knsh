@@ -1329,3 +1329,79 @@ mod platform {
         assert_eq!(real.fixture.sessions.live(), 0);
     }
 }
+
+/// A policy that denies every exec; envelope tests never deliver one.
+struct DenyExecs;
+
+impl crate::endpoint_security::ExecPolicy for DenyExecs {
+    fn decide_exec(
+        &self,
+        _request: &crate::endpoint_security::ExecRequest,
+        _gate: &crate::endpoint_security::ExecGate,
+    ) -> knsh_platform::ExecVerdict {
+        knsh_platform::ExecVerdict::Deny
+    }
+}
+
+/// The Endpoint Security layer over `clients`, attached to `harness`'s starter.
+fn attach_layer(harness: &Harness, clients: &Arc<knsh_platform::testing::ScriptedDescendantClients>) {
+    use crate::endpoint_security::{ExecAuthoriser, ExecLayer};
+
+    let authoriser = ExecAuthoriser::new(
+        Arc::new(DenyExecs),
+        Arc::new(FakeClock::new(knsh_core::Timestamp::UNIX_EPOCH)),
+    );
+    harness.starter.attach_exec_layer(Arc::new(ExecLayer::new(
+        clients.clone(),
+        Arc::new(authoriser),
+        CanonicalPath::new("/opt/knsh/bin/knsh-exec").unwrap(),
+        CanonicalPath::new(KNSH).unwrap(),
+        shim_dir(),
+    )));
+}
+
+// KNSH-094 (FR-AGT-13): with the Endpoint Security layer, each envelope gets its own descendant client before it starts,
+// deleted once the envelope has ended.
+#[test]
+fn envelope_gets_a_descendant_client_with_the_layer() {
+    let harness = harness();
+    let clients = Arc::new(knsh_platform::testing::ScriptedDescendantClients::new());
+    attach_layer(&harness, &clients);
+    harness.launcher.processes.expect(ENVELOPE, Script::Exits(0));
+    let result = start(&harness, &params(r#"["claude"]"#, r#","profile":"web""#)).unwrap();
+    assert_eq!(result.status, LineStatus::Exited(0));
+    assert_eq!(clients.watched(), 1);
+    assert_eq!(clients.live(), 0, "deleted with the envelope");
+    assert_eq!(harness.launcher.launched.lock().unwrap().len(), 1);
+}
+
+// KNSH-094 (fail closed): when `hello` reports the layer but an envelope's client cannot be created, nothing starts and
+// the session ends: no envelope runs undecided under a promise that it is decided.
+#[test]
+fn envelope_without_its_client_never_starts() {
+    let harness = harness();
+    let clients = Arc::new(knsh_platform::testing::ScriptedDescendantClients::failing(
+        knsh_platform::PlatformError::EndpointSecurityUnavailable,
+    ));
+    attach_layer(&harness, &clients);
+    let error = start(&harness, &params(r#"["claude"]"#, r#","profile":"web""#)).unwrap_err();
+    assert_eq!(error.code, ErrorCode::InternalError);
+    assert!(harness.launcher.launched.lock().unwrap().is_empty());
+    assert_eq!(harness.fixture.sessions.live(), 0);
+    // The envelope's credentials were issued and revoked again.
+    assert_eq!(
+        *harness.proxy.issued.lock().unwrap(),
+        *harness.proxy.revoked.lock().unwrap()
+    );
+}
+
+// KNSH-094 (decision 3): without the layer (macOS 14 to 26, no entitlement) no client is tried and the envelope starts
+// as before, with nothing about Endpoint Security reaching the caller.
+#[test]
+fn envelope_starts_without_a_client_when_the_layer_is_absent() {
+    let harness = harness();
+    harness.launcher.processes.expect(ENVELOPE, Script::Exits(0));
+    let result = start(&harness, &params(r#"["claude"]"#, r#","profile":"web""#)).unwrap();
+    assert_eq!(result.status, LineStatus::Exited(0));
+    assert_eq!(harness.launcher.launched.lock().unwrap().len(), 1);
+}

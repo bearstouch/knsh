@@ -28,6 +28,19 @@ impl FakeSystemProbe {
         }
     }
 
+    /// A machine with working file events and secrets whose OS version cannot be read (KNSH-094: a feature tied to a
+    /// version is then never tried).
+    #[must_use]
+    pub fn without_version() -> Self {
+        Self {
+            os_major: Err(PlatformError::Os {
+                operation: Operation::SystemInfo,
+                errno: libc::ENOENT,
+            }),
+            ..Self::working(0)
+        }
+    }
+
     /// A machine where every check fails.
     #[must_use]
     pub fn failing() -> Self {

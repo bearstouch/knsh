@@ -33,7 +33,7 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 | Field | Values |
 | --- | --- |
 | `verdict` | `allow`, `deny`, `rewrite` (final effective verdict) |
-| `source` | `rule`, `hook`, `authority`, `user`, `standalone`, `rate_limit`, `grant` (a grant answered the rules' ask, KNSH-042) |
+| `source` | `rule`, `hook`, `authority`, `user`, `standalone`, `rate_limit`, `grant` (a grant answered the rules' ask, KNSH-042), `endpoint_security` (an exec inside an envelope seen by the Endpoint Security descendant client, decided by the same pipeline; `rule_id` and `decided_by` still name the rule, hook, authority or user behind the verdict, KNSH-094) |
 | `rule_id` | e.g. `exec.allow[1]`, `exec.ask[0]` |
 | `decided_by` | Who decided (hook, authority, user) |
 | `latency_ms` | Time to decide: from receiving the line to its final decision, in milliseconds |
@@ -41,7 +41,7 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 
 The supervisor builds the record's `decision` from the pipeline's own decision, so the two always agree (KNSH-050).
 A line cancelled because its caller disconnected (FR-LC-41) is recorded as `deny` with source `standalone`: nobody
-decided it, and it never ran. `records.query` returns the object as `decision`, or `null` for records written before
+decided it, and it never ran. An exec decided through Endpoint Security (KNSH-094) is recorded with source `endpoint_security`: its `command` is the exec as a line (the executable's canonical path and `argv[1..]`, each quoted as one word), `exit_code` is null (it runs in the agent's process, not under the supervisor) and `ended_at` is when it was decided. `records.query` returns the object as `decision`, or `null` for records written before
 decisions were recorded.
 
 ## `sandbox_violations`

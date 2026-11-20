@@ -30,7 +30,11 @@
 //! 6. **Session.** Opened with its parent ([`Sessions::open_agent_in`]): row written, `session.started` published,
 //!    token issued. Its checkpoint roots' shadows start building in the background (KNSH-079,
 //!    [`Sessions::start_shadows`]); nothing waits for them here.
-//! 7. **Launch (KNSH-057).** The proxy issues the envelope's credentials ([`ProxyIssuer`]; none if no proxy
+//! 7. **Launch (KNSH-057).** With the Endpoint Security layer (`hello` reports `sandbox:
+//!    "seatbelt+endpoint_security"`, KNSH-094), the envelope's descendant client is created first
+//!    ([`ExecLayer::watch`]), so every exec in it is decided by the supervisor from its first one; if it cannot be
+//!    created nothing starts and the call is `-32603` (fail closed: `hello` promised the layer). Without the layer
+//!    (macOS 14 to 26, no entitlement) no client is tried and nothing about it reaches the caller. The proxy issues the envelope's credentials ([`ProxyIssuer`]; none if no proxy
 //!    runs), revoked with the session's lines' when the envelope ends. The [`Launcher`] compiles the envelope profile ([`envelope_profile`]) and starts the CLI through
 //!    `knsh-exec`, in a new process group, on the caller's descriptors, with the envelope environment
 //!    ([`envelope_env`]). The group's leader is registered as the session's envelope (FR-AGT-23) and its group kept
@@ -75,7 +79,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU16;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use knsh_core::{
@@ -90,6 +94,7 @@ use knsh_sandbox::{CommandTag, ProfileInput, SbplText, compile};
 
 use crate::agents::SessionToken;
 use crate::dispatch::{Call, Endpoint, Handler, Handlers, Reply, START_AGENT, answer, capability_unavailable, params};
+use crate::endpoint_security::ExecLayer;
 use crate::exec::{PATH_VAR, without_shims};
 use crate::holds::GroupKind;
 use crate::policy::ProfileLoader;
@@ -180,6 +185,9 @@ pub(crate) struct AgentStarter {
     shim_dir: PathBuf,
     /// The `knsh` binary: the envelope's `SHELL` (FR-AGT-03).
     knsh: PathBuf,
+    /// The Endpoint Security layer, attached when `hello` reports it (KNSH-094); unset, envelopes start without a
+    /// descendant client.
+    exec_layer: OnceLock<Arc<ExecLayer>>,
     /// The profile each live session this service started runs under, exactly as it was resolved for its envelope
     /// (with that session's `${PROJECT}`). A nested session is compared with this, never with the parent's profile
     /// loaded again: reloaded from the child's `cwd`, which the caller chooses, the parent's project-relative paths
@@ -207,8 +215,15 @@ impl AgentStarter {
             clock,
             shim_dir,
             knsh,
+            exec_layer: OnceLock::new(),
             running: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Creates a descendant client with `layer` for every later envelope, before it starts (KNSH-094). Set once at
+    /// start, and only when the probe reported the layer; a second call is a wiring mistake and is ignored.
+    pub(crate) fn attach_exec_layer(&self, layer: Arc<ExecLayer>) {
+        let _ = self.exec_layer.set(layer);
     }
 
     /// The live sessions' profiles. A poisoned lock is taken over: the map is only ever inserted into or removed
@@ -366,6 +381,16 @@ impl AgentStarter {
             .proxy
             .issue(session_id, &profile.network)
             .map_err(|_| internal_error())?;
+        // KNSH-094: the descendant client exists before the envelope does, so no exec in it goes undecided; it is
+        // deleted only once the leader has been reaped (below).
+        let exec_client = match self.exec_layer.get() {
+            Some(layer) => Some(
+                layer
+                    .watch(session_id, &profile.exec.bash, program)
+                    .map_err(|_| internal_error())?,
+            ),
+            None => None,
+        };
         let envelope = self
             .launcher
             .launch(Launch {
@@ -396,7 +421,9 @@ impl AgentStarter {
         }
         // Dropped before the leader is reaped, so a pause never signals a group id that may be reused.
         drop(kept);
-        let exit = processes.wait(group).map_err(|_| internal_error())?;
+        let exit = processes.wait(group).map_err(|_| internal_error());
+        drop(exec_client);
+        let exit = exit?;
         if !envelope.ran() {
             return Err(internal_error());
         }

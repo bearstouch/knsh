@@ -105,10 +105,15 @@ pub enum DecisionSource {
     RateLimit,
     /// A live grant answered the rules' ask (KNSH-042).
     Grant,
+    /// An exec inside an envelope, seen by the Endpoint Security descendant client and decided through the same
+    /// pipeline as a supervised line (FR-AGT-13, KNSH-094). The record's `rule_id` and `decided_by` still name the
+    /// rule, hook, authority or user behind the verdict.
+    EndpointSecurity,
 }
 
 impl DecisionSource {
-    /// The record spelling: `rule`, `hook`, `authority`, `user`, `standalone`, `rate_limit` or `grant`.
+    /// The record spelling: `rule`, `hook`, `authority`, `user`, `standalone`, `rate_limit`, `grant` or
+    /// `endpoint_security`.
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
@@ -119,6 +124,7 @@ impl DecisionSource {
             Self::Standalone => "standalone",
             Self::RateLimit => "rate_limit",
             Self::Grant => "grant",
+            Self::EndpointSecurity => "endpoint_security",
         }
     }
 
@@ -133,6 +139,7 @@ impl DecisionSource {
             Self::Standalone,
             Self::RateLimit,
             Self::Grant,
+            Self::EndpointSecurity,
         ]
         .into_iter()
         .find(|source| source.code() == code)

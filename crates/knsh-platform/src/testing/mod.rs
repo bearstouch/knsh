@@ -44,12 +44,16 @@
 //! - [`FakeWriteHolders`]: processes and the files they hold for writing, with failures for the table or one
 //!   process, every question counted (KNSH-085).
 //!
+//! - [`ScriptedDescendantClients`]: Endpoint Security descendant clients that can or cannot be created, whose exec
+//!   events the test delivers to the watched handler; counts checks and live clients (KNSH-094).
+//!
 //! Locks in the fakes are independent (one per fake) and never held across calls into another fake.
 
 mod ancestry;
 mod clock;
 mod control;
 mod denials;
+mod endpoint_security;
 mod file_events;
 mod fs;
 mod holders;
@@ -68,6 +72,7 @@ pub use ancestry::FakeProcessTree;
 pub use clock::FakeClock;
 pub use control::FakeCodeSigning;
 pub use denials::{ScriptedDenialLog, kernel_entry};
+pub use endpoint_security::ScriptedDescendantClients;
 pub use file_events::{FlushHook, ScriptedFileEvents, watch_failure};
 pub use fs::{DEFAULT_UID, MemFs};
 pub use holders::FakeWriteHolders;

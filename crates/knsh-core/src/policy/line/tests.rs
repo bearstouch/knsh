@@ -381,12 +381,26 @@ fn decision_sources_use_record_spellings() {
         DecisionSource::Standalone,
         DecisionSource::RateLimit,
         DecisionSource::Grant,
+        DecisionSource::EndpointSecurity,
     ]
     .iter()
     .map(|source| source.code())
     .collect();
     assert_eq!(
         codes,
-        ["rule", "hook", "authority", "user", "standalone", "rate_limit", "grant"]
+        [
+            "rule",
+            "hook",
+            "authority",
+            "user",
+            "standalone",
+            "rate_limit",
+            "grant",
+            "endpoint_security"
+        ]
     );
+    // KNSH-094: every spelling reads back as its source, so stored records keep the Endpoint Security source.
+    for code in codes {
+        assert_eq!(DecisionSource::from_code(code).map(DecisionSource::code), Some(code));
+    }
 }

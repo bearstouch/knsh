@@ -17,6 +17,10 @@ pub const NONE: &str = "none";
 pub enum Sandbox {
     /// Seatbelt through `sandbox-exec`, checked by a trivial successful run.
     Seatbelt,
+    /// Seatbelt plus the Endpoint Security descendant client over every envelope (macOS 27 and later, with Apple's
+    /// entitlement; FR-AGT-13, decision 3, KNSH-094): every exec inside an envelope is decided by `knshd`. Reported
+    /// only when the probe created a client; otherwise the value stays [`Sandbox::Seatbelt`].
+    SeatbeltEndpointSecurity,
     /// No working sandbox on this machine.
     None,
 }
@@ -71,11 +75,21 @@ pub enum CheckpointBackend {
 }
 
 impl Sandbox {
+    /// Whether every exec inside an envelope is decided through Endpoint Security (KNSH-094).
+    #[must_use]
+    pub const fn decides_execs(self) -> bool {
+        match self {
+            Self::SeatbeltEndpointSecurity => true,
+            Self::Seatbelt | Self::None => false,
+        }
+    }
+
     /// The wire value.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Seatbelt => "seatbelt",
+            Self::SeatbeltEndpointSecurity => "seatbelt+endpoint_security",
             Self::None => NONE,
         }
     }
@@ -388,5 +402,21 @@ mod tests {
         assert_eq!(roots.get("/b").and_then(Value::as_str), Some("apfs-clone"));
         assert_eq!(roots.get("/c").and_then(Value::as_str), Some("plain-copy"));
         assert_eq!(object.get("sandbox").and_then(Value::as_str), Some("seatbelt"));
+    }
+
+    // KNSH-094: the Endpoint Security layer has its own sandbox value, still a working sandbox for every method that
+    // needs one; only it decides execs.
+    #[test]
+    fn endpoint_security_is_a_sandbox_value_of_its_own() {
+        let mut caps = nothing();
+        caps.sandbox = Sandbox::SeatbeltEndpointSecurity;
+        assert!(caps.has(Backend::Sandbox));
+        assert_eq!(
+            caps.to_object().unwrap().get("sandbox").and_then(Value::as_str),
+            Some("seatbelt+endpoint_security")
+        );
+        assert!(Sandbox::SeatbeltEndpointSecurity.decides_execs());
+        assert!(!Sandbox::Seatbelt.decides_execs());
+        assert!(!Sandbox::None.decides_execs());
     }
 }

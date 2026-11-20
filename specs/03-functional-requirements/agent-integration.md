@@ -54,6 +54,43 @@ knsh agent --profile web-app -- claude
   the caller gone: a pending decision is cancelled (FR-LC-41) and a running line's process group is stopped
   (KNSH-051). Delivering a particular signal to the line instead is left to `exec.kill`.
 
+### Exec decisions through Endpoint Security (KNSH-094)
+
+On macOS 27 and later, with Apple's Endpoint Security entitlement (decision 3), `hello` reports `sandbox:
+"seatbelt+endpoint_security"` and FR-AGT-13 applies. Without either, nothing below happens: no client is tried, the
+envelope alone confines direct execution (FR-AGT-31), and no error reaches the agent.
+
+- **One client per envelope.** `session.start_agent` creates a descendant client before it starts the envelope and
+  deletes it once the envelope's leader has been reaped. If the client cannot be created, the envelope does not start
+  and the call is `-32603`: `hello` promised that every exec is decided (fail closed).
+- **What is not decided.** The envelope's own launch: `knsh-exec`, `/usr/bin/sandbox-exec`, the profile's bash and the
+  CLI, each exec'd by the envelope's leader (the process whose pid is its process group, and the same pid for every step: an exec keeps its pid), in that order, before the
+  CLI is reached; once it is, nothing more is exempt that way. And `knsh`, whose lines are forwarded and decided by
+  the supervisor (FR-AGT-10).
+- **Everything else is decided as a line.** The exec becomes the executable's canonical path followed by `argv[1..]`,
+  each quoted as one shell word (`argv[0]` is never trusted), with the exec's working directory and its environment's
+  `PATH` without the shims (the system default when it has none). It goes through the same pipeline as a forwarded
+  line in the envelope's session: parsing and classification (so `/bin/bash -c 'git push'` is decided on
+  `git push`), `command.proposed`, hooks, rules with grants, asks, rate limits. A denied exec fails in the agent's
+  process (`EPERM`). The decision is recorded like a supervised line with source `endpoint_security`
+  ([execution record](../05-models/execution-record.md#decision)), and a denial publishes `command.denied` with that
+  source. Nothing is spawned by the supervisor, and no checkpoint gate or secret applies: the exec runs in the agent's
+  process, inside its envelope, with what it already has.
+- **Deadlines (fail closed).** The answer is sent 250 ms before the deadline Endpoint Security gives, whatever the
+  decision is doing; an exec not allowed by then is denied. The deadline is the decision's caller, so an ask still
+  waiting is cancelled. An allow counts only if it was made before the deadline; one made later is recorded as a
+  deny.
+- **Also denied:** an exec whose working directory, executable or arguments cannot be read (not reported, not
+  canonical, not UTF-8), a line longer than `exec.run` accepts, a rewrite from a hook or the authority (the exec is
+  already under way with its own arguments), a session that is paused, taken over or ended (nothing is recorded
+  when it was already held before the decision, as for its held lines; one held while the exec was being decided is
+  recorded as a deny), and any failure of the decision itself.
+- **Known limit.** An allowed exec is recorded after the allow is given, since the deadline leaves no time to wait:
+  if that write fails, the exec has run unrecorded. The client is deleted once the envelope's leader has been
+  reaped; a process of the envelope that left its process group (`setsid`, `setpgid`) and so outlived the
+  group's `SIGTERM` keeps running under the envelope's Seatbelt profile, but its later execs are no longer decided.
+  What Endpoint Security does with such processes is part of still open 2 (decisions).
+
 ## Who counts as an agent
 
 | ID | Requirement |
