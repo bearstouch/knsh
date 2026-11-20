@@ -11,13 +11,13 @@
 //! than the limit is refused before evaluation and the check itself never overflows the stack.
 
 use knsh_bash::{
-    AndOr, ArithmeticParts, Command, CommandWord, CompoundCommand, CompoundKind, ListItem, Pipeline, SimpleCommand,
-    Span, UnsupportedCommand,
+    AndOr, ArithmeticParts, Command, CommandWord, CompoundCommand, CompoundKind, ListItem, Pipeline, Redirect,
+    RedirectionOperator, SimpleCommand, Span, UnsupportedCommand,
 };
 
 use crate::brace;
 use crate::error::{InterpError, Unsupported};
-use crate::eval::{external_builtin_differs, is_refused_builtin, trailing_redirection};
+use crate::eval::{exec_redirects_only, external_builtin_differs, is_refused_builtin, trailing_redirection};
 use crate::expand::MAX_EXPANSION_DEPTH;
 use crate::param::{self, Name, Op, Parsed};
 use crate::pattern;
@@ -130,15 +130,43 @@ impl Checker<'_> {
         // A builtin named literally is refused now; one produced by an expansion when it runs.
         if let (Some(Some(name)), Some(first)) = (literals.first(), simple.words.first()) {
             let args: Option<Vec<String>> = literals.iter().skip(1).cloned().collect();
-            let differs = args.is_some_and(|args| external_builtin_differs(name, &args));
-            if is_refused_builtin(name) || differs {
+            let differs = args.as_ref().is_some_and(|args| external_builtin_differs(name, args));
+            // `exec cmd` replaces the shell: refused; `exec` with redirections only is run (KNSH-099).
+            let replaces_shell = name == "exec" && args.is_some_and(|args| !exec_redirects_only(&args));
+            if is_refused_builtin(name) || differs || replaces_shell {
                 return Err(refuse(Unsupported::Builtin, first.span));
             }
         }
-        match simple.redirections.first() {
-            Some(redirect) => Err(refuse(Unsupported::Redirection, redirect.span)),
-            None => Ok(()),
+        self.redirections(&simple.redirections)
+    }
+
+    /// A command's redirections (KNSH-099): here-documents are refused (KNSH-105), a `{name}` variable bash
+    /// maintains itself too; each target is checked as an argument word (a here-string's as a plain word).
+    fn redirections(&self, redirects: &[Redirect]) -> Result<(), InterpError> {
+        for redirect in redirects {
+            let context = match redirect.operator {
+                RedirectionOperator::HereDocument | RedirectionOperator::HereDocumentStripTabs => {
+                    return Err(refuse(Unsupported::HereDocument, redirect.span));
+                }
+                RedirectionOperator::HereString => Context::Plain,
+                RedirectionOperator::Input
+                | RedirectionOperator::Output
+                | RedirectionOperator::Append
+                | RedirectionOperator::Clobber
+                | RedirectionOperator::ReadWrite
+                | RedirectionOperator::DuplicateInput
+                | RedirectionOperator::DuplicateOutput
+                | RedirectionOperator::OutputAll
+                | RedirectionOperator::AppendAll => Context::Argument,
+            };
+            if let Some(variable) = &redirect.variable
+                && is_always_unemulated(&variable.name)
+            {
+                return Err(refuse(Unsupported::ShellVariable, variable.span));
+            }
+            self.word(&redirect.target, context)?;
         }
+        Ok(())
     }
 
     fn compound(&self, compound: &CompoundCommand, depth: usize) -> Result<(), InterpError> {
@@ -166,10 +194,7 @@ impl Checker<'_> {
                 }
             }
         }
-        match compound.redirections.first() {
-            Some(redirect) => Err(refuse(Unsupported::Redirection, redirect.span)),
-            None => Ok(()),
-        }
+        self.redirections(&compound.redirections)
     }
 
     /// Checks a word in `context` (only arguments are brace-expanded, which is checked here too, so a word past

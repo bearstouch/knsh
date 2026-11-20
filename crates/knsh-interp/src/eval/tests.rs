@@ -3,9 +3,9 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use knsh_bash::{AndOr, CompoundCommand, Group, ListItem, Pipeline, parse};
-use knsh_platform::PlatformError;
-use knsh_platform::testing::{FakeCollation, FakeUserHomes, MemFs, ScriptedCommands};
+use knsh_bash::{AndOr, CompoundCommand, Group, ListItem, ParseOptions, Pipeline, parse, parse_with};
+use knsh_platform::testing::{FakeCollation, FakeDescriptors, FakeOpened, FakeUserHomes, MemFs, ScriptedCommands};
+use knsh_platform::{ChildDescriptor, PlatformError, StandardStream};
 
 use super::*;
 
@@ -42,7 +42,10 @@ struct Harness {
     interpreter: Interpreter,
     commands: Arc<ScriptedCommands>,
     fs: Arc<MemFs>,
+    descriptors: Arc<FakeDescriptors>,
     diagnostics: Buffer,
+    /// The spawner's standard output, as the shell itself writes to it.
+    output: Buffer,
 }
 
 impl Harness {
@@ -58,6 +61,8 @@ impl Harness {
         commands.on("/bin/true", exited(0));
         commands.on("/bin/false", exited(1));
         let diagnostics = Buffer::default();
+        let output = Buffer::default();
+        let descriptors = Arc::new(FakeDescriptors::new(fs.clone()));
         let state = ShellState::new("knsh", "/work")
             .unwrap()
             .with_environment([("PATH".into(), "/bin".into())]);
@@ -68,13 +73,17 @@ impl Harness {
             commands.clone(),
             homes,
             Arc::new(FakeCollation::new().with_locale("en_US.UTF-8")),
+            descriptors.clone(),
             Box::new(diagnostics.clone()),
-        );
+        )
+        .with_output(Box::new(output.clone()));
         Self {
             interpreter,
             commands,
             fs,
+            descriptors,
             diagnostics,
+            output,
         }
     }
 
@@ -85,9 +94,40 @@ impl Harness {
         }
     }
 
+    /// Runs `line`, read as bash 5.2 reads it (`{name}>file` is a redirection, KNSH-099).
     fn run(&mut self, line: &str) -> Result<Status, InterpError> {
-        let script = parse(line).unwrap();
+        let script = parse_with(line, ParseOptions::default().with_redirection_variables(true)).unwrap();
         self.interpreter.run(&script, line)
+    }
+
+    /// The descriptor table of the `index`th command run: each number with what it holds, as text (`stdout`, a
+    /// file's path, `<<<text`).
+    fn table(&self, index: usize) -> Vec<(i32, String)> {
+        let runs = self.commands.runs();
+        runs[index]
+            .descriptors
+            .iter()
+            .map(|(fd, held)| {
+                let text = match held {
+                    ChildDescriptor::Standard(StandardStream::Input) => "stdin".to_owned(),
+                    ChildDescriptor::Standard(StandardStream::Output) => "stdout".to_owned(),
+                    ChildDescriptor::Standard(StandardStream::Error) => "stderr".to_owned(),
+                    ChildDescriptor::Open(file) => match self.descriptors.opened(file) {
+                        Some(FakeOpened::File { path, .. }) => path.display().to_string(),
+                        Some(FakeOpened::HereString(text)) => format!("<<<{}", String::from_utf8_lossy(&text)),
+                        None => "unknown".to_owned(),
+                    },
+                };
+                (*fd, text)
+            })
+            .collect()
+    }
+
+    /// The contents of `/work/<name>` as text, if it exists.
+    fn file(&self, name: &str) -> Option<String> {
+        self.fs
+            .contents(&Path::new("/work").join(name))
+            .map(|data| String::from_utf8(data).unwrap())
     }
 
     fn status(&mut self, line: &str) -> u8 {
@@ -452,8 +492,10 @@ fn unsupported_constructs_are_refused_before_anything_runs() {
         ("true; echo ${a[0]}", Unsupported::Array),
         ("true; echo ${x@P}", Unsupported::PromptExpansion),
         ("true; (( x )) > out", Unsupported::Redirection),
-        ("true > out", Unsupported::Redirection),
-        ("{ true; } 2>&1", Unsupported::Redirection),
+        ("true; cat <<EOF\nx\nEOF\n", Unsupported::HereDocument),
+        ("true; { true; } <<-EOF\nx\nEOF\n", Unsupported::HereDocument),
+        ("true; exec ls", Unsupported::Builtin),
+        ("true; exec -a x ls", Unsupported::Builtin),
         ("true | true", Unsupported::Pipeline),
         ("true &", Unsupported::Background),
         ("(true)", Unsupported::Subshell),
@@ -974,4 +1016,282 @@ fn quoted_empty_strings_in_partly_quoted_words() {
     h.interpreter.state_mut().set_variable("v", " a ");
     assert_eq!(h.status("tool \"\"$e x ''$blank y $v\"\" \"$e\"$v"), 0);
     assert_eq!(args(&h), [vec!["", "x", "y", "a", "a"]]);
+}
+
+// ---- Redirections (KNSH-099) ----
+
+/// `(fd, what)` pairs for [`Harness::table`] comparisons.
+fn fds(entries: &[(i32, &str)]) -> Vec<(i32, String)> {
+    entries.iter().map(|&(fd, what)| (fd, what.to_owned())).collect()
+}
+
+/// The table of a command without redirections.
+fn standard() -> Vec<(i32, String)> {
+    fds(&[(0, "stdin"), (1, "stdout"), (2, "stderr")])
+}
+
+// NFR-COMPAT-02: redirections apply left to right: `2>&1 >file` sends errors where output went before, `>file 2>&1`
+// sends both to the file. The shell's own messages follow the same table.
+#[test]
+fn redirection_order_matters_like_bash() {
+    let mut h = Harness::new();
+    h.on("x", &[exited(0)]);
+    assert_eq!(h.status("x 2>&1 >out; x >out 2>&1"), 0);
+    assert_eq!(h.table(0), fds(&[(0, "stdin"), (1, "/work/out"), (2, "stdout")]));
+    assert_eq!(h.table(1), fds(&[(0, "stdin"), (1, "/work/out"), (2, "/work/out")]));
+    assert_eq!(h.status("let 1/0 2>&1 >out2; let 1/0 >out3 2>&1"), 1);
+    assert!(
+        h.output.text().contains("let: 1/0: division by 0"),
+        "{}",
+        h.output.text()
+    );
+    assert_eq!(h.file("out2").as_deref(), Some(""));
+    assert!(h.file("out3").unwrap().contains("division by 0"));
+    assert_eq!(h.diagnostics.text(), "");
+}
+
+// NFR-COMPAT-02: `set -C` makes `>` (and `&>`) refuse an existing regular file, leaving it as it was; the command
+// does not run and the status is 1. New files and devices are still written.
+#[test]
+fn noclobber_blocks_overwrite() {
+    let mut h = Harness::new();
+    h.on("x", &[exited(0)]);
+    h.fs.write(Path::new("/work/f"), b"old", 0o644).unwrap();
+    h.interpreter.state_mut().options_mut().noclobber = true;
+    assert_eq!(h.status("x >f"), 1);
+    assert_eq!(h.status("x &>f"), 1);
+    assert_eq!(h.file("f").as_deref(), Some("old"));
+    assert_eq!(
+        h.diagnostics.text(),
+        "knsh: line 1: f: cannot overwrite existing file\nknsh: line 1: f: cannot overwrite existing file\n"
+    );
+    assert_eq!(h.ran(), Vec::<String>::new());
+    assert_eq!(h.status("x >new; x >/dev/null; x >>f"), 0);
+    assert_eq!(h.ran(), ["x", "x", "x"]);
+    h.on("echo", &[exited(0)]);
+    assert_eq!(h.status("echo $- >flags"), 0);
+    assert_eq!(h.commands.runs()[3].args, ["hBCc"]);
+}
+
+// NFR-COMPAT-02: `>|` truncates even under `set -C`.
+#[test]
+fn force_clobber_overrides_noclobber() {
+    let mut h = Harness::new();
+    h.on("x", &[exited(0)]);
+    h.fs.write(Path::new("/work/f"), b"old", 0o644).unwrap();
+    h.interpreter.state_mut().options_mut().noclobber = true;
+    assert_eq!(h.status("x >|f"), 0);
+    assert_eq!(h.file("f").as_deref(), Some(""));
+    assert_eq!(h.table(0), fds(&[(0, "stdin"), (1, "/work/f"), (2, "stderr")]));
+}
+
+// NFR-COMPAT-02: redirections on builtins and on compound commands hold for that command only; afterwards every
+// descriptor is what it was. A redirection that fails undoes the ones before it and the command does not run.
+#[test]
+fn builtin_redirection_is_restored() {
+    let mut h = Harness::new();
+    h.on("x", &[exited(0)]);
+    assert_eq!(h.status("let 1/0 2>err; let 2/0"), 1);
+    assert!(h.file("err").unwrap().contains("1/0"));
+    assert!(h.diagnostics.text().contains("2/0") && !h.diagnostics.text().contains("1/0"));
+    assert_eq!(h.status(": >made 2>&1; x"), 0);
+    assert_eq!(h.file("made").as_deref(), Some(""));
+    assert_eq!(h.status("{ x; x 2>e; } >out; x"), 0);
+    assert_eq!(h.table(0), standard());
+    assert_eq!(h.table(1), fds(&[(0, "stdin"), (1, "/work/out"), (2, "stderr")]));
+    assert_eq!(h.table(2), fds(&[(0, "stdin"), (1, "/work/out"), (2, "/work/e")]));
+    assert_eq!(h.table(3), standard());
+    // A failure part-way: `>a` was applied, then `<missing` failed; nothing runs and `>a` is undone.
+    assert_eq!(h.status("x >a <missing; x"), 0);
+    assert!(h.diagnostics.text().contains("missing: No such file or directory"));
+    assert_eq!(h.commands.runs().len(), 5);
+    assert_eq!(h.table(4), standard());
+    assert_eq!(h.status("if x; then x; fi </missing"), 1);
+    assert_eq!(h.commands.runs().len(), 5);
+}
+
+// NFR-COMPAT-02: `exec` with only redirections changes the shell's own descriptors, for the rest of the script and
+// later runs; `exec 3>&-` closes; a redirection on a group around it is still undone. A failed `exec` keeps nothing.
+#[test]
+fn exec_redirection_persists() {
+    let mut h = Harness::new();
+    h.on("x", &[exited(0)]);
+    assert_eq!(h.status("exec 3>file; x"), 0);
+    assert_eq!(h.status("x; exec 3>&-; x"), 0);
+    let with_three = fds(&[(0, "stdin"), (1, "stdout"), (2, "stderr"), (3, "/work/file")]);
+    assert_eq!(h.table(0), with_three);
+    assert_eq!(h.table(1), with_three);
+    assert_eq!(h.table(2), standard());
+    assert_eq!(h.status("{ exec 4>g; } >out; x; exec 4>&-"), 0);
+    assert_eq!(
+        h.table(3),
+        fds(&[(0, "stdin"), (1, "stdout"), (2, "stderr"), (4, "/work/g")])
+    );
+    assert_eq!(h.status("exec 3>a 4</missing; x"), 0);
+    assert_eq!(h.table(4), standard());
+    assert_eq!(h.status("exec 2>log; let 1/0; x"), 0);
+    assert!(h.file("log").unwrap().contains("1/0"));
+    assert_eq!(h.table(5), fds(&[(0, "stdin"), (1, "stdout"), (2, "/work/log")]));
+}
+
+// NFR-COMPAT-02: `{name}>file` opens the lowest free descriptor from 10, stores its number in `name`, and outlives
+// the command; `{name}>&-` closes the descriptor `name` holds.
+#[test]
+fn named_fd_assigns_variable() {
+    let mut h = Harness::new();
+    h.on("x", &[exited(0)]);
+    assert_eq!(h.status("exec {fd}>f; x $fd {b}<&0; x $b; exec {fd}>&-; x"), 0);
+    let runs = h.commands.runs();
+    assert_eq!(runs[0].args, ["10"]);
+    assert_eq!(runs[1].args, ["11"]);
+    assert_eq!(
+        h.table(0),
+        fds(&[
+            (0, "stdin"),
+            (1, "stdout"),
+            (2, "stderr"),
+            (10, "/work/f"),
+            (11, "stdin")
+        ])
+    );
+    assert_eq!(
+        h.table(2),
+        fds(&[(0, "stdin"), (1, "stdout"), (2, "stderr"), (11, "stdin")])
+    );
+}
+
+// NFR-COMPAT-02: `<<<` gives the command its word, expanded without splitting or globbing, and a newline.
+#[test]
+fn here_string_appends_newline() {
+    let mut h = Harness::new();
+    h.on("x", &[exited(0)]);
+    assert_eq!(h.status("y='a  b'; x <<< $y; x <<<''; x 3<<<\"*\""), 0);
+    assert_eq!(h.table(0)[0], (0, "<<<a  b\n".to_owned()));
+    assert_eq!(h.table(1)[0], (0, "<<<\n".to_owned()));
+    assert_eq!(h.table(2)[3], (3, "<<<*\n".to_owned()));
+}
+
+// KNSH-099: a command gets exactly the shell's open descriptors: none left over from another command's
+// redirections, none the shell closed, and only what the script itself opened.
+#[test]
+fn no_descriptor_leak_to_children() {
+    let mut h = Harness::new();
+    h.on("x", &[exited(0)]);
+    assert_eq!(h.status("x 3>a 7<&0; x >&- 2<&-; x"), 0);
+    assert_eq!(
+        h.table(0),
+        fds(&[(0, "stdin"), (1, "stdout"), (2, "stderr"), (3, "/work/a"), (7, "stdin")])
+    );
+    assert_eq!(h.table(1), fds(&[(0, "stdin")]));
+    assert_eq!(h.table(2), standard());
+}
+
+// NFR-COMPAT-02: `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd/N` are the shell's own descriptors (never
+// the interpreter process's); `n>&m-` moves a descriptor; `>&file`, `&>` and `&>>` take output and errors.
+#[test]
+fn special_names_and_descriptor_forms_follow_bash() {
+    let mut h = Harness::new();
+    h.on("x", &[exited(0)]);
+    assert_eq!(h.status("exec 3>f; x >/dev/fd/3 2>/dev/stdout </dev/stderr"), 0);
+    assert_eq!(
+        h.table(0),
+        // `</dev/stderr` reads descriptor 2 as `2>/dev/stdout` just left it.
+        fds(&[(0, "/work/f"), (1, "/work/f"), (2, "/work/f"), (3, "/work/f")])
+    );
+    assert_eq!(h.status("x 4>&3-; x; exec 3>&-"), 0);
+    assert_eq!(
+        h.table(1),
+        fds(&[(0, "stdin"), (1, "stdout"), (2, "stderr"), (4, "/work/f")])
+    );
+    assert_eq!(h.table(2)[3], (3, "/work/f".to_owned()));
+    assert_eq!(h.status("x >&both; x &>all; x &>>all; x 1>&one"), 0);
+    for (index, file) in [(3, "/work/both"), (4, "/work/all"), (5, "/work/all"), (6, "/work/one")] {
+        assert_eq!(h.table(index), fds(&[(0, "stdin"), (1, file), (2, file)]), "{file}");
+    }
+    assert_eq!(h.status("x </dev/fd/9"), 1);
+    assert!(h.diagnostics.text().contains("/dev/fd/9: Bad file descriptor"));
+}
+
+// FR-NET-08 (decision 18): `/dev/tcp` and `/dev/udp` would make the shell itself connect; they are refused with a
+// message, the command does not run, and the status is 1, as for any failed redirection.
+#[test]
+fn network_redirections_are_refused() {
+    let mut h = Harness::new();
+    h.on("x", &[exited(0)]);
+    assert_eq!(h.status("x >/dev/tcp/example.com/80"), 1);
+    assert_eq!(h.status("h=example.com; x </dev/udp/$h/53"), 1);
+    assert_eq!(h.status("exec 3<>/dev/tcp/10.0.0.1/22"), 1);
+    assert_eq!(h.ran(), Vec::<String>::new());
+    let text = h.diagnostics.text();
+    assert!(
+        text.contains("/dev/tcp/example.com/80: network redirections are refused"),
+        "{text}"
+    );
+    assert!(text.contains("/dev/udp/example.com/53"), "{text}");
+}
+
+// NFR-COMPAT-02: bash's redirection errors, each reported with status 1 and the command not run: a target that is
+// not exactly one word, a descriptor that is not open or out of range, `2>&word`, an empty file name.
+#[test]
+fn redirection_errors_match_bash() {
+    let mut h = Harness::new();
+    h.on("x", &[exited(0)]);
+    h.fs.write(Path::new("/work/g1"), b"", 0o644).unwrap();
+    h.fs.write(Path::new("/work/g2"), b"", 0o644).unwrap();
+    for (line, message) in [
+        ("v='a b'; x >$v", "$v: ambiguous redirect"),
+        ("x >{p,q}", "{p,q}: ambiguous redirect"),
+        ("e=; x >$e", "$e: ambiguous redirect"),
+        ("x >g*", "g*: ambiguous redirect"),
+        ("x >&5", "5: Bad file descriptor"),
+        ("x 300>f", "300: Bad file descriptor"),
+        ("x 99999999999>f", "file descriptor out of range: Bad file descriptor"),
+        ("x 2>&f", "f: ambiguous redirect"),
+        ("x <''", ": No such file or directory"),
+        ("x >/work", "/work: Is a directory"),
+    ] {
+        assert_eq!(h.status(line), 1, "{line}");
+        let text = h.diagnostics.text();
+        assert!(text.ends_with(&format!("knsh: line 1: {message}\n")), "{line}: {text}");
+    }
+    assert_eq!(h.ran(), Vec::<String>::new());
+    // A glob matching one file is that file.
+    assert_eq!(h.status("x >g1*"), 0);
+    assert_eq!(h.table(0)[1], (1, "/work/g1".to_owned()));
+}
+
+// The shell's messages go nowhere while its descriptor 2 is closed.
+#[test]
+fn messages_to_a_closed_standard_error_are_dropped() {
+    let mut h = Harness::new();
+    assert_eq!(h.status("let 1/0 2>&-"), 1);
+    assert_eq!(h.diagnostics.text(), "");
+    assert_eq!(h.output.text(), "");
+}
+
+// NFR-COMPAT-02: a failed redirection is reported through the descriptors as the redirections before it left them,
+// then undone, as bash does: `x 2>/dev/null <missing` prints nothing, `{ …; } 2>err <missing` writes to `err`.
+#[test]
+fn redirection_error_is_reported_before_the_undo() {
+    let mut h = Harness::new();
+    h.on("x", &[exited(0)]);
+    assert_eq!(h.status("x 2>/dev/null <missing; exec 2>/dev/null >&9"), 1);
+    assert_eq!(h.diagnostics.text(), "");
+    assert_eq!(h.status("{ x; } 2>err <missing"), 1);
+    assert!(h.file("err").unwrap().contains("missing: No such file or directory"));
+    assert_eq!(h.diagnostics.text(), "");
+    assert_eq!(h.ran(), Vec::<String>::new());
+    // The undo still happened: the shell's descriptor 2 is its own again.
+    assert_eq!(h.status("x <missing"), 1);
+    assert!(h.diagnostics.text().contains("missing: No such file or directory"));
+}
+
+// NFR-COMPAT-02: `n>&n-` duplicates a descriptor onto itself, which bash does not do, so it neither duplicates nor
+// closes it: `exec 4>&4-` leaves 4 open.
+#[test]
+fn moving_a_descriptor_onto_itself_keeps_it() {
+    let mut h = Harness::new();
+    h.on("x", &[exited(0)]);
+    assert_eq!(h.status("exec 4>f; exec 4>&4-; x"), 0);
+    assert_eq!(h.table(0)[3], (4, "/work/f".to_owned()));
 }

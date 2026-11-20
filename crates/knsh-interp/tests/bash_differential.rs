@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use knsh_interp::{Interpreter, ShellOptions, ShellState};
-use knsh_platform::macos::{RealFs, SystemCollation, SystemProcesses, SystemUserHomes};
+use knsh_platform::macos::{RealFs, SystemCollation, SystemDescriptors, SystemProcesses, SystemUserHomes};
 use knsh_platform::{ProcessCommandSpawner, SharedFd, Stdio};
 
 /// Fifty lines; the last command fails, so the scripts' status is 1.
@@ -156,9 +156,11 @@ fn run_knsh_full(
         Arc::new(spawner),
         Arc::new(SystemUserHomes::new()),
         Arc::new(SystemCollation::new()),
+        Arc::new(SystemDescriptors::new()),
         Box::new(std::io::sink()),
     );
     let parsed = knsh_bash::parse_with(script, knsh_bash::ParseOptions::default().with_extglob(extglob)).unwrap();
+    // KNSH-099: what the shell writes to standard output itself goes nowhere, as for bash's captured stderr here.
     let status = interpreter.run(&parsed, script).unwrap();
     // The interpreter holds the spawner, which holds the pipe's write end: drop it so the read sees end of file.
     drop(interpreter);
@@ -342,4 +344,62 @@ fn glob_order_matches_bash_in_c_and_utf8_locales() {
         std::fs::remove_dir_all(&knsh_dir).unwrap();
         assert_eq!(knsh, bash, "LANG={locale}");
     }
+}
+
+/// Redirections in forms bash 3.2 and 5.2 agree on (no `{name}>`, `&>>` or `|&`, which bash 3.2 lacks, and no
+/// unquoted expansion in a here-string, which bash 3.2 splits and bash 4.4 and later do not), with real files and
+/// processes. `/bin/ls /dev/fd` shows exactly which descriptors a command receives.
+const REDIRECTIONS: &str = r#"echo one >out; cat out
+echo two >>out; cat out
+echo err 2>&1 >/dev/null
+echo swapped 3>&1 1>&2 2>&3 3>&- 2>/dev/null
+{ echo g1; echo g2; } >grp; cat grp
+cat <out
+if true; then echo in-if; fi >ifout; cat ifout
+for i in 1 2; do echo "$i"; done >loop; cat loop
+exec 3>fd3; echo three >&3; /bin/cat /dev/fd/3 </dev/null 2>/dev/null; exec 3>&-; cat fd3
+/bin/ls /dev/fd/; exec 4>f4; /bin/ls /dev/fd/; exec 4>&-; /bin/ls /dev/fd/
+exec 6>&1; exec >redirected; echo hidden; exec >&6 6>&-; cat redirected
+cat <<< "here  string"
+y='v  w'; cat <<<"$y"
+exec 5<out; cat <&5; exec 5<&-
+echo moved 6>&1 7>&6- >&7
+echo hi >&5 || echo bad-fd
+cat <missing || echo missing
+x='a b'; echo ambiguous >$x || echo ambiguous
+: >empty; cat empty; echo "empty $?"
+echo both &>both; cat both
+echo dup >&dupfile; cat dupfile
+echo rw 1<>rw; cat rw
+echo a >/dev/stdout
+cat /dev/fd/0 <out
+echo end
+"#;
+
+// NFR-COMPAT-02, KNSH-099: redirections, `exec` and the descriptors a command receives match bash.
+#[test]
+fn redirection_script_matches_bash() {
+    let bash_dir = temp_dir("bash-redirect");
+    let knsh_dir = temp_dir("knsh-redirect");
+    let bash = run_bash(REDIRECTIONS, &bash_dir);
+    let knsh = run_knsh(REDIRECTIONS, &knsh_dir);
+    std::fs::remove_dir_all(&bash_dir).unwrap();
+    std::fs::remove_dir_all(&knsh_dir).unwrap();
+    assert!(bash.0.contains("here  string\nv  w\n"), "bash output: {}", bash.0);
+    assert!(bash.0.contains("0\n1\n2\n3\n4\n"), "bash output: {}", bash.0);
+    assert_eq!(knsh, bash);
+}
+
+// NFR-COMPAT-02, KNSH-099: under `set -C` (`bash -C`), `>` refuses an existing file and `>|` overrides it.
+#[test]
+fn noclobber_matches_bash() {
+    let script = "echo a >f; echo b >f || echo refused; cat f; echo c >|f; cat f; echo d >/dev/null && echo null-ok\n";
+    let bash_dir = temp_dir("bash-noclobber");
+    let knsh_dir = temp_dir("knsh-noclobber");
+    let bash = run_bash_full(script, &bash_dir, &[], &["-C"], &[]);
+    let knsh = run_knsh_full(script, &knsh_dir, &[], |options| options.noclobber = true, &[]);
+    std::fs::remove_dir_all(&bash_dir).unwrap();
+    std::fs::remove_dir_all(&knsh_dir).unwrap();
+    assert_eq!(bash.0, "refused\na\nc\nnull-ok\n");
+    assert_eq!(knsh, bash);
 }

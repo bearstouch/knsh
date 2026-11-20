@@ -59,8 +59,8 @@ use crate::ast::{
     AndOr, AndOrOperator, AndOrPart, ArithmeticParts, Assignment, CaseClause, CaseCommand, CaseTerminator,
     CaseTerminatorKind, Command, CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems,
     FunctionDefinition, Group, HereDocument, IfClause, IfCommand, ListItem, LoopBody, LoopCommand, PipeOperator,
-    Pipeline, PipelinePart, Redirect, Script, Separator, SeparatorKind, SimpleCommand, Subshell, Substitution,
-    SubstitutionKind, TimeKeyword, UnsupportedCommand,
+    Pipeline, PipelinePart, Redirect, RedirectionVariable, Script, Separator, SeparatorKind, SimpleCommand, Subshell,
+    Substitution, SubstitutionKind, TimeKeyword, UnsupportedCommand,
 };
 use crate::error::{CompoundStart, LexError, ParseError, Unexpected, UnsupportedConstruct};
 use crate::functions::mark_function_calls;
@@ -71,6 +71,15 @@ use crate::token::{
     HereDocumentBody, Operator, Redirection, RedirectionOperator, ReservedWord, Segment, SegmentKind, Span, Token,
     TokenKind, Word,
 };
+
+/// Whether `text` is a bash name: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_name(text: &str) -> bool {
+    let mut bytes = text.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
 
 /// Parses a whole command line into a [`Script`].
 ///
@@ -113,6 +122,13 @@ pub struct ParseOptions {
     /// `shopt -s extglob`: `?(…)`, `*(…)`, `+(…)`, `@(…)` and `!(…)` are read as part of a word, with nothing inside
     /// the parentheses ending it, instead of being a syntax error (KNSH-098). Off by default, as in bash.
     pub extglob: bool,
+    /// Read `{name}>file` (any redirection operator, no descriptor number, `{name}` unquoted and right before it)
+    /// as bash 4.1 and later do: a redirection that opens a new descriptor and stores its number in `name`
+    /// ([`Redirect::variable`]), not a word followed by a redirection (KNSH-099). Off by default: bash 3.2, which
+    /// agent lines run under unless a profile names another bash, reads `{name}` as a word, so without this option
+    /// such a line is refused rather than read the way only one of the two would run it. The native interpreter,
+    /// which follows bash 5.2, parses with it on.
+    pub redirection_variables: bool,
 }
 
 impl ParseOptions {
@@ -120,6 +136,13 @@ impl ParseOptions {
     #[must_use]
     pub const fn with_extglob(mut self, on: bool) -> Self {
         self.extglob = on;
+        self
+    }
+
+    /// These options with `redirection_variables` set to `on`.
+    #[must_use]
+    pub const fn with_redirection_variables(mut self, on: bool) -> Self {
+        self.redirection_variables = on;
         self
     }
 }
@@ -144,6 +167,7 @@ pub fn parse_with(input: &str, options: ParseOptions) -> Result<Script, ParseErr
     let tokens_left = Cell::new(MAX_TOKENS);
     let context = LexContext {
         extglob: options.extglob,
+        redirection_variables: options.redirection_variables,
         ..LexContext::default()
     };
     let mut script = parse_source(input, Span::new(0, input.len()), context, 0, &tokens_left)?;
@@ -570,15 +594,18 @@ impl Parser<'_> {
                     }
                 }
                 TokenKind::Redirection(redirection) => {
+                    let mut variable = None;
                     if redirection.fd.is_none() && braced_word_end == Some(token.span.start) {
                         // Under bash 3.2 `{fd}>f cmd` runs a program named `{fd}`; under bash 4.1 and later it runs
-                        // `cmd`. Refused rather than guess which bash runs the line.
-                        return Err(ParseError::Unsupported {
-                            construct: UnsupportedConstruct::RedirectionVariable,
-                            span: token.span,
-                        });
+                        // `cmd`. Refused rather than guess which bash runs the line, unless the caller reads lines as
+                        // bash 4.1 and later do (the native interpreter, KNSH-099).
+                        variable = self.redirection_variable(&mut words, token.span)?;
                     }
-                    let redirect = self.redirect(redirection, token.span)?;
+                    let mut redirect = self.redirect(redirection, token.span)?;
+                    if let Some(variable) = variable {
+                        redirect.span = Span::new(variable.span.start, redirect.span.end);
+                        redirect.variable = Some(variable);
+                    }
                     end = redirect.span.end;
                     braced_word_end = self.is_braced(redirect.target.span).then_some(redirect.target.span.end);
                     redirections.push(redirect);
@@ -637,6 +664,8 @@ impl Parser<'_> {
             here_document,
             // Set afterwards, once the command reading it is known (`mark_interpreter_inputs`).
             feeds_interpreter: false,
+            // Set by the simple command that reads it, which saw the `{name}` before the operator.
+            variable: None,
         })
     }
 
@@ -739,6 +768,7 @@ impl Parser<'_> {
             substitutions: self.context.substitutions + 1,
             process_substitutions: self.context.process_substitutions + usize::from(process),
             extglob: self.context.extglob,
+            redirection_variables: self.context.redirection_variables,
         };
         let script = parse_source(self.input, segment.body, context, self.depth + 1, self.tokens_left)?;
         Ok(Substitution {
@@ -760,6 +790,7 @@ impl Parser<'_> {
             substitutions: 0,
             process_substitutions: 0,
             extglob: self.context.extglob,
+            redirection_variables: self.context.redirection_variables,
         };
         let body = segment.body.text(self.input).unwrap_or_default();
         let (text, script) = match unescape_backtick(body, in_double_quotes, None) {
@@ -1326,6 +1357,52 @@ impl Parser<'_> {
         Ok(None)
     }
 
+    /// The descriptor variable of the redirection at `operator`, which follows a `{…}` word with nothing between:
+    /// with [`ParseOptions::redirection_variables`], a word made only of unquoted text spelling `{name}` is taken
+    /// from `words` (it is not an argument) and becomes the variable; any other braced word stays an argument, as
+    /// in bash 4.1 and later. Without the option the line is refused.
+    ///
+    /// # Errors
+    ///
+    /// [`UnsupportedConstruct::RedirectionVariable`] without the option, or when the braced word is not the last
+    /// argument read (it was the target of the redirection before: bash would read a redirection without a target).
+    fn redirection_variable(
+        &self,
+        words: &mut Vec<CommandWord>,
+        operator: Span,
+    ) -> Result<Option<RedirectionVariable>, ParseError> {
+        let refused = ParseError::Unsupported {
+            construct: UnsupportedConstruct::RedirectionVariable,
+            span: operator,
+        };
+        if !self.context.redirection_variables {
+            return Err(refused);
+        }
+        let Some(last) = words.last().filter(|word| word.span.end == operator.start) else {
+            return Err(refused);
+        };
+        let unquoted = last
+            .word
+            .segments
+            .iter()
+            .all(|segment| segment.kind == SegmentKind::Literal);
+        let name = last
+            .span
+            .text(self.input)
+            .and_then(|text| text.strip_prefix('{'))
+            .and_then(|text| text.strip_suffix('}'))
+            .filter(|name| unquoted && is_name(name))
+            .map(str::to_owned);
+        Ok(match name {
+            Some(name) => {
+                let span = last.span;
+                words.pop();
+                Some(RedirectionVariable { name, span })
+            }
+            None => None,
+        })
+    }
+
     /// Whether the word at `span` is spelled `{…}` with something between the braces, the shape of a bash 4.1
     /// descriptor variable (`{fd}>file`). Quoting is not looked at, so the check errs towards refusing.
     fn is_braced(&self, span: Span) -> bool {
@@ -1784,6 +1861,13 @@ mod tests {
         commands[0].clone()
     }
 
+    /// The only simple command of `script`.
+    fn only_command_of(script: &Script) -> SimpleCommand {
+        let commands: Vec<&SimpleCommand> = script.simple_commands().collect();
+        assert_eq!(commands.len(), 1, "{commands:#?}");
+        commands[0].clone()
+    }
+
     fn word_texts<'a>(input: &'a str, words: &[CommandWord]) -> Vec<&'a str> {
         words.iter().map(|word| text(input, word.span)).collect()
     }
@@ -2204,6 +2288,43 @@ mod tests {
         assert_eq!(names("{fd} >f x"), [Some("{fd}")]);
         assert_eq!(names("echo {} 2>f"), [Some("echo")]);
         assert_eq!(names("echo {a}2>f"), [Some("echo")]);
+    }
+
+    // KNSH-099: with `redirection_variables`, `{name}>file` is a redirection storing its descriptor in `name`, in any
+    // position, and the braced word is not an argument; other braced words stay words, as in bash 4.1 and later.
+    #[test]
+    fn redirection_variable_is_read_when_enabled() {
+        let options = ParseOptions::default().with_redirection_variables(true);
+        let input = "{fd}>/dev/null rm f {in}<&-";
+        let script = parse_with(input, options).unwrap();
+        let command = only_command_of(&script);
+        assert_eq!(word_texts(input, &command.words), ["rm", "f"]);
+        let variables: Vec<_> = command
+            .redirections
+            .iter()
+            .map(|redirect| redirect.variable.as_ref().map(|variable| variable.name.as_str()))
+            .collect();
+        assert_eq!(variables, [Some("fd"), Some("in")]);
+        assert_eq!(command.redirections[0].span.text(input), Some("{fd}>/dev/null"));
+        // Not a name, quoted, or not adjacent: ordinary words.
+        for (input, words) in [
+            ("echo {a,b}>f", vec!["echo", "{a,b}"]),
+            ("echo {1x}>f", vec!["echo", "{1x}"]),
+            ("echo '{a}'>f", vec!["echo", "'{a}'"]),
+            ("echo {a} >f", vec!["echo", "{a}"]),
+        ] {
+            let script = parse_with(input, options).unwrap();
+            let command = only_command_of(&script);
+            assert_eq!(word_texts(input, &command.words), words, "{input:?}");
+            assert_eq!(command.redirections[0].variable, None, "{input:?}");
+        }
+        // A braced word that was the previous redirection's target is still refused.
+        assert!(parse_with("x >{fd}>b", options).is_err());
+        // Without the option nothing changes.
+        assert_eq!(
+            unsupported("{fd}>/dev/null rm f"),
+            UnsupportedConstruct::RedirectionVariable
+        );
     }
 
     // ---- Limits ----

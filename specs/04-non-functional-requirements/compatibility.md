@@ -42,6 +42,9 @@ tests (`crates/knsh-interp/src/expand/tests.rs`, `src/arith/tests.rs`); forms bo
 | `${x/p/&}` | `&` is literal | `patsub_replacement` on by default: an unquoted `&` is the match |
 | `set -u` with an unset parameter, `${x?}` | Shell exits with status 127 | Shell exits with status 1 |
 | `${x?}` with `x` unset | `x: parameter null or not set` | `x: parameter not set` (`${x:?}` keeps the longer message) |
+| `cmd <<<$x` (unquoted expansion in a here-string, KNSH-099) | Split on `IFS` and joined with spaces | Not split |
+| `{name}>file` (KNSH-099) | `{name}` is an ordinary word | Opens a descriptor from 10 up and stores its number in `name` |
+| `&>>file` (KNSH-099) | Syntax error | Appends standard output and error |
 | `${!x}` with `x` unset or empty | Expands to nothing | Error `x: invalid indirect expansion` or `: invalid variable name`, line abandoned |
 | `{01..03}`, `{1..9..2}`, `{a..e..2}` (KNSH-098) | No padding (`1 2 3`); a step leaves the word as written | Zero padding to the widest end; steps |
 | `**` with `globstar` (KNSH-098) | No such option: `**` is `*` | Any depth of directories |
@@ -53,6 +56,18 @@ matches `é` here, `??` does in bash); the `failglob` error names the word after
 with an `extglob` group matches a hidden name when one of the group's alternatives starts with `.` (bash 5.2 looks
 deeper); `GLOBIGNORE` implies `dotglob` only while it is set and not empty. Glob results are sorted with the system's
 `strcoll` (macOS); glibc's collation is checked with the Linux port (KNSH-110).
+
+Known differences of the native interpreter from bash 5.2 in redirections (KNSH-099): descriptor numbers above 255
+are `Bad file descriptor` (bash allows up to its open-file limit); `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and
+`/dev/fd/N` are the shell's own descriptors, duplicated without truncation, as opening `/dev/fd` does on macOS, while
+any other path that leads into `/dev/fd` (a symlink to it) is refused with `Operation not permitted`, because in the
+interpreter's process it would reach the engine's own descriptors; `/dev/tcp` and `/dev/udp` are refused
+([decision 18](../09-reference/decisions.md)); here-documents are refused until KNSH-105, and a redirection after
+`(( … ))` or `for (( … ))` is refused; what the shell would write to its standard input (its messages after `2>&0`)
+is dropped; a program that vanishes between lookup and `exec` while descriptors above 2 are redirected ends with
+127 (126 if it cannot be executed) without bash's message. `{name}>file` is read only when the line is parsed with
+`knsh_bash::ParseOptions::redirection_variables`, which the native interpreter's caller sets (bash 3.2 reads
+`{name}` as a word, so without the option the line is refused).
 | Messages under `bash -c` | `bash: message` (no line number on one-line scripts) | `bash: line n: message` |
 | Arithmetic error token after trailing blanks (`$(( 1 + ))`) | `error token is " "` | The last token read: `error token is "+ "` |
 | `base#` with no digits (`$((2#))`) | 0 | Error `invalid integer constant` |

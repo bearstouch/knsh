@@ -12,13 +12,17 @@
 //! removes the entry and reaps.
 
 use std::collections::HashMap;
+use std::ffi::{CString, OsString};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::error::{Operation, PlatformError};
-use crate::process::{ExitStatus, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest, Stdio};
+use crate::process::{
+    ExitStatus, MAX_PLACED_FD, PlacementSource, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest, Stdio,
+};
 
 /// Starts processes in new process groups and signals only the groups it holds.
 ///
@@ -71,25 +75,51 @@ fn standard_descriptors(wanted: &Stdio) -> Result<[std::process::Stdio; 3], Plat
     }
 }
 
-/// Sets up the child's descriptors above stdio, after the fork and in the child only.
+/// Sets up the child's descriptors, after the fork and in the child only.
 ///
-/// 1. Closes every descriptor that is open without `FD_CLOEXEC` and not listed in `request.inherit`. macOS has no
-///    `pipe2` or `accept4`, so std creates pipes and sockets first and sets `FD_CLOEXEC` in a second call. A fork by
-///    another thread between the two calls would hand that descriptor to this child for its whole life: a hook would
-///    hold a stranger's stdout pipe open (its reader never sees end of file) and an agent command would receive a
-///    descriptor from another session. A descriptor that already has `FD_CLOEXEC` (including std's own pipe that
-///    reports a failed `exec`) is left alone; `exec` closes it.
-/// 2. Keeps `request.inherit` open under their own numbers by clearing their `FD_CLOEXEC`, so no other child spawned
+/// 1. Places `request.placements` (KNSH-099): each source is first copied to a number that is not a target, then
+///    each target receives its copy (or is closed), then the copies are closed. Reading every source before writing any
+///    target is what makes `1>&2 2>&1` a swap, and a source whose number is also a target is never overwritten
+///    before it is read.
+/// 2. Closes every descriptor that is open without `FD_CLOEXEC` and not listed in `request.inherit` or placed. macOS
+///    has no `pipe2` or `accept4`, so std creates pipes and sockets first and sets `FD_CLOEXEC` in a second call. A
+///    fork by another thread between the two calls would hand that descriptor to this child for its whole life: a
+///    hook would hold a stranger's stdout pipe open (its reader never sees end of file) and an agent command would
+///    receive a descriptor from another session. A descriptor that already has `FD_CLOEXEC` (including std's own
+///    pipe that reports a failed `exec`) is left alone; `exec` closes it.
+/// 3. Keeps `request.inherit` open under their own numbers by clearing their `FD_CLOEXEC`, so no other child spawned
 ///    concurrently by this multithreaded process can inherit them.
-fn inherit(command: &mut Command, request: &SpawnRequest) -> Result<(), PlatformError> {
+/// 4. With a placement above stdio, executes the program itself ([`ExecImage`]): such a target may be the number of
+///    std's pipe that reports a failed `exec`, which the placement replaced, so std's own report would land in the
+///    placed file. A failed `exec` then ends the child with bash's status (127 for `ENOENT`, 126 otherwise) instead.
+fn child_descriptors(command: &mut Command, request: &SpawnRequest) -> Result<(), PlatformError> {
     let fds: Vec<i32> = request.inherit.iter().map(AsRawFd::as_raw_fd).collect();
+    let bad = |errno| PlatformError::Os {
+        operation: Operation::Spawn,
+        errno,
+    };
     // Stdio is set up by the command itself; a number below 3 here would be silently replaced.
     if fds.iter().any(|&fd| fd < 3) {
-        return Err(PlatformError::Os {
-            operation: Operation::Spawn,
-            errno: libc::EBADF,
-        });
+        return Err(bad(libc::EBADF));
     }
+    let placements = placements(request).ok_or_else(|| bad(libc::EINVAL))?;
+    let targets: Vec<i32> = placements.iter().map(|&(target, _)| target).collect();
+    let keep: Vec<i32> = fds
+        .iter()
+        .copied()
+        .chain(
+            placements
+                .iter()
+                .filter(|(_, source)| source.is_some())
+                .map(|&(target, _)| target),
+        )
+        .collect();
+    let mut copies = vec![-1; placements.len()];
+    let image = if targets.iter().any(|&target| target > 2) {
+        Some(ExecImage::new(request).ok_or_else(|| bad(libc::EINVAL))?)
+    } else {
+        None
+    };
     // Read before the fork: no descriptor number in the child can reach the table size.
     // SAFETY: `getdtablesize` has no preconditions and touches no memory.
     let table_size = unsafe { libc::getdtablesize() };
@@ -106,12 +136,50 @@ fn inherit(command: &mut Command, request: &SpawnRequest) -> Result<(), Platform
     ];
     let listed_bytes = libc::c_int::try_from(listed.len() * size_of::<libc::proc_fdinfo>()).unwrap_or(libc::c_int::MAX);
     // SAFETY: the closure runs in the forked child before `exec`. It only calls `getpid`, `proc_pidinfo` (a thin
-    // wrapper of the `proc_info` system call: no lock, no allocation), `fcntl` and `close`, and reads or writes only
-    // memory allocated before the fork (`fds`, `listed`, whose length in bytes `listed_bytes` never exceeds). The
-    // listed descriptors are open: `request` (and so every `SharedFd`) outlives the spawn, and the child inherited
-    // them at the fork.
+    // wrapper of the `proc_info` system call: no lock, no allocation), `fcntl`, `dup2`, `close`, `execve` and
+    // `_exit`, and reads or writes only memory allocated before the fork (`fds`, `keep`, `targets`, `placements`, `copies`,
+    // `listed`, whose length in bytes `listed_bytes` never exceeds, and `image`). The listed and placed source
+    // descriptors are open: `request` (and so every `SharedFd`) outlives the spawn, and the child inherited them at
+    // the fork.
     unsafe {
         command.pre_exec(move || {
+            // Each copy takes the lowest free number from 3 that is not a target, so writing a target never
+            // overwrites a copy. A copy that lands on a target number is left open there (the target is written or
+            // closed below, which replaces it) and the source copied again; at most one extra copy per target. Not
+            // above every target: with a target at `MAX_PLACED_FD` that would need a number past the default limit
+            // of 256 open descriptors.
+            for (copy, (_, source)) in copies.iter_mut().zip(&placements) {
+                if let Some(source) = source {
+                    loop {
+                        *copy = libc::fcntl(*source, libc::F_DUPFD, 3);
+                        if *copy == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if !targets.contains(copy) {
+                            break;
+                        }
+                    }
+                }
+            }
+            // From the first target written on, std's pipe that reports a failed `exec` may already be one of the
+            // targets (only with `image`, which is there whenever a target is above 2): reporting a failure through
+            // it would write std's error bytes into the placed file. The child then ends with 126 instead.
+            let failed = |image: &Option<ExecImage>| -> std::io::Error {
+                if image.is_some() {
+                    libc::_exit(126);
+                }
+                std::io::Error::last_os_error()
+            };
+            for (&copy, &(target, _)) in copies.iter().zip(&placements) {
+                if copy == -1 {
+                    libc::close(target);
+                } else if libc::dup2(copy, target) == -1 {
+                    return Err(failed(&image));
+                }
+            }
+            for &copy in copies.iter().filter(|&&copy| copy != -1) {
+                libc::close(copy);
+            }
             let got = libc::proc_pidinfo(
                 libc::getpid(),
                 libc::PROC_PIDLISTFDS,
@@ -123,24 +191,123 @@ fn inherit(command: &mut Command, request: &SpawnRequest) -> Result<(), Platform
                 Ok(bytes) if got > 0 && got < listed_bytes => {
                     let count = bytes / size_of::<libc::proc_fdinfo>();
                     for entry in listed.iter().take(count) {
-                        close_if_leaked(entry.proc_fd, &fds);
+                        close_if_leaked(entry.proc_fd, &keep);
                     }
                 }
                 Ok(_) | Err(_) => {
                     for fd in 3..table_size {
-                        close_if_leaked(fd, &fds);
+                        close_if_leaked(fd, &keep);
                     }
                 }
             }
             for &fd in &fds {
                 if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
+                    return Err(failed(&image));
                 }
+            }
+            if let Some(image) = &image {
+                image.exec();
             }
             Ok(())
         });
     }
     Ok(())
+}
+
+/// `request.placements` as (target, source number) pairs, the source read in the child: a shared descriptor's own
+/// number or a standard one. `None` if a target is out of range or repeated, collides with an inherited number, or a
+/// standard source is not 0 to 2.
+fn placements(request: &SpawnRequest) -> Option<Vec<(i32, Option<i32>)>> {
+    let mut out: Vec<(i32, Option<i32>)> = Vec::with_capacity(request.placements.len());
+    for placement in &request.placements {
+        let target = placement.target;
+        let repeated = out.iter().any(|&(seen, _)| seen == target);
+        let inherited = request.inherit.iter().any(|fd| fd.as_raw_fd() == target);
+        if !(0..=MAX_PLACED_FD).contains(&target) || repeated || inherited {
+            return None;
+        }
+        let source = match &placement.source {
+            None => None,
+            Some(PlacementSource::Shared(fd)) => Some(fd.as_raw_fd()),
+            Some(PlacementSource::Stdio(fd @ 0..=2)) => Some(*fd),
+            Some(PlacementSource::Stdio(_)) => return None,
+        };
+        out.push((target, source));
+    }
+    Some(out)
+}
+
+/// What `execve` needs, built before the fork so the child allocates nothing: the program, `argv` and the
+/// environment as C strings, with null-terminated pointer arrays into them.
+struct ExecImage {
+    /// The program's path.
+    program: CString,
+    /// `argv[0]` and the arguments; owns what `argv` points to.
+    _args: Vec<CString>,
+    /// `NAME=value` for each variable; owns what `envp` points to.
+    _env: Vec<CString>,
+    /// Pointers into `_args`, then a null pointer.
+    argv: Vec<*const libc::c_char>,
+    /// Pointers into `_env`, then a null pointer.
+    envp: Vec<*const libc::c_char>,
+}
+
+// SAFETY: the pointers point into heap buffers the same value owns (`CString` contents never move when the struct
+// does), are only read, and only by `execve` in the child; nothing is shared mutably across threads.
+unsafe impl Send for ExecImage {}
+// SAFETY: as for `Send`: the value is never mutated after it is built.
+unsafe impl Sync for ExecImage {}
+
+impl ExecImage {
+    /// The image of `request`, or `None` if a string holds a NUL byte (std refuses such a command too).
+    fn new(request: &SpawnRequest) -> Option<Self> {
+        let c_string = |bytes: &[u8]| CString::new(bytes).ok();
+        let program = c_string(request.program.as_os_str().as_bytes())?;
+        let argv0 = request.argv0.as_deref().unwrap_or(request.program.as_os_str());
+        let args = std::iter::once(argv0)
+            .chain(request.args.iter().map(OsString::as_os_str))
+            .map(|arg| c_string(arg.as_bytes()))
+            .collect::<Option<Vec<CString>>>()?;
+        let env = request
+            .env
+            .iter()
+            .map(|(name, value)| {
+                let mut entry = name.as_bytes().to_vec();
+                if entry.contains(&b'=') {
+                    return None;
+                }
+                entry.push(b'=');
+                entry.extend_from_slice(value.as_bytes());
+                c_string(&entry)
+            })
+            .collect::<Option<Vec<CString>>>()?;
+        let pointers = |strings: &[CString]| {
+            strings
+                .iter()
+                .map(|s| s.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect()
+        };
+        Some(Self {
+            argv: pointers(&args),
+            envp: pointers(&env),
+            program,
+            _args: args,
+            _env: env,
+        })
+    }
+
+    /// Executes the image; returns only by ending the process. In the forked child only: async-signal-safe
+    /// (`execve` and `_exit`, reading memory allocated before the fork).
+    fn exec(&self) -> ! {
+        // SAFETY: every pointer is valid and null-terminated (built in `new` and owned by `self`, which lives until
+        // the process image is replaced or ends). `_exit` takes a plain integer.
+        unsafe {
+            libc::execve(self.program.as_ptr(), self.argv.as_ptr(), self.envp.as_ptr());
+            let failed_as = if *libc::__error() == libc::ENOENT { 127 } else { 126 };
+            libc::_exit(failed_as)
+        }
+    }
 }
 
 /// Entries for the child's list of open descriptors: the parent's count now, plus room for those other threads open
@@ -216,7 +383,7 @@ impl Processes for SystemProcesses {
         }
         let [stdin, stdout, stderr] = standard_descriptors(&request.stdio)?;
         command.stdin(stdin).stdout(stdout).stderr(stderr);
-        inherit(&mut command, request)?;
+        child_descriptors(&mut command, request)?;
         let child = command
             .spawn()
             .map_err(|error| PlatformError::from_io(Operation::Spawn, &error))?;
@@ -334,6 +501,7 @@ impl Processes for SystemProcesses {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::Placement;
 
     // CLAUDE.md "Concurrency": never signal a pid that may have been reused.
     #[test]
@@ -467,6 +635,151 @@ mod tests {
         let mut text = String::new();
         out_read.read_to_string(&mut text).unwrap();
         assert_eq!(text, "closed\n");
+    }
+
+    /// Spawns `/bin/sh -c script` with stdin `/dev/null`, stdout and stderr on two pipes and `placements`; returns
+    /// (exit status, stdout, stderr).
+    fn run_placed(script: &str, placements: Vec<Placement>) -> (ExitStatus, String, String) {
+        use std::io::Read;
+
+        let (mut out_read, out_write) = std::io::pipe().unwrap();
+        let (mut err_read, err_write) = std::io::pipe().unwrap();
+        let null = SharedFd::new(std::fs::File::open("/dev/null").unwrap().into());
+        let mut request = SpawnRequest::new("/bin/sh").arg("-c").arg(script);
+        request.stdio = Stdio::Passed(Box::new([
+            null,
+            SharedFd::new(out_write.into()),
+            SharedFd::new(err_write.into()),
+        ]));
+        request.placements = placements;
+        let processes = SystemProcesses::new();
+        let group = processes.spawn(&request).unwrap();
+        let status = processes.wait(group).unwrap();
+        drop(request);
+        let (mut out, mut err) = (String::new(), String::new());
+        out_read.read_to_string(&mut out).unwrap();
+        err_read.read_to_string(&mut err).unwrap();
+        (status, out, err)
+    }
+
+    fn placed(target: i32, source: PlacementSource) -> Placement {
+        Placement {
+            target,
+            source: Some(source),
+        }
+    }
+
+    // KNSH-099: placements put descriptors at the numbers asked for; every source is read before any target is
+    // written, so `1>&2 2>&1` swaps standard output and error.
+    #[test]
+    fn placements_swap_standard_descriptors() {
+        let (status, out, err) = run_placed(
+            "echo to-one; echo to-two >&2",
+            vec![
+                placed(1, PlacementSource::Stdio(2)),
+                placed(2, PlacementSource::Stdio(1)),
+            ],
+        );
+        assert_eq!(status, ExitStatus::Exited(0));
+        assert_eq!((out.as_str(), err.as_str()), ("to-two\n", "to-one\n"));
+    }
+
+    // KNSH-099: a shared descriptor placed above stdio keeps that number in the child (even one whose source number
+    // is itself a target), a closed number is closed, and nothing else leaks.
+    #[test]
+    fn placements_set_numbers_above_stdio_and_close() {
+        use std::io::Read;
+
+        let (mut three_read, three_write) = std::io::pipe().unwrap();
+        let three = SharedFd::new(three_write.into());
+        let (_leak_read, leak_write) = std::io::pipe().unwrap();
+        let leak_fd = leak_write.as_raw_fd();
+        // The pipe's own number is a target too: it receives `/dev/null`, after the pipe was read for 250. (Test
+        // descriptors stay far below 250.)
+        let own = three.as_raw_fd();
+        let null = SharedFd::new(std::fs::File::open("/dev/null").unwrap().into());
+        let script = format!(
+            "echo seven >&250; [ -e /dev/fd/{leak_fd} ] && echo leaked; echo x >&251 2>/dev/null || echo closed; \
+             [ -e /dev/fd/{own} ] && echo own-placed"
+        );
+        let (status, out, _) = run_placed(
+            &script,
+            vec![
+                placed(250, PlacementSource::Shared(three.clone())),
+                placed(own, PlacementSource::Shared(null)),
+                Placement {
+                    target: 251,
+                    source: None,
+                },
+            ],
+        );
+        drop(three);
+        drop(leak_write);
+        assert_eq!(status, ExitStatus::Exited(0));
+        assert_eq!(out, "closed\nown-placed\n");
+        let mut text = String::new();
+        three_read.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "seven\n");
+    }
+
+    // KNSH-099: a source's copy never lands on a target number. The lowest free number is made a target, which is
+    // where a plain `F_DUPFD(source, 3)` would put the copy (and then close it with the copies); it must still hold
+    // standard output, and 255 (`MAX_PLACED_FD`) can be given even though copies above every target would need
+    // descriptor 256, past macOS's default soft limit.
+    #[test]
+    fn placement_copies_avoid_target_numbers() {
+        let free = std::fs::File::open("/dev/null").unwrap().as_raw_fd();
+        let script = format!("echo low >&{free}; echo top >&255");
+        let (status, out, err) = run_placed(
+            &script,
+            vec![
+                placed(free, PlacementSource::Stdio(1)),
+                placed(MAX_PLACED_FD, PlacementSource::Stdio(1)),
+            ],
+        );
+        assert_eq!(status, ExitStatus::Exited(0), "{err}");
+        assert_eq!(out, "low\ntop\n");
+    }
+
+    // KNSH-099: with a placement above stdio the child executes the program itself, so a program that cannot be
+    // executed ends with bash's status (127 missing, 126 refused) instead of std's report landing in a placed file.
+    #[test]
+    fn placed_spawn_of_missing_program_exits_127() {
+        let null = SharedFd::new(std::fs::File::open("/dev/null").unwrap().into());
+        let processes = SystemProcesses::new();
+        let mut request = SpawnRequest::new("/nonexistent/knsh-placed");
+        request.placements = vec![placed(3, PlacementSource::Shared(null.clone()))];
+        let group = processes.spawn(&request).unwrap();
+        assert_eq!(processes.wait(group), Ok(ExitStatus::Exited(127)));
+        let mut request = SpawnRequest::new("/etc");
+        request.placements = vec![placed(3, PlacementSource::Shared(null))];
+        let group = processes.spawn(&request).unwrap();
+        assert_eq!(processes.wait(group), Ok(ExitStatus::Exited(126)));
+    }
+
+    // KNSH-099: a target out of range, repeated, or a standard source other than 0 to 2 is refused before forking.
+    #[test]
+    fn refuses_invalid_placements() {
+        let processes = SystemProcesses::new();
+        for placements in [
+            vec![placed(MAX_PLACED_FD + 1, PlacementSource::Stdio(1))],
+            vec![placed(-1, PlacementSource::Stdio(1))],
+            vec![
+                placed(4, PlacementSource::Stdio(1)),
+                placed(4, PlacementSource::Stdio(2)),
+            ],
+            vec![placed(4, PlacementSource::Stdio(3))],
+        ] {
+            let mut request = SpawnRequest::new("/usr/bin/true");
+            request.placements = placements;
+            assert_eq!(
+                processes.spawn(&request),
+                Err(PlatformError::Os {
+                    operation: Operation::Spawn,
+                    errno: libc::EINVAL
+                })
+            );
+        }
     }
 
     #[test]

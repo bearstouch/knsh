@@ -10,7 +10,11 @@
 //! ([`ShellOptions::nounset`]); [`evaluate_arithmetic`] evaluates one arithmetic expression on its own. KNSH-098
 //! adds brace expansion, `IFS` word splitting, pathname expansion (with `set -f` and the `dotglob`, `nullglob`,
 //! `failglob`, `nocaseglob`, `globstar` and `extglob` options of [`ShellOptions`]), `$'…'` and quote removal, in
-//! bash's order.
+//! bash's order. KNSH-099 adds every redirection but here-documents (`< > >> >| <> <& >& &> &>> <<<`, numbered and
+//! `{name}` descriptors, closing with `-`, moving with `n-`, `set -C` as [`ShellOptions::noclobber`]), applied left to
+//! right on the shell's own descriptor table and undone after each command, `exec` with redirections only (kept for
+//! the shell's life) and `:`; `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd/N` name the shell's
+//! descriptors, and `/dev/tcp` and `/dev/udp` are refused (FR-NET-08).
 //!
 //! # Boundaries
 //!
@@ -18,12 +22,14 @@
 //!   segments; only the bodies the parser keeps whole (`${…}`, `$((…))`, `(( … ))`) are read again, as bash reads
 //!   them when it expands them. `case` patterns, the pattern operators and pathname expansion match with bash's
 //!   `*`, `?`, bracket and (with `extglob`) group rules. A script using `extglob` groups in its own text is parsed
-//!   with [`knsh_bash::parse_with`].
+//!   with [`knsh_bash::parse_with`]; so is a script using `{name}>file` (with
+//!   [`knsh_bash::ParseOptions::redirection_variables`], as bash 4.1 and later read it).
 //! - Every effect goes through an injected trait from `knsh-platform`: commands are looked up and directories read
 //!   for pathname expansion through [`knsh_platform::Fs`], file names sorted through [`knsh_platform::Collation`]
-//!   (bash's `strcoll` order), and commands run through [`knsh_platform::CommandSpawner`], so tests run without
-//!   processes or a real filesystem. That spawner is where KNSH-108 inserts a decision before each command.
-//! - What later stories implement (command substitution, redirections, pipelines and subshells, functions, arrays,
+//!   (bash's `strcoll` order), redirection files opened through [`knsh_platform::Descriptors`], and commands run
+//!   through [`knsh_platform::CommandSpawner`] with exactly the shell's descriptor table, so tests run without
+//!   processes or a real filesystem and no descriptor of the interpreter's own process reaches a command. That spawner is where KNSH-108 inserts a decision before each command.
+//! - What later stories implement (command substitution, here-documents, pipelines and subshells, functions, arrays,
 //!   most builtins) is refused with [`InterpError::Unsupported`] by a check of the
 //!   whole script before anything runs, or, when only an expansion's value reveals it, when that expansion runs. Builtins whose
 //!   external program behaves the same for literal arguments (`echo`, `printf`, `true`, `false`, `test`, `[`) run as
@@ -32,11 +38,14 @@
 //!   [`InterpError::DepthExceeded`], on an evaluation thread whose stack ([`EVAL_STACK_SIZE`]) holds that many
 //!   levels. Loops have no iteration limit, as in bash. Brace and pathname expansion are bounded in words, size and
 //!   directory entries read, failing with [`InterpError::ExpansionLimit`].
-//! - No `unsafe`, no I/O of its own beyond the injected traits and the diagnostics writer, no third-party crates.
+//! - No `unsafe`, no I/O of its own beyond the injected traits and the diagnostics and output writers, no
+//!   third-party crates.
 //!
 //! # Specification
 //!
 //! - `specs/00-stories/KNSH-096-interpreter-core-and-ast-evaluator.md`
+//! - `specs/00-stories/KNSH-099-redirections-and-descriptor-management.md`, `specs/09-reference/decisions.md`
+//!   (decision 18: network redirections refused)
 //! - `specs/04-non-functional-requirements/compatibility.md` (NFR-COMPAT-01: bash semantics; NFR-COMPAT-02: corpus
 //!   behaviour; NFR-COMPAT-09: 126 and 127)
 //! - `specs/00-stories/KNSH-097-parameter-variable-and-arithmetic-expansion.md`

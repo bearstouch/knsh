@@ -88,6 +88,7 @@ mod tests {
             args: Vec::new(),
             env: Vec::new(),
             cwd: "/".into(),
+            descriptors: CommandRequest::standard_descriptors(),
         }
     }
 

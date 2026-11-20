@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::error::{Operation, PlatformError};
-use crate::process::{ExitStatus, Processes, SpawnRequest, Stdio};
+use crate::process::{ExitStatus, Placement, PlacementSource, Processes, SharedFd, SpawnRequest, Stdio};
 
 /// One external command, resolved by the interpreter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +31,60 @@ pub struct CommandRequest {
     pub env: Vec<(OsString, OsString)>,
     /// The shell's working directory, absolute.
     pub cwd: PathBuf,
+    /// The command's whole descriptor table, by number in increasing order: what the shell's redirections left
+    /// (KNSH-099). A number not listed is closed in the command, so nothing reaches it that the shell did not pass
+    /// (bash passes every descriptor it holds open for the script and none of its own). [`standard_descriptors`]
+    /// is the table of a command without redirections.
+    ///
+    /// [`standard_descriptors`]: CommandRequest::standard_descriptors
+    pub descriptors: Vec<(i32, ChildDescriptor)>,
+}
+
+impl CommandRequest {
+    /// Standard input, output and error as the spawner's own: the table of a command without redirections.
+    #[must_use]
+    pub fn standard_descriptors() -> Vec<(i32, ChildDescriptor)> {
+        StandardStream::ALL
+            .iter()
+            .map(|&stream| (stream.number(), ChildDescriptor::Standard(stream)))
+            .collect()
+    }
+}
+
+/// One of the three standard descriptors a [`CommandSpawner`] gives every command it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum StandardStream {
+    /// Standard input, descriptor 0.
+    Input,
+    /// Standard output, descriptor 1.
+    Output,
+    /// Standard error, descriptor 2.
+    Error,
+}
+
+impl StandardStream {
+    /// The three, in descriptor order.
+    pub const ALL: [Self; 3] = [Self::Input, Self::Output, Self::Error];
+
+    /// The descriptor number: 0, 1 or 2.
+    #[must_use]
+    pub const fn number(self) -> i32 {
+        match self {
+            Self::Input => 0,
+            Self::Output => 1,
+            Self::Error => 2,
+        }
+    }
+}
+
+/// What one descriptor of a command holds.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ChildDescriptor {
+    /// One of the spawner's standard descriptors (what a command gets without redirections): `2>&1` while standard
+    /// output is the shell's own makes descriptor 2 `Standard(Output)`.
+    Standard(StandardStream),
+    /// A file, pipe or other descriptor the shell opened (`>file`, `<<<text`, `exec 3>file`).
+    Open(SharedFd),
 }
 
 /// How an external command ended, as far as the shell's exit status is concerned.
@@ -98,6 +152,7 @@ impl CommandSpawner for ProcessCommandSpawner {
             cwd: Some(request.cwd.clone()),
             stdio: self.stdio.clone(),
             inherit: Vec::new(),
+            placements: placements(&request.descriptors),
         };
         let group = match self.processes.spawn(&spawn) {
             Ok(group) => group,
@@ -109,6 +164,34 @@ impl CommandSpawner for ProcessCommandSpawner {
         };
         self.processes.wait(group).map(CommandOutcome::Finished)
     }
+}
+
+/// The placements that turn the spawner's standard descriptors into `descriptors`: every standard number the table
+/// does not hold as the same stream is placed or closed, every number above them is placed. A table of the three
+/// standard streams in place needs none, so a command without redirections spawns exactly as before KNSH-099.
+fn placements(descriptors: &[(i32, ChildDescriptor)]) -> Vec<Placement> {
+    let mut placements = Vec::new();
+    for stream in StandardStream::ALL {
+        let number = stream.number();
+        if !descriptors.iter().any(|(target, _)| *target == number) {
+            placements.push(Placement {
+                target: number,
+                source: None,
+            });
+        }
+    }
+    for (target, descriptor) in descriptors {
+        let source = match descriptor {
+            ChildDescriptor::Standard(held) if held.number() == *target => continue,
+            ChildDescriptor::Standard(held) => PlacementSource::Stdio(held.number()),
+            ChildDescriptor::Open(fd) => PlacementSource::Shared(fd.clone()),
+        };
+        placements.push(Placement {
+            target: *target,
+            source: Some(source),
+        });
+    }
+    placements
 }
 
 /// The outcome of a spawn that failed with `errno`, as bash's `shell_execve` reports it: `ENOENT` is 127, every
@@ -137,6 +220,7 @@ mod tests {
             args: vec!["a".into()],
             env: vec![("PATH".into(), "/bin".into())],
             cwd: PathBuf::from("/work"),
+            descriptors: CommandRequest::standard_descriptors(),
         }
     }
 
@@ -169,6 +253,43 @@ mod tests {
             let spawner = ProcessCommandSpawner::new(processes, Stdio::Null);
             assert_eq!(spawner.run(&request("/bin/tool")).unwrap(), outcome, "errno {errno}");
         }
+    }
+
+    // KNSH-099: a table of the standard streams in place spawns with no placements; any other table becomes the
+    // placements that produce it, closing the standard numbers it leaves out.
+    #[test]
+    fn descriptor_table_becomes_placements() {
+        let processes = Arc::new(ScriptedProcesses::new());
+        processes.expect("/bin/tool", Script::Exits(0));
+        processes.expect("/bin/tool", Script::Exits(0));
+        let spawner = ProcessCommandSpawner::new(processes.clone(), Stdio::Null);
+        spawner.run(&request("/bin/tool")).unwrap();
+        let file = SharedFd::new(std::fs::File::open("/dev/null").unwrap().into());
+        let mut redirected = request("/bin/tool");
+        redirected.descriptors = vec![
+            (1, ChildDescriptor::Open(file.clone())),
+            (2, ChildDescriptor::Standard(StandardStream::Output)),
+            (5, ChildDescriptor::Open(file.clone())),
+        ];
+        spawner.run(&redirected).unwrap();
+        let requests = processes.spawned();
+        assert_eq!(requests[0].placements, []);
+        let placed = |target, source| Placement {
+            target,
+            source: Some(source),
+        };
+        assert_eq!(
+            requests[1].placements,
+            [
+                Placement {
+                    target: 0,
+                    source: None
+                },
+                placed(1, PlacementSource::Shared(file.clone())),
+                placed(2, PlacementSource::Stdio(1)),
+                placed(5, PlacementSource::Shared(file)),
+            ]
+        );
     }
 
     // A resource shortage is not the program's fault: it stays an error instead of a made-up status.

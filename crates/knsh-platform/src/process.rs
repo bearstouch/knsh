@@ -98,6 +98,35 @@ pub struct SpawnRequest {
     /// child only), for example a status pipe whose number the child is told in an argument. Everything else the
     /// engine has open stays close-on-exec and never reaches the child.
     pub inherit: Vec<SharedFd>,
+    /// Descriptors the child gets under numbers of the caller's choosing, after [`stdio`](Self::stdio) is set up: a
+    /// shell's redirections (`3>file`, `2>&1`, `>&-`), KNSH-099. Each target number appears at most once and never
+    /// as an [`inherit`](Self::inherit) descriptor's number; numbers 0 to 2 here replace what `stdio` put there.
+    /// Every source is read before any target is written, so `1>&2 2>&1` swaps rather than collapses. Empty for
+    /// every other caller.
+    pub placements: Vec<Placement>,
+}
+
+/// Most descriptor numbers a [`Placement`] may target: 0 to `MAX_PLACED_FD`. Below macOS's default soft limit on open
+/// descriptors (256), so a placement never fails in the child for a number its limit does not cover.
+pub const MAX_PLACED_FD: i32 = 255;
+
+/// One descriptor number of a child and what it holds ([`SpawnRequest::placements`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Placement {
+    /// The number in the child, 0 to [`MAX_PLACED_FD`].
+    pub target: i32,
+    /// What the number holds, or `None` to close it.
+    pub source: Option<PlacementSource>,
+}
+
+/// Where a [`Placement`]'s descriptor comes from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PlacementSource {
+    /// A descriptor of this process. The child gets its own copy; this one stays as it is.
+    Shared(SharedFd),
+    /// The child's own standard descriptor 0, 1 or 2 as [`SpawnRequest::stdio`] set it up, before any placement
+    /// (for `2>&1` when standard output is the caller's).
+    Stdio(i32),
 }
 
 impl SpawnRequest {
@@ -113,6 +142,7 @@ impl SpawnRequest {
             cwd: None,
             stdio: Stdio::Null,
             inherit: Vec::new(),
+            placements: Vec::new(),
         }
     }
 

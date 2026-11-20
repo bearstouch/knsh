@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use knsh_bash::{ParseOptions, parse_with};
 use knsh_interp::{InterpError, Interpreter, ShellState};
-use knsh_platform::testing::{FakeCollation, FakeUserHomes, MemFs, ScriptedCommands};
+use knsh_platform::testing::{FakeCollation, FakeDescriptors, FakeUserHomes, MemFs, ScriptedCommands};
 use knsh_platform::{CommandOutcome, ExitStatus, Fs};
 
 /// Longest word text tried: brace expansion and matching are polynomial, and a short input keeps each run fast.
@@ -64,13 +64,16 @@ fn run(line: &str, flags: u8) -> Option<Outcome> {
     if flags & 128 != 0 {
         state.set_variable("IFS", ":");
     }
-    let fs: Arc<dyn Fs> = Arc::new(files());
+    let files = Arc::new(files());
+    let fs: Arc<dyn Fs> = files.clone();
     let mut interpreter = Interpreter::new(
         state,
         fs,
         commands.clone(),
         Arc::new(FakeUserHomes::new().with_user("u", "/home/u")),
         Arc::new(FakeCollation::new().with_locale("en_US.UTF-8")),
+        // Redirections in the text (KNSH-099) open files in the same memory filesystem.
+        Arc::new(FakeDescriptors::new(files)),
         Box::new(std::io::sink()),
     );
     let result = interpreter.run(&script, line).map(knsh_interp::Status::code);

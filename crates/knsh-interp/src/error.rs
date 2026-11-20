@@ -127,8 +127,11 @@ pub enum Unsupported {
     NonUtf8Value,
     /// A file name that is not UTF-8, matched by pathname expansion. Passing it on unchanged needs byte-level words.
     NonUtf8FileName,
-    /// A redirection, on a simple or compound command (KNSH-099).
+    /// A redirection after `(( … ))` or `for (( … ))`, which the parser keeps opaque, so its redirections are not
+    /// read.
     Redirection,
+    /// A here-document, `<<` or `<<-` (KNSH-105).
+    HereDocument,
     /// A pipeline of more than one command (KNSH-100).
     Pipeline,
     /// A list run in the background with `&` (KNSH-100).
@@ -161,7 +164,8 @@ impl fmt::Display for Unsupported {
             Self::DirectoryStack => f.write_str("the directory stack and OLDPWD (KNSH-101)"),
             Self::NonUtf8Value => f.write_str("a variable value that is not UTF-8"),
             Self::NonUtf8FileName => f.write_str("a file name that is not UTF-8"),
-            Self::Redirection => f.write_str("redirection (KNSH-099)"),
+            Self::Redirection => f.write_str("a redirection of an arithmetic command"),
+            Self::HereDocument => f.write_str("here-document (KNSH-105)"),
             Self::Pipeline => f.write_str("pipeline (KNSH-100)"),
             Self::Background => f.write_str("background list (KNSH-100)"),
             Self::Subshell => f.write_str("subshell (KNSH-100)"),
