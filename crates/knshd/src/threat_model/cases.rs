@@ -855,9 +855,119 @@ fn secret_not_visible_to_other_process_groups() {
         assert_eq!(exit_code(&holding.join().unwrap()), 0);
     });
     case.pending(
-        "secret injection (secrets.env: only approved matching lines receive a secret, their network narrowed to its \
-         hosts, FR-SEC-01 – FR-SEC-05) is completed in phase 3; only the process-information limit is tested here",
+        "secret injection and network narrowing (FR-SEC-01 – FR-SEC-04) are tested by \
+         injected_secret_reaches_only_its_hosts; this case covers the process-information limit (FR-SEC-05)",
     );
+    case.passed();
+}
+
+// Row "An agent leaks a secret" (FR-SEC-01 – FR-SEC-04, FR-SEC-06, FR-NET-10; KNSH-092): a granted `curl` matching
+// `inject_for` is given the secret, which its output shows only redacted, and reaches the secret's host through the
+// real proxy; the same line sending it to another host of `network.hosts` is refused (`secret_hosts`) and no byte
+// arrives. Positive control: without the secret (`ls`-only line), that other host is reached.
+#[test]
+fn injected_secret_reaches_only_its_hosts() {
+    let Some((case, bins)) = binaries(Case::start("injected_secret_reaches_only_its_hosts")) else {
+        return;
+    };
+    let token = format!(
+        "ghp_tm{}x{}",
+        std::process::id(),
+        Ulid::from_u128(u128::from(std::process::id()))
+    );
+    let secrets = crate::redaction::tests::FakeSecrets::default();
+    secrets
+        .stored
+        .lock()
+        .unwrap()
+        .push(("gh-token", Box::leak(token.clone().into_boxed_str())));
+    let stack = Stack::start_with(
+        "inject",
+        &bins,
+        super::harness::Wiring {
+            redactors: Some(crate::redaction::Redactors::new(std::sync::Arc::new(secrets))),
+            ..super::harness::Wiring::default()
+        },
+    );
+    // The test server is on loopback, so its address is listed in both `network.hosts` and the secret's `hosts`
+    // (FR-NET-07); the names decide.
+    stack.profile(
+        "inject",
+        "[fs]\nwrite = [\"${PROJECT}\"]\n[exec]\nallow = [\"curl\", \"printenv\"]\n[network]\nmode = \"allowlist\"\n\
+         hosts = [\"allowed.test\", \"other.test\", \"127.0.0.1\"]\n[secrets.env]\n\
+         GH_TOKEN = { secret = \"gh-token\", inject_for = [\"curl\"], hosts = [\"allowed.test\", \"127.0.0.1\"] }\n",
+    );
+    let (server, received) = recording_tcp();
+    stack.resolver.answer("allowed.test", &[server.ip()]);
+    stack.resolver.answer("other.test", &[server.ip()]);
+    let session = stack.session("inject");
+    let now = knsh_platform::macos::SystemClock::new().now().unwrap();
+    let expires = Timestamp::from_unix_micros(now.as_unix_micros() + 3_600_000_000).unwrap();
+    let grant = Grant::new(
+        GrantId::from_ulid(Ulid::from_u128(92)),
+        GrantScope::Session(session),
+        "curl",
+        expires,
+    );
+    stack.grants.insert(grant.unwrap(), now).unwrap();
+    let port = server.port();
+    let line = |host: &str| {
+        let command = format!("curl -s -m 10 https://{host}:{port}/; printenv GH_TOKEN");
+        let finished = stack.line(session, &command, &[]).unwrap();
+        let record = stack.record_of(session, &finished);
+        (output(&finished).0, record)
+    };
+
+    // The secret's host: reached, its ClientHello arrives; the line had the token, shown only redacted.
+    let (stdout, record) = line("allowed.test");
+    assert!(contacted(&record.details.network, "allowed.test"), "{record:?}");
+    assert!(first_bytes_arrive(&received));
+    assert_eq!(stdout.trim(), "«redacted:gh-token»");
+    assert_eq!(record.details.secrets_injected, ["gh-token"]);
+    assert_eq!(record.details.decision.unwrap().source, DecisionSource::Grant);
+
+    // Another host the profile opens: refused to this line, and nothing arrives.
+    let (stdout, record) = line("other.test");
+    assert!(
+        refused_for(&record.details.network, "other.test", "secret_hosts"),
+        "{record:?}"
+    );
+    assert!(
+        !record
+            .details
+            .network
+            .iter()
+            .any(|entry| entry.result == NetworkResult::Contacted),
+        "{record:?}"
+    );
+    assert_eq!(stdout.trim(), "«redacted:gh-token»");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        received.lock().unwrap().iter().all(Vec::is_empty),
+        "bytes reached other.test"
+    );
+    assert!(!format!("{record:?}").contains(&token));
+
+    // Positive control: the same line under the same network without `[secrets.env]` receives nothing and reaches
+    // that host.
+    stack.profile(
+        "plain",
+        "[fs]\nwrite = [\"${PROJECT}\"]\n[exec]\nallow = [\"curl\", \"printenv\"]\n[network]\nmode = \"allowlist\"\n\
+         hosts = [\"allowed.test\", \"other.test\", \"127.0.0.1\"]\n",
+    );
+    let plain = stack.session("plain");
+    let finished = stack
+        .line(
+            plain,
+            &format!("curl -s -m 10 https://other.test:{port}/; printenv GH_TOKEN"),
+            &[],
+        )
+        .unwrap();
+    let record = stack.record_of(plain, &finished);
+    assert!(contacted(&record.details.network, "other.test"), "{record:?}");
+    assert!(first_bytes_arrive(&received));
+    assert_eq!(output(&finished).0, "");
+    assert_eq!(record.details.secrets_injected, Vec::<String>::new());
     case.passed();
 }
 

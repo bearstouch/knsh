@@ -47,6 +47,8 @@ pub enum Refusal {
     ApprovalRequired,
     /// An approval host asked for by a line holding dynamic code, which never reaches one (FR-NET-11, FR-POL-21).
     DynamicCode,
+    /// The line receives a secret whose `hosts` do not list the destination (FR-SEC-03, FR-NET-10).
+    SecretHosts,
     /// The name resolved to an address the checks refuse (FR-NET-07).
     AddressNotAllowed,
     /// The name could not be resolved.
@@ -87,6 +89,7 @@ impl Refusal {
             Self::NetworkOff => "network_off",
             Self::ApprovalRequired => "approval_required",
             Self::DynamicCode => "dynamic_code",
+            Self::SecretHosts => "secret_hosts",
             Self::AddressNotAllowed => "address_not_allowed",
             Self::Unresolved => "unresolved",
             Self::NoHostRules => "no_host_rules",

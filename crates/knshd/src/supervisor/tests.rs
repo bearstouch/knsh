@@ -170,6 +170,19 @@ impl Spawner for FakeSpawner {
         ));
         // The line's sandbox rules are tagged with the record it is written to (FR-SBX-06).
         self.journal.push(format!("record {}", plan.record_id));
+        // KNSH-092: what it is given, and the hosts its network is narrowed to.
+        for secret in &plan.secrets {
+            self.journal.push(format!(
+                "inject {}={} value={}",
+                secret.variable,
+                secret.name,
+                String::from_utf8_lossy(secret.value.expose())
+            ));
+        }
+        let narrowed = knsh_core::LineAccess::of(&plan.allowed).secret_hosts;
+        if !narrowed.is_empty() {
+            self.journal.push(format!("narrow {narrowed:?}"));
+        }
         if !matches!(
             self.outcome,
             Err(SpawnFailure::ProfileFile | SpawnFailure::Trampoline(_))
@@ -2131,4 +2144,218 @@ fn restores_pushed_policy_after_restart() {
         "the pushed policy, not the file, decides"
     );
     assert_eq!(daemon.spawns(), ["spawn echo hi as bash"]);
+}
+
+/// `git` allowed; `GH_TOKEN` (secret `gh-token`) injected into `git push`, narrowed to `github.com` (KNSH-092).
+const SECRETS: &str = "name = \"web\"\n[exec]\nallow = [\"git\", \"ls\", \"echo\"]\n[network]\nmode = \"allowlist\"\n\
+hosts = [\"github.com\", \"registry.npmjs.org\"]\n[secrets.env]\n\
+GH_TOKEN = { secret = \"gh-token\", inject_for = [\"git push\"], hosts = [\"github.com\"] }\n";
+
+/// The value the fake Keychain holds for `gh-token`.
+const GH_TOKEN: &str = "ghp_T0kenValue123";
+
+/// Redactors over a fake Keychain holding `stored`.
+fn keychain(stored: &[(&'static str, &'static str)]) -> Arc<crate::redaction::Redactors> {
+    let fake = crate::redaction::tests::FakeSecrets::default();
+    fake.stored.lock().unwrap().extend_from_slice(stored);
+    crate::redaction::Redactors::new(Arc::new(fake))
+}
+
+/// A setup on the `SECRETS` profile with `gh-token` in the Keychain, and a session grant for `git push`.
+fn granted(daemon: &Daemon, stored: &[(&'static str, &'static str)]) -> Setup {
+    let grants = crate::grants::GrantStore::new();
+    let now = daemon.clock.now().unwrap();
+    let expires = Timestamp::from_unix_micros(now.as_unix_micros() + 3_600_000_000).unwrap();
+    grants
+        .insert(
+            knsh_core::Grant::new(
+                knsh_core::GrantId::from_ulid(Ulid::from_u128(5)),
+                knsh_core::GrantScope::Session(daemon.session_id),
+                "git push",
+                expires,
+            )
+            .unwrap(),
+            now,
+        )
+        .unwrap();
+    Setup {
+        profiles: Some(vec![("web", SECRETS)]),
+        redactors: Some(keychain(stored)),
+        grants: Some(grants),
+        ..Setup::default()
+    }
+}
+
+fn injections(daemon: &Daemon) -> Vec<String> {
+    daemon
+        .journal
+        .entries()
+        .into_iter()
+        .filter(|entry| entry.starts_with("inject") || entry.starts_with("narrow"))
+        .collect()
+}
+
+// KNSH-092 secret_injected_only_for_matching_line (FR-SEC-01, FR-SEC-03, FR-REC-11): the line matching `inject_for`
+// receives the secret as its variable, narrowed to the secret's hosts, and its record names it; another line of the
+// same session receives nothing and is not narrowed.
+#[test]
+fn secret_injected_only_for_matching_line() {
+    let daemon = Daemon::new();
+    daemon
+        .next(granted(&daemon, &[("gh-token", GH_TOKEN)]), "git push origin main")
+        .unwrap();
+    assert_eq!(
+        injections(&daemon),
+        [
+            format!("inject GH_TOKEN=gh-token value={GH_TOKEN}"),
+            "narrow [[\"github.com\"]]".to_owned(),
+        ]
+    );
+    let pushed = daemon.records().pop().unwrap();
+    assert_eq!(pushed.details.secrets_injected, ["gh-token"]);
+    assert_eq!(pushed.details.decision.unwrap().source, DecisionSource::Grant);
+
+    daemon.journal.0.lock().unwrap().clear();
+    daemon
+        .next(granted(&daemon, &[("gh-token", GH_TOKEN)]), "git status")
+        .unwrap();
+    assert_eq!(injections(&daemon), Vec::<String>::new());
+    assert_eq!(
+        daemon.records().pop().unwrap().details.secrets_injected,
+        Vec::<String>::new()
+    );
+}
+
+// KNSH-092 matching_line_asks_without_grant (FR-SEC-02): without a grant, the line that would receive the secret asks,
+// naming `secrets.env[0]`; once approved it receives it. Unanswered, it is denied and receives nothing.
+#[test]
+fn matching_line_asks_without_grant() {
+    let daemon = Daemon::new();
+    let setup = || Setup {
+        profiles: Some(vec![("web", SECRETS)]),
+        redactors: Some(keychain(&[("gh-token", GH_TOKEN)])),
+        ..Setup::default()
+    };
+    daemon
+        .next(
+            Setup {
+                authority: Some(vec![AskReply::Allow]),
+                ..setup()
+            },
+            "git push",
+        )
+        .unwrap();
+    assert!(daemon.journal.entries().contains(&"ask git push".to_owned()));
+    assert_eq!(
+        injections(&daemon)[0],
+        format!("inject GH_TOKEN=gh-token value={GH_TOKEN}")
+    );
+    let decision = daemon.records().pop().unwrap().details.decision.unwrap();
+    assert_eq!(decision.source, DecisionSource::Authority);
+    assert_eq!(decision.rule_id.as_deref(), Some("secrets.env[0]"));
+
+    daemon.journal.0.lock().unwrap().clear();
+    daemon.next(setup(), "git push").unwrap_err();
+    assert_eq!(daemon.spawns(), Vec::<String>::new());
+    assert_eq!(
+        daemon.records().pop().unwrap().details.secrets_injected,
+        Vec::<String>::new()
+    );
+}
+
+// KNSH-092 grant_allows_injection_without_ask (FR-SEC-02): a grant covering the line answers the ask; no one is asked.
+#[test]
+fn grant_allows_injection_without_ask() {
+    let daemon = Daemon::new();
+    let setup = Setup {
+        // An authority that would fail the test if asked: its script is empty.
+        authority: Some(Vec::new()),
+        ..granted(&daemon, &[("gh-token", GH_TOKEN)])
+    };
+    daemon.next(setup, "git push").unwrap();
+    assert!(!daemon.journal.entries().iter().any(|entry| entry.starts_with("ask")));
+    assert_eq!(
+        injections(&daemon)[0],
+        format!("inject GH_TOKEN=gh-token value={GH_TOKEN}")
+    );
+}
+
+// KNSH-092 dynamic_code_never_receives_secret (FR-SEC-04): a line holding dynamic code receives no secret even when
+// a command matches `inject_for` and the authority approves it, and its network is not narrowed to the secret's hosts
+// (it keeps `network.hosts` only, FR-POL-21).
+#[test]
+fn dynamic_code_never_receives_secret() {
+    let daemon = Daemon::new();
+    let setup = Setup {
+        authority: Some(vec![AskReply::Allow]),
+        ..granted(&daemon, &[("gh-token", GH_TOKEN)])
+    };
+    daemon.next(setup, "git push && eval \"$X\"").unwrap();
+    assert_eq!(daemon.spawns().len(), 1);
+    assert_eq!(injections(&daemon), Vec::<String>::new());
+    assert_eq!(
+        daemon.records().pop().unwrap().details.secrets_injected,
+        Vec::<String>::new()
+    );
+    assert!(!daemon.events().iter().any(|event| event.name() == "secret.injected"));
+}
+
+// KNSH-092 secret_injected_event_contains_name_not_value (FR-SEC-06): once the line is spawned, `secret.injected`
+// names the secret and the line, never the value, as published and on the wire.
+#[test]
+fn secret_injected_event_contains_name_not_value() {
+    let daemon = Daemon::new();
+    daemon
+        .next(granted(&daemon, &[("gh-token", GH_TOKEN)]), "git push origin main")
+        .unwrap();
+    let events = daemon.events();
+    let order: Vec<_> = names(&events)
+        .into_iter()
+        .filter(|name| matches!(*name, "command.started" | "secret.injected" | "command.finished"))
+        .collect();
+    assert_eq!(order, ["command.started", "secret.injected", "command.finished"]);
+    let injected = events.iter().find(|event| event.name() == "secret.injected").unwrap();
+    let EventData::SecretInjected {
+        record_id,
+        name,
+        command,
+    } = &injected.data
+    else {
+        panic!("not secret.injected: {injected:?}");
+    };
+    assert_eq!(name.as_str(), "gh-token");
+    assert_eq!(command.expose(), "git push origin main");
+    assert_eq!(Some(*record_id), daemon.records().pop().map(|record| record.record_id));
+    let notification = knsh_proto::event_notification(knsh_core::SubscriptionId::new(1), injected).unwrap();
+    let wire = knsh_proto::encode(&knsh_proto::Message::Notification(notification)).unwrap();
+    assert!(wire.contains(r#""name":"gh-token""#), "{wire}");
+    assert!(
+        !wire.contains(GH_TOKEN) && !format!("{injected:?}").contains(GH_TOKEN),
+        "{wire}"
+    );
+}
+
+// KNSH-092 unavailable_secret_denies_line: a granted line whose secret is not in the Keychain is denied, with a reason
+// naming the secret, recorded, and never spawned.
+#[test]
+fn unavailable_secret_denies_line() {
+    let daemon = Daemon::new();
+    let error = daemon.next(granted(&daemon, &[]), "git push").unwrap_err();
+    assert_eq!(error.code, ErrorCode::Denied);
+    let reason = data_field(&error, "reason").unwrap();
+    let reason = reason.as_str().unwrap();
+    assert!(reason.contains("gh-token") && reason.contains("not found"), "{reason}");
+    assert_eq!(daemon.spawns(), Vec::<String>::new());
+    let record = daemon.records().pop().unwrap();
+    assert_eq!(record.details.decision.unwrap().verdict, DecisionVerdict::Deny);
+    assert_eq!(record.details.secrets_injected, Vec::<String>::new());
+    let denied = daemon
+        .events()
+        .into_iter()
+        .find(|event| event.name() == "command.denied")
+        .unwrap();
+    let EventData::CommandDenied { reason, .. } = &denied.data else {
+        panic!("not command.denied");
+    };
+    assert!(reason.as_ref().unwrap().expose().contains("gh-token"));
 }

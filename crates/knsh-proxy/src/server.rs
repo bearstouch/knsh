@@ -531,6 +531,7 @@ fn refuse_http(shared: &Shared, stream: &TcpStream, owner: Option<Owner>, target
         | Refusal::NetworkOff
         | Refusal::ApprovalRequired
         | Refusal::DynamicCode
+        | Refusal::SecretHosts
         | Refusal::AddressNotAllowed
         | Refusal::NoHostRules
         | Refusal::NotTls
@@ -631,6 +632,7 @@ fn refuse_socks5(shared: &Shared, stream: &TcpStream, owner: Owner, target: Opti
         | Refusal::NetworkOff
         | Refusal::ApprovalRequired
         | Refusal::DynamicCode
+        | Refusal::SecretHosts
         | Refusal::AddressNotAllowed
         | Refusal::NoHostRules
         | Refusal::NotTls

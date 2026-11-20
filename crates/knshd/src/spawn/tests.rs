@@ -302,6 +302,7 @@ struct Line {
     control: LineControl,
     capture: Option<CapturePlan>,
     access: LineAccess,
+    secrets: Vec<crate::injection::Injected>,
 }
 
 impl Line {
@@ -318,6 +319,7 @@ impl Line {
             control: LineControl::default(),
             capture: None,
             access: LineAccess::default(),
+            secrets: Vec::new(),
         }
     }
 
@@ -337,6 +339,7 @@ impl Line {
             capture: self.capture.clone(),
             control: &self.control,
             access: self.access.clone(),
+            secrets: &self.secrets,
         }
     }
 }
@@ -542,6 +545,7 @@ fn line_credentials_carry_its_access_and_return_its_network() {
         classes: vec![knsh_core::NetworkClass::Fetch],
         dynamic: false,
         approved: true,
+        secret_hosts: Vec::new(),
     };
     let (report, _) = fixture.run(&line);
     assert_eq!(ran(&report).status, LineStatus::Exited(0));
@@ -550,6 +554,54 @@ fn line_credentials_carry_its_access_and_return_its_network() {
     assert_eq!(report.network[0].host.expose(), "registry.npmjs.org");
     // Revoked exactly once, when the network was collected.
     assert_eq!(proxy.revoked_lines.lock().unwrap().len(), 1);
+}
+
+// KNSH-092 (FR-SEC-01, FR-SEC-03): a line given a secret gets it as its variable, in place of any inherited value of
+// that name; its credentials carry the secret's hosts, and neither the proxy scope nor its sandbox profile keeps a
+// loopback port. A line without secrets keeps them.
+#[test]
+fn injects_secret_and_narrows_line_network() {
+    let (fixture, proxy) = fixture_with_proxy(exits(0));
+    let mut line = Line::new(Interpreter::Bash);
+    line.profile = profile("[network]\nmode = \"allowlist\"\nhosts = [\"registry.npmjs.org\"]\nloopback = [3999]\n");
+    line.env.push(("NPM_TOKEN".to_owned(), "inherited".to_owned()));
+    line.access.secret_hosts = vec![vec!["registry.npmjs.org".to_owned()]];
+    line.secrets = vec![crate::injection::Injected {
+        variable: "NPM_TOKEN".to_owned(),
+        name: knsh_core::SecretName::new("npm-token").unwrap(),
+        value: knsh_platform::SecretValue::from_vec(b"npm_s3cr3t".to_vec()),
+    }];
+    let (report, _) = fixture.run(&line);
+    assert_eq!(ran(&report).status, LineStatus::Exited(0));
+    let request = fixture.request();
+    let tokens: Vec<_> = request.env.iter().filter(|(name, _)| name == "NPM_TOKEN").collect();
+    assert_eq!(tokens, [&(OsString::from("NPM_TOKEN"), OsString::from("npm_s3cr3t"))]);
+    assert_eq!(proxy.accesses.lock().unwrap()[0].secret_hosts, line.access.secret_hosts);
+    assert_eq!(proxy.networks.lock().unwrap()[0].loopback, Vec::<u16>::new());
+    let compiled = String::from_utf8(fixture.processes.state().profile_seen.clone().unwrap()).unwrap();
+    assert!(!compiled.contains("3999"), "{compiled}");
+    // FR-SEC-05 (decision 8): other processes cannot read the injected environment.
+    assert!(
+        compiled.contains("(allow process-info* (target same-sandbox))"),
+        "{compiled}"
+    );
+
+    // Without secrets, the loopback port stays.
+    let (fixture, proxy) = fixture_with_proxy(exits(0));
+    let mut plain = Line::new(Interpreter::Bash);
+    plain.profile = line.profile.clone();
+    fixture.run(&plain);
+    assert_eq!(proxy.networks.lock().unwrap()[0].loopback, [3999]);
+    let compiled = String::from_utf8(fixture.processes.state().profile_seen.clone().unwrap()).unwrap();
+    assert!(compiled.contains("3999"), "{compiled}");
+}
+
+/// A fixture whose spawner issues through a fake proxy, returned beside it.
+fn fixture_with_proxy(behaviour: Behaviour) -> (Fixture, Arc<crate::proxy::tests::FakeProxy>) {
+    let mut fixture = fixture(behaviour);
+    let proxy = Arc::new(crate::proxy::tests::FakeProxy::new(41_000));
+    fixture.spawner.proxy = proxy.clone();
+    (fixture, proxy)
 }
 
 // FR-NET-01, fail closed: a line whose credentials cannot be issued never starts, and nothing is left issued.
@@ -952,6 +1004,7 @@ mod platform {
             capture: None,
             control: &LineControl::default(),
             access: LineAccess::default(),
+            secrets: &[],
         };
         let report = spawner.run(line, &Seen::default());
         let mut out = String::new();
@@ -982,6 +1035,7 @@ mod platform {
             capture: Some(super::capture_plan(knsh_core::DEFAULT_OUTPUT_CAP)),
             control,
             access: LineAccess::default(),
+            secrets: &[],
         };
         spawner.run(line, &Seen::default())
     }

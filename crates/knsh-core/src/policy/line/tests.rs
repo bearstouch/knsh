@@ -140,6 +140,7 @@ fn dynamic_part_clamps_network_to_hosts() {
         loopback: vec![3000],
         classes: Vec::new(),
         secrets: Vec::new(),
+        secret_hosts: Vec::new(),
         dynamic: true,
     };
     assert_eq!(decision.capabilities, clamped);

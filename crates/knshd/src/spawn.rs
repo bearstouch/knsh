@@ -10,6 +10,12 @@
 //!    setting (the envelope's credentials included, which would attribute its connections to the session alone) and
 //!    gets its own ([`command_env`]); its profile allows the proxy's port. Without a proxy it gets neither. Revoking
 //!    returns the hosts the line contacted or was refused, for its record's `network` field (FR-NET-09).
+//!
+//!    **Secrets (KNSH-092).** A line that receives secrets is narrowed to their hosts: its [`LineAccess`] carries
+//!    each secret's `hosts`, which the proxy's host rules apply on top of the profile's (FR-SEC-03, FR-NET-10), and it
+//!    gets no loopback ports, in its sandbox profile or at the proxy, so the value cannot be sent to a local service
+//!    either ([`narrowed_profile`]). The secrets themselves are set as environment variables in step 3, after every
+//!    inherited variable of the same name is removed.
 //! 1. **Profile (FR-LC-12, FR-SBX-03, FR-SBX-04, FR-LC-15).** The session's profile is compiled for this line by
 //!    `knsh-sandbox`, tagged with its record, allowing exec only of trusted folders, the profile's bash and the
 //!    binaries the line resolved to. It is written to its private `0600` file ([`ProfileFiles`]), referenced until the
@@ -19,7 +25,9 @@
 //! 3. **Spawn (FR-LC-13, FR-LC-16).** `knsh-exec --status-fd <n> --profile <file> --interpreter <path> --line
 //!    <re-serialised line> [--arg <operand>]…` as the leader of a new process group, in the line's working directory,
 //!    on the caller's three descriptors, with the environment `knshd` received (shims and session token already
-//!    removed, KNSH-049) minus the dynamic linker's `DYLD_*` variables, and nothing else. An empty line runs as
+//!    removed, KNSH-049) minus the dynamic linker's `DYLD_*` variables, plus the line's secrets (FR-SEC-01), and
+//!    nothing else. Process information stays within the line's own sandbox in every profile (FR-SEC-05, decision 8),
+//!    so other processes cannot read the injected environment. An empty line runs as
 //!    `:` (`knsh-exec` refuses an empty `--line`). `knshd` never applies a sandbox itself: `knsh-exec` does, after the exec
 //!    (CLAUDE.md "One process starts agent commands").
 //!    With output captured (KNSH-053: `exec.run` and `exec.start` without passed stdio, or any line of a session
@@ -48,10 +56,12 @@
 //! - Teeing `knsh -c` output (a session that records output) puts `knshd` in the data path: the line's stdout and
 //!   stderr are pipes, not the caller's terminal, so `isatty` is false for them (stdin stays the caller's).
 
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,6 +77,7 @@ use knsh_sandbox::{CommandTag, ProfileInput, compile};
 use crate::capture::{CapturePlan, DRAIN_GRACE, LineCapture, Source};
 use crate::exec::Stdio as LineStdio;
 use crate::holds::Kept;
+use crate::injection::Injected;
 use crate::jobs::LineControl;
 use crate::profiles::ProfileFiles;
 use crate::proxy::{ProxyCredential, ProxyIssuer, command_env};
@@ -153,8 +164,11 @@ pub(crate) struct LineToRun<'a> {
     pub(crate) capture: Option<CapturePlan>,
     /// The line's handle: its kill flag is read while it runs (`exec.kill`).
     pub(crate) control: &'a LineControl,
-    /// What the line presents to the proxy's host rules: its classes, dynamic flag and approval (KNSH-060).
+    /// What the line presents to the proxy's host rules: its classes, dynamic flag, approval and its secrets' hosts
+    /// (KNSH-060, KNSH-092).
     pub(crate) access: LineAccess,
+    /// The secrets it receives as environment variables (KNSH-092).
+    pub(crate) secrets: &'a [Injected],
 }
 
 /// The [`Spawner`] that runs lines through `knsh-exec` (module documentation).
@@ -209,6 +223,7 @@ impl Spawner for TrampolineSpawner {
             allowed,
             profile,
             capture,
+            secrets,
         } = plan;
         let binaries = resolved_binaries(&allowed);
         self.run(
@@ -227,6 +242,7 @@ impl Spawner for TrampolineSpawner {
                 capture,
                 control: &line.control,
                 access: LineAccess::of(&allowed),
+                secrets: &secrets,
             },
             events,
         )
@@ -236,6 +252,12 @@ impl Spawner for TrampolineSpawner {
 impl TrampolineSpawner {
     /// Steps 0 to 5 of the module documentation for `line`.
     pub(crate) fn run(&self, line: LineToRun<'_>, events: &dyn LineEvents) -> SpawnReport {
+        // KNSH-092: one narrowed profile for the proxy scope and the sandbox profile alike.
+        let narrowed = narrowed_profile(line.profile, &line.access);
+        let line = LineToRun {
+            profile: &narrowed,
+            ..line
+        };
         // Step 0. Revoked once the line has ended (`finish`), or on a panic when `revoke` is dropped. Revoking is
         // harmless when nothing was issued.
         let revoke = RevokeOnDrop {
@@ -529,6 +551,18 @@ pub(crate) fn read_by_dynamic_linker(name: &str) -> bool {
     name.starts_with("DYLD_")
 }
 
+/// `profile` as a line presenting `access` runs under it: unchanged, or, for a line that receives secrets (its
+/// access is narrowed to their hosts), without loopback ports, so neither its sandbox profile nor the proxy lets it
+/// reach a local port the secrets' hosts do not name (FR-SEC-03, module documentation, step 0).
+pub(crate) fn narrowed_profile<'a>(profile: &'a Profile, access: &LineAccess) -> Cow<'a, Profile> {
+    if access.secret_hosts.is_empty() {
+        return Cow::Borrowed(profile);
+    }
+    let mut narrowed = profile.clone();
+    narrowed.network.loopback.clear();
+    Cow::Owned(narrowed)
+}
+
 /// The `knsh-exec` invocation for `line` (module documentation, step 3).
 fn request(
     trampoline: &Path,
@@ -558,7 +592,16 @@ fn request(
     request.env = env
         .iter()
         .filter(|(name, _)| !read_by_dynamic_linker(name))
+        // KNSH-092: a secret's variable replaces any inherited one of the same name.
+        .filter(|(name, _)| !line.secrets.iter().any(|secret| secret.variable == *name))
         .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        // FR-SEC-01. The copy is the child's environment; it is not zeroed, as nothing in the environment can be.
+        .chain(line.secrets.iter().map(|secret| {
+            (
+                OsString::from(&secret.variable),
+                OsString::from_vec(secret.value.expose().to_vec()),
+            )
+        }))
         .collect();
     request.cwd = Some(line.cwd.as_path().to_path_buf());
     request.inherit = vec![status_writer];

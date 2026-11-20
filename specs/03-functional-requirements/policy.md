@@ -110,7 +110,7 @@ before any of it runs and returns `LineDecision { verdict, source, rule_id, reas
 - *Capabilities.* What the line may receive if it runs: the hosts open to it (`network.hosts`), the approval hosts it
   may reach once its classes or an approval allow (`network.approval_hosts`; the proxy decides each connection,
   FR-NET-03), the approval hosts its classes alone open (`class_hosts`, above), the loopback ports, the classes it presents, and the `secrets.env` variables whose `inject_for` patterns
-  certainly match one of its commands (an upper bound: asking and injecting are FR-SEC-01 – FR-SEC-02's). Under
+  certainly match one of its commands, with each one's `hosts` (the proxy narrows the line to them, FR-SEC-03). Each such command the rules allow asks instead, with rule ID `secrets.env[N]` (FR-SEC-02, KNSH-092). Under
   `network.mode = "none"` there are no hosts. A denied line receives nothing.
 - *Line classes.* The proxy identifies a line, not a command within it, so a line presents classes only when every
   command that can connect through the proxy has them: the union of its normalised commands' classes, or none if any

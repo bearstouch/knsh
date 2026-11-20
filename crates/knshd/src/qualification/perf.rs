@@ -194,6 +194,7 @@ fn deciding_stack(tag: &str, bins: &Binaries, wiring: &Wiring) -> (Stack, Arc<Ti
             spawner: Some(Arc::clone(&timer) as Arc<dyn Spawner>),
             hooks: wiring.hooks,
             real_clock: wiring.real_clock,
+            redactors: None,
         },
     );
     stack.profile(PROFILE, &perf_profile(&stack.tools));

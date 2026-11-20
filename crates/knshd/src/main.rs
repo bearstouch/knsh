@@ -140,6 +140,9 @@ mod secrets;
 // One redactor per session on every output path (KNSH-091).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod redaction;
+// Secret injection into supervised lines (KNSH-092).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod injection;
 // Pause, resume and human control (KNSH-054): owned by the session registry.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod holds;

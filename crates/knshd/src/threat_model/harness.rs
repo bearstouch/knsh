@@ -171,6 +171,8 @@ pub(crate) struct Wiring {
     /// Stamps events with the system clock instead of the fixture's fake one, so an event's `ts` is the time it was
     /// published.
     pub(crate) real_clock: bool,
+    /// The sessions' redactors, and through them the secrets lines are given (KNSH-092); none by default.
+    pub(crate) redactors: Option<Arc<crate::redaction::Redactors>>,
 }
 
 impl Wiring {
@@ -265,7 +267,7 @@ impl Stack {
             approvals: crate::approvals::tests::unanswered(ASK_TIMEOUT),
             grants: Arc::clone(&grants),
             spawner,
-            redactors: crate::redaction::Redactors::none(),
+            redactors: wiring.redactors.unwrap_or_else(crate::redaction::Redactors::none),
         });
         let launcher = TrampolineLauncher {
             processes: Arc::new(SystemProcesses::new()),

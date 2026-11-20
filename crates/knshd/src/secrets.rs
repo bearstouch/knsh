@@ -13,7 +13,7 @@
 //!
 //! [`SecretBroker::lookup`] answers with the value or a typed [`Unavailable`]; [`SecretBroker::resolve`] takes every
 //! secret a line needs, or none. A line that needs a secret it cannot have is denied, never run without it: the
-//! injection path (KNSH-092) runs lines only with what `resolve` returned.
+//! injection path (KNSH-092, [`crate::injection`]) runs lines only with what `resolve` returned.
 //!
 //! # Expiry
 //!
@@ -43,6 +43,7 @@ use knsh_proto::{
 };
 
 use crate::dispatch::{Call, Handler, Handlers, Reply, answer, params};
+pub(crate) use crate::injection::{Missing, Unavailable};
 use crate::supervise::control_only;
 
 /// Most secrets the authority may have provided at once. Another name past this is `-32602`; replacing a live one
@@ -51,27 +52,6 @@ pub(crate) const MAX_PROVIDED_SECRETS: usize = 256;
 
 /// How often the watcher drops expired secrets from memory. Lookups refuse an expired secret whatever the period.
 pub(crate) const PURGE_PERIOD: Duration = Duration::from_secs(1);
-
-/// Why a secret could not be had. Either way the line that needs it is denied (fail closed).
-#[cfg_attr(not(test), allow(dead_code, reason = "used by secret injection, KNSH-092"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Unavailable {
-    /// No provided secret is live under the name and the Keychain has no such item.
-    NotFound,
-    /// The Keychain has the item but it cannot be read (decision 11: not readable by `knshd`, a locked keychain,
-    /// tampering), or its value was refused.
-    AccessDenied,
-}
-
-/// A secret a line needs that it cannot have: what its denial names (KNSH-092).
-#[cfg_attr(not(test), allow(dead_code, reason = "used by secret injection, KNSH-092"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Missing {
-    /// The secret.
-    pub(crate) name: SecretName,
-    /// Why.
-    pub(crate) reason: Unavailable,
-}
 
 /// One secret the authority provided.
 struct Provided {
@@ -169,7 +149,6 @@ impl SecretBroker {
     /// # Errors
     ///
     /// [`Unavailable`] when neither source has it; the caller must deny the line that needs it.
-    #[cfg_attr(not(test), allow(dead_code, reason = "used by secret injection, KNSH-092"))]
     pub(crate) fn lookup(&self, name: &SecretName) -> Result<SecretValue, Unavailable> {
         if let Some(provided) = self.live().get(name) {
             return Ok(provided.value.duplicate());
@@ -191,7 +170,6 @@ impl SecretBroker {
     /// # Errors
     ///
     /// [`Missing`] naming the first secret that is unavailable, and why.
-    #[cfg_attr(not(test), allow(dead_code, reason = "used by secret injection, KNSH-092"))]
     pub(crate) fn resolve(&self, names: &[SecretName]) -> Result<Vec<(SecretName, SecretValue)>, Missing> {
         names
             .iter()

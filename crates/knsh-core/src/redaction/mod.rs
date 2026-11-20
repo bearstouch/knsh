@@ -162,6 +162,13 @@ impl Redactor {
         &self.inner.names
     }
 
+    /// Whether `other` is a clone of this redactor (the same instance, not merely the same names): only then is a
+    /// value known to be in one known to be in the other (KNSH-092 checks the line's redactor holds what it injects).
+    #[must_use]
+    pub fn is_same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Whether there is nothing to redact: every stream passes through unchanged.
     #[must_use]
     pub fn is_empty(&self) -> bool {

@@ -79,6 +79,9 @@ pub enum RuleId {
     ProjectExecutables,
     /// `exec.default`: no rule matched (FR-POL-17).
     Default,
+    /// `secrets.env[N]`: the command would receive the `N`-th `[secrets.env]` variable, in variable-name order, so a
+    /// command the rules allow asks instead (FR-SEC-02, KNSH-092).
+    Secret(usize),
 }
 
 impl fmt::Display for RuleId {
@@ -89,6 +92,7 @@ impl fmt::Display for RuleId {
             Self::Deny(index) => write!(f, "exec.deny[{index}]"),
             Self::ProjectExecutables => f.write_str("exec.project_executables"),
             Self::Default => f.write_str("exec.default"),
+            Self::Secret(index) => write!(f, "secrets.env[{index}]"),
         }
     }
 }
@@ -608,6 +612,7 @@ mod tests {
         assert_eq!(RuleId::Deny(12).to_string(), "exec.deny[12]");
         assert_eq!(RuleId::ProjectExecutables.to_string(), "exec.project_executables");
         assert_eq!(RuleId::Default.to_string(), "exec.default");
+        assert_eq!(RuleId::Secret(1).to_string(), "secrets.env[1]");
     }
 
     // `*` is matched against the argument strings, never expanded against the filesystem.

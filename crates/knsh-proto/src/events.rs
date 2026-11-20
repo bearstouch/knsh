@@ -436,6 +436,16 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
             .with("command", command.expose().as_str())?
             .with("cwd", path(cwd))?
             .with("started_at", started_at.to_string()),
+        // KNSH-092 (FR-SEC-06): the secret's name and the line, never the value; `command` was redacted before it was
+        // published.
+        EventData::SecretInjected {
+            record_id,
+            name,
+            command,
+        } => Object::new()
+            .with("record_id", record_id.to_string())?
+            .with("name", name.as_str())?
+            .with("command", command.expose().as_str()),
         // KNSH-053: the chunk's place; its bytes are added by `event_notification_with_bytes`, never inline here.
         EventData::CommandOutput {
             record_id,
