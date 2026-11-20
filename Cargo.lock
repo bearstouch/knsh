@@ -55,6 +55,14 @@ name = "knsh-exec"
 version = "0.0.0"
 
 [[package]]
+name = "knsh-interp"
+version = "0.0.0"
+dependencies = [
+ "knsh-bash",
+ "knsh-platform",
+]
+
+[[package]]
 name = "knsh-json"
 version = "0.0.0"
 

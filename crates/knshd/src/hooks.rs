@@ -181,6 +181,7 @@ impl ProcessExecutor<'_> {
         let null = OpenOptions::new().write(true).open("/dev/null").ok()?;
         let request = SpawnRequest {
             program: hook.program.clone(),
+            argv0: None,
             args: Vec::new(),
             env: vec![
                 ("PATH".into(), HOOK_PATH.into()),

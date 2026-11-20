@@ -208,6 +208,9 @@ impl Processes for SystemProcesses {
             .envs(request.env.iter().map(|(k, v)| (k, v)))
             // A new group led by the child itself (`setpgid(0, 0)` in the child before exec).
             .process_group(0);
+        if let Some(argv0) = &request.argv0 {
+            command.arg0(argv0);
+        }
         if let Some(cwd) = &request.cwd {
             command.current_dir(cwd);
         }

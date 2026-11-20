@@ -228,9 +228,10 @@ agent-command corpus behaving as in bash (NFR-COMPAT-02, NFR-COMPAT-11). zsh is 
 **Gate.** Phase 4 ships only when KNSH-109 is green. Until then, integration mode and stock-interpreter agent lines
 (phase 2) stay the default; a feature that breaks bash compatibility is not shipped as a default.
 
-**Crate.** The specs do not name the interpreter's crate. Proposal: a new library crate `knsh-interp` that depends on
-`knsh-bash` (AST) and `knsh-platform` (process, fd and signal effects), used by the `knsh` binary.
-`CLAUDE.md`'s workspace table must be updated when KNSH-096 starts.
+**Crate.** The interpreter is the library crate `knsh-interp` (decided in KNSH-096), which depends on `knsh-bash`
+(AST) and `knsh-platform` (process, fd and signal effects) and is used by the `knsh` binary. External commands run
+through `knsh_platform::CommandSpawner`, the seam KNSH-108 wraps to decide on each one. `CLAUDE.md`'s workspace
+table lists it.
 
 Critical path: [KNSH-096](KNSH-096-interpreter-core-and-ast-evaluator.md) → [KNSH-099](KNSH-099-redirections-and-descriptor-management.md) → [KNSH-100](KNSH-100-pipelines-subshells-and-job-control.md) → [KNSH-104](KNSH-104-traps-signals-set-and-shopt-options.md) → [KNSH-106](KNSH-106-posix-mode.md) → [KNSH-109](KNSH-109-conformance-gate-bash-test-suite-oils-subset-99-corpus.md) (**34 points**).
 

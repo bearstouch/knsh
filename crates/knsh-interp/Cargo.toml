@@ -1,0 +1,20 @@
+[package]
+name = "knsh-interp"
+description = "Native bash interpreter: evaluates the knsh-bash syntax tree"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# The syntax tree the evaluator walks, consumed unchanged (KNSH-096: no second parser).
+knsh-bash = { path = "../knsh-bash" }
+# Every process and filesystem effect, behind traits (`CommandSpawner`, `Fs`), so tests run without processes.
+knsh-platform = { path = "../knsh-platform" }
+
+[dev-dependencies]
+knsh-platform = { path = "../knsh-platform", features = ["testing"] }
+
+[lints]
+workspace = true

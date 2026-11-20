@@ -83,7 +83,10 @@ pub enum Stdio {
 pub struct SpawnRequest {
     /// Absolute path of the executable. Not searched in `PATH`: the engine always names what it runs.
     pub program: PathBuf,
-    /// Arguments after `argv[0]` (which is `program`).
+    /// `argv[0]`, or `None` for `program` itself. A shell passes the command name as written (`ls`), as bash does
+    /// (KNSH-096).
+    pub argv0: Option<OsString>,
+    /// Arguments after `argv[0]`.
     pub args: Vec<OsString>,
     /// The complete environment. Always explicit: the engine's own environment is never inherited by accident.
     pub env: Vec<(OsString, OsString)>,
@@ -98,12 +101,13 @@ pub struct SpawnRequest {
 }
 
 impl SpawnRequest {
-    /// A request for `program` with no arguments, an empty environment, the caller's working directory and
+    /// A request for `program` (also its `argv[0]`) with no arguments, an empty environment, the caller's working directory and
     /// [`Stdio::Null`].
     #[must_use]
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            argv0: None,
             args: Vec::new(),
             env: Vec::new(),
             cwd: None,
