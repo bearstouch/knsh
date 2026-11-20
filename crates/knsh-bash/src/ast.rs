@@ -655,12 +655,36 @@ pub struct FunctionDefinition {
 
 /// A construct outside decision 6's exact list, kept whole so that it is never dropped (see
 /// [`Command::Unsupported`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedCommand {
     /// What it is.
     pub construct: UnsupportedConstruct,
     /// All of it, redirections written after it included.
     pub span: Span,
+    /// For `(( … ))` and `for (( … ))` (not as a function body): the parts an evaluator needs, as the parser read
+    /// them (KNSH-097). The node stays opaque to the classifier: this only saves the native interpreter from reading
+    /// the construct a second time.
+    pub arithmetic: Option<Box<ArithmeticParts>>,
+}
+
+/// The parts of an arithmetic command or arithmetic `for` loop (KNSH-097), kept inside a
+/// [`Command::Unsupported`] node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArithmeticParts {
+    /// `(( expression ))`.
+    Command {
+        /// The expression, between `((` and `))`.
+        expression: Span,
+        /// The closing `))`. Anything in the node's span after it is a redirection.
+        close: Span,
+    },
+    /// `for (( init; test; update ))` and its body.
+    For {
+        /// The three expressions and the `;` between them, between `((` and `))`, as written.
+        expressions: Span,
+        /// The body, `do … done` or `{ … }`. Anything in the node's span after its close is a redirection.
+        body: LoopBody,
+    },
 }
 
 /// A simple command: assignments, then the command name and its arguments, with redirections anywhere among them.

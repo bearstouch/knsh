@@ -24,6 +24,7 @@ libfuzzer-sys = "=0.4.13"
 knsh-json = { path = "../crates/knsh-json" }
 knsh-toml = { path = "../crates/knsh-toml" }
 knsh-bash = { path = "../crates/knsh-bash" }
+knsh-interp = { path = "../crates/knsh-interp" }
 knsh-core = { path = "../crates/knsh-core" }
 knsh-platform = { path = "../crates/knsh-platform" }
 knsh-proxy = { path = "../crates/knsh-proxy" }
@@ -100,3 +101,10 @@ bench = false
 
 [profile.release]
 debug = 1
+
+[[bin]]
+name = "arith_expr"
+path = "fuzz_targets/arith_expr.rs"
+test = false
+doc = false
+bench = false

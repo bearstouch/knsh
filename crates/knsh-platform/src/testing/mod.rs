@@ -50,6 +50,8 @@
 //! - [`ScriptedCommands`]: external commands of the native interpreter answering with outcomes scripted per
 //!   program, the last one repeated; records every run (KNSH-096).
 //!
+//! - [`FakeUserHomes`]: a user database of home directories the test fills in (KNSH-097).
+//!
 //! Locks in the fakes are independent (one per fake) and never held across calls into another fake.
 
 mod ancestry;
@@ -70,6 +72,7 @@ mod process;
 mod random;
 mod resolver;
 mod secrets;
+mod users;
 mod volumes;
 
 pub use ancestry::FakeProcessTree;
@@ -90,6 +93,7 @@ pub use process::{Script, ScriptedProcesses};
 pub use random::SeededRandom;
 pub use resolver::FakeResolver;
 pub use secrets::MemSecretStore;
+pub use users::FakeUserHomes;
 pub use volumes::FakeVolumes;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};

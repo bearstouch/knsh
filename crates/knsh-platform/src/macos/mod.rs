@@ -24,6 +24,7 @@ mod random;
 mod resolver;
 mod shell_host;
 mod thread;
+mod users;
 mod volumes;
 mod xpc;
 
@@ -50,6 +51,7 @@ pub use random::SystemRandom;
 pub use resolver::SystemResolver;
 pub use shell_host::{JobSignalsIgnored, TelemetryPipe, reraise_default};
 pub use thread::set_current_thread_utility_qos;
+pub use users::SystemUserHomes;
 pub use volumes::SystemVolumes;
 pub use xpc::{SecCodeSigning, XpcControlService, XpcMessage};
 

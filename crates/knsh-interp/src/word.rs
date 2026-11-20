@@ -1,114 +1,49 @@
-//! Reading words: quote removal over words made only of literal text and quotes (KNSH-096).
+//! Words as the expansion engine reads them (KNSH-096, KNSH-097): the parser's segments turned into [`Part`]s, the
+//! characters an expansion produces ([`WordChar`]), and the checks for expansions later stories implement.
 //!
-//! Expansions arrive with KNSH-097 and KNSH-098. Until then a word holding one is refused with the exact span of the
-//! segment, and so is a word bash would change by tilde, brace or pathname expansion, decided from its unquoted
-//! characters: running such a word unexpanded would run something other than what bash runs.
+//! Brace expansion and pathname expansion (KNSH-098) are still refused. Brace expansion only ever applies to the
+//! literal text of a word, so a word that could hold one is refused before anything runs. Pathname expansion also
+//! applies to the unquoted result of an expansion, so it is refused before anything runs for literal text, and when
+//! the expansion happens for anything else.
 
-use knsh_bash::{Assignment, CommandWord, Segment, SegmentKind, Span};
+use knsh_bash::{Segment, SegmentKind, Span};
 
 use crate::error::{InterpError, Unsupported};
+use crate::scan::Part;
 use crate::state::is_name;
 
-/// One character of a word after quote removal, with whether it was quoted. Patterns need the difference: a quoted
-/// `*` matches only itself.
+/// One character of a word after expansion, with what bash needs to know about it later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WordChar {
     /// The character.
     pub(crate) ch: char,
-    /// Whether it was quoted (inside quotes or escaped by a backslash).
+    /// Whether it was quoted (inside quotes, escaped by a backslash, or the result of an expansion inside double
+    /// quotes). Patterns need the difference: a quoted `*` matches only itself.
     pub(crate) quoted: bool,
+    /// Whether it came from an expansion: bash splits the unquoted ones on `IFS`, never the literal text.
+    pub(crate) expanded: bool,
 }
 
 /// Where a word is read, which decides the expansions bash applies to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Context {
-    /// A command word or a `for` item: tilde, brace and pathname expansion.
+    /// A command word or a `for` item: every expansion, then word splitting and pathname expansion.
     Argument,
-    /// A `case` subject or a `for` variable: tilde expansion only.
+    /// A `case` subject or a `for` variable: no splitting, no pathname expansion.
     Plain,
-    /// A `case` pattern: tilde expansion; the unquoted characters are pattern characters.
+    /// A `case` pattern: as [`Context::Plain`]; the unquoted characters are pattern characters.
     Pattern,
 }
 
-/// `word` after quote removal, in `context`.
+/// The parts of a word made of `segments`, skipping text before `from` (the name and `=` of an assignment, which
+/// share its first literal segment).
 ///
 /// # Errors
 ///
-/// [`InterpError::Unsupported`] for an expansion bash would perform; [`InterpError::SourceMismatch`] if a span does
-/// not index `source`.
-pub(crate) fn expand(word: &CommandWord, source: &str, context: Context) -> Result<String, InterpError> {
-    Ok(characters(word, source, context)?.into_iter().map(|c| c.ch).collect())
-}
-
-/// `word` after quote removal, each character with whether it was quoted, in `context`.
-///
-/// # Errors
-///
-/// As [`expand`].
-pub(crate) fn characters(word: &CommandWord, source: &str, context: Context) -> Result<Vec<WordChar>, InterpError> {
+/// [`InterpError::Unsupported`] for a command or process substitution or `$'…'`; [`InterpError::SourceMismatch`] if
+/// a span does not index `source`.
+pub(crate) fn parts(segments: &[Segment], source: &str, from: usize) -> Result<Vec<Part>, InterpError> {
     let mut out = Vec::new();
-    read_segments(&word.word.segments, source, false, 0, &mut out)?;
-    let refuse = |feature| {
-        Err(InterpError::Unsupported {
-            feature,
-            span: word.span,
-        })
-    };
-    // Outside posix mode bash also expands a tilde after the `=` of any word that looks like an assignment
-    // (`env A=~ cmd`, `echo a=x:~`), wherever the word appears.
-    let assignment_tilde = assignment_value_start(&out).is_some_and(|start| has_assignment_tilde(&out, start));
-    if starts_with_tilde(&out) || assignment_tilde {
-        return refuse(Unsupported::TildeExpansion);
-    }
-    if context == Context::Argument {
-        if has_brace_expansion(&out) {
-            return refuse(Unsupported::BraceExpansion);
-        }
-        if has_glob(&out) {
-            return refuse(Unsupported::PathnameExpansion);
-        }
-    }
-    Ok(out)
-}
-
-/// The value of `assignment` after quote removal. Bash applies no brace, pathname or word-splitting expansion to it,
-/// but does expand a `~` at its start or after an unquoted `:`.
-///
-/// # Errors
-///
-/// As [`expand`].
-pub(crate) fn assignment_value(assignment: &Assignment, source: &str) -> Result<String, InterpError> {
-    let mut out = Vec::new();
-    read_segments(
-        &assignment.word.segments,
-        source,
-        false,
-        assignment.value.start,
-        &mut out,
-    )?;
-    if has_assignment_tilde(&out, 0) {
-        return Err(InterpError::Unsupported {
-            feature: Unsupported::TildeExpansion,
-            span: assignment.span,
-        });
-    }
-    Ok(out.into_iter().map(|c| c.ch).collect())
-}
-
-/// An unquoted `ch`.
-const fn unquoted(ch: char) -> WordChar {
-    WordChar { ch, quoted: false }
-}
-
-/// Appends the characters of `segments` after quote removal, skipping text before `from` (the name and `=` of an
-/// assignment, which share its first literal segment).
-fn read_segments(
-    segments: &[Segment],
-    source: &str,
-    quoted: bool,
-    from: usize,
-    out: &mut Vec<WordChar>,
-) -> Result<(), InterpError> {
     for segment in segments.iter().filter(|segment| segment.span.end > from) {
         let refuse = |feature| {
             Err(InterpError::Unsupported {
@@ -116,82 +51,120 @@ fn read_segments(
                 span: segment.span,
             })
         };
-        match &segment.kind {
+        let part = match &segment.kind {
             SegmentKind::Literal => {
                 let span = Span::new(segment.span.start.max(from), segment.span.end);
-                push(text(span, source)?, quoted, out);
+                Part::Text(text(span, source)?.to_owned())
             }
             SegmentKind::Escape => match text(segment.body, source)? {
                 // A backslash at the very end of the input quotes nothing and stays, as in bash.
-                "" => push("\\", true, out),
-                escaped => push(escaped, true, out),
+                "" => Part::Quoted("\\".to_owned()),
+                escaped => Part::Quoted(escaped.to_owned()),
             },
-            SegmentKind::LineContinuation => {}
-            SegmentKind::SingleQuoted => push(text(segment.body, source)?, true, out),
+            SegmentKind::LineContinuation => continue,
+            SegmentKind::SingleQuoted => Part::Quoted(text(segment.body, source)?.to_owned()),
             // In the C locale `$"…"` is plain double quoting; translation catalogues are not supported by design.
             SegmentKind::DoubleQuoted(inner) | SegmentKind::Locale(inner) => {
-                read_segments(inner, source, true, from, out)?;
+                Part::Double(quoted_parts(parts(inner, source, from)?))
             }
             SegmentKind::AnsiC => return refuse(Unsupported::AnsiCQuoting),
-            SegmentKind::Parameter | SegmentKind::ParameterExpansion => {
-                return refuse(Unsupported::ParameterExpansion);
-            }
-            SegmentKind::Arithmetic => return refuse(Unsupported::ArithmeticExpansion),
+            SegmentKind::Parameter => Part::Param {
+                name: text(segment.body, source)?.to_owned(),
+                span: segment.span,
+            },
+            SegmentKind::ParameterExpansion => Part::Brace {
+                body: segment.body,
+                span: segment.span,
+            },
+            SegmentKind::Arithmetic => Part::Arith {
+                body: segment.body,
+                span: segment.span,
+            },
             SegmentKind::CommandSubstitution | SegmentKind::Backtick => {
                 return refuse(Unsupported::CommandSubstitution);
             }
             SegmentKind::InputProcessSubstitution | SegmentKind::OutputProcessSubstitution => {
                 return refuse(Unsupported::ProcessSubstitution);
             }
-        }
+        };
+        out.push(part);
     }
-    Ok(())
+    Ok(out)
+}
+
+/// Inside double quotes, literal text is quoted.
+fn quoted_parts(parts: Vec<Part>) -> Vec<Part> {
+    parts
+        .into_iter()
+        .map(|part| match part {
+            Part::Text(text) => Part::Quoted(text),
+            other @ (Part::Quoted(_)
+            | Part::Double(_)
+            | Part::Param { .. }
+            | Part::Brace { .. }
+            | Part::Arith { .. }) => other,
+        })
+        .collect()
 }
 
 /// The text `span` indexes in `source`.
-fn text(span: Span, source: &str) -> Result<&str, InterpError> {
+pub(crate) fn text(span: Span, source: &str) -> Result<&str, InterpError> {
     span.text(source).ok_or(InterpError::SourceMismatch { span })
 }
 
-fn push(text: &str, quoted: bool, out: &mut Vec<WordChar>) {
-    out.extend(text.chars().map(|ch| WordChar { ch, quoted }));
+/// The characters of `parts` as far as they are known before expansion: literal text as written, and one quoted
+/// placeholder for each expansion. Enough to find brace and pathname expansion in literal text.
+pub(crate) fn literal_view(parts: &[Part]) -> Vec<WordChar> {
+    let mut out = Vec::new();
+    for part in parts {
+        match part {
+            Part::Text(text) => out.extend(text.chars().map(|ch| WordChar {
+                ch,
+                quoted: false,
+                expanded: false,
+            })),
+            Part::Quoted(text) => out.extend(text.chars().map(|ch| WordChar {
+                ch,
+                quoted: true,
+                expanded: false,
+            })),
+            Part::Double(inner) => out.extend(literal_view(inner).into_iter().map(|c| WordChar { quoted: true, ..c })),
+            Part::Param { .. } | Part::Brace { .. } | Part::Arith { .. } => out.push(WordChar {
+                ch: '\0',
+                quoted: true,
+                expanded: true,
+            }),
+        }
+    }
+    out
 }
 
-/// Whether the word starts with an unquoted `~`, which bash replaces by a home directory.
-fn starts_with_tilde(chars: &[WordChar]) -> bool {
-    chars.first() == Some(&unquoted('~'))
+/// The word `parts` spell when they hold no expansion at all, after quote removal.
+pub(crate) fn literal(parts: &[Part]) -> Option<String> {
+    let mut out = String::new();
+    for part in parts {
+        match part {
+            Part::Text(text) | Part::Quoted(text) => out.push_str(text),
+            Part::Double(inner) => out.push_str(&literal(inner)?),
+            Part::Param { .. } | Part::Brace { .. } | Part::Arith { .. } => return None,
+        }
+    }
+    Some(out)
 }
 
-/// Whether the assignment value starting at `value_start` in `chars` holds a tilde bash expands: an unquoted `~` at
-/// its start or right after an unquoted `:` in it.
-fn has_assignment_tilde(chars: &[WordChar], value_start: usize) -> bool {
-    let Some(value) = chars.get(value_start..) else {
-        return false;
-    };
-    starts_with_tilde(value)
-        || value
-            .windows(2)
-            .any(|pair| pair[0] == unquoted(':') && pair[1] == unquoted('~'))
-}
-
-/// Where the value starts in a word spelled like an assignment (`NAME=…` or `NAME+=…`, with the name and the `=`
-/// unquoted), which bash marks as one even when it is not in assignment position; `None` for any other word.
-fn assignment_value_start(chars: &[WordChar]) -> Option<usize> {
-    let equals = chars.iter().position(|c| c.ch == '=')?;
-    let before = chars.get(..equals)?;
-    let name = match before.split_last() {
-        Some((last, name)) if *last == unquoted('+') => name,
-        _ => before,
-    };
-    let unquoted_name = !chars.get(equals)?.quoted && name.iter().all(|c| !c.quoted);
-    let text: String = name.iter().map(|c| c.ch).collect();
-    (unquoted_name && is_name(&text)).then_some(equals + 1)
+/// Where the value starts in unquoted text spelled like an assignment (`NAME=…` or `NAME+=…`), which bash outside
+/// posix mode treats as one for tilde expansion wherever the word appears; `None` for any other text.
+pub(crate) fn assignment_value_start(text: &str) -> Option<usize> {
+    let equals = text.find('=')?;
+    let name = text.get(..equals)?;
+    let name = name.strip_suffix('+').unwrap_or(name);
+    is_name(name).then_some(equals + 1)
 }
 
 /// Whether bash could match the word against file names: an unquoted `*` or `?`, or an unquoted `[` with an unquoted
 /// `]` after it. Conservative: a word that matches nothing would stay as written in bash too, but which words match
 /// depends on the filesystem, so any candidate is refused.
-fn has_glob(chars: &[WordChar]) -> bool {
+pub(crate) fn has_glob(chars: &[WordChar]) -> bool {
     let mut open = false;
     for c in chars.iter().filter(|c| !c.quoted) {
         match c.ch {
@@ -206,7 +179,7 @@ fn has_glob(chars: &[WordChar]) -> bool {
 
 /// Whether the word could hold a brace expansion: an unquoted `{` followed by an unquoted `,` or `..` and then an
 /// unquoted `}`. Conservative, like [`has_glob`]: `{}` and `{x}` stay as written, as in bash.
-fn has_brace_expansion(chars: &[WordChar]) -> bool {
+pub(crate) fn has_brace_expansion(chars: &[WordChar]) -> bool {
     let unquoted: Vec<char> = chars.iter().filter(|c| !c.quoted).map(|c| c.ch).collect();
     let Some(open) = unquoted.iter().position(|&ch| ch == '{') else {
         return false;
@@ -221,7 +194,7 @@ fn has_brace_expansion(chars: &[WordChar]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use knsh_bash::{Command, parse};
+    use knsh_bash::{Command, CommandWord, parse};
 
     use super::*;
 
@@ -234,105 +207,83 @@ mod tests {
         simple.words.clone()
     }
 
-    fn expand_all(line: &str) -> Result<Vec<String>, InterpError> {
-        words(line)
-            .iter()
-            .map(|word| expand(word, line, Context::Argument))
-            .collect()
+    fn word_parts(line: &str, index: usize) -> Result<Vec<Part>, InterpError> {
+        parts(&words(line)[index].word.segments, line, 0)
     }
 
-    fn refused(line: &str) -> Unsupported {
-        match expand_all(line) {
+    fn refused(line: &str, index: usize) -> Unsupported {
+        match word_parts(line, index) {
             Err(InterpError::Unsupported { feature, .. }) => feature,
             other => panic!("{line}: {other:?}"),
         }
     }
 
     #[test]
-    fn removes_quotes_escapes_and_line_continuations() {
-        assert_eq!(
-            expand_all(
-                r#"echo 'a b' "c\"d" e\ f g\
-h "" $"loc""#
-            )
-            .unwrap(),
-            ["echo", "a b", "c\"d", "e f", "gh", "", "loc"]
-        );
-    }
-
-    #[test]
-    fn keeps_a_backslash_inside_double_quotes_that_escapes_nothing() {
-        assert_eq!(expand_all(r#"echo "a\b""#).unwrap(), ["echo", r"a\b"]);
-    }
-
-    #[test]
-    fn refuses_expansions_until_their_stories() {
-        assert_eq!(refused("echo $x"), Unsupported::ParameterExpansion);
-        assert_eq!(refused(r#"echo "${x}""#), Unsupported::ParameterExpansion);
-        assert_eq!(refused("echo $((1+1))"), Unsupported::ArithmeticExpansion);
-        assert_eq!(refused("echo $(ls)"), Unsupported::CommandSubstitution);
-        assert_eq!(refused("echo `ls`"), Unsupported::CommandSubstitution);
-        assert_eq!(refused("cat <(ls)"), Unsupported::ProcessSubstitution);
-        assert_eq!(refused("echo $'a'"), Unsupported::AnsiCQuoting);
-        assert_eq!(refused("ls ~"), Unsupported::TildeExpansion);
-        assert_eq!(refused("ls ~/x"), Unsupported::TildeExpansion);
-        assert_eq!(refused("ls *.rs"), Unsupported::PathnameExpansion);
-        assert_eq!(refused("ls a?"), Unsupported::PathnameExpansion);
-        assert_eq!(refused("ls [ab]"), Unsupported::PathnameExpansion);
-        assert_eq!(refused("echo {a,b}"), Unsupported::BraceExpansion);
-        assert_eq!(refused("echo {1..3}"), Unsupported::BraceExpansion);
-    }
-
-    // Bash (outside posix mode) expands `~` after the `=` of any word spelled like an assignment, and after a `:`
-    // in its value; other words keep `=~` and `:~` as written.
-    #[test]
-    fn refuses_tilde_in_assignment_like_arguments() {
-        for line in ["env A=~ cmd", "echo a+=~", "echo a=x:~/bin", "echo _b=c=:~"] {
-            assert_eq!(refused(line), Unsupported::TildeExpansion, "{line}");
-        }
-        assert_eq!(
-            expand_all(r#"echo host:~/x "a"=~ 1a=~ a=b=~ a=\~ a="~""#).unwrap(),
-            ["echo", "host:~/x", "a=~", "1a=~", "a=b=~", "a=~", "a=~"]
-        );
-    }
-
-    #[test]
-    fn quoted_or_incomplete_special_characters_stay_literal() {
-        assert_eq!(
-            expand_all(r#"echo '*' "?" \[a] [ ] {} {x} a~ "~" a]"#).unwrap(),
-            ["echo", "*", "?", "[a]", "[", "]", "{}", "{x}", "a~", "~", "a]"]
-        );
-    }
-
-    #[test]
-    fn reads_assignment_values_without_glob_but_with_tilde_checks() {
-        let line = "A=*.rs B='x y' C=a:~ D=";
-        let script = parse(line).unwrap();
-        let Command::Simple(simple) = &script.items[0].and_or.first.first else {
-            panic!("not simple");
-        };
-        let values: Vec<_> = simple
-            .assignments
-            .iter()
-            .map(|assignment| assignment_value(assignment, line))
+    fn reads_quotes_escapes_and_line_continuations() {
+        let line = r#"echo 'a b' "c\"d" e\ f g\
+h "" $"loc""#;
+        let literals: Vec<_> = (1..7)
+            .map(|i| literal(&word_parts(line, i).unwrap()).unwrap())
             .collect();
-        assert_eq!(values[0], Ok("*.rs".to_owned()));
-        assert_eq!(values[1], Ok("x y".to_owned()));
-        assert!(matches!(
-            values[2],
-            Err(InterpError::Unsupported {
-                feature: Unsupported::TildeExpansion,
-                ..
-            })
-        ));
-        assert_eq!(values[3], Ok(String::new()));
+        assert_eq!(literals, ["a b", "c\"d", "e f", "gh", "", "loc"]);
+        assert_eq!(literal(&word_parts(r#"echo "a\b""#, 1).unwrap()).unwrap(), r"a\b");
+    }
+
+    #[test]
+    fn expansions_become_parts() {
+        let line = r#"echo a$x"${y}$((1))""#;
+        let found = word_parts(line, 1).unwrap();
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0], Part::Text("a".into()));
+        assert!(matches!(&found[1], Part::Param { name, .. } if name == "x"));
+        let Part::Double(inner) = &found[2] else {
+            panic!("{found:?}")
+        };
+        assert!(matches!(inner[0], Part::Brace { .. }));
+        assert!(matches!(inner[1], Part::Arith { .. }));
+        assert_eq!(literal(&found), None);
+    }
+
+    #[test]
+    fn refuses_substitutions_and_ansi_c_quotes() {
+        assert_eq!(refused("echo $(ls)", 1), Unsupported::CommandSubstitution);
+        assert_eq!(refused("echo `ls`", 1), Unsupported::CommandSubstitution);
+        assert_eq!(refused(r#"echo "$(ls)""#, 1), Unsupported::CommandSubstitution);
+        assert_eq!(refused("cat <(ls)", 1), Unsupported::ProcessSubstitution);
+        assert_eq!(refused("echo $'a'", 1), Unsupported::AnsiCQuoting);
+    }
+
+    #[test]
+    fn literal_view_finds_globs_and_braces_only_in_literal_text() {
+        let view = |line: &str| literal_view(&word_parts(line, 1).unwrap());
+        for line in ["ls *.rs", "ls a?", "ls [ab]", "ls $x*"] {
+            assert!(has_glob(&view(line)), "{line}");
+        }
+        for line in ["ls '*'", "ls \\[a]", "ls $x", r#"ls "${x}*""#, "ls a]"] {
+            assert!(!has_glob(&view(line)), "{line}");
+        }
+        for line in ["echo {a,b}", "echo {1..3}", "echo {$x,b}"] {
+            assert!(has_brace_expansion(&view(line)), "{line}");
+        }
+        for line in ["echo {}", "echo {x}", "echo '{a,b}'", "echo ${x}"] {
+            assert!(!has_brace_expansion(&view(line)), "{line}");
+        }
+    }
+
+    #[test]
+    fn assignment_shaped_text() {
+        assert_eq!(assignment_value_start("a=~"), Some(2));
+        assert_eq!(assignment_value_start("_b+=x"), Some(4));
+        assert_eq!(assignment_value_start("1a=~"), None);
+        assert_eq!(assignment_value_start("host:~"), None);
+        assert_eq!(assignment_value_start("=x"), None);
     }
 
     #[test]
     fn a_span_outside_the_source_is_a_mismatch() {
         let word = &words("echo hello")[1];
         assert!(matches!(
-            expand(word, "echo", Context::Argument),
+            parts(&word.word.segments, "echo", 0),
             Err(InterpError::SourceMismatch { .. })
         ));
     }

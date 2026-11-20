@@ -26,3 +26,24 @@ Humans keep their own zsh or bash; agent lines run in stock bash under the super
 | NFR-COMPAT-09 | Exit status must follow bash: 127 for command not found, 128 plus the signal number for signals. A policy denial uses 126, with the reason always printed on stderr and kept in the record ([exit codes](../09-reference/exit-codes.md)). |
 | NFR-COMPAT-10 | In every mode the engine must emit OSC 7 (working directory) and OSC 133 (prompt, command, output and exit code). |
 | NFR-COMPAT-11 | Native mode must reach at least 99% of the agent-command corpus behaving as in bash 5.2. |
+
+## Bash 3.2 and 5.2: expansion differences
+
+The native interpreter follows bash 5.2. Where `/bin/bash` (3.2) used by agent lines (NFR-COMPAT-04) behaves
+differently for parameter and arithmetic expansion, the difference is listed here and covered by the KNSH-097 unit
+tests (`crates/knsh-interp/src/expand/tests.rs`, `src/arith/tests.rs`); forms both agree on are checked against
+`/bin/bash` itself (`crates/knsh-interp/tests/bash_differential.rs`) (NFR-COMPAT-05).
+
+| Form | Bash 3.2 | Bash 5.2 (native) |
+| --- | --- | --- |
+| `${x^}`, `${x^^}`, `${x,}`, `${x,,}`, `${x~}`, `${x~~}` | Bad substitution | Case modification |
+| `${x@Q}`, `@E`, `@A`, `@a`, `@U`, `@u`, `@L`, `@K`, `@k` | Bad substitution | Transformations (`@P` refused until KNSH-107) |
+| `${x:1:-1}` (negative length) | Error: `substring expression < 0` | Counts from the end |
+| `${x/p/&}` | `&` is literal | `patsub_replacement` on by default: an unquoted `&` is the match |
+| `set -u` with an unset parameter, `${x?}` | Shell exits with status 127 | Shell exits with status 1 |
+| `${x?}` with `x` unset | `x: parameter null or not set` | `x: parameter not set` (`${x:?}` keeps the longer message) |
+| `${!x}` with `x` unset or empty | Expands to nothing | Error `x: invalid indirect expansion` or `: invalid variable name`, line abandoned |
+| Messages under `bash -c` | `bash: message` (no line number on one-line scripts) | `bash: line n: message` |
+| Arithmetic error token after trailing blanks (`$(( 1 + ))`) | `error token is " "` | The last token read: `error token is "+ "` |
+| `base#` with no digits (`$((2#))`) | 0 | Error `invalid integer constant` |
+| Division by zero inside a longer expression (`$((4/0+1))`) | `error token is "+1"` (the token after the divisor) | `error token is "0+1"` (from the divisor on) |

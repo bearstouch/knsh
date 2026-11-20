@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use knsh_bash::{AndOr, CompoundCommand, Group, ListItem, Pipeline, parse};
 use knsh_platform::PlatformError;
-use knsh_platform::testing::{MemFs, ScriptedCommands};
+use knsh_platform::testing::{FakeUserHomes, MemFs, ScriptedCommands};
 
 use super::*;
 
@@ -61,7 +61,14 @@ impl Harness {
         let state = ShellState::new("knsh", "/work")
             .unwrap()
             .with_environment([("PATH".into(), "/bin".into())]);
-        let interpreter = Interpreter::new(state, fs.clone(), commands.clone(), Box::new(diagnostics.clone()));
+        let homes = Arc::new(FakeUserHomes::new().with_user("alice", "/Users/alice"));
+        let interpreter = Interpreter::new(
+            state,
+            fs.clone(),
+            commands.clone(),
+            homes,
+            Box::new(diagnostics.clone()),
+        );
         Self {
             interpreter,
             commands,
@@ -284,7 +291,7 @@ fn evaluator_enforces_the_depth_limit_itself() {
     let run = Run { source: "true" };
     assert_eq!(
         h.interpreter.list(&script.items, &run),
-        Err(InterpError::DepthExceeded { limit: 4 })
+        Err(Stop::Error(InterpError::DepthExceeded { limit: 4 }))
     );
     assert_eq!(h.ran(), Vec::<String>::new());
     // Depth is released on the way out, so the next run starts from zero.
@@ -395,6 +402,8 @@ fn passes_argv_environment_and_directory_to_the_spawner() {
         [
             (OsString::from("A"), OsString::from("1")),
             (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("PWD"), OsString::from("/work")),
+            (OsString::from("SHLVL"), OsString::from("1")),
         ]
     );
     // The prefix assignment did not change the shell.
@@ -435,7 +444,13 @@ fn a_prefix_path_assignment_is_used_for_lookup() {
 fn unsupported_constructs_are_refused_before_anything_runs() {
     let mut h = Harness::new();
     let cases: &[(&str, Unsupported)] = &[
-        ("true; echo $x", Unsupported::ParameterExpansion),
+        ("true; echo $(ls)", Unsupported::CommandSubstitution),
+        ("true; echo $RANDOM", Unsupported::ShellVariable),
+        ("true; echo ${#LINENO}", Unsupported::ShellVariable),
+        ("true; echo ${!BASH*}", Unsupported::ShellVariable),
+        ("true; echo ${a[0]}", Unsupported::Array),
+        ("true; echo ${x@P}", Unsupported::PromptExpansion),
+        ("true; (( x )) > out", Unsupported::Redirection),
         ("true; ls *.rs", Unsupported::PathnameExpansion),
         ("true > out", Unsupported::Redirection),
         ("{ true; } 2>&1", Unsupported::Redirection),
@@ -447,9 +462,8 @@ fn unsupported_constructs_are_refused_before_anything_runs() {
         ("true; cd /", Unsupported::Builtin),
         ("if true; then export X; fi", Unsupported::Builtin),
         ("mapfile x", Unsupported::Builtin),
-        ("case x in ~) true;; esac", Unsupported::TildeExpansion),
         ("for v in *; do true; done", Unsupported::PathnameExpansion),
-        ("X=~ true", Unsupported::TildeExpansion),
+        ("echo {a,$x}", Unsupported::BraceExpansion),
     ];
     for (line, feature) in cases {
         assert_eq!(refused(h.run(line)), *feature, "{line}");
@@ -527,4 +541,193 @@ fn a_script_parsed_from_other_text_is_refused() {
         h.interpreter.run(&script, "true"),
         Err(InterpError::SourceMismatch { .. })
     ));
+}
+
+// ---- KNSH-097: expansions in commands ----
+
+/// The arguments of each run, in order.
+fn args(h: &Harness) -> Vec<Vec<String>> {
+    h.commands
+        .runs()
+        .into_iter()
+        .map(|run| run.args.into_iter().map(|arg| arg.into_string().unwrap()).collect())
+        .collect()
+}
+
+#[test]
+fn expanded_words_reach_the_command() {
+    let mut h = Harness::new();
+    h.on("tool", &[exited(0)]);
+    h.interpreter.state_mut().set_variable("x", "a b");
+    assert_eq!(h.status(r#"y=$((2 * 3)); tool "$x" ${y} "${x#a }" $z"#), 0);
+    assert_eq!(args(&h), [vec!["a b", "6", "b"]]);
+}
+
+// Bash expands the words first, then the assignments in order, each seeing the ones before it; prefix assignments
+// reach only the command's environment.
+#[test]
+fn assignments_expand_in_order_after_the_words() {
+    let mut h = Harness::new();
+    h.on("env", &[exited(0)]);
+    h.interpreter.state_mut().set_variable("a", "old");
+    assert_eq!(h.status("a=new b=$a env $a"), 0);
+    let run = &h.commands.runs()[0];
+    assert_eq!(run.args, [OsString::from("old")]);
+    assert!(run.env.contains(&("b".into(), "new".into())));
+    assert_eq!(h.interpreter.state().variable("a"), Some(std::ffi::OsStr::new("old")));
+    assert_eq!(h.status("c=1 d=$c"), 0);
+    assert_eq!(h.interpreter.state().variable("d"), Some(std::ffi::OsStr::new("1")));
+}
+
+// Bash: `(( ))` is 0 for a non-zero result, 1 for zero or an error, and the script goes on after an error.
+#[test]
+fn double_paren_status_is_zero_for_nonzero_result() {
+    let mut h = Harness::new();
+    assert_eq!(h.status("(( 2 ))"), 0);
+    assert_eq!(h.status("(( 0 ))"), 1);
+    assert_eq!(h.status("(( -1 ))"), 0);
+    assert_eq!(h.status("((x = 5, x > 3))"), 0);
+    assert_eq!(h.interpreter.state().variable("x"), Some(std::ffi::OsStr::new("5")));
+    assert_eq!(h.status("(( 1/0 )); true"), 0);
+    assert_eq!(h.status("(( 1/0 ))"), 1);
+    assert_eq!(
+        h.diagnostics.text(),
+        "knsh: line 1: ((: 1/0 : division by 0 (error token is \"0 \")\n\
+         knsh: line 1: ((: 1/0 : division by 0 (error token is \"0 \")\n"
+    );
+}
+
+#[test]
+fn let_evaluates_each_argument_and_tests_the_last() {
+    let mut h = Harness::new();
+    // Unquoted, `b=a*2` would be a pathname pattern (refused until KNSH-098), as in bash.
+    assert_eq!(h.status("let a=1+2 'b=a*2'"), 0);
+    assert_eq!(h.interpreter.state().variable("b"), Some(std::ffi::OsStr::new("6")));
+    assert_eq!(h.status("let 'c = 0'"), 1);
+    assert_eq!(h.status("let"), 1);
+    assert_eq!(h.status("let 1/0 d=9"), 1);
+    assert_eq!(h.interpreter.state().variable("d"), None);
+    assert_eq!(
+        h.diagnostics.text(),
+        "knsh: line 1: let: expression expected\nknsh: line 1: let: 1/0: division by 0 (error token is \"0\")\n"
+    );
+}
+
+// Fail closed: `a=1 let …` gives `let` a temporary scope that is not emulated, and a prefix assignment to a variable
+// bash maintains (read-only `UID` makes bash run nothing) is refused before anything runs.
+#[test]
+fn let_with_prefix_assignments_and_bash_variables_are_refused() {
+    let mut h = Harness::new();
+    h.on("tool", &[exited(0)]);
+    assert_eq!(refused(h.run("tool; a=5 let 'x=a'")), Unsupported::Builtin);
+    assert_eq!(h.interpreter.state().variable("x"), None);
+    assert_eq!(refused(h.run("tool; UID=0 tool")), Unsupported::ShellVariable);
+    assert_eq!(refused(h.run("tool; RANDOM=1")), Unsupported::ShellVariable);
+    // Only the first `tool`, of the first script: the others were refused before running.
+    assert_eq!(h.ran(), ["tool"]);
+}
+
+#[test]
+fn arithmetic_for_loops_like_bash() {
+    let mut h = Harness::new();
+    h.on("tool", &[exited(0)]);
+    assert_eq!(h.status("for ((i = 0; i < 3; i++)); do tool $i; done"), 0);
+    assert_eq!(args(&h), [vec!["0"], vec!["1"], vec!["2"]]);
+    assert_eq!(h.interpreter.state().variable("i"), Some(std::ffi::OsStr::new("3")));
+    // The body's last status; 0 when it never runs.
+    assert_eq!(h.status("for ((;0;)); do tool; done"), 0);
+    assert_eq!(h.status("for ((n = 2; n; n--)) { false; }"), 1);
+    // An arithmetic error ends the loop with status 1.
+    assert_eq!(h.status("for ((j = 0; j < 1/0; j++)); do tool; done"), 1);
+    // Three `tool` runs and two `false` runs: the last loop's body never ran.
+    assert_eq!(h.commands.runs().len(), 5);
+}
+
+// Bash (`-c`): an expansion error abandons the rest of its line with status 1; the next line runs.
+#[test]
+fn expansion_errors_discard_the_rest_of_the_line() {
+    let mut h = Harness::new();
+    h.on("tool", &[exited(0)]);
+    let status = h.status("tool one; echo $((1/0)); tool same-line\ntool next \"$?\"\nif true; then\n  tool ${x!}\n  tool inside\nfi\ntool after");
+    assert_eq!(status, 0);
+    // `true` (the `if` condition) ran; nothing else of the `if` did.
+    let expected: [&[&str]; 4] = [&["one"], &["next", "1"], &[], &["after"]];
+    assert_eq!(args(&h), expected);
+    assert_eq!(
+        h.diagnostics.text(),
+        "knsh: line 1: 1/0: division by 0 (error token is \"0\")\nknsh: line 4: ${x!}: bad substitution\n"
+    );
+    assert_eq!(h.status("tool; x=$((2/0))"), 1);
+}
+
+// With `set -u`, an unset parameter ends the script with status 1 and bash's message.
+#[test]
+fn nounset_ends_the_script_with_status_one() {
+    let mut h = Harness::new();
+    h.on("tool", &[exited(0)]);
+    h.interpreter.state_mut().options_mut().nounset = true;
+    assert_eq!(h.status("tool a\ntool $missing\ntool never"), 1);
+    assert_eq!(args(&h), [vec!["a"]]);
+    assert_eq!(h.interpreter.state().last_status(), Status::FAILURE);
+    assert_eq!(h.diagnostics.text(), "knsh: line 2: missing: unbound variable\n");
+    assert_eq!(h.status("tool ${missing:-ok} \"$@\""), 0);
+    assert_eq!(h.status("tool ${missing?gone}; tool never"), 1);
+    assert!(h.diagnostics.text().ends_with("knsh: line 1: missing: gone\n"));
+}
+
+// Fail closed: a builtin or a split word that only an expansion reveals is refused when it is found.
+#[test]
+fn refusals_found_by_expansion_stop_the_script_there() {
+    let mut h = Harness::new();
+    h.on("tool", &[exited(0)]);
+    h.interpreter.state_mut().set_variable("cmd", "cd");
+    h.interpreter.state_mut().set_variable("words", "a b");
+    assert_eq!(refused(h.run("tool; $cmd /; tool")), Unsupported::Builtin);
+    assert_eq!(refused(h.run("tool $words")), Unsupported::WordSplitting);
+    assert_eq!(refused(h.run("echo -e${cmd:+n} x")), Unsupported::Builtin);
+    assert_eq!(h.ran(), ["tool"]);
+}
+
+// Fail closed: where bash does not split, it joins an unquoted `$*` or `$@` with the first character of `IFS` or a
+// space depending on the context and version (bash 3.2: `x=$*` is `a:b` but `${x:?$*}` says `a b` with `IFS=:`).
+// With a space first in `IFS` every form agrees; otherwise the join is refused.
+#[test]
+fn unquoted_lists_joined_without_splitting_follow_ifs_or_are_refused() {
+    let mut h = Harness::new();
+    h.on("tool", &[exited(0)]);
+    let state = h
+        .interpreter
+        .state()
+        .clone()
+        .with_positional(vec!["a".into(), "b".into()]);
+    *h.interpreter.state_mut() = state;
+    assert_eq!(h.status("x=$* y=$@; case $* in 'a b') tool \"$x\" \"$y\";; esac"), 0);
+    assert_eq!(args(&h), [vec!["a b", "a b"]]);
+    for line in [
+        "IFS=:; x=$*",
+        "IFS=:; x=$@",
+        "IFS=; x=$*",
+        "IFS=:; case $* in *) ;; esac",
+        "IFS=:; x=${u:=$@}",
+    ] {
+        assert_eq!(refused(h.run(line)), Unsupported::WordSplitting, "{line}");
+    }
+    // Quoted, the join is bash's in every context: `"$*"` with the first character of `IFS`, `"$@"` with spaces.
+    assert_eq!(h.status("IFS=:; x=\"$*\" y=\"$@\"; IFS=' '; tool \"$x\" \"$y\""), 0);
+    assert_eq!(args(&h)[1], ["a:b", "a b"]);
+}
+
+#[test]
+fn case_and_for_words_expand() {
+    let mut h = Harness::new();
+    h.on("tool", &[exited(0)]);
+    h.interpreter.state_mut().set_variable("f", "main.rs");
+    h.interpreter.state_mut().set_variable("pat", "*.rs");
+    assert_eq!(
+        h.status(
+            "case $f in \"$pat\") tool quoted;; $pat) tool pattern;; esac; for v in \"$f\" ${f%.rs}; do tool $v; done"
+        ),
+        0
+    );
+    assert_eq!(args(&h), [vec!["pattern"], vec!["main.rs"], vec!["main"]]);
 }

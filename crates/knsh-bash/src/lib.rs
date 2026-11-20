@@ -118,11 +118,11 @@ mod token;
 mod wrappers;
 
 pub use ast::{
-    AndOr, AndOrOperator, AndOrPart, Assignment, CaseClause, CaseCommand, CaseTerminator, CaseTerminatorKind, Command,
-    CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems, FunctionCall, FunctionDefinition,
-    Group, HereDocument, IfClause, IfCommand, ListItem, LoopBody, LoopCommand, PipeOperator, Pipeline, PipelinePart,
-    Redirect, Script, Separator, SeparatorKind, SimpleCommand, Subshell, Substitution, SubstitutionKind, TimeKeyword,
-    UnsupportedCommand,
+    AndOr, AndOrOperator, AndOrPart, ArithmeticParts, Assignment, CaseClause, CaseCommand, CaseTerminator,
+    CaseTerminatorKind, Command, CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems,
+    FunctionCall, FunctionDefinition, Group, HereDocument, IfClause, IfCommand, ListItem, LoopBody, LoopCommand,
+    PipeOperator, Pipeline, PipelinePart, Redirect, Script, Separator, SeparatorKind, SimpleCommand, Subshell,
+    Substitution, SubstitutionKind, TimeKeyword, UnsupportedCommand,
 };
 pub use builtins::is_builtin;
 pub use classify::{
