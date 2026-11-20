@@ -937,6 +937,8 @@ impl Supervision<'_> {
             // KNSH-091: every path of every line is redacted with its session's redactor.
             redactors: self.redactors,
         });
+        // KNSH-093: an irreversible line's marks go to its checkpoint, so its undo lists what it cannot take back.
+        lifecycle.attach_marks(Arc::clone(self.history) as Arc<dyn supervisor::IrreversibleMarks>);
         exec::ExecRun::new(lifecycle, self.paths.shim_dir()).handlers()
     }
 }

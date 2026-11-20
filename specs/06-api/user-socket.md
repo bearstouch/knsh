@@ -407,11 +407,12 @@ would see it in `decision.requested`:
 ```json
 {"request_id": "01J…", "session_id": "01J…", "actor": {"kind": "agent", "agent_id": "claude-code"},
  "command": "git push origin main", "rewritten_from": null, "cwd": "/Users/me/code/app",
- "matched_rule": "exec.ask[0]", "hook": null, "irreversible": null, "timeout_at": "2026-11-16T10:01:30.000000Z"}
+ "matched_rule": "exec.ask[0]", "hook": null, "irreversible": {"value": true, "reasons": ["git push"]},
+ "timeout_at": "2026-11-16T10:01:30.000000Z"}
 ```
 
 `command` and `rewritten_from` are redacted. `matched_rule` is `null` when only a hook asked; `hook` names it.
-`irreversible` is `{"value", "reasons"}`, or `null` until lines are classified for irreversibility (KNSH-093). A
+`irreversible` is `{"value", "reasons"}` (KNSH-093), reasons redacted like the command. A
 request past its `timeout_at` is not listed. No authentication: listing changes nothing.
 
 ### `approval.approve`

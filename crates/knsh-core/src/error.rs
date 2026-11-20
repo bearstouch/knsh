@@ -108,6 +108,8 @@ pub enum CoreError {
     InvalidUnprotected,
     /// A record's stored `files_changed` list is not in the form the engine writes (KNSH-082).
     InvalidFilesChanged,
+    /// A record's stored `irreversible` object is not in the form the engine writes (KNSH-093).
+    InvalidIrreversible,
 }
 
 impl fmt::Display for CoreError {
@@ -163,6 +165,7 @@ impl fmt::Display for CoreError {
             Self::InvalidNetwork => f.write_str("not a stored record network list"),
             Self::InvalidUnprotected => f.write_str("not a stored list of unprotected checkpoint roots"),
             Self::InvalidFilesChanged => f.write_str("not a stored list of changed files"),
+            Self::InvalidIrreversible => f.write_str("not a stored irreversible flag"),
         }
     }
 }

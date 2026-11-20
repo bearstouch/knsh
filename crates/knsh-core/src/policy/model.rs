@@ -211,6 +211,10 @@ pub struct ApprovalsPolicy {
     /// `approvals.irreversible_commands` (proposed): patterns the profile adds to the irreversible list. Default
     /// none.
     pub irreversible_commands: Vec<String>,
+    /// `approvals.upload_hosts` (KNSH-093): hosts the profile adds to the built-in upload-capable list
+    /// ([`BUILTIN_UPLOAD_HOSTS`](crate::BUILTIN_UPLOAD_HOSTS)); a line that reached one is marked irreversible after it
+    /// runs (FR-IRR-03). Matched like every host entry. Default none.
+    pub upload_hosts: Vec<String>,
 }
 
 /// `[checkpoints]`: protected roots.

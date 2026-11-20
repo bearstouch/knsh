@@ -248,6 +248,7 @@ fn proposed_keys_are_read() {
         "name = \"p\"\n[exec]\ntrusted_folders = [\"/nix/bin\"]\ntrusted_tools = [\"chrome\"]\nbash = \"/opt/homebrew/bin/bash\"\n\
          [exec.interpreters.lua]\ncode_options = [\"-e\"]\n\
          [approvals]\nirreversible = \"deny\"\nirreversible_commands = [\"terraform destroy\"]\n\
+         upload_hosts = [\"*.drop.example.org\"]\n\
          [output]\nmode = \"errors_only\"\n",
     );
     let profile = load(&source, "p").unwrap();
@@ -257,6 +258,7 @@ fn proposed_keys_are_read() {
     assert_eq!(profile.exec.interpreters.find("lua").unwrap().code_options, ["-e"]);
     assert_eq!(profile.approvals.irreversible, RuleAction::Deny);
     assert_eq!(profile.approvals.irreversible_commands, ["terraform destroy"]);
+    assert_eq!(profile.approvals.upload_hosts, ["*.drop.example.org"]);
     assert_eq!(profile.output.mode, OutputMode::ErrorsOnly);
 
     let bad = Source::default().with("p", "name = \"p\"\n[exec.interpreters.lua5]\n");

@@ -32,11 +32,12 @@
 //!
 //! The spec lists settings without keys (`policy-profile.md`, "Profiles may also set"). This module reads them as
 //! proposed in the models page: `exec.trusted_folders`, `exec.trusted_tools`, `exec.bash`,
-//! `approvals.irreversible_commands` and `output.mode`.
+//! `approvals.irreversible_commands` and `output.mode`. KNSH-093 adds `approvals.upload_hosts`.
 
 mod check;
 mod fixed;
 mod grant;
+mod irreversible;
 mod layer;
 mod line;
 mod model;
@@ -56,6 +57,7 @@ pub use fixed::{
     VOLUME_CHECKPOINT_DIR,
 };
 pub use grant::{Grant, GrantScope, GrantSet, MAX_GRANTS, line_grant_rule};
+pub use irreversible::{BUILTIN_UPLOAD_HOSTS, classify_irreversible, mark_observed};
 use layer::{Layer, LayerKind, ReadTemplate};
 pub use line::{
     DecisionSource, LineCapabilities, LineDecision, LineReason, MatchedRule, evaluate_line, evaluate_line_with_grants,
@@ -246,6 +248,7 @@ fn override_layer(parent: Layer, child: Layer) -> Layer {
         approvals_irreversible_commands: child
             .approvals_irreversible_commands
             .or(parent.approvals_irreversible_commands),
+        approvals_upload_hosts: child.approvals_upload_hosts.or(parent.approvals_upload_hosts),
         checkpoints_roots: child.checkpoints_roots.or(parent.checkpoints_roots),
         checkpoints_required: child.checkpoints_required.or(parent.checkpoints_required),
         checkpoints_exclude: child.checkpoints_exclude.or(parent.checkpoints_exclude),
@@ -445,6 +448,7 @@ fn build<F: PolicyFs + ?Sized>(
         approvals: ApprovalsPolicy {
             irreversible: layer.approvals_irreversible.unwrap_or(RuleAction::Ask),
             irreversible_commands: layer.approvals_irreversible_commands.unwrap_or_default(),
+            upload_hosts: layer.approvals_upload_hosts.unwrap_or_default(),
         },
         checkpoints: CheckpointPolicy {
             roots: paths(layer.checkpoints_roots, "checkpoints.roots")?,

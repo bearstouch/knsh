@@ -51,6 +51,15 @@
 //! `secret.injected` names each secret and the line, and the record's `secrets_injected` lists the names (FR-SEC-06).
 //! Dynamic code never receives one (FR-SEC-04).
 //!
+//! # Irreversible lines (KNSH-093)
+//!
+//! The pipeline classifies every line it parses as irreversible or not (FR-IRR-01) and asks about a flagged line as
+//! `approvals.irreversible` says (FR-IRR-05); a refused line's record keeps that classification. Once an allowed line
+//! has run, what it was seen doing is added ([`knsh_core::mark_observed`], FR-IRR-03): an approval or upload-capable
+//! host the proxy reported it contacted, and paths written outside the checkpoint roots (none are observed yet: file
+//! events cover the roots only). The marks go to the line's checkpoint ([`IrreversibleMarks`], so its undo lists them,
+//! FR-IRR-06) and to its record, before `command.finished` is published.
+//!
 //! # Held lines (KNSH-054)
 //!
 //! A line for a session that is paused or under human control is answered `-32007` with `data.state` before anything
@@ -76,16 +85,16 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use knsh_checkpoint::{Gate, ShadowProgress, gate, line_touches_root};
 use knsh_core::{
-    Actor, Allowed, Authority, BinaryLookup, Caller, CancelReason, CanonicalPath, Counted, Decision, DecisionSource,
-    DenialLimiter, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR, LineInput, LineKey, LocalApprovals,
-    NetworkEntry, Observer, Outcome, OutputStream, Profile, Proposal, RateLimits, RecordDetails, RecordId, Redacted,
-    Redactor, Refusal, RefusalKind, RequestId, SessionId, Timestamp, Ulid, UnprotectedReason, UnprotectedRoot, argv_of,
-    decide,
+    Actor, Allowed, Authority, BinaryLookup, Caller, CancelReason, CanonicalPath, CheckpointId, Counted, Decision,
+    DecisionSource, DenialLimiter, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR, LineInput, LineKey,
+    LocalApprovals, NetworkEntry, Observer, Outcome, OutputStream, Profile, Proposal, RateLimits, RecordDetails,
+    RecordId, Redacted, Redactor, Refusal, RefusalKind, RequestId, SessionId, Timestamp, Ulid, UnprotectedReason,
+    UnprotectedRoot, argv_of, decide, mark_observed,
 };
 use knsh_json::{Object, ToJson, Value};
 use knsh_platform::{Clock, ProcessGroupId, Processes, Random};
@@ -139,6 +148,13 @@ const SHADOW_WAIT_SLICE: Duration = Duration::from_millis(100);
 pub(crate) trait Spawner: Send + Sync {
     /// Runs `plan`, reports its start and a long run through `events`, and waits for it to end.
     fn spawn(&self, plan: SpawnPlan, events: &dyn LineEvents) -> SpawnReport;
+}
+
+/// Where a line's irreversible marks go once it has run (KNSH-093, FR-IRR-03, FR-IRR-06): the checkpoint history, so
+/// undoing the line's checkpoint lists what it cannot take back. Must not block on a restore in progress.
+pub(crate) trait IrreversibleMarks: Send + Sync {
+    /// Notes `reasons` (never empty) on `checkpoint`, which holds the line's changes.
+    fn mark(&self, checkpoint: CheckpointId, reasons: &[String]);
 }
 
 /// What a [`Spawner`] reports while a line runs (FR-LC-17). Best effort: an event never decides anything.
@@ -357,6 +373,9 @@ pub(crate) struct Lifecycle {
     parts: Parts,
     /// Denials counted per session and line (KNSH-055). A leaf lock (module documentation, "Repeated denials").
     limiter: Mutex<DenialLimiter>,
+    /// The checkpoint history, once attached ([`Lifecycle::attach_marks`]). Without one no line has a checkpoint in a
+    /// history, and the marks are kept in the record only.
+    marks: OnceLock<Arc<dyn IrreversibleMarks>>,
 }
 
 /// A line that may be spawned: everything its record needs once it ends. A line that may not is an `Err` holding
@@ -410,7 +429,14 @@ impl Lifecycle {
         Arc::new(Self {
             parts,
             limiter: Mutex::new(DenialLimiter::new()),
+            marks: OnceLock::new(),
         })
+    }
+
+    /// Sends every later line's irreversible marks to `marks` as well as to its record (KNSH-093).
+    pub(crate) fn attach_marks(&self, marks: Arc<dyn IrreversibleMarks>) {
+        // Set once at start; a second call would be a wiring mistake and is ignored.
+        let _ = self.marks.set(marks);
     }
 
     /// Steps 1 to 8 and the handling of a refusal, for `line` from `caller` (module documentation).
@@ -485,6 +511,7 @@ impl Lifecycle {
                 kind: RefusalKind::Cancelled { request_id: None },
                 classification: Some(allowed.classification),
                 line_key: None,
+                irreversible: Some(allowed.irreversible),
             },
             // The session was paused or taken over while the line was decided (module documentation, "Held lines"):
             // recorded as a deny so the decision is not lost, and answered with the hold so the client retries.
@@ -626,6 +653,7 @@ impl Lifecycle {
             kind,
             classification: Some(allowed.classification),
             line_key: None,
+            irreversible: Some(allowed.irreversible),
         };
         let error = self.refused(line, actor, Some(redactor), record, &refusal);
         match blocked {
@@ -739,6 +767,7 @@ impl Lifecycle {
             // Refused before step 2: the line was never parsed, so its record has no `argv` and no rate-limit key.
             classification: None,
             line_key: None,
+            irreversible: None,
         };
         // Without a record ID (no clock or random bytes) nothing can be recorded; the denial is still reported.
         let Some((record_id, received_at)) = record else {
@@ -796,6 +825,8 @@ impl Lifecycle {
                     .zip(redactor)
                     .map(|(classification, redactor)| argv_of(classification, redactor))
                     .unwrap_or_default(),
+                // FR-IRR-04: a refused line keeps its classification (KNSH-093).
+                irreversible: refusal.irreversible.clone(),
                 ..RecordDetails::default()
             },
         };
@@ -898,8 +929,10 @@ impl Lifecycle {
         unprotected: Vec<UnprotectedRoot>,
         closed: &ClosedLine,
         secrets_injected: Vec<String>,
+        profile: &Profile,
     ) -> (bool, Timestamp) {
         let ended_at = self.parts.clock.now().unwrap_or(started_at);
+        let irreversible = self.mark_irreversible(allowed, profile, report, closed);
         let ran = report.outcome.as_ref().ok();
         let (exit_code, signal) = match ran {
             // FR-LC-40: a timed-out line always got `SIGTERM` first; one that then exited by itself (it trapped the
@@ -950,6 +983,7 @@ impl Lifecycle {
                 }),
                 // FR-SEC-06, FR-REC-11: names only, never a value.
                 secrets_injected,
+                irreversible: Some(irreversible),
                 // `pipestatus` stays empty: the line runs in a separate bash whose `PIPESTATUS` is not reported back
                 // yet (KNSH-100).
                 ..RecordDetails::default()
@@ -976,6 +1010,28 @@ impl Lifecycle {
             let _ = self.parts.events.publish(session_id, actor, data);
         }
         (written, ended_at)
+    }
+
+    /// The line's irreversible flag once it has run (module documentation, "Irreversible lines"): its classification
+    /// with what it was seen doing added (FR-IRR-03), noted on its checkpoint too when it has one (FR-IRR-06). Called
+    /// before its record is written and `command.finished` published.
+    fn mark_irreversible(
+        &self,
+        allowed: &Allowed,
+        profile: &Profile,
+        report: &SpawnReport,
+        closed: &ClosedLine,
+    ) -> knsh_core::Irreversibility {
+        let mut irreversible = allowed.irreversible.clone();
+        // Coverage (KNSH-093): file events are watched only under the checkpoint roots, so no write outside them is
+        // observed yet; the proxy reports every connection.
+        mark_observed(profile, &mut irreversible, &report.network, &[]);
+        if irreversible.value()
+            && let (Some(checkpoint), Some(marks)) = (closed.checkpoint.as_ref(), self.marks.get())
+        {
+            marks.mark(checkpoint.id, irreversible.reasons());
+        }
+        irreversible
     }
 
     /// How `line` is captured (module documentation, "Output"), given whether its session records output: `None` when
@@ -1055,6 +1111,8 @@ impl Supervisor for Lifecycle {
             secrets: injection::injected_names(&admitted.secrets),
             spawned: AtomicBool::new(false),
         };
+        // What the line reached is judged against the profile it ran with (KNSH-093), after the plan takes it.
+        let observing = profile.clone();
         let plan = SpawnPlan {
             record_id,
             line,
@@ -1099,6 +1157,7 @@ impl Supervisor for Lifecycle {
             admitted.unprotected,
             &closed,
             events.secrets_injected(),
+            &observing,
         );
         let record_id = written.then_some(record_id);
         // FR-CKP-04: the line's checkpoints in these roots are uncertain (the roots were rescanned).

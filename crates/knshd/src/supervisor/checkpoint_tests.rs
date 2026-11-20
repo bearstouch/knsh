@@ -17,8 +17,9 @@ use crate::shadows::CheckpointEvents;
 use crate::shadows::EdgeSink;
 use crate::shadows::tests::{ROOT, RecordedEdges, SETTLE, echoing_events, profile_with, shadows, shadows_with_edges};
 
-/// Lines the profile allows.
-const ALLOW: &str = "[exec]\nallow = [\"echo\", \"ls\"]\n";
+/// Lines the profile allows, and `github.com` as an approval host (KNSH-093).
+const ALLOW: &str =
+    "[exec]\nallow = [\"echo\", \"ls\"]\n[network]\nmode = \"allowlist\"\napproval_hosts = [\"github.com\"]\n";
 
 /// A session on profile `ckpt`, protecting `ROOT`, with shadows built from `tree`.
 struct Rig {
@@ -569,4 +570,119 @@ fn files_changed_is_zero_in_a_root_and_null_outside() {
     assert_eq!(record(quiet.record_id).details.files_changed, Some(Vec::new()));
     assert_eq!(record(outside.record_id).details.files_changed, None);
     assert_eq!(record(quiet.record_id).details.checkpoint_id, None);
+}
+
+/// Irreversible marks as the history receives them, each with the `command.finished` events published by then.
+struct RecordedMarks {
+    subscriber: crate::events::Subscriber,
+    /// Every event taken off the subscriber, in order, with a `mark` entry where a mark arrived.
+    seen: Mutex<Vec<String>>,
+}
+
+impl RecordedMarks {
+    fn take(&self) {
+        let names = self
+            .subscriber
+            .take(usize::MAX)
+            .into_iter()
+            .filter_map(|(_, delivery)| match delivery {
+                knsh_core::Delivery::Event(event) => Some(event.name().to_owned()),
+                _ => None,
+            });
+        self.seen.lock().unwrap().extend(names);
+    }
+}
+
+impl IrreversibleMarks for RecordedMarks {
+    fn mark(&self, checkpoint: CheckpointId, reasons: &[String]) {
+        self.take();
+        self.seen.lock().unwrap().push(format!("mark {checkpoint} {reasons:?}"));
+    }
+}
+
+// FR-IRR-03, FR-IRR-04 (KNSH-093): a line the proxy reports reaching an `approval_hosts` destination is marked
+// irreversible with `network` and the host, on its record and on its checkpoint, before `command.finished` is
+// published.
+#[test]
+fn marks_present_before_command_finished() {
+    let tree = Arc::new(FakeTree::new());
+    let writer_tree = Arc::clone(&tree);
+    let rig = Rig::with_spawner(&tree, true, false, move |journal, file_events| {
+        let mut inner = FakeSpawner::new(journal);
+        inner.network = vec![
+            knsh_core::NetworkEntry::new(
+                knsh_core::Redacted::new("github.com".to_owned()),
+                443,
+                knsh_core::NetworkResult::Contacted,
+            ),
+            knsh_core::NetworkEntry::new(
+                knsh_core::Redacted::new("example.com".to_owned()),
+                443,
+                knsh_core::NetworkResult::Refused("host_not_allowed".to_owned()),
+            ),
+        ];
+        Arc::new(WritingSpawner {
+            inner,
+            tree: writer_tree,
+            file_events,
+        })
+    });
+    assert_eq!(settled_root(&rig), knsh_checkpoint::RootReadiness::Ready);
+    let marks = Arc::new(RecordedMarks {
+        subscriber: crate::events::Subscriber::new(),
+        seen: Mutex::new(Vec::new()),
+    });
+    marks
+        .subscriber
+        .subscribe(&rig.fixture.hub, knsh_core::EventScope::Session(rig.session_id), None)
+        .unwrap();
+    rig.lifecycle
+        .attach_marks(Arc::clone(&marks) as Arc<dyn IrreversibleMarks>);
+
+    let finished = rig.lifecycle.run(rig.line("echo hi", true), &StillWaiting).unwrap();
+    let checkpoint_id = finished.checkpoint_id.expect("the line's checkpoint");
+    marks.take();
+    let seen = marks.seen.lock().unwrap().clone();
+    let mark = format!("mark {checkpoint_id} [\"network\", \"github.com\"]");
+    let marked_at = seen
+        .iter()
+        .position(|entry| *entry == mark)
+        .expect("the checkpoint was marked");
+    let finished_at = seen
+        .iter()
+        .position(|entry| entry == "command.finished")
+        .expect("command.finished");
+    assert!(marked_at < finished_at, "{seen:?}");
+
+    let records = rig.records();
+    let record = records
+        .iter()
+        .find(|record| Some(record.record_id) == finished.record_id)
+        .unwrap();
+    let flag = record.details.irreversible.as_ref().expect("the record's flag");
+    assert!(flag.value());
+    assert_eq!(flag.reasons(), ["network", "github.com"]);
+}
+
+// FR-IRR-04 (KNSH-093): a line that ran without doing anything irreversible is recorded `{"value": false}`, and its
+// checkpoint is not marked.
+#[test]
+fn reversible_line_is_recorded_unflagged_and_not_marked() {
+    let tree = Arc::new(FakeTree::new());
+    let rig = Rig::new(&tree, true, false);
+    assert_eq!(settled_root(&rig), knsh_checkpoint::RootReadiness::Ready);
+    let marks = Arc::new(RecordedMarks {
+        subscriber: crate::events::Subscriber::new(),
+        seen: Mutex::new(Vec::new()),
+    });
+    rig.lifecycle
+        .attach_marks(Arc::clone(&marks) as Arc<dyn IrreversibleMarks>);
+    let finished = rig.lifecycle.run(rig.line("echo hi", true), &StillWaiting).unwrap();
+    let records = rig.records();
+    let record = records
+        .iter()
+        .find(|record| Some(record.record_id) == finished.record_id)
+        .unwrap();
+    assert_eq!(record.details.irreversible, Some(knsh_core::Irreversibility::none()));
+    assert!(marks.seen.lock().unwrap().is_empty());
 }

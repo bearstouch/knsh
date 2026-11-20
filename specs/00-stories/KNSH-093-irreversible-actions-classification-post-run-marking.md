@@ -22,27 +22,30 @@ back, so that I am never misled about what was reversed.
 **Acceptance criteria**
 *Irreversible classification before running*
 
-- [ ] The built-in list marks at least `git push`, `npm publish`, `docker push`, `kubectl apply`, `terraform apply`,
+- [x] The built-in list marks at least `git push`, `npm publish`, `docker push`, `kubectl apply`, `terraform apply`,
       `gh pr merge`, `ssh`, `scp`, `rsync` to a remote host, and `curl` with `POST`, `PUT`, `PATCH` or `DELETE`
       (FR-IRR-02).
-- [ ] Matching uses normalised subcommands, so `git -c x=y push` is flagged.
-- [ ] `rsync` with only local paths is not flagged; `curl` without a method flag (`GET`) is not flagged.
-- [ ] Profile entries add to the built-in list.
-- [ ] The record's `irreversible` holds `value` and `reasons` (FR-IRR-04).
+- [x] Matching uses normalised subcommands, so `git -c x=y push` is flagged.
+- [x] `rsync` with only local paths is not flagged; `curl` without a method flag (`GET`) is not flagged.
+- [x] Profile entries add to the built-in list.
+- [x] The record's `irreversible` holds `value` and `reasons` (FR-IRR-04).
 
 *Irreversible marking after running*
 
-- [ ] A line that reached an `approval_hosts` destination (from proxy reports) is marked irreversible with reason
+- [x] A line that reached an `approval_hosts` destination (from proxy reports) is marked irreversible with reason
       `network` and the host.
-- [ ] A line that reached an upload-capable host is marked irreversible.
+- [x] A line that reached an upload-capable host is marked irreversible.
 - [ ] A line that wrote outside the checkpoint roots is marked irreversible with the paths as reasons.
-- [ ] Marks are added to the record and to the checkpoint before `command.finished` is emitted.
+      **Pending:** the marking takes observed paths and is unit-tested (`write_outside_roots_marks_irreversible`),
+      but no source observes writes outside the roots yet (file events watch the roots only), so nothing is marked
+      in practice. Recorded as a coverage limit in the irreversible-actions spec.
+- [x] Marks are added to the record and to the checkpoint before `command.finished` is emitted.
 
 *Irreversible approvals and undo reporting*
 
-- [ ] With `approvals.irreversible = "ask"`, every flagged line becomes an ask, and `decision.requested` carries
+- [x] With `approvals.irreversible = "ask"`, every flagged line becomes an ask, and `decision.requested` carries
       `irreversible.reasons` (FR-IRR-05).
-- [ ] Undo of a flagged change restores its files and lists what cannot be undone (FR-IRR-06, FR-CKP-36).
+- [x] Undo of a flagged change restores its files and lists what cannot be undone (FR-IRR-06, FR-CKP-36).
 
 **Unit tests**
 *Irreversible classification before running*
@@ -68,6 +71,7 @@ back, so that I am never misled about what was reversed.
 **Notes**
 *Irreversible marking after running*
 
+- Spec gap (resolved in KNSH-093): upload-capable hosts are a built-in list plus the profile's `approvals.upload_hosts`.
 - Spec gap: how a host is known to be "upload-capable" is not defined. Propose a profile or preset list in
   [../03-functional-requirements/irreversible-actions.md](../03-functional-requirements/irreversible-actions.md) as part of this story.
 - Writes outside checkpoint roots are only observable where file events or sandbox reports cover them; record the

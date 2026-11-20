@@ -208,12 +208,15 @@ fn python_subprocess_git_push_cannot_reach_approval_host() {
     };
     let stack = Stack::start("python", &bins);
     let developer = developer_dir();
+    // `approvals.irreversible = "allow"`: the plain `git push` below must reach the proxy, which is what this case
+    // checks, rather than ask as irreversible (KNSH-093) and time out unanswered.
     stack.profile(
         "net",
         &format!(
             "[fs]\nwrite = [\"${{PROJECT}}\"]\n[exec]\nallow = [\"python3\", \"git\"]\ntrusted_folders = [\"{}\"]\n\
              [network]\nmode = \"allowlist\"\nhosts = [\"allowed.test\", \"127.0.0.1\"]\n\
-             approval_hosts = [\"github.com\"]\n",
+             approval_hosts = [\"github.com\"]\n\
+             [approvals]\nirreversible = \"allow\"\n",
             developer.display()
         ),
     );

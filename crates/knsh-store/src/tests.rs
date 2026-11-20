@@ -179,7 +179,17 @@ fn full_details() -> RecordDetails {
                 sha256: Some([7; 32]),
             }),
         }]),
+        irreversible: Some(irreversible(&["git push", "network", "github.com"])),
     }
+}
+
+/// An irreversible flag with `reasons` (KNSH-093).
+fn irreversible(reasons: &[&str]) -> knsh_core::Irreversibility {
+    let mut flag = knsh_core::Irreversibility::none();
+    for reason in reasons {
+        flag.add(*reason);
+    }
+    flag
 }
 
 /// A violation of record `n` of `session`, from process `pid`.
@@ -326,6 +336,8 @@ fn human_record_drops_non_telemetry_fields() {
     assert_eq!(details.attribution, Some(knsh_core::Attribution::Concurrent));
     // KNSH-082: the changed files read back with their post-image identities.
     assert_eq!(details.files_changed, full_details().files_changed);
+    // KNSH-093 (FR-IRR-04): the irreversible flag reads back with its reasons, in order.
+    assert_eq!(details.irreversible, full_details().irreversible);
     assert_eq!(stored.stdout.map(|info| info.stored), Some(3));
     assert_eq!(stored.stderr.map(|info| info.stored), Some(0));
 }
@@ -988,6 +1000,42 @@ fn files_changed_corrupt_is_reported_and_empty_is_kept() {
         raw.execute(
             "UPDATE records SET files_changed = '[{\"path\":\"/a\",\"change\":\"renamed\",\"post_image\":null}]' \
              WHERE record_id = ?1",
+            &[Value::Text(&record_id(1).to_string())],
+        )
+        .unwrap();
+    }
+    let read = store.query(Scope::All, RecordQuery::default());
+    assert!(matches!(read, Err(StoreError::Corrupt)));
+}
+
+// KNSH-093 (FR-IRR-04): a record whose line was not irreversible keeps `{"value": false}`, one refused before it was
+// classified keeps none, and a stored flag the engine could not have written is reported as corrupt.
+#[test]
+fn irreversible_flag_round_trips_and_corrupt_is_reported() {
+    let dir = TempDir::new("irreversible");
+    let store = open(&dir);
+    for (n, flag) in [(1, Some(irreversible(&[]))), (2, None)] {
+        let line = ExecutionRecord {
+            details: RecordDetails {
+                irreversible: flag,
+                ..full_details()
+            },
+            ..record(n, session_id(1), agent(), "true")
+        };
+        store.write_record(line, RecordedOutput::default()).unwrap();
+    }
+    let page = store.query(Scope::All, RecordQuery::default()).unwrap();
+    let flags: Vec<_> = page
+        .records
+        .iter()
+        .map(|stored| (stored.record.record_id, stored.record.details.irreversible.clone()))
+        .collect();
+    assert!(flags.contains(&(record_id(1), Some(irreversible(&[])))));
+    assert!(flags.contains(&(record_id(2), None)));
+    {
+        let raw = Connection::open(&RealFs::new(), &dir.db(), DEFAULT_BUSY_TIMEOUT).unwrap();
+        raw.execute(
+            "UPDATE records SET irreversible = '{\"value\":true,\"reasons\":[]}' WHERE record_id = ?1",
             &[Value::Text(&record_id(1).to_string())],
         )
         .unwrap();

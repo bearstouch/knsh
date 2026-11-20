@@ -60,8 +60,8 @@ use knsh_json::ToJson;
 use knsh_platform::{Clock, ConnectionId, Field, Level, Monotonic, Random, SystemLog, Value};
 use knsh_proto::{
     DECISION_CANCELLED, DECISION_REQUESTED, DecisionAnswer, DecisionCancelledParams, DecisionRequestedParams,
-    DecisionRespondParams, DecisionRespondResult, ErrorCode, GrantRequest, GrantRequestScope, Message, MethodName,
-    Notification, PendingApproval, RpcError, encode,
+    DecisionRespondParams, DecisionRespondResult, ErrorCode, GrantRequest, GrantRequestScope, Irreversible, Message,
+    MethodName, Notification, PendingApproval, RpcError, encode,
 };
 
 use crate::dispatch::{Call, Endpoint, Handler, Handlers, Reply, answer, params};
@@ -408,8 +408,8 @@ impl Decisions {
             cwd: proposal.cwd.as_path().to_string_lossy().into_owned(),
             matched_rule: request.rule_id.map(str::to_owned),
             hook: request.hook.map(str::to_owned),
-            // Not classified yet (KNSH-093): reported as unknown, never as reversible.
-            irreversible: None,
+            // FR-IRR-05, FR-AUTH-20 (KNSH-093): the line's classification, reasons redacted like the command.
+            irreversible: Some(crate::decisions::irreversible_of(request)),
             timeout_at,
         };
         let requested = notification(DECISION_REQUESTED, &params)?;
@@ -539,6 +539,21 @@ impl AuthorityWatch for Decisions {
         if state.authority == Some(connection) {
             state.authority = None;
         }
+    }
+}
+
+/// `irreversible` of the pending request for `request` (FR-IRR-05, FR-AUTH-20, KNSH-093): whether the line is
+/// classified irreversible, with each reason passed through the session's redactor like the command, so nothing the
+/// authority or `knsh approvals` sees can carry a secret (FR-REC-05).
+pub(crate) fn irreversible_of(request: &AskRequest<'_>) -> Irreversible {
+    let flag = request.irreversible;
+    Irreversible {
+        value: flag.value(),
+        reasons: flag
+            .reasons()
+            .iter()
+            .map(|reason| request.proposal.redactor.redact_text(reason).expose().clone())
+            .collect(),
     }
 }
 

@@ -132,6 +132,7 @@ impl Harness {
                 rule_id: Some("exec.ask[0]"),
                 hook: None,
                 profile: &profile,
+                irreversible: &flag_of(&line),
             };
             approvals.ask(&request, caller.as_ref())
         });
@@ -205,7 +206,14 @@ fn lists_pending_requests() {
     assert_eq!(entry.cwd, CWD);
     assert_eq!(entry.matched_rule.as_deref(), Some("exec.ask[0]"));
     assert_eq!(entry.hook, None);
-    assert_eq!(entry.irreversible, None, "not classified yet (KNSH-093)");
+    // FR-IRR-05 (KNSH-093): `knsh approvals` sees why the line is irreversible.
+    assert_eq!(
+        entry.irreversible,
+        Some(knsh_proto::Irreversible {
+            value: true,
+            reasons: vec!["git push".to_owned()],
+        })
+    );
     // The injected clock's start plus the 30 s timeout.
     assert_eq!(entry.timeout_at.to_string(), "2027-01-15T08:00:30.000000Z");
 
@@ -460,4 +468,13 @@ fn prompt_success_after_the_request_ended_is_refused() {
     }));
     assert_eq!(harness.approve(id).unwrap_err().code, ErrorCode::DecisionTimeout);
     assert_eq!(asking.join().unwrap().reply, AskReply::TimedOut);
+}
+
+/// The irreversible flag the pipeline gives `line` in these tests: `git push` for a push, none otherwise (KNSH-093).
+fn flag_of(line: &str) -> knsh_core::Irreversibility {
+    let mut flag = knsh_core::Irreversibility::none();
+    if line.starts_with("git push") {
+        flag.add("git push");
+    }
+    flag
 }

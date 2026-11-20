@@ -56,7 +56,7 @@ Implemented in KNSH-069 (FR-AUTH-20 – FR-AUTH-24, FR-EVT-06, FR-LC-41). While 
 {"method": "decision.requested", "params": {"request_id": "…", "session_id": "…",
   "actor": {"kind": "agent", "agent_id": "claude-code"}, "command": "git push origin main", "rewritten_from": null,
   "cwd": "/Users/me/code/app", "matched_rule": "exec.ask[0]", "hook": null,
-  "irreversible": {"value": true, "reasons": ["network", "git push"]}, "timeout_at": "…"}}
+  "irreversible": {"value": true, "reasons": ["git push"]}, "timeout_at": "…"}}
 
 // authority → engine
 {"method": "decision.respond", "params": {"request_id": "…", "verdict": "allow",
@@ -81,7 +81,7 @@ event. The same members as an entry of [`approval.list`](user-socket.md#approval
 | `cwd` | Working directory |
 | `matched_rule` | Rule that asked, e.g. `exec.ask[0]`; `null` when only a hook asked |
 | `hook` | The hook that asked, when one did; otherwise `null` |
-| `irreversible` | `value` and `reasons`; `null` until lines are classified for irreversibility (KNSH-093) |
+| `irreversible` | `value` and `reasons` ([irreversible actions](../03-functional-requirements/irreversible-actions.md#reasons)): whether the line is classified irreversible before it runs, and why. `{"value": false, "reasons": []}` for a line asked about for another reason |
 | `timeout_at` | When the request will be denied |
 
 ### `decision.respond` params

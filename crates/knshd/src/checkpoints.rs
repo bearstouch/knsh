@@ -8,6 +8,10 @@
 //!   watchers whose reports end in the sink, so finished checkpoints queue and are recorded by whoever holds or
 //!   next takes the lock, in the order they finished. Every holder records the queue right after taking the lock and
 //!   again before releasing it, then retries once the lock is free, so nothing waits in the queue past a call.
+//! - **Marked.** A line that ran and is irreversible has its reasons noted on its checkpoint ([`IrreversibleMarks`],
+//!   KNSH-093), so its undo restores its files and lists what it cannot take back (FR-IRR-06, FR-CKP-36). Marks join
+//!   the same queue as finished checkpoints, never waiting for the lock, and are applied in order behind the
+//!   checkpoint they name: a restore that takes the lock after the line's `command.finished` sees them.
 //! - **Served** on each endpoint with the caller the endpoint implies: on `agent.sock` the agent session the
 //!   connection was bound to (`Caller::Agent`), which sees and acts on its own session's changes only; on `user.sock`
 //!   the user; on the control service the authority. `force` from `agent.sock` is refused before anything else is
@@ -42,7 +46,9 @@ use knsh_checkpoint::{
     Caller, Checkpoint, CheckpointError, DiffRequest, Forget, History, Request, RestoreEvents, Restored, Retention,
     StateRequest, StateRestored, Swept, Target,
 };
-use knsh_core::{CanonicalPath, EdgeKind, EventData, HistoryEdge, RestoreOperation, SessionId, Timestamp};
+use knsh_core::{
+    CanonicalPath, CheckpointId, EdgeKind, EventData, HistoryEdge, RestoreOperation, SessionId, Timestamp,
+};
 use knsh_json::ToJson;
 use knsh_platform::{Clock, Field, Level, PlatformError, SystemLog, Value};
 use knsh_proto::{
@@ -55,6 +61,7 @@ use knsh_proto::{
 use crate::dispatch::{Answer, Call, Endpoint, Handler, Handlers, Reply, answer, params};
 use crate::events::EventHub;
 use crate::shadows::{CheckpointSink, RestoreWindows};
+use crate::supervisor::IrreversibleMarks;
 
 /// The longest the retention thread sleeps when nothing is due: a backstop, so a sweep that was never requested
 /// (a clock step, a missed wake-up) still happens.
@@ -83,11 +90,20 @@ struct SweepState {
     stopped: bool,
 }
 
+/// One item waiting for the history lock (module documentation, "Fed" and "Marked").
+#[derive(Debug)]
+enum Queued {
+    /// A finished checkpoint, to record as a change.
+    Checkpoint(Checkpoint),
+    /// What the change held by this checkpoint did that cannot be undone (KNSH-093).
+    Marks(CheckpointId, Vec<String>),
+}
+
 /// The daemon's checkpoint history (module documentation).
 pub(crate) struct HistoryService {
     history: Mutex<History>,
-    /// Finished checkpoints not recorded yet, oldest first.
-    pending: Mutex<Vec<Checkpoint>>,
+    /// Finished checkpoints and irreversible marks not recorded yet, oldest first.
+    pending: Mutex<Vec<Queued>>,
     events: Arc<dyn RestoreEvents + Send + Sync>,
     /// The shadows, once they exist: what brackets each restore. Without them no root is watched, so a restore needs
     /// no window.
@@ -142,17 +158,22 @@ impl HistoryService {
         result
     }
 
-    /// Records every queued checkpoint, oldest first. A checkpoint the history refuses (already there: a bug) is
-    /// logged and dropped.
+    /// Records every queued checkpoint and mark, oldest first. A checkpoint the history refuses (already there: a
+    /// bug) is logged and dropped.
     fn record_pending(&self, history: &mut History) {
         let queued = std::mem::take(&mut *lock(&self.pending));
         if queued.is_empty() {
             return;
         }
-        for checkpoint in queued {
-            if history.record(checkpoint).is_err() {
-                self.log
-                    .log(Level::Error, "checkpoint not recorded in the history", &[]);
+        for item in queued {
+            match item {
+                Queued::Checkpoint(checkpoint) => {
+                    if history.record(checkpoint).is_err() {
+                        self.log
+                            .log(Level::Error, "checkpoint not recorded in the history", &[]);
+                    }
+                }
+                Queued::Marks(checkpoint, reasons) => history.mark_irreversible(checkpoint, reasons),
             }
         }
         self.request_sweep();
@@ -452,7 +473,14 @@ impl HistoryService {
 
 impl CheckpointSink for HistoryService {
     fn finished(&self, finished: &[Checkpoint]) {
-        lock(&self.pending).extend(finished.iter().cloned());
+        lock(&self.pending).extend(finished.iter().cloned().map(Queued::Checkpoint));
+        self.record_if_free();
+    }
+}
+
+impl IrreversibleMarks for HistoryService {
+    fn mark(&self, checkpoint: CheckpointId, reasons: &[String]) {
+        lock(&self.pending).push(Queued::Marks(checkpoint, reasons.to_vec()));
         self.record_if_free();
     }
 }

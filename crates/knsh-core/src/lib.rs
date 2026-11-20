@@ -228,16 +228,16 @@ pub use output::{
 };
 pub use path::CanonicalPath;
 pub use policy::{
-    AGENT_SOCKET, ApprovalsPolicy, CONTROL_SERVICE, CheckpointPolicy, ClassHosts, CommandVerdict, DEFAULT_AGENT_BASH,
-    DEFAULT_CHECKPOINT_EXCLUDES, DEFAULT_RETENTION_DAYS, DecisionSource, ENGINE_CONFIG_DIR, ENGINE_DATA_DIR,
-    ENGINE_RUN_DIR, ExecPolicy, FixedDenies, FsPolicy, Grant, GrantScope, GrantSet, HostAccess, HostRefusal,
-    LineAccess, LineCapabilities, LineCheck, LineDecision, LineReason, LineResolver, LoadedProfiles, LookupError,
-    MAX_EXTENDS_DEPTH, MAX_GRANTS, MAX_PROFILE_LEN, MatchedRule, NetworkMode, NetworkPolicy, OutputMode, OutputPolicy,
-    PRESETS, PathContext, PolicyFs, Profile, ProfileSource, RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy,
-    Requester, RuleAction, RuleId, SecretInjection, UNATTENDED_PROFILE, UNATTENDED_PROFILE_TEXT, USER_SOCKET,
-    VOLUME_CHECKPOINT_DIR, at_least_as_strict, check_host, check_line, evaluate_command, evaluate_line,
-    evaluate_line_with_grants, host_matches, is_non_tls_host, line_grant_rule, load_profile, load_profile_text,
-    load_unattended, project_root,
+    AGENT_SOCKET, ApprovalsPolicy, BUILTIN_UPLOAD_HOSTS, CONTROL_SERVICE, CheckpointPolicy, ClassHosts, CommandVerdict,
+    DEFAULT_AGENT_BASH, DEFAULT_CHECKPOINT_EXCLUDES, DEFAULT_RETENTION_DAYS, DecisionSource, ENGINE_CONFIG_DIR,
+    ENGINE_DATA_DIR, ENGINE_RUN_DIR, ExecPolicy, FixedDenies, FsPolicy, Grant, GrantScope, GrantSet, HostAccess,
+    HostRefusal, LineAccess, LineCapabilities, LineCheck, LineDecision, LineReason, LineResolver, LoadedProfiles,
+    LookupError, MAX_EXTENDS_DEPTH, MAX_GRANTS, MAX_PROFILE_LEN, MatchedRule, NetworkMode, NetworkPolicy, OutputMode,
+    OutputPolicy, PRESETS, PathContext, PolicyFs, Profile, ProfileSource, RETENTION_DAYS_RANGE, ReadScope,
+    RecordingPolicy, Requester, RuleAction, RuleId, SecretInjection, UNATTENDED_PROFILE, UNATTENDED_PROFILE_TEXT,
+    USER_SOCKET, VOLUME_CHECKPOINT_DIR, at_least_as_strict, check_host, check_line, classify_irreversible,
+    evaluate_command, evaluate_line, evaluate_line_with_grants, host_matches, is_non_tls_host, line_grant_rule,
+    load_profile, load_profile_text, load_unattended, mark_observed, project_root,
 };
 pub use ratelimit::{
     Counted, DenialLimiter, LIMIT_DENIALS, LIMIT_DURATION, LIMIT_WINDOW, LineKey, MAX_TRACKED_LINES,
@@ -245,10 +245,11 @@ pub use ratelimit::{
 };
 pub use record::{
     ArgvClass, ArgvEntry, Attribution, ChangedFile, DecisionVerdict, ExecutionRecord, FileChange, HookResult, HookRun,
-    MAX_HOOK_RUNS, MAX_NETWORK_ENTRIES, MAX_RECORD_FILES_CHANGED, NetworkEntry, NetworkResult, OutputInfo,
-    OutputStream, RecordDecision, RecordDetails, RecordedIdentity, UnprotectedReason, UnprotectedRoot, argv_of,
-    decode_argv, decode_decision, decode_files_changed, decode_network, decode_unprotected, encode_argv,
-    encode_decision, encode_files_changed, encode_network, encode_unprotected, merge_network,
+    Irreversibility, MAX_HOOK_RUNS, MAX_IRREVERSIBLE_REASONS, MAX_NETWORK_ENTRIES, MAX_RECORD_FILES_CHANGED,
+    NetworkEntry, NetworkResult, OutputInfo, OutputStream, RecordDecision, RecordDetails, RecordedIdentity,
+    UnprotectedReason, UnprotectedRoot, argv_of, decode_argv, decode_decision, decode_files_changed,
+    decode_irreversible, decode_network, decode_unprotected, encode_argv, encode_decision, encode_files_changed,
+    encode_irreversible, encode_network, encode_unprotected, merge_network,
 };
 pub use redacted::{REDACTED_MARKER, Redacted};
 pub use redaction::{MAX_REDACTION_BYTES, RedactStream, Redactor, redaction_marker};

@@ -332,8 +332,8 @@ impl LocalApprovals for Approvals {
                 cwd: proposal.cwd.as_path().to_string_lossy().into_owned(),
                 matched_rule: request.rule_id.map(str::to_owned),
                 hook: request.hook.map(str::to_owned),
-                // Not classified yet (KNSH-093): reported as unknown, never as reversible.
-                irreversible: None,
+                // FR-IRR-05, FR-AUTH-20 (KNSH-093): the line's classification, reasons redacted like the command.
+                irreversible: Some(crate::decisions::irreversible_of(request)),
                 timeout_at,
             },
             prompt: PromptReason::agent_command(command, proposal.cwd, proposal.session_id),

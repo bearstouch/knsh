@@ -56,6 +56,11 @@
 //! FR-NET-03). An option the table does not know, an expansion or an unknown subcommand keeps the raw argv and gives
 //! no classes: the subcommand is never guessed.
 //!
+//! Irreversible actions (KNSH-093): [`BUILTIN_IRREVERSIBLE`] is the list of commands flagged irreversible before
+//! they run (FR-IRR-01, FR-IRR-02), matched by policy like `exec.ask` patterns over normalised arguments, and
+//! [`curl_reason`] and [`rsync_reason`] read the arguments that decide whether a `curl` writes (`POST`, `PUT`,
+//! `PATCH`, `DELETE`) or an `rsync` reaches a remote host. Unknown arguments are flagged (fail closed).
+//!
 //! Re-serialisation, [`reserialise`] (KNSH-038): the classified line is re-emitted with every command name that
 //! resolved to a binary replaced by its absolute canonical path, quoted when needed, and nothing else changed, so the
 //! binary that runs is the one that was classified (FR-LC-13). Builtins, function calls and dynamic parts are left
@@ -83,6 +88,7 @@
 //!   FR-LC-15: executable rules stop a binary swapped after classification)
 //! - `specs/03-functional-requirements/policy.md` (FR-POL-15: subcommand normalisation) and
 //!   `specs/03-functional-requirements/network-proxy.md` (FR-NET-03: classes reaching `approval_hosts`)
+//! - `specs/03-functional-requirements/irreversible-actions.md` (FR-IRR-01, FR-IRR-02: the built-in list)
 //! - `specs/09-reference/decisions.md` (decision 6: parser scope for phase 2)
 //! - `specs/04-non-functional-requirements/security.md` (NFR-SEC-05: memory-safe, fuzzed parsers)
 //! - `specs/09-reference/defaults-and-limits.md` (the parser limits and their rationale)
@@ -100,6 +106,7 @@ mod error;
 mod functions;
 mod interpreter_table;
 mod interpreters;
+mod irreversible;
 mod lex;
 mod limits;
 mod outcome;
@@ -126,6 +133,7 @@ pub use error::{
     UnsupportedConstruct,
 };
 pub use interpreter_table::{Interpreter, Interpreters, family_of};
+pub use irreversible::{BUILTIN_IRREVERSIBLE, curl_reason, rsync_reason};
 pub use lex::lex;
 pub use limits::{MAX_FUNCTION_DEFINITIONS, MAX_INPUT_LEN, MAX_NESTING_DEPTH, MAX_TOKENS};
 pub use outcome::{Dynamic, DynamicPart, DynamicReason, Exact, ParseOutcome, parse_line};

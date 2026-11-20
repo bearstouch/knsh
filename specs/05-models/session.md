@@ -55,7 +55,7 @@ by key. Where two values cannot be compared exactly, only the same value counts,
 | `network.hosts`, `network.loopback`, `network.non_tls_hosts` | a subset of the parent's |
 | `network.approval_hosts` | a subset of the parent's `hosts` and `approval_hosts` |
 | `network.class_hosts` | per class, a subset of the parent's `hosts` and of the parent's `class_hosts` for that class |
-| `approvals.irreversible_commands` | a superset of the parent's |
+| `approvals.irreversible_commands`, `approvals.upload_hosts` | a superset of the parent's |
 | `checkpoints` | `required` kept, every parent root kept, `exclude` a subset of the parent's |
 | `recording` | `commands` and `output` on wherever the parent's are, `retention_days` at least the parent's |
 | `secrets.env` | every child entry is the parent's, unchanged |

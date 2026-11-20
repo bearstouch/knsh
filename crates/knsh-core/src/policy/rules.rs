@@ -82,6 +82,9 @@ pub enum RuleId {
     /// `secrets.env[N]`: the command would receive the `N`-th `[secrets.env]` variable, in variable-name order, so a
     /// command the rules allow asks instead (FR-SEC-02, KNSH-092).
     Secret(usize),
+    /// `approvals.irreversible`: the command is classified irreversible, so it is treated as that setting says even
+    /// when the rules allow it (FR-IRR-05, KNSH-093).
+    Irreversible,
 }
 
 impl fmt::Display for RuleId {
@@ -93,6 +96,7 @@ impl fmt::Display for RuleId {
             Self::ProjectExecutables => f.write_str("exec.project_executables"),
             Self::Default => f.write_str("exec.default"),
             Self::Secret(index) => write!(f, "secrets.env[{index}]"),
+            Self::Irreversible => f.write_str("approvals.irreversible"),
         }
     }
 }
@@ -156,6 +160,31 @@ pub fn evaluate_command(profile: &Profile, command: &ClassifiedCommand) -> Comma
 /// not found or built from an expansion) never matches.
 pub(crate) fn matches_certainly(pattern: &str, command: &ClassifiedCommand) -> bool {
     Subject::of(command).is_some_and(|subject| subject.matches(pattern) == Match::Certain)
+}
+
+/// Whether `pattern` matches `command` for some value of its unknown arguments: the test a deny or ask rule passes
+/// (module documentation). Used to flag irreversible commands (KNSH-093), which, like an ask, must not be stepped
+/// around with an expansion. A command no rule may name never matches.
+pub(crate) fn matches_possibly(pattern: &str, command: &ClassifiedCommand) -> bool {
+    Subject::of(command).is_some_and(|subject| subject.matches(pattern) >= Match::Possible)
+}
+
+/// The arguments of `command` (`None` for one built from an expansion) and whether they are complete, if it is a
+/// program that answers to `name` as rules see it (module documentation, "Who rules can name"), possibly only through
+/// the name as written. Used by the irreversible readers of one tool (`curl`, `rsync`, KNSH-093).
+pub(crate) fn arguments_if_named<'a>(
+    name: &str,
+    command: &'a ClassifiedCommand,
+) -> Option<(Vec<Option<&'a str>>, bool)> {
+    let subject = Subject::of(command)?;
+    subject.names.iter().any(|(candidate, _)| *candidate == name).then(|| {
+        let arguments = command
+            .arguments
+            .iter()
+            .map(|argument| argument.text.as_deref())
+            .collect();
+        (arguments, command.arguments_complete)
+    })
 }
 
 /// As [`matches_certainly`], but a pattern without `*` matches only the command with exactly its arguments, never

@@ -676,11 +676,18 @@ pub(crate) mod tests {
         let service = service(fixture().sessions, fs(&[]));
         let result = check(
             &service,
-            r#"{"command":"git push","cwd":"/Users/u/app","profile":"unattended"}"#,
+            r#"{"command":"touch x","cwd":"/Users/u/app","profile":"unattended"}"#,
         );
         assert_eq!(text(&result, "verdict"), r#""deny""#);
         assert_eq!(text(&result, "source"), r#""standalone""#);
         assert_ne!(text(&result, "reason"), "null");
+        // KNSH-093: its `approvals.irreversible = "deny"` refuses a push by rule.
+        let pushed = check(
+            &service,
+            r#"{"command":"git push","cwd":"/Users/u/app","profile":"unattended"}"#,
+        );
+        assert_eq!(text(&pushed, "verdict"), r#""deny""#);
+        assert_eq!(text(&pushed, "source"), r#""rule""#);
     }
 
     // The answer is the full result: an allowed read-only line names every part's rule.

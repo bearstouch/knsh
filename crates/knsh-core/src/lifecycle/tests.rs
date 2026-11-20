@@ -960,10 +960,18 @@ fn decision_source_matches_deciding_component() {
             DecisionSource::Standalone,
             None,
         ),
+        // `unattended` asks about an unknown command, which no one can answer: a standalone deny.
+        (
+            Harness::new().profile(unattended()),
+            "make",
+            DecisionSource::Standalone,
+            None,
+        ),
+        // FR-IRR-05 (KNSH-093): `unattended` sets `approvals.irreversible = "deny"`, so a push is a deny by rule.
         (
             Harness::new().profile(unattended()),
             "git push",
-            DecisionSource::Standalone,
+            DecisionSource::Rule,
             None,
         ),
     ];

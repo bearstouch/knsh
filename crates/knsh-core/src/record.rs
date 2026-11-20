@@ -792,6 +792,124 @@ pub fn decode_unprotected(text: &str) -> Result<Vec<UnprotectedRoot>, CoreError>
         .map_err(|_| CoreError::InvalidUnprotected)
 }
 
+/// The most reasons one record's `irreversible` keeps (KNSH-093). Further reasons are dropped (the flag stays set),
+/// so a line that writes thousands of paths outside its roots cannot grow its record without bound.
+pub const MAX_IRREVERSIBLE_REASONS: usize = 64;
+
+/// The longest reason kept, in bytes; a longer one is cut at a character boundary. Far above any built-in reason;
+/// only a path or a profile pattern could come near it.
+const MAX_IRREVERSIBLE_REASON_LEN: usize = 1024;
+
+/// Whether a line is irreversible, and why: the record's `irreversible` (FR-IRR-04, KNSH-093), `{"value",
+/// "reasons"}`.
+///
+/// Reasons come from classification before the line runs (a built-in or profile pattern such as `git push`, or
+/// `curl POST`) and from what it was seen doing (`network` and the host it reached, a path written outside the
+/// checkpoint roots), FR-IRR-01 and FR-IRR-03.
+///
+/// # Invariants
+///
+/// - The value is `true` exactly when there is at least one reason.
+/// - Reasons are non-empty, distinct, kept in the order first added, at most [`MAX_IRREVERSIBLE_REASONS`], each at
+///   most 1024 bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Irreversibility {
+    reasons: Vec<String>,
+}
+
+impl Irreversibility {
+    /// Not irreversible: no reason.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self { reasons: Vec::new() }
+    }
+
+    /// Whether the line is irreversible: it has at least one reason.
+    #[must_use]
+    pub fn value(&self) -> bool {
+        !self.reasons.is_empty()
+    }
+
+    /// The reasons, in the order first added.
+    #[must_use]
+    pub fn reasons(&self) -> &[String] {
+        &self.reasons
+    }
+
+    /// Adds `reason` unless it is empty, already there, or the list is full (type invariants).
+    pub fn add(&mut self, reason: impl Into<String>) {
+        let mut reason = reason.into();
+        if reason.len() > MAX_IRREVERSIBLE_REASON_LEN {
+            let mut end = MAX_IRREVERSIBLE_REASON_LEN;
+            while !reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            reason.truncate(end);
+        }
+        if reason.is_empty() || self.reasons.len() >= MAX_IRREVERSIBLE_REASONS || self.reasons.contains(&reason) {
+            return;
+        }
+        self.reasons.push(reason);
+    }
+
+    /// Adds every reason of `other`, as [`add`](Self::add).
+    pub fn merge(&mut self, other: &Self) {
+        for reason in &other.reasons {
+            self.add(reason.clone());
+        }
+    }
+}
+
+impl ToJson for Irreversibility {
+    fn to_json(&self) -> Result<Value, JsonError> {
+        Ok(Value::Object(
+            Object::new()
+                .with("value", self.value())?
+                .with("reasons", self.reasons.to_json()?)?,
+        ))
+    }
+}
+
+impl FromJson for Irreversibility {
+    /// Reads the object [`ToJson`] writes: both members, nothing else, and a value that agrees with the reasons.
+    fn from_json(value: &Value) -> Result<Self, JsonError> {
+        let mut fields = Fields::new(value)?;
+        let flag: bool = fields.required("value")?;
+        let reasons: Vec<String> = fields.required("reasons")?;
+        fields.finish_closed()?;
+        let mut read = Self::none();
+        for reason in &reasons {
+            read.add(reason.clone());
+        }
+        if read.reasons != reasons || read.value() != flag {
+            return Err(JsonError::OutOfRange {
+                field: Some("irreversible"),
+            });
+        }
+        Ok(read)
+    }
+}
+
+/// The stored form of a record's `irreversible`: its JSON object as text.
+///
+/// # Errors
+///
+/// [`CoreError::InvalidIrreversible`] if it cannot be written (it always can).
+pub fn encode_irreversible(irreversible: &Irreversibility) -> Result<String, CoreError> {
+    let value = irreversible.to_json().map_err(|_| CoreError::InvalidIrreversible)?;
+    knsh_json::write(&value).map_err(|_| CoreError::InvalidIrreversible)
+}
+
+/// Reads the stored form written by [`encode_irreversible`].
+///
+/// # Errors
+///
+/// [`CoreError::InvalidIrreversible`] for text that is not such an object.
+pub fn decode_irreversible(text: &str) -> Result<Irreversibility, CoreError> {
+    let value = knsh_json::parse(text.as_bytes(), text.len()).map_err(|_| CoreError::InvalidIrreversible)?;
+    Irreversibility::from_json(&value).map_err(|_| CoreError::InvalidIrreversible)
+}
+
 /// The most entries a record's `files_changed` lists (KNSH-082). A line may change tens of thousands of files; the
 /// record keeps the first of them, sorted, and its checkpoint keeps them all, so one `npm install` cannot make a record
 /// megabytes long. The `exec.run` result's `files_changed` is the full count.
@@ -1086,6 +1204,10 @@ pub struct RecordDetails {
     /// `concurrent` line, those of its whole set, which cannot be told apart (FR-CKP-07). `None` for a line that
     /// touched no protected root or never ran; empty for one that changed nothing.
     pub files_changed: Option<Vec<ChangedFile>>,
+    /// Whether the line is irreversible, and why (FR-IRR-04, KNSH-093): from its classification, and for a line that
+    /// ran also from what it was seen doing (FR-IRR-03). `None` for a line refused before it was classified, and for
+    /// records written before KNSH-093.
+    pub irreversible: Option<Irreversibility>,
 }
 
 impl RecordDetails {
@@ -1106,6 +1228,7 @@ impl RecordDetails {
             unprotected,
             attribution,
             files_changed,
+            irreversible,
         } = self;
         rewritten_from.is_none()
             && pipestatus.is_empty()
@@ -1120,6 +1243,7 @@ impl RecordDetails {
             && unprotected.is_empty()
             && attribution.is_none()
             && files_changed.is_none()
+            && irreversible.is_none()
     }
 }
 
