@@ -91,5 +91,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "redactor"
+path = "fuzz_targets/redactor.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

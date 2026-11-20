@@ -13,12 +13,12 @@ look-behind; marker `«redacted:<name>»`; integration with the `Redacted<T>` ty
 and files written to disk (documented limit).
 
 **Acceptance criteria**
-- [ ] The exact value and its base64, URL-encoded and hex forms are replaced with `«redacted:<name>»` (FR-SEC-10).
-- [ ] A value split across two or more chunks is still redacted; held-back bytes are bounded by the longest encoded
+- [x] The exact value and its base64, URL-encoded and hex forms are replaced with `«redacted:<name>»` (FR-SEC-10).
+- [x] A value split across two or more chunks is still redacted; held-back bytes are bounded by the longest encoded
       form.
-- [ ] Overlapping secrets are both redacted, with the longest match winning.
-- [ ] The redactor never outputs partial secret bytes when a stream ends mid-match.
-- [ ] Throughput is measured and documented.
+- [x] Overlapping secrets are both redacted, with the longest match winning.
+- [x] The redactor never outputs partial secret bytes when a stream ends mid-match.
+- [x] Throughput is measured and documented.
 
 **Unit tests**
 - `redacts_exact_value` (FR-SEC-10)
@@ -31,3 +31,13 @@ and files written to disk (documented limit).
 **Notes**
 - Property test: for random chunkings of a stream containing a secret, the output never contains the secret.
 - Add a fuzz target for the redactor in `fuzz/`.
+
+**Implementation notes**
+- `knsh_core::Redactor` and `RedactStream` (`crates/knsh-core/src/redaction/`). The matching rules, the
+  end-of-stream rule and the limits are on the [secrets](../03-functional-requirements/secrets.md#redaction-engine-knsh-090)
+  page. Throughput is under [performance validation](../07-testing/performance-validation.md#redaction-throughput-fr-sec-10-knsh-090).
+- Property test `random_chunkings_never_leak_a_secret`; fuzz target `redactor` (`fuzz/src/redaction_checks.rs`).
+- Wiring the redactor into records, events, hooks and the authority is KNSH-091. Today's `OutputRedaction` hook
+  (`&self`, one chunk at a time) cannot carry the stream state, so KNSH-091 must hold one `RedactStream` per output
+  stream. It must also decide what a refused set means (`CoreError::RedactionTooLarge`), for example refusing to
+  inject a secret that cannot be redacted.

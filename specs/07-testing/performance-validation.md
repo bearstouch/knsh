@@ -67,3 +67,15 @@ bookkeeping before and after `sandbox-exec` (proxy credentials, profile file wri
 agent lines only for signed profiles), and machines other than this one.
 
 Related verification claims: per-file copy-on-write cloning speed, and FSEvents flushing ([verification-claims.md](verification-claims.md)).
+
+## Redaction throughput (FR-SEC-10, KNSH-090)
+
+`knsh-core`'s ignored test `redaction::tests::redaction_throughput` streams 16 MiB through one `RedactStream` in
+64 KiB chunks (a pipe read) with 16 secrets of 38 bytes, so 112 raw and 48 decoded patterns. It measures two inputs:
+build-log text with one secret every 64 KiB, and random bytes. Run it with `cargo test -p knsh-core --release --lib
+-- --ignored --nocapture redaction_throughput`. There is no target yet: output is capped at 1 MB per stream
+(FR-REC-06), so at these rates redacting a full cap takes about 10 ms.
+
+| Date | Machine | Commit | Build log | Random bytes |
+| --- | --- | --- | --- | --- |
+| 2026-11-19 | MacBookPro18,3, Apple M1 Pro, macOS 26.6.2, release build | b0c4ae6 + KNSH-090 (uncommitted) | 93 MiB/s | 114 MiB/s |

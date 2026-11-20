@@ -66,6 +66,13 @@
 //! [`OutputMode`] (FR-OUT-01) without ever rewriting it (FR-OUT-05). Every chunk passes through the
 //! [`OutputRedaction`] hook first (FR-EVT-07), a pass-through until secret redaction arrives (KNSH-091).
 //!
+//! # Secret redaction (KNSH-090)
+//!
+//! [`Redactor`] replaces secret values and their base64, hex and percent-encoded forms with
+//! `«redacted:<name>»` ([`redaction_marker`], FR-SEC-10). [`RedactStream`] does it across chunk boundaries, holding
+//! back only bytes that could still begin a match ([`Redactor::max_held_back`]), and never emits part of a secret
+//! when a stream ends mid-match. Everything it returns is [`Redacted`].
+//!
 //! # Binary resolution (KNSH-035)
 //!
 //! [`resolve`] turns a simple command's name into a [`Resolution`] the way bash would run it: a function, a builtin,
@@ -172,6 +179,7 @@ mod policy;
 mod ratelimit;
 mod record;
 mod redacted;
+mod redaction;
 mod registry;
 mod resolve;
 mod secret;
@@ -238,6 +246,7 @@ pub use record::{
     encode_decision, encode_files_changed, encode_network, encode_unprotected, merge_network,
 };
 pub use redacted::{REDACTED_MARKER, Redacted};
+pub use redaction::{MAX_REDACTION_BYTES, RedactStream, Redactor, redaction_marker};
 pub use registry::{EqualProfileOnly, ProfileOrder, SessionRegistry};
 pub use resolve::{
     BinaryLookup, CommandName, DEFAULT_TRUSTED_FOLDERS, MAX_PATH_ENTRIES, Resolution, TrustedFolders, resolve,

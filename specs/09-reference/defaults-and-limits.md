@@ -68,6 +68,8 @@
 | Grant from `policy.grant` | 1 s to 30 days (`duration_s`); rule 1 to 4096 bytes | — | [control service](../06-api/control-service.md#policygrant) (KNSH-071) |
 | Secrets from `secrets.provide` | 256 names at once; value 1 byte to 64 KiB; `duration_s` 1 s to 24 hours; expired secrets dropped within about 1 s | — | [control service](../06-api/control-service.md#secretsprovide) (KNSH-089) |
 | Keychain secret value | 64 KiB; a larger item is access denied | — | [secret](../05-models/secret.md#lookup-knsh-089) (KNSH-089) |
+| Secret values one redactor holds | 256 KiB in total, each 1 byte to 64 KiB; a larger set is refused (at the limit about 110 MB, 400 MB while built) | — | [secrets](../03-functional-requirements/secrets.md#redaction-engine-knsh-090) (KNSH-090) |
+| Bytes a redaction stream holds back | Fewer than 3 × the longest decoded form of any secret (about 4 × the longest value) | — | [secrets](../03-functional-requirements/secrets.md#redaction-engine-knsh-090) (KNSH-090) |
 | Pushed policy snapshots | 64 profiles; each at most 1 MiB of text | — | [control service](../06-api/control-service.md#policyset) (KNSH-071) |
 | Pushed-policy expiry check | Every 1 s: sessions on an expired snapshot are paused at most about 1 s late (their lines are denied from `expires_at` on) | — | [control service](../06-api/control-service.md#policyset) (KNSH-072) |
 | `profile.use` prompt | Waits at most 120 s | — | [`profile.use`](../06-api/user-socket.md#profileuse) (KNSH-072) |

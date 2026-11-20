@@ -46,6 +46,11 @@ pub enum CoreError {
     InvalidProfileName,
     /// A secret name was empty, too long or held a character outside `[A-Za-z0-9._-]` (KNSH-089).
     InvalidSecretName,
+    /// A secret value given to the redactor was empty; it would match everywhere (KNSH-090).
+    EmptySecretValue,
+    /// A secret value given to the redactor was over 64 KiB, or the values together over the redactor's limit
+    /// (`MAX_REDACTION_BYTES`, KNSH-090).
+    RedactionTooLarge,
     /// An agent actor had no `agent_id` (`specs/05-models/session.md`).
     AgentIdRequired,
     /// A human actor carried an `agent_id`, which only agents have.
@@ -124,6 +129,8 @@ impl fmt::Display for CoreError {
             Self::InvalidAgentId => f.write_str("agent_id must be 1 to 64 characters from [A-Za-z0-9._-]"),
             Self::InvalidProfileName => f.write_str("profile name must be 1 to 64 characters from [A-Za-z0-9._-]"),
             Self::InvalidSecretName => f.write_str("secret name must be 1 to 64 characters from [A-Za-z0-9._-]"),
+            Self::EmptySecretValue => f.write_str("a secret value to redact must not be empty"),
+            Self::RedactionTooLarge => f.write_str("secret values to redact are over the redactor's size limit"),
             Self::AgentIdRequired => f.write_str("an agent session requires actor.agent_id"),
             Self::AgentIdForHuman => f.write_str("a human session must not have actor.agent_id"),
             Self::EnvelopeForHuman => f.write_str("a human session cannot have an envelope"),
