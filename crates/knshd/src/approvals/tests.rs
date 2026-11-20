@@ -124,6 +124,7 @@ impl Harness {
                 cwd: &cwd,
                 rewritten_from: None,
                 classification: &classification,
+                redactor: &knsh_core::Redactor::default(),
             };
             let profile = knsh_core::ProfileName::new("web").unwrap();
             let request = AskRequest {

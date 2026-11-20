@@ -87,6 +87,7 @@ use crate::dispatch::{Answer, Call, Endpoint, Handler, Handlers, Reply, answer, 
 use crate::events::EventHub;
 use crate::holds::{GroupKind, Holds, Kept};
 use crate::lifetime::Activity;
+use crate::redaction::{Redactors, hidden};
 use crate::shadows::{CheckpointLine, ClosedLine, Shadows};
 
 /// The profile recorded for human sessions. Nothing in a human session is enforced (FR-SES-22); profiles are loaded
@@ -127,6 +128,9 @@ pub(crate) struct Sessions {
     expiry_paused: Mutex<BTreeSet<SessionId>>,
     /// Agent sessions' checkpoint shadows (KNSH-079), attached once at start-up; absent in tests that need none.
     shadows: OnceLock<Arc<Shadows>>,
+    /// Each session's redactor (KNSH-091), attached once at start-up: human records are redacted with it, and an ended
+    /// session's is dropped. Without one, nothing is redacted (tests that need none).
+    redactors: OnceLock<Arc<Redactors>>,
 }
 
 /// A state change asked of a live session (KNSH-054): the edges of the state diagram other than ending, which has its
@@ -282,7 +286,13 @@ impl Sessions {
             holds: Holds::new(),
             expiry_paused: Mutex::new(BTreeSet::new()),
             shadows: OnceLock::new(),
+            redactors: OnceLock::new(),
         })
+    }
+
+    /// Attaches the sessions' redactors (KNSH-091), the same the supervisor uses. Only the first call has an effect.
+    pub(crate) fn attach_redactors(&self, redactors: Arc<Redactors>) {
+        let _ = self.redactors.set(redactors);
     }
 
     /// Attaches the checkpoint shadows (KNSH-079): from now on every agent session that ends, however it ends, has
@@ -456,7 +466,15 @@ impl Sessions {
         let now = self.clock.now().map_err(|_| internal_error())?;
         // Records sort by ID in creation order, so the ID is made from now, not from when the line started.
         let record_id = RecordId::from_ulid(self.ulid(now)?);
-        let command = Redacted::new(command);
+        // FR-REC-05 (KNSH-091): redacted before it is stored or published, with the session's redactor (the provided
+        // secrets: a human session has no profile here). A set that cannot be redacted hides the command, and the
+        // command is still recorded: a human session is never blocked.
+        let command = match self.redactors.get() {
+            Some(redactors) => redactors
+                .for_session(session_id, None)
+                .map_or_else(|_| hidden(), |redactor| redactor.redact_text(&command)),
+            None => Redacted::new(command),
+        };
         let record = ExecutionRecord {
             record_id,
             session_id,
@@ -1030,6 +1048,10 @@ impl Sessions {
         // Outside every lock: the shadow table is a leaf, and its builds are only told to stop.
         if let Some(shadows) = self.shadows.get() {
             shadows.end(session_id);
+        }
+        // KNSH-091: the ended session's redactor, and the values it held, go with it.
+        if let Some(redactors) = self.redactors.get() {
+            redactors.forget(session_id);
         }
     }
 

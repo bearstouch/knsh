@@ -212,6 +212,8 @@ struct Harness {
     profile: Profile,
     limited: Vec<LineKey>,
     report_runs: bool,
+    /// The session's redactor (KNSH-091): none by default.
+    redactor: Redactor,
 }
 
 /// Rate limits that limit exactly the listed lines, in any session.
@@ -234,7 +236,15 @@ impl Harness {
             profile: profile(),
             limited: Vec::new(),
             report_runs: false,
+            redactor: Redactor::default(),
         }
+    }
+
+    /// Redacts the secret `name` with value `value` on every path (KNSH-091).
+    fn secret(mut self, name: &str, value: &str) -> Self {
+        let name = crate::SecretName::new(name).unwrap();
+        self.redactor = Redactor::new([(name, Redacted::new(value.as_bytes()))]).unwrap();
+        self
     }
 
     fn report_runs(mut self) -> Self {
@@ -293,6 +303,7 @@ impl Harness {
             command: line,
             cwd: &cwd,
             env_path: "/usr/bin:/bin",
+            redactor: &self.redactor,
         };
         let authority = ScriptedAsker {
             name: "authority",
@@ -796,6 +807,74 @@ fn refuses_rewrite_of_line_with_redaction_marker() {
     // Without a rewrite, a line holding a marker is decided like any other.
     let harness = Harness::new().authority(vec![Some(AskReply::Allow)]);
     allowed(harness.decide(&format!("git push https://{named}@example.com")));
+}
+
+// FR-AUTH-32 (KNSH-091): a line holding a secret value is seen by the rewriter with the value replaced by its
+// marker, so a rewrite of it is refused and the line denied: the rewrite could only hold the marker, never the value.
+#[test]
+fn rewrite_of_line_with_marker_is_denied() {
+    let secret = "s3cr3t-T0KEN-value";
+    let line = format!("git push https://{secret}@example.com");
+    for (harness, source) in [
+        (
+            Harness::new()
+                .secret("git-token", secret)
+                .authority(vec![Some(AskReply::Rewrite {
+                    command: "git push origin".to_owned(),
+                })]),
+            DecisionSource::Authority,
+        ),
+        (
+            Harness::new()
+                .secret("git-token", secret)
+                .hooks(vec![Some(HookVerdict::Rewrite {
+                    command: "git push origin".to_owned(),
+                })]),
+            DecisionSource::Hook,
+        ),
+    ] {
+        let refusal = refused(harness.decide(&line));
+        assert_eq!(refusal.decision.verdict, DecisionVerdict::Deny);
+        assert_eq!(refusal.decision.source, source);
+        assert_eq!(refusal.reason.as_deref(), Some(REWRITE_OF_REDACTED));
+        assert_eq!(refusal.rewritten_from, None, "no rewrite was applied");
+        // Nothing the pipeline published or asked about held the value.
+        let entries = harness.journal.entries();
+        assert!(entries.iter().all(|entry| !entry.contains(secret)), "{entries:?}");
+        assert!(
+            entries.iter().any(|entry| entry.contains("«redacted:git-token»")),
+            "{entries:?}"
+        );
+    }
+    // Without a secret in it, the same rewrite is accepted.
+    let harness = Harness::new()
+        .secret("git-token", secret)
+        .authority(vec![Some(AskReply::Rewrite {
+            command: "git status".to_owned(),
+        })]);
+    allowed(harness.decide("git push https://other@example.com"));
+}
+
+// FR-REC-05, FR-SEC-11 (KNSH-091): `command.proposed`, the hooks and the ask all see one redacted text, made by the
+// session's redactor; the line that runs is the real one.
+#[test]
+fn hooks_authority_and_events_see_the_redacted_line() {
+    let secret = "s3cr3t-T0KEN-value";
+    let harness = Harness::new()
+        .secret("git-token", secret)
+        .authority(vec![Some(AskReply::Allow)]);
+    let line = format!("git push https://{secret}@example.com");
+    let allowed = allowed(harness.decide(&line));
+    let redacted = "git push https://«redacted:git-token»@example.com";
+    assert_eq!(
+        harness.journal.entries(),
+        vec![
+            format!("proposed {redacted}"),
+            format!("hooks {redacted}"),
+            format!("ask authority {redacted} rule=exec.ask[0]"),
+        ]
+    );
+    assert!(allowed.executed.contains(secret), "the spawned line keeps the value");
 }
 
 // NFR-REL-07, FR-HOOK-04: every failure in any step is a deny, never a run, panics included.

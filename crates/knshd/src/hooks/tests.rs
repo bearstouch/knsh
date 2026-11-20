@@ -104,6 +104,7 @@ fn run_as(dir: &TempDir, actor: &Actor, line: &str) -> HookOutcome {
         cwd: &cwd,
         rewritten_from: None,
         classification: &classification,
+        redactor: &knsh_core::Redactor::default(),
     };
     dir.runner().run(&proposal)
 }

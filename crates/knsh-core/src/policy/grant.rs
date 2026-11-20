@@ -44,8 +44,8 @@ use super::layer::is_pattern;
 use super::rules::{matches_certainly, matches_exactly};
 use crate::error::CoreError;
 use crate::id::{GrantId, SessionId};
-use crate::lifecycle::redact;
 use crate::redacted::holds_redaction_marker;
+use crate::redaction::Redactor;
 use crate::session::ProfileName;
 use crate::time::Timestamp;
 
@@ -272,12 +272,12 @@ impl GrantSet {
 ///   the rule names everything the line runs;
 /// - every word is known (no expansion), non-empty, and holds no whitespace or `*`: a pattern splits on spaces and
 ///   reads `*` as a wildcard, so such a word would make the rule match other commands;
-/// - the text holds no secret: redaction leaves it unchanged, since grants are listed and stored;
+/// - the text holds no secret: `redactor`, the session's, leaves it unchanged, since grants are listed and stored;
 /// - it is a valid command pattern (a name without `/`, no control characters, bounded length).
 ///
 /// Use it with [`Grant::exact`], so the grant covers the same command with more arguments only if asked again.
 #[must_use]
-pub fn line_grant_rule(classification: &Classification) -> Option<String> {
+pub fn line_grant_rule(classification: &Classification, redactor: &Redactor) -> Option<String> {
     if classification.is_whole_line() || !classification.dynamic_parts().is_empty() {
         return None;
     }
@@ -299,7 +299,7 @@ pub fn line_grant_rule(classification: &Classification) -> Option<String> {
     let rule = words.join(" ");
     // Grants are listed and stored, so a rule redaction would change (or one already holding the marker, which could
     // not be told apart from a redacted secret) gets no grant rather than a secret written down.
-    let holds_secret = redact(&rule).expose() != &rule || holds_redaction_marker(&rule);
+    let holds_secret = redactor.redact_text(&rule).expose() != &rule || holds_redaction_marker(&rule);
     (!holds_secret && is_pattern(&rule)).then_some(rule)
 }
 

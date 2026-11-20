@@ -174,6 +174,7 @@ fn ask_rewritten(
             cwd: &cwd,
             rewritten_from: rewritten_from.as_ref(),
             classification: &classification,
+            redactor: &knsh_core::Redactor::default(),
         };
         let profile = profile();
         let request = AskRequest {

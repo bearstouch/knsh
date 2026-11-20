@@ -416,7 +416,7 @@ impl Decisions {
         let grant_target = GrantTarget {
             session_id: proposal.session_id,
             profile: request.profile.clone(),
-            rule: line_grant_rule(proposal.classification),
+            rule: line_grant_rule(proposal.classification, proposal.redactor),
         };
         Some((
             request_id,

@@ -29,7 +29,16 @@
 //! what the authority set for the session with `recording.set` (KNSH-071), which takes its place. Only in
 //! the second case is it stored with the record and published as `command.output` (FR-LC-18): with
 //! `recording.output = false` (the default) nothing is stored and nothing is emitted, and a captured line's output
-//! goes only to its caller. Every chunk passes the [`OutputRedaction`] hook first (FR-EVT-07).
+//! goes only to its caller. Every chunk passes the session's redaction first (FR-EVT-07).
+//!
+//! # Redaction (KNSH-091)
+//!
+//! The session's [`Redactor`] is taken once per line, right after its profile is loaded ([`Redactors::for_session`]),
+//! and that one instance redacts everything about the line: what the pipeline gives hooks, the authority and
+//! `command.proposed`, the record (`command`, `rewritten_from`, `argv` names, network hosts), every lifecycle event,
+//! the captured output and what `exec.run` returns (FR-SEC-11, FR-REC-05, FR-EVT-07, FR-OUT-06). A secret set that
+//! cannot be redacted denies the line (fail closed), and what is recorded and published of it is the plain marker,
+//! as for a line refused before its profile was loaded when even the provided secrets cannot be redacted.
 //!
 //! # Held lines (KNSH-054)
 //!
@@ -62,9 +71,9 @@ use knsh_checkpoint::{Gate, ShadowProgress, gate, line_touches_root};
 use knsh_core::{
     Actor, Allowed, Authority, BinaryLookup, Caller, CancelReason, CanonicalPath, Counted, Decision, DecisionSource,
     DenialLimiter, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR, LineInput, LineKey, LocalApprovals,
-    NetworkEntry, Observer, Outcome, OutputRedaction, OutputStream, Profile, Proposal, RateLimits, RecordDetails,
-    RecordId, Redacted, Refusal, RefusalKind, RequestId, SessionId, Timestamp, Ulid, UnprotectedReason,
-    UnprotectedRoot, argv_of, decide, redact,
+    NetworkEntry, Observer, Outcome, OutputStream, Profile, Proposal, RateLimits, RecordDetails, RecordId, Redacted,
+    Redactor, Refusal, RefusalKind, RequestId, SessionId, Timestamp, Ulid, UnprotectedReason, UnprotectedRoot, argv_of,
+    decide,
 };
 use knsh_json::{Object, ToJson, Value};
 use knsh_platform::{Clock, ProcessGroupId, Processes, Random};
@@ -78,6 +87,7 @@ use crate::grants::GrantStore;
 use crate::holds::{GroupKind, Kept};
 use crate::jobs::LineControl;
 use crate::policy::ProfileLoader;
+use crate::redaction::{Redactors, redact_or_hide};
 use crate::sessions::Sessions;
 use crate::shadows::ClosedLine;
 
@@ -87,6 +97,9 @@ pub(crate) const DEFAULT_ASK_TIMEOUT: Duration = Duration::from_secs(90);
 /// Reasons for denials the driver makes itself, before the pipeline decides. Fixed texts.
 const NO_STORE: &str = "the record store is unavailable, so the line cannot be recorded and was denied (fail closed)";
 const NO_PROFILE: &str = "the session's profile could not be loaded, so the line was denied (fail closed)";
+/// Reason for a line whose session's secrets cannot be redacted (KNSH-091).
+const NO_REDACTION: &str =
+    "the session's secrets could not be set up for redaction, so the line was denied (fail closed)";
 /// Reason for a line whose profile file (or a parent's) has a missing or bad signature (FR-POL-42, KNSH-065).
 const INVALID_PROFILE: &str =
     "the session's policy file has a missing or bad signature and was ignored, so the line was denied (fail closed)";
@@ -218,9 +231,8 @@ pub(crate) struct Parts {
     pub(crate) grants: Arc<GrantStore>,
     /// Starts allowed lines (KNSH-051).
     pub(crate) spawner: Arc<dyn Spawner>,
-    /// The hook every output chunk passes before it is stored, emitted or returned (FR-EVT-07): a pass-through
-    /// until secret redaction arrives (KNSH-091).
-    pub(crate) redaction: Arc<dyn OutputRedaction>,
+    /// Each session's redactor, taken once per line for every path of the line (KNSH-091, module documentation).
+    pub(crate) redactors: Arc<Redactors>,
 }
 
 /// `command.started` and `command.long_running` for one line, from the [`Spawner`] (FR-LC-17).
@@ -307,6 +319,8 @@ pub(crate) struct Lifecycle {
 /// its answer, already recorded and reported.
 struct Ready {
     record_id: RecordId,
+    /// The session's redactor the line was decided with: its record, events and output use the same (KNSH-091).
+    redactor: Redactor,
     actor: Actor,
     allowed: Box<Allowed>,
     /// The session's profile the line was decided with, for its sandbox profile.
@@ -352,29 +366,24 @@ impl Lifecycle {
         // The session ended under the call: there is no one to record for, and nothing runs. A session that holds its
         // lines answers `-32007` here, before anything is recorded (module documentation, "Held lines").
         let (actor, profile_name) = parts.sessions.runnable(session_id)?;
+        // Before the profile is loaded, a refusal is redacted of the provided secrets, or hidden entirely if even
+        // those cannot be redacted (module documentation, "Redaction").
+        let early = || parts.redactors.for_session(session_id, None).ok();
         let Some((received_at, record_id)) = self.record_id() else {
-            return Err(self.refuse_early(line, &actor, None, NO_CLOCK));
+            return Err(self.refuse_early(line, &actor, None, early().as_ref(), NO_CLOCK));
         };
         let record = Some((record_id, received_at));
         // A line that cannot be recorded must not run (NFR-REL-05, FR-REC-02).
         if parts.store.is_none() {
-            return Err(self.refuse_early(line, &actor, record, NO_STORE));
+            return Err(self.refuse_early(line, &actor, record, early().as_ref(), NO_STORE));
         }
-        let profile = match self.parts.profiles.load(&profile_name, line.proposal.cwd.as_path()) {
-            Ok(profile) => profile,
-            Err(error) => {
-                // FR-POL-42: a policy file with a missing or bad signature is reported on the session, and the line
-                // is denied; the session never falls back to another profile.
-                let reason = match crate::policy::invalid_profile(&error) {
-                    Some(invalid) => {
-                        let data = EventData::PolicyInvalid { profile: invalid };
-                        let _ = self.parts.events.publish(line.session_id, &actor, data);
-                        INVALID_PROFILE
-                    }
-                    None => NO_PROFILE,
-                };
-                return Err(self.refuse_early(line, &actor, record, reason));
-            }
+        let profile = self
+            .load_profile(line, &actor, &profile_name)
+            .map_err(|reason| self.refuse_early(line, &actor, record, early().as_ref(), reason))?;
+        // KNSH-091: the one redactor of every path of this line. A set that cannot be redacted denies it, and nothing
+        // of the line is kept or published but the marker.
+        let Ok(redactor) = parts.redactors.for_session(session_id, Some(&profile)) else {
+            return Err(self.refuse_early(line, &actor, record, None, NO_REDACTION));
         };
 
         let observer = ProposedEvents {
@@ -407,6 +416,7 @@ impl Lifecycle {
             command: &line.proposal.command,
             cwd: &line.proposal.cwd,
             env_path: &line.proposal.path,
+            redactor: &redactor,
         };
         let outcome = decide(&input, &effects);
         let latency_ms = self.since(received_at);
@@ -428,6 +438,7 @@ impl Lifecycle {
                 return Err(self.blocked(
                     line,
                     &actor,
+                    &redactor,
                     (record_id, received_at, latency_ms),
                     allowed,
                     Blocked::Held(hold),
@@ -440,6 +451,7 @@ impl Lifecycle {
                 Ok((unprotected, protected)) => {
                     return Ok(Ready {
                         record_id,
+                        redactor,
                         actor,
                         allowed,
                         profile: Box::new(profile),
@@ -450,12 +462,41 @@ impl Lifecycle {
                     });
                 }
                 Err(blocked) => {
-                    return Err(self.blocked(line, &actor, (record_id, received_at, latency_ms), allowed, blocked));
+                    return Err(self.blocked(
+                        line,
+                        &actor,
+                        &redactor,
+                        (record_id, received_at, latency_ms),
+                        allowed,
+                        blocked,
+                    ));
                 }
             },
             Outcome::Refused(refusal) => *refusal,
         };
-        Err(self.refused(line, &actor, record_id, received_at, latency_ms, &refusal))
+        let record = (record_id, received_at, latency_ms);
+        Err(self.refused(line, &actor, Some(&redactor), record, &refusal))
+    }
+
+    /// The session's profile for `line`, or the reason to deny it. FR-POL-42: a policy file with a missing or bad
+    /// signature is reported on the session, and the line is denied; the session never falls back to another
+    /// profile.
+    fn load_profile(
+        &self,
+        line: &ForwardedLine,
+        actor: &Actor,
+        name: &knsh_core::ProfileName,
+    ) -> Result<Profile, &'static str> {
+        self.parts.profiles.load(name, line.proposal.cwd.as_path()).map_err(
+            |error| match crate::policy::invalid_profile(&error) {
+                Some(invalid) => {
+                    let data = EventData::PolicyInvalid { profile: invalid };
+                    let _ = self.parts.events.publish(line.session_id, actor, data);
+                    INVALID_PROFILE
+                }
+                None => NO_PROFILE,
+            },
+        )
     }
 
     /// Records an allowed line that may not be spawned as a deny, so its decision is not lost, and returns its answer
@@ -467,7 +508,8 @@ impl Lifecycle {
         &self,
         line: &ForwardedLine,
         actor: &Actor,
-        (record_id, received_at, latency_ms): (RecordId, Timestamp, u64),
+        redactor: &Redactor,
+        record: (RecordId, Timestamp, u64),
         allowed: Box<Allowed>,
         blocked: Blocked,
     ) -> RpcError {
@@ -487,7 +529,7 @@ impl Lifecycle {
             classification: Some(allowed.classification),
             line_key: None,
         };
-        let error = self.refused(line, actor, record_id, received_at, latency_ms, &refusal);
+        let error = self.refused(line, actor, Some(redactor), record, &refusal);
         match blocked {
             Blocked::NotReady { root, progress } => not_ready(&root, progress),
             Blocked::Held(hold) => hold,
@@ -580,12 +622,14 @@ impl Lifecycle {
     }
 
     /// A deny the driver makes before the pipeline runs (module documentation, "Before the decision"): recorded
-    /// when a record ID and a store exist, reported, and answered `-32001`.
+    /// when a record ID and a store exist, reported, and answered `-32001`. Its text goes through `redactor`, or is
+    /// hidden entirely without one (module documentation, "Redaction").
     fn refuse_early(
         &self,
         line: &ForwardedLine,
         actor: &Actor,
         record: Option<(RecordId, Timestamp)>,
+        redactor: Option<&Redactor>,
         reason: &str,
     ) -> RpcError {
         let refusal = Refusal {
@@ -600,23 +644,24 @@ impl Lifecycle {
         };
         // Without a record ID (no clock or random bytes) nothing can be recorded; the denial is still reported.
         let Some((record_id, received_at)) = record else {
-            self.publish_denied(line, actor, None, &refusal);
+            self.publish_denied(line, actor, redactor, None, &refusal);
             return denial_error(&refusal);
         };
         let latency_ms = self.since(received_at);
-        self.refused(line, actor, record_id, received_at, latency_ms, &refusal)
+        self.refused(line, actor, redactor, (record_id, received_at, latency_ms), &refusal)
     }
 
     /// A refused line (FR-LC-30 to FR-LC-32, FR-LC-41): `decision.cancelled` if it was cancelled or timed out, its
     /// record, `command.denied`, and the error to answer with. The order is the spec's: the pending decision ends
-    /// before the denial is recorded, and `command.denied` names the record only once it was written.
+    /// before the denial is recorded, and `command.denied` names the record only once it was written. `record` is the
+    /// line's record ID, receipt time and decision latency. Every text goes through `redactor`, the session's, or is
+    /// hidden without one (KNSH-091).
     fn refused(
         &self,
         line: &ForwardedLine,
         actor: &Actor,
-        record_id: RecordId,
-        received_at: Timestamp,
-        latency_ms: u64,
+        redactor: Option<&Redactor>,
+        (record_id, received_at, latency_ms): (RecordId, Timestamp, u64),
         refusal: &Refusal,
     ) -> RpcError {
         let session_id = line.session_id;
@@ -635,21 +680,30 @@ impl Lifecycle {
             record_id,
             session_id,
             actor: actor.clone(),
-            command: redact(&refusal.command),
+            command: redact_or_hide(redactor, &refusal.command),
             cwd: line.proposal.cwd.clone(),
             started_at: received_at,
             ended_at: Some(self.parts.clock.now().unwrap_or(received_at)),
             exit_code: None,
             details: RecordDetails {
-                rewritten_from: refusal.rewritten_from.as_deref().map(redact),
+                rewritten_from: refusal
+                    .rewritten_from
+                    .as_deref()
+                    .map(|from| redact_or_hide(redactor, from)),
                 decision: Some(refusal.decision.to_record(latency_ms)),
-                argv: refusal.classification.as_ref().map(argv_of).unwrap_or_default(),
+                // Without a redactor nothing of the line is kept, its command names included.
+                argv: refusal
+                    .classification
+                    .as_ref()
+                    .zip(redactor)
+                    .map(|(classification, redactor)| argv_of(classification, redactor))
+                    .unwrap_or_default(),
                 ..RecordDetails::default()
             },
         };
         let written = self.write(record, RecordedOutput::default());
-        self.publish_denied(line, actor, written.then_some(record_id), refusal);
-        self.count_denial(line, actor, refusal, received_at);
+        self.publish_denied(line, actor, redactor, written.then_some(record_id), refusal);
+        self.count_denial(line, actor, redactor, refusal, received_at);
         match refusal.kind {
             RefusalKind::Denied => denial_error(refusal),
             RefusalKind::TimedOut { request_id } => request_error(ErrorCode::DecisionTimeout, request_id),
@@ -660,7 +714,14 @@ impl Lifecycle {
     /// Counts `refusal` towards rate limiting its line (FR-HOOK-20), and publishes `command.denied_repeatedly` when
     /// this denial starts a limit (FR-HOOK-21). Not counted: a denial by the limit itself (it would only prolong it),
     /// a cancellation (nobody denied the line), and a line refused before it was parsed (it has no key).
-    fn count_denial(&self, line: &ForwardedLine, actor: &Actor, refusal: &Refusal, received_at: Timestamp) {
+    fn count_denial(
+        &self,
+        line: &ForwardedLine,
+        actor: &Actor,
+        redactor: Option<&Redactor>,
+        refusal: &Refusal,
+        received_at: Timestamp,
+    ) {
         let Some(key) = refusal.line_key else { return };
         let counts = match refusal.kind {
             RefusalKind::Denied | RefusalKind::TimedOut { .. } => refusal.decision.source != DecisionSource::RateLimit,
@@ -674,7 +735,7 @@ impl Lifecycle {
         let counted = lock(&self.limiter).record_denial(line.session_id, key, now);
         if let Counted::Started { until } = counted {
             let data = EventData::CommandDeniedRepeatedly {
-                command: redact(&refusal.command),
+                command: redact_or_hide(redactor, &refusal.command),
                 cwd: line.proposal.cwd.clone(),
                 until,
             };
@@ -683,15 +744,26 @@ impl Lifecycle {
         }
     }
 
-    /// Publishes `command.denied` (FR-LC-32). Best effort, like every event.
-    fn publish_denied(&self, line: &ForwardedLine, actor: &Actor, record_id: Option<RecordId>, refusal: &Refusal) {
+    /// Publishes `command.denied` (FR-LC-32), its texts through `redactor` (KNSH-091). Best effort, like every event.
+    fn publish_denied(
+        &self,
+        line: &ForwardedLine,
+        actor: &Actor,
+        redactor: Option<&Redactor>,
+        record_id: Option<RecordId>,
+        refusal: &Refusal,
+    ) {
         let data = EventData::CommandDenied {
             record_id,
-            command: redact(&refusal.command),
+            command: redact_or_hide(redactor, &refusal.command),
             cwd: line.proposal.cwd.clone(),
             source: refusal.decision.source,
-            rule_id: refusal.decision.rule_id.as_deref().map(redact),
-            reason: refusal.reason.as_deref().map(redact),
+            rule_id: refusal
+                .decision
+                .rule_id
+                .as_deref()
+                .map(|rule| redact_or_hide(redactor, rule)),
+            reason: refusal.reason.as_deref().map(|reason| redact_or_hide(redactor, reason)),
         };
         let _ = self.parts.events.publish(line.session_id, actor, data);
     }
@@ -716,6 +788,7 @@ impl Lifecycle {
         &self,
         session_id: SessionId,
         actor: &Actor,
+        redactor: &Redactor,
         record_id: RecordId,
         cwd: &CanonicalPath,
         started_at: Timestamp,
@@ -742,7 +815,8 @@ impl Lifecycle {
             }) => (None, Some(signal_name(*number))),
             None => (None, None),
         };
-        let command = redact(&allowed.command);
+        // KNSH-091, FR-REC-05: the text hooks and the authority saw, made by the same redactor.
+        let command = redactor.redact_text(&allowed.command);
         let record = ExecutionRecord {
             record_id,
             session_id,
@@ -753,11 +827,12 @@ impl Lifecycle {
             ended_at: Some(ended_at),
             exit_code,
             details: RecordDetails {
-                rewritten_from: allowed.rewritten_from.as_deref().map(redact),
+                rewritten_from: allowed.rewritten_from.as_deref().map(|from| redactor.redact_text(from)),
                 decision: Some(allowed.decision.to_record(latency_ms)),
-                argv: argv_of(&allowed.classification),
+                argv: argv_of(&allowed.classification, redactor),
                 signal,
                 sandbox_profile: report.sandbox_profile.clone(),
+                // Hosts were redacted by the proxy's report with this session's redactor, the line's (KNSH-091).
                 network: report.network.clone(),
                 // FR-CKP-02 with `required = false`: the roots this line changed unprotected (KNSH-079).
                 unprotected,
@@ -809,6 +884,7 @@ impl Lifecycle {
         record_output: bool,
         actor: &Actor,
         record_id: RecordId,
+        redactor: &Redactor,
     ) -> Option<CapturePlan> {
         if line.stdio.is_some() && !record_output {
             return None;
@@ -822,7 +898,8 @@ impl Lifecycle {
             }) as Arc<dyn OutputSink>
         });
         Some(CapturePlan {
-            redaction: Arc::clone(&self.parts.redaction),
+            // FR-EVT-07, FR-OUT-06: the line's own redactor, so output and record hide the same secrets (KNSH-091).
+            redactor: redactor.clone(),
             // A line is only spawned with a store (it is denied otherwise), so this is the store's cap.
             cap: self
                 .parts
@@ -839,6 +916,7 @@ impl Supervisor for Lifecycle {
         // Defence in depth (NFR-REL-07): a panic before the spawn is a deny. Only shared references cross.
         let Ready {
             record_id,
+            redactor,
             actor,
             allowed,
             profile,
@@ -859,7 +937,7 @@ impl Supervisor for Lifecycle {
             .output_recording_of(session_id)
             .unwrap_or(profile.recording.output);
         let default_mode = profile.output.mode;
-        let capture = self.capture_plan(&line, record_output, &actor, record_id);
+        let capture = self.capture_plan(&line, record_output, &actor, record_id, &redactor);
         // Never a 1970 start, which retention would expire at once.
         let started_at = self.parts.clock.now().unwrap_or(received_at);
         let events = RunningEvents {
@@ -867,7 +945,7 @@ impl Supervisor for Lifecycle {
             session_id,
             actor: &actor,
             record_id,
-            command: redact(&allowed.command),
+            command: redactor.redact_text(&allowed.command),
             cwd: &cwd,
             started_at,
             control: &control,
@@ -905,6 +983,7 @@ impl Supervisor for Lifecycle {
         let (written, ended_at) = self.finished(
             session_id,
             &actor,
+            &redactor,
             record_id,
             &cwd,
             started_at,
@@ -935,7 +1014,7 @@ impl Supervisor for Lifecycle {
                 files_changed,
                 checkpoint_id,
                 // FR-AUTH-33: the line actually spawned, after any rewrite.
-                executed_command: redact(&allowed.executed),
+                executed_command: redactor.redact_text(&allowed.executed),
                 decision: allowed.decision.clone(),
                 duration_ms: ended_at.as_unix_micros().saturating_sub(started_at.as_unix_micros()) / 1000,
                 default_mode,

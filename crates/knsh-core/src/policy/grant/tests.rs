@@ -390,7 +390,10 @@ fn insert_refuses_duplicates_expired_and_overflow() {
 /// The rule a grant from an answer to `line` would get.
 fn answer_rule(line: &str) -> Option<String> {
     let p = profile(RULES);
-    line_grant_rule(&classify(&parse_line(line), line, &Session, &p.exec.interpreters))
+    line_grant_rule(
+        &classify(&parse_line(line), line, &Session, &p.exec.interpreters),
+        &crate::Redactor::default(),
+    )
 }
 
 // KNSH-069, FR-POL-62: a grant in `decision.respond` covers the asked line itself: one simple command whose every
@@ -458,4 +461,24 @@ fn answer_grant_rule_refuses_lines_with_redaction_markers() {
     for line in ["npm publish «redacted»", "npm publish --token=«redacted:npm-token»"] {
         assert_eq!(answer_rule(line), None, "{line:?}");
     }
+}
+
+// FR-REC-05 (KNSH-091): a line holding one of the session's secrets gets no grant, since grants are listed and
+// stored; the same line without the secret does.
+#[test]
+fn answer_grant_rule_refuses_lines_holding_a_secret() {
+    let p = profile(RULES);
+    let name = crate::SecretName::new("npm-token").unwrap();
+    let redactor = Redactor::new([(name, crate::Redacted::new(&b"tok-123456"[..]))]).unwrap();
+    let rule = |line: &str| {
+        line_grant_rule(
+            &classify(&parse_line(line), line, &Session, &p.exec.interpreters),
+            &redactor,
+        )
+    };
+    assert_eq!(rule("npm publish --token=tok-123456"), None);
+    assert_eq!(
+        answer_rule("npm publish --token=tok-123456").as_deref(),
+        Some("npm publish --token=tok-123456")
+    );
 }

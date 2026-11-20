@@ -97,8 +97,8 @@ its output (FR-OUT-04).
   gets `EPIPE` as it would have. Teeing puts `knshd` in the data path: the line's stdout and stderr are pipes, not the
   caller's terminal (latency to confirm in KNSH-076).
 - **Redaction hook.** Every chunk then passes the redaction hook (FR-EVT-07, FR-OUT-06) before it is kept, returned,
-  stored or emitted. It does nothing until secret redaction arrives (KNSH-091); a secret split across two chunks will
-  need handling then.
+  stored or emitted: the session's redactor, one stream per output stream, so a secret split across two chunks is
+  still replaced ([secrets](secrets.md#redaction-on-every-output-path-knsh-091), KNSH-091).
 - **Cap.** Each stream is kept within 1 MB as it is read: the first half and the last half, with the size written,
   the bytes skipped and where (FR-REC-06), and the line count.
 - **Storage and events.** Only when the profile records output is the capture stored with the record and published

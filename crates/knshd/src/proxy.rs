@@ -52,12 +52,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use knsh_core::{
     EventData, LineAccess, MAX_NETWORK_ENTRIES, NetworkEntry, NetworkPolicy, NetworkResult, RecordId, Redacted,
-    Requester, SessionId, merge_network, redact,
+    Requester, SessionId, merge_network,
 };
 use knsh_platform::{Field, Level, SystemLog, Value};
 use knsh_proxy::{Denial, HostRules, Owner, Proxy, ProxyReport, Scope, Target};
 
 use crate::events::EventHub;
+use crate::redaction::{Redactors, redact_or_hide};
 
 /// The variables that carry the proxy URL (decision 14): curl, git, pip, cargo and Node (with
 /// [`NODE_USE_ENV_PROXY`]) read one of them.
@@ -294,17 +295,26 @@ type Running = HashMap<RecordId, (SessionId, Vec<NetworkEntry>)>;
 pub(crate) struct NetworkReport {
     log: Arc<dyn SystemLog>,
     events: Arc<EventHub>,
+    /// Host names are line text: each goes through its session's redactor before it is published or collected
+    /// (KNSH-091, FR-REC-05).
+    redactors: Arc<Redactors>,
     running: Mutex<Running>,
 }
 
 impl NetworkReport {
-    /// Reports to `log` and publishes to `events`.
-    pub(crate) fn new(log: Arc<dyn SystemLog>, events: Arc<EventHub>) -> Arc<Self> {
+    /// Reports to `log` and publishes to `events`, host names redacted with `redactors`.
+    pub(crate) fn new(log: Arc<dyn SystemLog>, events: Arc<EventHub>, redactors: Arc<Redactors>) -> Arc<Self> {
         Arc::new(Self {
             log,
             events,
+            redactors,
             running: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// `host` as `session` may show it: through its current redactor, or hidden if it has none (KNSH-091).
+    fn host_text(&self, session: SessionId, host: &str) -> Redacted<String> {
+        redact_or_hide(self.redactors.latest(session).ok().as_ref(), host)
     }
 
     /// Takes the lock even if a thread panicked while holding it: every update is one map operation.
@@ -337,7 +347,8 @@ impl NetworkReport {
         let Some(record) = owner.line else {
             return;
         };
-        let entry = NetworkEntry::new(redact(&target.host.to_string()), target.port.get(), result);
+        let host = self.host_text(owner.session, &target.host.to_string());
+        let entry = NetworkEntry::new(host, target.port.get(), result);
         if let Some((session, entries)) = self.lock().get_mut(&record)
             && *session == owner.session
         {
@@ -375,7 +386,10 @@ impl ProxyReport for NetworkReport {
         let data = EventData::ProxyDenied {
             record_id: owner.line,
             protocol: denial.protocol.map(knsh_proxy::Protocol::name),
-            host: denial.target.as_ref().map(|target| redact(&target.host.to_string())),
+            host: denial
+                .target
+                .as_ref()
+                .map(|target| self.host_text(owner.session, &target.host.to_string())),
             port: denial.target.as_ref().map(|target| target.port.get()),
             reason,
         };
@@ -531,7 +545,11 @@ pub(crate) mod tests {
         let log = Arc::new(RecordingLog::new());
         let hub = crate::events::tests::hub();
         let rules = Arc::new(HostRules::new(resolver));
-        let report = NetworkReport::new(Arc::clone(&log) as Arc<dyn SystemLog>, Arc::clone(&hub));
+        let report = NetworkReport::new(
+            Arc::clone(&log) as Arc<dyn SystemLog>,
+            Arc::clone(&hub),
+            crate::redaction::Redactors::none(),
+        );
         let proxy = Proxy::start(
             Config::DEFAULT,
             Parts {

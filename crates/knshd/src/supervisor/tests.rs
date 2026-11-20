@@ -179,14 +179,14 @@ impl Spawner for FakeSpawner {
                 events.long_running();
             }
         }
-        // A captured line's output goes through the plan as the real readers would take it: hook, capture, sink.
+        // A captured line's output goes through the plan as the real readers would take it: redaction, capture, sink.
         let output = plan.capture.as_ref().map(|capture| {
             self.journal
                 .push(format!("capture publishing={}", capture.sink.is_some()));
             let read = |stream: OutputStream, written: &[u8]| {
                 let mut kept = knsh_core::OutputCapture::new(capture.cap);
                 if !written.is_empty() {
-                    let chunk = capture.redaction.redact_chunk(written);
+                    let chunk = capture.redactor.redact(written);
                     kept.push(chunk.expose());
                     if let Some(sink) = &capture.sink {
                         sink.chunk(stream, 0, &chunk);
@@ -246,8 +246,8 @@ struct Setup {
     hooks_observe: bool,
     /// The spawner; one whose lines exit 0 by default.
     spawner: Option<FakeSpawner>,
-    /// The output redaction hook; a pass-through by default.
-    redaction: Option<Arc<dyn knsh_core::OutputRedaction>>,
+    /// The sessions' redactors; none (nothing redacted) by default.
+    redactors: Option<Arc<crate::redaction::Redactors>>,
     /// The live grants; none by default.
     grants: Option<Arc<crate::grants::GrantStore>>,
     /// A real authority in place of the scripted `authority` (KNSH-069).
@@ -282,7 +282,17 @@ impl Daemon {
         }
     }
 
-    fn lifecycle(&self, setup: Setup) -> Arc<Lifecycle> {
+    fn lifecycle(&self, mut setup: Setup) -> Arc<Lifecycle> {
+        let hooks: Arc<dyn Hooks + Send + Sync> = Arc::new(FakeHooks {
+            journal: Arc::clone(&self.journal),
+            script: Mutex::new(std::mem::take(&mut setup.hooks)),
+            seen: setup.hooks_observe.then(|| Arc::clone(&self.subscriber)),
+        });
+        self.lifecycle_with_hooks(setup, hooks)
+    }
+
+    /// The orchestrator as [`Self::lifecycle`] builds it, with `hooks` in place of the scripted ones.
+    fn lifecycle_with_hooks(&self, setup: Setup, hooks: Arc<dyn Hooks + Send + Sync>) -> Arc<Lifecycle> {
         let profiles = setup.profiles.unwrap_or_else(|| vec![("web", WEB)]);
         let authority: Arc<dyn Authority + Send + Sync> = match setup.authority {
             _ if setup.authority_service.is_some() => setup.authority_service.clone().unwrap(),
@@ -293,11 +303,6 @@ impl Daemon {
             }),
             None => Arc::new(NoAuthority),
         };
-        let hooks: Arc<dyn Hooks + Send + Sync> = Arc::new(FakeHooks {
-            journal: Arc::clone(&self.journal),
-            script: Mutex::new(setup.hooks),
-            seen: setup.hooks_observe.then(|| Arc::clone(&self.subscriber)),
-        });
         let fs = filesystem(&profiles);
         let policies = EnginePaths::for_home(Path::new(HOME)).unwrap().policies_dir();
         for (name, bytes) in &setup.raw_files {
@@ -325,9 +330,7 @@ impl Daemon {
                     .spawner
                     .unwrap_or_else(|| FakeSpawner::new(Arc::clone(&self.journal))),
             ),
-            redaction: setup
-                .redaction
-                .unwrap_or_else(|| Arc::new(knsh_core::NoOutputRedaction)),
+            redactors: setup.redactors.unwrap_or_else(crate::redaction::Redactors::none),
         })
     }
 
@@ -850,7 +853,7 @@ fn runs_with_no_hooks_and_no_authority() {
         approvals: crate::approvals::tests::unanswered(DEFAULT_ASK_TIMEOUT),
         grants: crate::grants::GrantStore::new(),
         spawner: Arc::new(FakeSpawner::new(Arc::clone(&daemon.journal))),
-        redaction: Arc::new(knsh_core::NoOutputRedaction),
+        redactors: crate::redaction::Redactors::none(),
     });
     // `echo` is a builtin and stays as written; `ls` runs by its absolute path.
     lifecycle.run(daemon.line("echo hi; ls"), &StillWaiting).unwrap();
@@ -1460,34 +1463,49 @@ fn recording_set_output_overrides_the_profile() {
     }
 }
 
-// FR-EVT-07: what is stored and published is what the redaction hook returned, never the raw chunk.
+/// The secret the redaction tests use, provided as `api-key` (KNSH-091).
+const SECRET: &str = "sk-live-0123456789abcdef";
+
+/// Redactors holding [`SECRET`] as a provided secret.
+fn secret_redactors() -> Arc<crate::redaction::Redactors> {
+    crate::redaction::tests::provided(&[("api-key", SECRET)])
+}
+
+/// Every event as its wire JSON, so a test can see every text it carries.
+fn events_json(events: &[Arc<knsh_core::Event>]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| knsh_json::write(&Value::Object(knsh_proto::event_envelope(event).unwrap())).unwrap())
+        .collect()
+}
+
+// FR-EVT-07, FR-OUT-06 (KNSH-091): the output `exec.run` returns, publishes as `command.output` and stores is
+// redacted with the session's secrets.
 #[test]
-fn stores_and_emits_only_redacted_output() {
-    struct Masking;
-    impl knsh_core::OutputRedaction for Masking {
-        fn redact_chunk(&self, chunk: &[u8]) -> Redacted<Vec<u8>> {
-            Redacted::new(chunk.iter().map(|_| b'#').collect())
-        }
-    }
+fn command_output_event_is_redacted() {
     let daemon = Daemon::new();
     daemon.events();
+    let written: &'static [u8] = Box::leak(format!("token={SECRET}\n").into_bytes().into_boxed_slice());
     let finished = daemon
         .next(
             Setup {
-                spawner: Some(writing(&daemon, b"token=abc\n", b"")),
+                spawner: Some(writing(&daemon, written, b"")),
                 profiles: Some(vec![("web", WEB_RECORDING_OUTPUT)]),
-                redaction: Some(Arc::new(Masking)),
+                redactors: Some(secret_redactors()),
                 ..Setup::default()
             },
             "ls",
         )
         .unwrap();
-    assert_eq!(finished.output.unwrap().stdout.output.data().expose(), b"##########");
-    let published = daemon.events().iter().find_map(|event| match &event.data {
+    let expected = "token=«redacted:api-key»\n".as_bytes();
+    assert_eq!(finished.output.unwrap().stdout.output.data().expose(), expected);
+    let events = daemon.events();
+    let published = events.iter().find_map(|event| match &event.data {
         EventData::CommandOutput { bytes, .. } => Some(bytes.expose().clone()),
         _ => None,
     });
-    assert_eq!(published.as_deref(), Some(&b"##########"[..]));
+    assert_eq!(published.as_deref(), Some(expected));
+    assert!(events_json(&events).iter().all(|json| !json.contains(SECRET)));
     let record_id = last_stored(&daemon).record.record_id;
     let range = daemon
         .fixture
@@ -1502,7 +1520,161 @@ fn stores_and_emits_only_redacted_output() {
             },
         )
         .unwrap();
-    assert_eq!(range.data, b"##########");
+    assert_eq!(range.data, expected);
+}
+
+// FR-REC-05 (KNSH-091): the record's `command`, `rewritten_from` and `argv` names, `executed_command` and every
+// lifecycle event are redacted before they are written or published; the line that runs keeps the value.
+#[test]
+fn record_command_is_redacted_before_write() {
+    let daemon = Daemon::new();
+    daemon.events();
+    // An allowed line holding the secret.
+    let finished = daemon
+        .next(
+            Setup {
+                redactors: Some(secret_redactors()),
+                ..Setup::default()
+            },
+            &format!("echo {SECRET}"),
+        )
+        .unwrap();
+    // `echo` is the shell's builtin, so the executed line keeps its name as written.
+    assert_eq!(finished.executed_command.expose(), "echo «redacted:api-key»");
+    let spawns = daemon.spawns();
+    assert!(
+        spawns.len() == 1 && spawns[0].contains(SECRET),
+        "the line runs with the real value"
+    );
+    let stored = last_stored(&daemon).record;
+    assert_eq!(stored.command.expose(), "echo «redacted:api-key»");
+
+    // A rewrite to a line holding the secret: the rewritten line is recorded redacted, beside the received one.
+    daemon
+        .next(
+            Setup {
+                redactors: Some(secret_redactors()),
+                authority: Some(vec![AskReply::Rewrite {
+                    command: format!("echo {SECRET}"),
+                }]),
+                ..Setup::default()
+            },
+            "git push",
+        )
+        .unwrap();
+    let stored = last_stored(&daemon).record;
+    assert_eq!(stored.command.expose(), "echo «redacted:api-key»");
+    assert_eq!(
+        stored
+            .details
+            .rewritten_from
+            .as_ref()
+            .map(|from| from.expose().as_str()),
+        Some("git push")
+    );
+
+    // A denied line holding the secret, as an argument and as a command name.
+    for line in [format!("rm {SECRET}"), format!("{SECRET} --flag")] {
+        let _ = daemon.next(
+            Setup {
+                redactors: Some(secret_redactors()),
+                ..Setup::default()
+            },
+            &line,
+        );
+        let stored = last_stored(&daemon).record;
+        assert!(stored.command.expose().contains("«redacted:api-key»"), "{line}");
+        assert!(!stored.command.expose().contains(SECRET), "{line}");
+        for entry in &stored.details.argv {
+            assert!(
+                entry.name.as_ref().is_none_or(|name| !name.expose().contains(SECRET)),
+                "{line}"
+            );
+        }
+    }
+    let events = events_json(&daemon.events());
+    assert!(events.iter().any(|json| json.contains("command.denied")));
+    assert!(events.iter().all(|json| !json.contains(SECRET)), "{events:?}");
+}
+
+// FR-REC-05 (KNSH-091): hooks read on stdin, and the authority is asked about, the same redacted text the record keeps.
+#[test]
+fn hook_input_matches_redacted_record_text() {
+    /// Hooks that keep what each hook would read on stdin.
+    struct Inputs(Mutex<Vec<String>>);
+    impl Hooks for Inputs {
+        fn run(&self, proposal: &Proposal<'_>) -> HookOutcome {
+            let input = knsh_proto::hook_input(proposal).unwrap();
+            self.0.lock().unwrap().push(String::from_utf8(input).unwrap());
+            HookOutcome {
+                verdict: HookVerdict::Allow,
+                hook: None,
+                runs: Vec::new(),
+            }
+        }
+    }
+    let daemon = Daemon::new();
+    let inputs = Arc::new(Inputs(Mutex::new(Vec::new())));
+    let setup = Setup {
+        redactors: Some(secret_redactors()),
+        authority: Some(vec![AskReply::Allow]),
+        ..Setup::default()
+    };
+    let lifecycle = daemon.lifecycle_with_hooks(setup, Arc::clone(&inputs) as Arc<dyn Hooks + Send + Sync>);
+    lifecycle
+        .run(
+            daemon.line(&format!("git push https://{SECRET}@example.com")),
+            &StillWaiting,
+        )
+        .unwrap();
+    let recorded = last_stored(&daemon).record.command.expose().clone();
+    assert_eq!(recorded, "git push https://«redacted:api-key»@example.com");
+    let inputs = inputs.0.lock().unwrap().clone();
+    assert_eq!(inputs.len(), 1);
+    let input = knsh_json::parse(inputs[0].as_bytes(), 1 << 20).unwrap();
+    let command = input
+        .as_object()
+        .and_then(|object| object.get("data"))
+        .and_then(Value::as_object)
+        .and_then(|data| data.get("command"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    assert_eq!(
+        command.as_deref(),
+        Some(recorded.as_str()),
+        "the hook read the record's text"
+    );
+    assert!(!inputs[0].contains(SECRET));
+    assert!(
+        daemon.journal.entries().contains(&format!("ask {recorded}")),
+        "the authority was asked about the record's text"
+    );
+}
+
+// KNSH-091, fail closed: a session whose secrets cannot be redacted runs nothing, and nothing of the line is recorded
+// or published but the marker.
+#[test]
+fn unredactable_secrets_deny_the_line() {
+    let daemon = Daemon::new();
+    daemon.events();
+    let huge: &'static str = Box::leak("x".repeat(knsh_core::MAX_SECRET_VALUE_LEN + 1).into_boxed_str());
+    let error = daemon
+        .next(
+            Setup {
+                redactors: Some(crate::redaction::tests::provided(&[("huge", huge)])),
+                ..Setup::default()
+            },
+            "echo private-words",
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Denied);
+    assert_eq!(data_field(&error, "reason"), Some(Value::from(NO_REDACTION)));
+    assert_eq!(daemon.spawns(), Vec::<String>::new());
+    let stored = last_stored(&daemon).record;
+    assert_eq!(stored.command.expose(), knsh_core::REDACTED_MARKER);
+    assert!(stored.details.argv.is_empty());
+    let events = events_json(&daemon.events());
+    assert!(events.iter().all(|json| !json.contains("private-words")), "{events:?}");
 }
 
 // FR-AUTH-33: `executed_command` is the line actually spawned, after the rewrite, not the one received.

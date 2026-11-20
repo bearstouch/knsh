@@ -137,6 +137,9 @@ mod supervise;
 // The secrets broker (KNSH-089): Keychain secrets and memory-only secrets the authority provides.
 #[cfg(target_os = "macos")]
 mod secrets;
+// One redactor per session on every output path (KNSH-091).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod redaction;
 // Pause, resume and human control (KNSH-054): owned by the session registry.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod holds;
@@ -322,13 +325,12 @@ fn start() -> Result<(), StartError> {
         // reader that cannot start is reported as `sandbox_violations: none` and never blocks anything.
         let reader = start_violation_reader(&paths, clock.clone(), random.clone(), &log, store.clone(), &events);
         // `agent.sock` callers without a token are matched to their envelope through the process table (KNSH-048).
-        let processes = Arc::new(SystemProcessTree::new());
         let sessions = Sessions::new(
             store.clone(),
             Arc::clone(&events),
             clock.clone(),
             random.clone(),
-            processes,
+            Arc::new(SystemProcessTree::new()),
         );
         let authority = authority_supervision(&paths, uid, &log, &clock, &random, &sessions, &events);
         let mut handlers = records.handlers();
@@ -353,6 +355,7 @@ fn start() -> Result<(), StartError> {
             approvals,
             decisions: Arc::clone(&decisions),
             history: &history,
+            redactors: authority.redactors,
         };
         handlers.extend(supervision.handlers());
         let violation_status = reader.as_ref().map_or_else(ReaderStatus::stopped, Reader::status);
@@ -597,6 +600,8 @@ struct AuthoritySupervision {
     /// The control service's `session.*`, `recording.set`, `policy.*` and `secrets.*` handlers, and `profile.use`
     /// (KNSH-072).
     handlers: dispatch::Handlers,
+    /// Each session's redactor (KNSH-091), attached to the sessions and shared with the supervisor.
+    redactors: std::sync::Arc<redaction::Redactors>,
 }
 
 /// The state store and what the authority supervises agents with (KNSH-071): the store's grants and pushed policy,
@@ -663,13 +668,35 @@ fn authority_supervision(
         })
         .handlers(),
     );
-    // `secrets.provide` and `secrets.revoke` (KNSH-089).
-    handlers.extend(secret_broker(clock, log).handlers());
+    // `secrets.provide` and `secrets.revoke` (KNSH-089), from the broker every session's redactor reads (KNSH-091).
+    let (broker, redactors) = session_redactors(clock, log, sessions);
+    handlers.extend(broker.handlers());
     AuthoritySupervision {
         profiles,
         grants,
         handlers,
+        redactors,
     }
+}
+
+/// The secrets broker (KNSH-089), which serves `secrets.*`, and every session's redactor (KNSH-091), which reads
+/// its secrets from the broker: one set of redactors, attached to `sessions` for human records and shared with the
+/// supervisor.
+#[cfg(target_os = "macos")]
+fn session_redactors(
+    clock: &std::sync::Arc<knsh_platform::macos::SystemClock>,
+    log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
+    sessions: &std::sync::Arc<sessions::Sessions>,
+) -> (
+    std::sync::Arc<secrets::SecretBroker>,
+    std::sync::Arc<redaction::Redactors>,
+) {
+    use std::sync::Arc;
+
+    let broker = secret_broker(clock, log);
+    let redactors = redaction::Redactors::new(Arc::clone(&broker) as Arc<dyn redaction::RedactionSecrets>);
+    sessions.attach_redactors(Arc::clone(&redactors));
+    (broker, redactors)
 }
 
 /// The secrets broker (KNSH-089): Keychain items under service `knsh`, and secrets the authority provides, held in
@@ -795,6 +822,8 @@ struct Supervision<'a> {
     /// The checkpoint history the shadows feed and whose restores they bracket, with its `checkpoint.*` handlers
     /// (KNSH-088).
     history: &'a std::sync::Arc<checkpoints::HistoryService>,
+    /// Each session's redactor (KNSH-091), shared with the sessions' human records.
+    redactors: std::sync::Arc<redaction::Redactors>,
 }
 
 /// Starts the network proxy (KNSH-059) on a loopback port with the host rules, the system resolver and address
@@ -807,6 +836,7 @@ fn start_proxy(
     random: std::sync::Arc<knsh_platform::macos::SystemRandom>,
     log: &std::sync::Arc<dyn knsh_platform::SystemLog>,
     events: &std::sync::Arc<events::EventHub>,
+    redactors: &std::sync::Arc<redaction::Redactors>,
 ) -> std::sync::Arc<dyn proxy::ProxyIssuer> {
     use std::sync::Arc;
 
@@ -815,7 +845,7 @@ fn start_proxy(
     use knsh_proxy::{Config, HostRules, Parts, Proxy};
 
     let rules = Arc::new(HostRules::new(Arc::new(SystemResolver::new())));
-    let report = proxy::NetworkReport::new(Arc::clone(log), Arc::clone(events));
+    let report = proxy::NetworkReport::new(Arc::clone(log), Arc::clone(events), Arc::clone(redactors));
     let started = Proxy::start(
         Config::DEFAULT,
         Parts {
@@ -901,8 +931,8 @@ impl Supervision<'_> {
             authority: self.decisions,
             approvals: self.approvals,
             spawner: Arc::new(spawner),
-            // Secret redaction arrives with KNSH-091; the hook is already on the capture path.
-            redaction: Arc::new(knsh_core::NoOutputRedaction),
+            // KNSH-091: every path of every line is redacted with its session's redactor.
+            redactors: self.redactors,
         });
         exec::ExecRun::new(lifecycle, self.paths.shim_dir()).handlers()
     }
@@ -928,7 +958,13 @@ impl Supervision<'_> {
             .attach_windows(std::sync::Arc::clone(&shadows) as std::sync::Arc<dyn shadows::RestoreWindows>);
         self.sessions.attach_shadows(shadows);
         // One proxy issues every envelope's and line's credentials (KNSH-059).
-        let proxy = start_proxy(self.clock.clone(), self.random.clone(), self.log, self.events);
+        let proxy = start_proxy(
+            self.clock.clone(),
+            self.random.clone(),
+            self.log,
+            self.events,
+            &self.redactors,
+        );
         let mut handlers = self.history.handlers();
         handlers.extend(self.start_agent_handlers(&proxy));
         handlers.extend(self.exec_run_handlers(proxy));

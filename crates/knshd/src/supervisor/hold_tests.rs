@@ -132,7 +132,7 @@ impl Daemon {
                 running: Mutex::new(running_tx),
                 release: Mutex::new(release_rx),
             }),
-            redaction: Arc::new(knsh_core::NoOutputRedaction),
+            redactors: crate::redaction::Redactors::none(),
         });
         Self {
             fixture,

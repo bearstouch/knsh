@@ -7,7 +7,10 @@
 //!    records output: the capture tees, so what the caller sees does not change). If that write fails (the caller
 //!    closed its end), the reader stops and closes the pipe, so the line gets `EPIPE`/`SIGPIPE` exactly as it would
 //!    have writing to the caller directly.
-//! 2. **Redacted** through the [`OutputRedaction`] hook. Everything after this sees only the redacted chunk.
+//! 2. **Redacted** through the stream's [`RedactStream`], made from the session's [`Redactor`] (FR-EVT-07,
+//!    FR-OUT-06, KNSH-091). Everything after this sees only redacted bytes. The stream holds back the trailing bytes
+//!    that could still begin a secret, so a secret split across two reads is still replaced; what it holds is
+//!    released, redacted, when the stream ends or its capture is sealed, whichever comes first.
 //! 3. **Kept** in an [`OutputCapture`]: head and tail within the cap, with the stream's size and line count.
 //! 4. **Published** as `command.output` through the [`OutputSink`], only when the session records output, and
 //!    only while the stream is within the cap: a line writing gigabytes cannot flood the event bus.
@@ -22,8 +25,9 @@
 //!
 //! # Lock order
 //!
-//! A stream's state, then the event hub (inside [`OutputSink::chunk`]). The state is held while a chunk is captured
-//! and published, so a sealed capture never gains a chunk or publishes one afterwards. Nothing else takes a
+//! A stream's state, then the event hub (inside [`OutputSink::chunk`]). The state is held while a chunk is redacted,
+//! captured and published, so a sealed capture never gains a chunk or publishes one afterwards, and the held-back
+//! bytes are released exactly once. Nothing else takes a
 //! stream's state while holding the hub.
 
 use std::fs::File;
@@ -32,7 +36,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use knsh_core::{CapturedStream, OutputCapture, OutputRedaction, OutputStream, Redacted};
+use knsh_core::{CapturedStream, OutputCapture, OutputStream, RedactStream, Redacted, Redactor};
 
 /// The most bytes read (and so published in one `command.output`) at a time. Each chunk is buffered by the event
 /// bus, so small chunks bound its memory: at most [`knsh_core::EVENT_BUFFER_LEN`] chunks per session.
@@ -50,8 +54,9 @@ pub(crate) trait OutputSink: Send + Sync {
 /// How a line's output is captured.
 #[derive(Clone)]
 pub(crate) struct CapturePlan {
-    /// The hook every chunk passes through before it is kept or published (FR-EVT-07).
-    pub(crate) redaction: Arc<dyn OutputRedaction>,
+    /// The session's redactor: each stream is redacted through its own [`RedactStream`] before anything is kept or
+    /// published (FR-EVT-07, KNSH-091). The same instance the line's record and events were redacted with.
+    pub(crate) redactor: Redactor,
     /// Bytes kept per stream (FR-REC-06): the record store's cap, so the record holds exactly what was captured.
     pub(crate) cap: usize,
     /// Where `command.output` goes; `None` when the session does not record output.
@@ -59,10 +64,11 @@ pub(crate) struct CapturePlan {
 }
 
 impl std::fmt::Debug for CapturePlan {
-    /// The cap and whether chunks are published; the hook and sink are trait objects with nothing to show.
+    /// The cap, the secret names redacted and whether chunks are published; the sink has nothing to show.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CapturePlan")
             .field("cap", &self.cap)
+            .field("redactor", &self.redactor)
             .field("publishes", &self.sink.is_some())
             .finish_non_exhaustive()
     }
@@ -80,6 +86,8 @@ pub(crate) struct LineOutput {
 /// What one reader shares with the spawner.
 struct StreamState {
     capture: OutputCapture,
+    /// The stream's redaction, until its held-back bytes are released at its end or at the seal.
+    redaction: Option<RedactStream>,
     /// The capture is final: nothing more is kept or published.
     sealed: bool,
     /// The reader has finished: end of file, a read error, or a failed forward.
@@ -89,6 +97,12 @@ struct StreamState {
 struct Shared {
     state: Mutex<StreamState>,
     changed: Condvar,
+    /// Which stream this is, for `command.output`.
+    stream: OutputStream,
+    /// Where `command.output` goes, if anywhere.
+    sink: Option<Arc<dyn OutputSink>>,
+    /// Chunks are published only while the stream is within this many bytes (the cap).
+    cap: u64,
 }
 
 /// Takes the lock even if a reader panicked while holding it: a capture is only ever appended to whole chunks.
@@ -149,6 +163,8 @@ fn seal(shared: &Shared, deadline: Instant) -> CapturedStream {
             .unwrap_or_else(PoisonError::into_inner)
             .0;
     }
+    // A reader still going (a leftover process holds the pipe) has bytes held back: they are the capture's last.
+    release(&mut state, shared);
     state.sealed = true;
     std::mem::replace(&mut state.capture, OutputCapture::new(0)).finish()
 }
@@ -158,25 +174,56 @@ fn reader(stream: OutputStream, source: Source, plan: &CapturePlan) -> std::io::
     let shared = Arc::new(Shared {
         state: Mutex::new(StreamState {
             capture: OutputCapture::new(plan.cap),
+            redaction: Some(plan.redactor.stream()),
             sealed: false,
             done: false,
         }),
         changed: Condvar::new(),
+        stream,
+        sink: plan.sink.clone(),
+        cap: u64::try_from(plan.cap).unwrap_or(u64::MAX),
     });
     let thread_shared = Arc::clone(&shared);
-    let plan = plan.clone();
     thread::Builder::new().name(format!("knshd-{stream}")).spawn(move || {
-        read_stream(stream, source, &plan, &thread_shared);
-        lock(&thread_shared).done = true;
+        read_stream(source, &thread_shared);
+        let mut state = lock(&thread_shared);
+        // The stream ended: the bytes still held back are released, redacted, a secret cut at the end included.
+        release(&mut state, &thread_shared);
+        state.done = true;
+        drop(state);
         thread_shared.changed.notify_all();
     })?;
     Ok(shared)
 }
 
+/// Releases the bytes `state`'s redaction still holds back, unless the capture is sealed or they were released.
+fn release(state: &mut StreamState, shared: &Shared) {
+    if state.sealed {
+        return;
+    }
+    if let Some(redaction) = state.redaction.take() {
+        let tail = redaction.finish();
+        keep(state, shared, &tail);
+    }
+}
+
+/// Steps 3 and 4 for `bytes`, already redacted: kept, and published in pieces of at most [`OUTPUT_CHUNK`] while the
+/// stream is within the cap. A marker can be longer than what it replaced, so one read may give more than a chunk.
+fn keep(state: &mut StreamState, shared: &Shared, bytes: &Redacted<Vec<u8>>) {
+    for piece in bytes.expose().chunks(OUTPUT_CHUNK) {
+        let offset = state.capture.written();
+        state.capture.push(piece);
+        if let Some(sink) = &shared.sink
+            && offset < shared.cap
+        {
+            sink.chunk(shared.stream, offset, &Redacted::new(piece.to_vec()));
+        }
+    }
+}
+
 /// The reader loop: steps 1 to 4 of the module documentation for each chunk, until end of file.
-fn read_stream(stream: OutputStream, source: Source, plan: &CapturePlan, shared: &Shared) {
+fn read_stream(source: Source, shared: &Shared) {
     let Source { mut pipe, mut forward } = source;
-    let cap = u64::try_from(plan.cap).unwrap_or(u64::MAX);
     let mut buffer = vec![0u8; OUTPUT_CHUNK];
     loop {
         let read = match pipe.read(&mut buffer) {
@@ -199,39 +246,26 @@ fn read_stream(stream: OutputStream, source: Source, plan: &CapturePlan, shared:
             // The record is written: keep draining (and forwarding) so a leftover process never blocks.
             continue;
         }
-        let chunk = plan.redaction.redact_chunk(raw);
-        let offset = state.capture.written();
-        state.capture.push(chunk.expose());
-        if let Some(sink) = &plan.sink
-            && offset < cap
-        {
-            sink.chunk(stream, offset, &chunk);
-        }
+        // Step 2. `None` only once released, which happens after the last read or at the seal (skipped above).
+        let Some(redaction) = state.redaction.as_mut() else {
+            continue;
+        };
+        let chunk = redaction.push(raw);
+        keep(&mut state, shared, &chunk);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use knsh_core::NoOutputRedaction;
-
     use super::*;
 
-    /// Counts chunks and replaces every `s` with `*`, so redacted bytes can be told from raw ones.
-    #[derive(Default)]
-    struct Starring(AtomicUsize);
+    /// The secret the tests redact, as `«redacted:api-key»`.
+    const SECRET: &[u8] = b"sk-live-0123456789abcdef";
+    const MARKER: &[u8] = "«redacted:api-key»".as_bytes();
 
-    impl OutputRedaction for Starring {
-        fn redact_chunk(&self, chunk: &[u8]) -> Redacted<Vec<u8>> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Redacted::new(
-                chunk
-                    .iter()
-                    .map(|&byte| if byte == b's' { b'*' } else { byte })
-                    .collect(),
-            )
-        }
+    fn redactor() -> Redactor {
+        let name = knsh_core::SecretName::new("api-key").unwrap();
+        Redactor::new([(name, Redacted::new(SECRET))]).unwrap()
     }
 
     #[derive(Default)]
@@ -243,14 +277,34 @@ mod tests {
         }
     }
 
-    fn plan(redaction: Arc<dyn OutputRedaction>, sink: Option<Arc<dyn OutputSink>>, cap: usize) -> CapturePlan {
-        CapturePlan { redaction, cap, sink }
+    fn plan(redactor: Redactor, sink: Option<Arc<dyn OutputSink>>, cap: usize) -> CapturePlan {
+        CapturePlan { redactor, cap, sink }
     }
 
-    // FR-EVT-07: every chunk passes the hook once, before it is kept or published; the caller's copy is raw.
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|window| window == needle)
+    }
+
+    /// `bytes` with every [`SECRET`] replaced by [`MARKER`].
+    fn redacted(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            if rest.starts_with(SECRET) {
+                out.extend_from_slice(MARKER);
+                rest = &rest[SECRET.len()..];
+            } else {
+                out.push(rest[0]);
+                rest = &rest[1..];
+            }
+        }
+        out
+    }
+
+    // FR-EVT-07, FR-OUT-06 (KNSH-091): what is kept and published as `command.output` is redacted, a secret written
+    // across two reads included, in order and in chunks of at most 8 KiB; the caller's own copy is the raw bytes.
     #[test]
-    fn every_chunk_passes_redaction_hook() {
-        let redaction = Arc::new(Starring::default());
+    fn command_output_event_is_redacted() {
         let sink = Arc::new(Chunks::default());
         let (out_read, mut out_write) = std::io::pipe().unwrap();
         let (err_read, err_write) = std::io::pipe().unwrap();
@@ -264,7 +318,7 @@ mod tests {
                 pipe: err_read,
                 forward: None,
             },
-            &plan(redaction.clone(), Some(sink.clone()), 1 << 20),
+            &plan(redactor(), Some(sink.clone()), 1 << 20),
         )
         .unwrap();
         // The caller reads its end as the line writes, as a terminal or pipe reader would.
@@ -273,35 +327,81 @@ mod tests {
             tee_read.read_to_end(&mut teed).unwrap();
             teed
         });
-        let written: Vec<u8> = b"secrets stay shown to the caller\n".repeat(2000);
+        let mut line = b"token=".to_vec();
+        line.extend_from_slice(SECRET);
+        line.push(b'\n');
+        let mut written: Vec<u8> = line.repeat(2000);
+        // A secret cut in two by the reads: the first half is read alone before the second is written.
+        let (first, second) = SECRET.split_at(7);
         out_write.write_all(&written).unwrap();
+        out_write.write_all(first).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sink.0.lock().unwrap().iter().map(|(_, _, b)| b.len()).sum::<usize>() < redacted(&written).len()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(20));
+        out_write.write_all(second).unwrap();
+        out_write.write_all(b" end").unwrap();
+        written.extend_from_slice(SECRET);
+        written.extend_from_slice(b" end");
         drop(out_write);
         drop(err_write);
         let output = capture.finish(Duration::from_secs(10));
         let teed = caller.join().unwrap();
         assert!(teed == written, "the caller sees the line's bytes unchanged");
 
-        let starred: Vec<u8> = written.iter().map(|&b| if b == b's' { b'*' } else { b }).collect();
-        assert!(output.stdout.output.data().expose() == &starred, "kept redacted");
-        assert_eq!(output.stdout.lines, 2000);
+        let expected = redacted(&written);
+        let kept = output.stdout.output.data().expose();
+        assert!(*kept == expected, "kept redacted");
+        assert!(!contains(kept, SECRET) && !contains(kept, first));
+        // 2000 full lines, and the last one, `«secret» end`, with no newline.
+        assert_eq!(output.stdout.lines, 2001);
         let chunks = sink.0.lock().unwrap().clone();
         assert!(chunks.len() > 1, "read in several chunks");
-        assert_eq!(
-            chunks.len(),
-            redaction.0.load(Ordering::SeqCst),
-            "one hook call per chunk"
-        );
-        // In order, contiguous, and each redacted.
+        // In order, contiguous, each at most a chunk, and none showing the secret or its first half.
         let mut offset = 0u64;
         let mut published = Vec::new();
         for (stream, at, bytes) in chunks {
             assert_eq!(stream, OutputStream::Stdout);
             assert_eq!(at, offset);
             assert!(bytes.len() <= OUTPUT_CHUNK);
+            assert!(!contains(&bytes, SECRET));
             offset += bytes.len() as u64;
             published.extend(bytes);
         }
-        assert!(published == starred, "published redacted");
+        assert!(published == expected, "published redacted");
+    }
+
+    // KNSH-091: a stream that ends on the start of a secret never emits it: the held-back prefix becomes the marker.
+    #[test]
+    fn trailing_prefix_of_a_secret_is_redacted_at_end_of_file() {
+        let sink = Arc::new(Chunks::default());
+        let (out_read, mut out_write) = std::io::pipe().unwrap();
+        let (err_read, err_write) = std::io::pipe().unwrap();
+        let capture = LineCapture::start(
+            Source {
+                pipe: out_read,
+                forward: None,
+            },
+            Source {
+                pipe: err_read,
+                forward: None,
+            },
+            &plan(redactor(), Some(sink.clone()), 1024),
+        )
+        .unwrap();
+        out_write.write_all(b"cut: ").unwrap();
+        out_write.write_all(&SECRET[..10]).unwrap();
+        drop(out_write);
+        drop(err_write);
+        let output = capture.finish(Duration::from_secs(10));
+        let mut expected = b"cut: ".to_vec();
+        expected.extend_from_slice(MARKER);
+        assert_eq!(output.stdout.output.data().expose(), &expected);
+        let published: Vec<u8> = sink.0.lock().unwrap().iter().flat_map(|(_, _, b)| b.clone()).collect();
+        assert_eq!(published, expected);
     }
 
     // FR-LC-18: chunks are published only through a sink (none when output is not recorded), and only within the
@@ -320,7 +420,7 @@ mod tests {
                 pipe: err_read,
                 forward: None,
             },
-            &plan(Arc::new(NoOutputRedaction), Some(sink.clone()), 64),
+            &plan(Redactor::default(), Some(sink.clone()), 64),
         )
         .unwrap();
         out_write.write_all(&[b'x'; 10_000]).unwrap();
@@ -355,10 +455,12 @@ mod tests {
                 pipe: err_read,
                 forward: None,
             },
-            &plan(Arc::new(NoOutputRedaction), Some(sink.clone()), 1024),
+            &plan(redactor(), Some(sink.clone()), 1024),
         )
         .unwrap();
         out_write.write_all(b"before\n").unwrap();
+        // The start of a secret, held back by the redaction until the seal releases it as the marker.
+        out_write.write_all(&SECRET[..5]).unwrap();
         drop(err_write);
         // Let the reader take the first chunk before sealing.
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -368,10 +470,20 @@ mod tests {
         let started = Instant::now();
         let output = capture.finish(Duration::from_millis(50));
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert_eq!(output.stdout.output.data().expose(), b"before\n");
+        let mut expected = b"before\n".to_vec();
+        expected.extend_from_slice(MARKER);
+        assert_eq!(output.stdout.output.data().expose(), &expected);
+        let published = sink.0.lock().unwrap().len();
         out_write.write_all(b"after\n").unwrap();
+        out_write.write_all(&SECRET[5..]).unwrap();
         drop(out_write);
         thread::sleep(Duration::from_millis(20));
-        assert_eq!(sink.0.lock().unwrap().len(), 1, "nothing published after sealing");
+        assert_eq!(
+            sink.0.lock().unwrap().len(),
+            published,
+            "nothing published after sealing"
+        );
+        let all: Vec<u8> = sink.0.lock().unwrap().iter().flat_map(|(_, _, b)| b.clone()).collect();
+        assert_eq!(all, expected, "the held-back prefix was published as the marker");
     }
 }

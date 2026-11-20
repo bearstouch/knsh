@@ -678,7 +678,7 @@ fn kill_terminates_whole_process_group() {
 /// A capture plan keeping `cap` bytes, publishing nothing.
 fn capture_plan(cap: usize) -> CapturePlan {
     CapturePlan {
-        redaction: Arc::new(knsh_core::NoOutputRedaction),
+        redactor: knsh_core::Redactor::default(),
         cap,
         sink: None,
     }

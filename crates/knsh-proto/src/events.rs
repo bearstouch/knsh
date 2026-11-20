@@ -747,6 +747,7 @@ mod tests {
             cwd: &cwd,
             rewritten_from: Some(&from),
             classification: &classification,
+            redactor: &knsh_core::Redactor::default(),
         };
         let text = String::from_utf8(hook_input(&proposal).unwrap()).unwrap();
         assert_eq!(

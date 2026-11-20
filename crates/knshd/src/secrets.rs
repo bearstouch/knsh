@@ -206,6 +206,26 @@ impl SecretBroker {
             .collect()
     }
 
+    /// The secrets a session redacts (KNSH-091, [`crate::redaction`]): every live provided secret, and each of `names`
+    /// (its profile's `[secrets.env]`) that can be read, each once, in name order. Secrets that cannot be had are left
+    /// out: the engine never holds their value, so nothing it emits can show it.
+    pub(crate) fn redaction_set(&self, names: &[SecretName]) -> Vec<(SecretName, SecretValue)> {
+        let mut set: BTreeMap<SecretName, SecretValue> = self
+            .live()
+            .iter()
+            .map(|(name, provided)| (name.clone(), provided.value.duplicate()))
+            .collect();
+        // The lock is released before the Keychain is read ("Locks").
+        for name in names {
+            if !set.contains_key(name)
+                && let Ok(value) = self.keychain.read(name)
+            {
+                set.insert(name.clone(), value);
+            }
+        }
+        set.into_iter().collect()
+    }
+
     /// Drops every expired provided secret now.
     pub(crate) fn purge_expired(&self) {
         drop(self.live());

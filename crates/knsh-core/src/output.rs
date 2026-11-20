@@ -1,11 +1,10 @@
 //! Output capture and output modes (KNSH-053, `specs/03-functional-requirements/output-modes.md`, FR-REC-06,
 //! FR-OUT-01, FR-OUT-05).
 //!
-//! Three pure building blocks, used by the supervisor in `knshd`:
+//! Two pure building blocks, used by the supervisor in `knshd`, which first passes every captured chunk through the
+//! session's [`RedactStream`](crate::RedactStream) (FR-EVT-07, FR-OUT-06, KNSH-091), so both only ever see redacted
+//! bytes:
 //!
-//! - [`OutputRedaction`]: the hook every captured chunk passes through before it is stored, emitted or returned
-//!   (FR-EVT-07, FR-OUT-06). Phase 2 has no secret redaction yet ([`NoOutputRedaction`]); KNSH-091 adds it behind
-//!   the same hook.
 //! - [`OutputCapture`]: a streaming accumulator that keeps at most a cap of one stream, the head and the tail, and
 //!   counts what it dropped and how many lines the stream had. A command can write gigabytes; memory stays at the
 //!   cap.
@@ -33,26 +32,6 @@ pub const MAX_HEAD_TAIL_LINES: usize = 10_000;
 
 /// `errors_only`: the last 20 lines of stdout.
 pub const ERRORS_ONLY_STDOUT_LINES: usize = 20;
-
-/// The hook every output chunk passes through before it is stored, emitted or returned (FR-EVT-07, FR-OUT-06).
-///
-/// It sees each chunk once, in order, per stream. Chunks are cut where the pipe's reads happen to end, so a secret
-/// split across two chunks is not seen whole; KNSH-091 must account for that when it adds real redaction.
-pub trait OutputRedaction: Send + Sync {
-    /// `chunk` as it may leave the engine.
-    fn redact_chunk(&self, chunk: &[u8]) -> Redacted<Vec<u8>>;
-}
-
-/// Phase 2's redaction: none (secret redaction is KNSH-091). The hook point exists so the capture path never
-/// changes when it arrives.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoOutputRedaction;
-
-impl OutputRedaction for NoOutputRedaction {
-    fn redact_chunk(&self, chunk: &[u8]) -> Redacted<Vec<u8>> {
-        Redacted::new(chunk.to_vec())
-    }
-}
 
 /// One stream as kept: at most a cap of bytes, the head and the tail of what the command wrote, and where the
 /// dropped bytes were.
