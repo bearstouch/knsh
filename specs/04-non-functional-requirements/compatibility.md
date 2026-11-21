@@ -195,9 +195,10 @@ Known differences of the native interpreter from bash 5.2 in traps, signals, `se
 - Refused: a `SIGCHLD` trap with a command (bash runs it as each child ends); `trap` listing in a subshell whose
   parent had command traps, until the subshell changes one (bash 5.2 still lists the parent's); `set` alone (it
   lists the variables bash maintains itself); changing an option the interpreter does not implement (`set -a`, `-b`,
-  `-k`, `-t`, `-p`, `-i`, `-r`, `+h`, `+B`, `-H`, `-o history`, `emacs`, `vi`, `ignoreeof`, `nolog`, `posix`
-  (KNSH-106), and every `shopt` option outside `extglob`, `globstar`, `nullglob`, `failglob`, `dotglob`,
-  `nocaseglob`, `lastpipe`, `expand_aliases`, `inherit_errexit` and `xpg_echo`); those are listed and tested at bash
+  `-k`, `-t`, `-p`, `-i`, `-r`, `+h`, `+B`, `-H`, `-o history`, `emacs`, `vi`, `ignoreeof`, `nolog`, and every
+  `shopt` option outside `extglob`, `globstar`, `nullglob`, `failglob`, `dotglob`, `nocaseglob`, `lastpipe`,
+  `expand_aliases`, `inherit_errexit`, `xpg_echo` and `shift_verbose` (`set -o posix` is implemented since
+  KNSH-106); those are listed and tested at bash
   5.2's defaults for `bash -c`. In an interactive shell, reading or listing the line-editing and history options is
   refused (KNSH-107). `BASH_XTRACEFD` and `BASH_COMMAND` are refused as variables bash maintains.
 - `inherit_errexit` is held and reported; it acts on command substitution (KNSH-105: `set -e` is off inside one
@@ -245,6 +246,60 @@ here-documents (KNSH-105):
   its array and descriptors stay until the script closes or reuses them (bash closes them and unsets the array as it
   reaps the coprocess), and a second coprocess gives no warning. A coprocess of a compound command has no process of
   its own: reading `NAME_PID` (or `$!`) is refused.
+
+Bash's POSIX mode in the native interpreter (KNSH-106). POSIX mode is the flag `ShellOptions::posix` on the same
+interpreter, read where bash 5.2 reads `posixly_correct` (NFR-COMPAT-02: no separate dialect). It is on for a shell
+started as `sh` or with `--posix` or `-o posix` (`knsh_interp::posix_mode_requested`, then
+`ShellState::with_posix_mode`), with `POSIXLY_CORRECT` or `POSIX_PEDANTIC` in the environment, after `set -o posix`
+or `shopt -so posix`, and while a script's `POSIXLY_CORRECT` is set. Turning it on sets `POSIXLY_CORRECT=y`,
+`inherit_errexit`, `shift_verbose` and `expand_aliases`, and stops `.` searching the working directory; turning it
+off reverses that as bash 5.2's `posix_initialize` does (`inherit_errexit` stays on).
+
+Implemented after bash 5.2's source and test suite (`errors.right`, `builtins.right`, `func3.sub`, `varenv12.sub`,
+`tilde.right`, `redir.right`, `set-e1.sub`, `source5.sub`, `builtins7.sub`), and checked against macOS `/bin/sh`
+(bash 3.2 in POSIX mode) where it agrees:
+
+- Special builtins (`:`, `.`, `source`, `break`, `continue`, `eval`, `exec`, `exit`, `export`, `readonly`,
+  `return`, `set`, `shift`, `times`, `trap`, `unset`) are found before functions, in lookup and in `type` and
+  `command -v`; defining a function of such a name, or of a name that is not an identifier, ends a non-interactive
+  shell with status 2. A function whose name holds a `/` is not run.
+- Assignments before a special builtin persist, exported, in the scope where the variable is visible; one that sets
+  a temporary of the running function's call is given to the caller as it returns (`var=20 return`). `command`
+  takes the special properties away, and keeps a declaration builtin's assignment words after it.
+- In a non-interactive shell: a special builtin's usage error (bash's `EX_USAGE`) ends it with status 2 unless the
+  status is tested (`||`, `&&`, `if`, `!`); a special builtin's redirection error, an assignment error before one or
+  without a command, `export` or `readonly` failing to make an assignment it was given (bash's `EX_BADASSIGN`, tested
+  or not), a read-only `for` variable, `.` not finding or reading its file, a bad substitution, a `$((…))`
+  error and `${name=word}` on a read-only variable end it with status 1; a syntax error in `eval` or `.` text, an
+  invalid `for` name, with status 2. Inside `command`, `.` and `eval` errors and assignment errors do not end it. An
+  assignment error before any other command abandons the command and the line with status 1.
+- Words spelled like assignments are not tilde-expanded after `=` (`echo a=~`); redirection words are not split, and
+  in a non-interactive shell not matched against file names (`$(< file*)` too).
+- `echo` takes no options and interprets escapes, as macOS's `/bin/sh` ([decision 22](../09-reference/decisions.md));
+  `trap` lists signals without `SIG` and takes a signal alone as an action; `alias` without `-p` and `export -p` list
+  in POSIX form; `shift` past the parameters says `shift count out of range`; `break` and `continue` outside a loop
+  say nothing; a job that failed is `Done(n)`; a hashed program that is gone is searched for again; `cd` in logical
+  mode does not retry the operand from the physical directory.
+
+Known differences in POSIX mode (KNSH-106):
+
+- Where bash 3.2 and 5.2 differ, bash 5.2's source is followed (pending a run against bash 5.2 itself, KNSH-109):
+  assignments before a special builtin inside a function set the visible variable only (3.2 also sets the caller's);
+  `echo foo=bar:~` is not expanded at all (3.2 expands after `:`); `command .` not finding its file goes on and
+  `return` outside a function ends the shell; `shift_verbose` and `inherit_errexit` are on; `set -o bogus` is a
+  usage error (3.2: status 1, not fatal); `export 1a=b` ends the shell (3.2 goes on); `${r=x}` on a read-only `r` ends the shell; `command export w=$v` keeps
+  the assignment word (3.2 splits it).
+- The parser has no POSIX mode and reads the whole script before it runs, so what bash's parser reads differently in
+  POSIX mode is not reproduced: a `}` or `"` between single quotes in a double-quoted `${name-word}` is refused
+  (`Unsupported::PosixMode`); the other parse-time items (`time` followed by `-`, reserved words never
+  alias-expanded, `!` in double quotes) follow the default parser, and a script turning POSIX mode on part-way is
+  parsed as a whole before that.
+- Refused: `trap -p` without signals (POSIX mode also lists every signal at its default). Not applicable, as the
+  interpreter does not implement the feature: `kill -l`, `fc`, `ulimit`, `bg`'s message, `set` without arguments,
+  `printf` floating point, `wait` status removal, `read` interrupted by a trap, history and line-editing items
+  (KNSH-107), `$ENV` and the startup files. A subshell of an interactive shell counts as non-interactive here
+  (bash's `interactive_shell` stays set in it).
+
 | Messages under `bash -c` | `bash: message` (no line number on one-line scripts) | `bash: line n: message` |
 | Arithmetic error token after trailing blanks (`$(( 1 + ))`) | `error token is " "` | The last token read: `error token is "+ "` |
 | `base#` with no digits (`$((2#))`) | 0 | Error `invalid integer constant` |

@@ -138,6 +138,22 @@ fn run_knsh_full(
     env: &[(&str, &str)],
     umask: u32,
 ) -> (String, u8) {
+    let configure = |mut state: ShellState| {
+        options(state.options_mut());
+        state
+    };
+    run_knsh_configured(script, dir, args, configure, env, umask)
+}
+
+/// As [`run_knsh_full`], the state changed by `configure` once made (KNSH-106: started in POSIX mode).
+fn run_knsh_configured(
+    script: &str,
+    dir: &Path,
+    args: &[&str],
+    configure: impl FnOnce(ShellState) -> ShellState,
+    env: &[(&str, &str)],
+    umask: u32,
+) -> (String, u8) {
     let (mut reader, writer) = std::io::pipe().unwrap();
     let null = || SharedFd::new(OwnedFd::from(std::fs::File::open("/dev/null").unwrap()));
     // KNSH-100: what the shell writes to standard output itself (`jobs`) goes into the same pipe as its commands'.
@@ -148,12 +164,12 @@ fn run_knsh_full(
     let environment = std::iter::once(("PATH", PATH))
         .chain(env.iter().copied())
         .map(|(name, value)| (OsString::from(name), OsString::from(value)));
-    let mut state = ShellState::new("knsh", dir)
+    let state = ShellState::new("knsh", dir)
         .unwrap()
         .with_environment(environment)
         .with_positional(args.iter().map(|arg| (*arg).to_owned()).collect())
         .with_umask(umask);
-    options(state.options_mut());
+    let state = configure(state);
     let extglob = state.options().extglob;
     let mut interpreter = Interpreter::new(
         state,
@@ -808,4 +824,60 @@ fn coproc_of_a_real_program_ends_when_its_input_closes() {
     let knsh = run_knsh(script, &dir);
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(knsh, ("PING\nstatus 0\neof 1\n".to_owned(), 0));
+}
+
+/// KNSH-106: POSIX-mode behaviour where macOS's `/bin/sh` (bash 3.2 in POSIX mode) and bash 5.2 agree. The forms
+/// where bash 3.2 differs (assignments before a special builtin in a function, `foo=bar:~`, `command .`,
+/// `command export w=$v`, `shift_verbose`, `inherit_errexit`, function names of special builtins) are in the unit
+/// tests, after bash 5.2's source and test suite.
+const POSIX_MODE: &str = r#"x=1 :
+echo "x=$x"
+y=2 true
+echo "y=${y-unset}"
+env | grep '^x='
+alias ll='ls -l'
+alias
+alias ll
+alias -p
+trap 'echo t' INT TERM
+trap
+trap -p INT
+trap - INT TERM
+export E=1
+export -p | grep ' E='
+echo a=~/x ~/y
+q=~:~; echo "$q"
+echo -n 'a\tb'
+echo -e x
+break
+continue
+echo "P=$POSIXLY_CORRECT"
+shopt expand_aliases
+z="a b"; echo hi > $z; cat "a b"
+touch g1; echo there > g*; cat 'g*'; ls g*
+type -t :
+set -Q 2>/dev/null || echo "tested $?"
+command set -Q 2>/dev/null; echo "command set $?"
+set +o posix
+echo -n 'a\tb'; echo
+alias
+set -o posix
+set -Q 2>/dev/null
+echo never
+"#;
+
+// KNSH-106 acceptance, NFR-COMPAT-02: a script in POSIX mode (`with_posix_mode`, as `sh` and `--posix` start it)
+// matches `/bin/bash --posix`, real programs on both sides.
+#[test]
+fn posix_mode_script_matches_bash_posix() {
+    let bash_dir = temp_dir("bash-posix");
+    let knsh_dir = temp_dir("knsh-posix");
+    let home = [("HOME", "/tmp/knsh-home")];
+    let bash = run_bash_full(POSIX_MODE, &bash_dir, &[], &["--posix"], &home);
+    let knsh = run_knsh_configured(POSIX_MODE, &knsh_dir, &[], ShellState::with_posix_mode, &home, 0o022);
+    std::fs::remove_dir_all(&bash_dir).unwrap();
+    std::fs::remove_dir_all(&knsh_dir).unwrap();
+    assert!(bash.0.contains("-n a\tb"), "bash output: {}", bash.0);
+    assert_eq!(bash.1, 2);
+    assert_eq!(knsh, bash);
 }

@@ -112,13 +112,19 @@ impl Interpreter {
         let Some((file, parameters)) = args.split_first() else {
             self.report(span, run, format_args!("{name}: filename argument required"));
             self.report_plain(format_args!("{name}: usage: {name} filename [arguments]"));
+            self.usage_error = true;
             return Ok(Status::new(2));
         };
         // The shell's own descriptors (`. /dev/stdin`) are not files the interpreter can read.
         if file.starts_with("/dev/fd/") || matches!(file.as_str(), "/dev/stdin" | "/dev/stdout" | "/dev/stderr") {
             return Err(unsupported(Unsupported::SourceDescriptor, span).into());
         }
-        let found = self.find_source(file);
+        let Some(found) = self.find_source(file) else {
+            // KNSH-106: POSIX mode does not look in the working directory; not finding the file ends a
+            // non-interactive shell unless `command` runs `.`.
+            self.report(span, run, format_args!("{name}: {file}: file not found"));
+            return self.source_failed();
+        };
         let path = self.state.cwd().join(&found);
         match self
             .fs
@@ -133,7 +139,7 @@ impl Interpreter {
             Err(error) => {
                 let reason = super::redirect::strerror(error.errno().unwrap_or(2));
                 self.report(span, run, format_args!("{found}: {reason}"));
-                return Ok(Status::FAILURE);
+                return self.source_failed();
             }
         }
         let bytes = match self.fs.read(&path, MAX_SOURCE_LEN as u64) {
@@ -148,7 +154,7 @@ impl Interpreter {
             Err(error) => {
                 let reason = super::redirect::strerror(error.errno().unwrap_or(5));
                 self.report(span, run, format_args!("{found}: {reason}"));
-                return Ok(Status::FAILURE);
+                return self.source_failed();
             }
         };
         if is_binary(&bytes) {
@@ -199,11 +205,21 @@ impl Interpreter {
         }
     }
 
+    /// The status of `.` failing to open or read its file: 1, or in POSIX mode the end of a non-interactive shell
+    /// with status 1 unless `command` runs `.` (bash's `FEVAL_LONGJMP`, KNSH-106).
+    fn source_failed(&mut self) -> Flow<Status> {
+        if self.posix_fatal() && self.command_depth == 0 {
+            return Err(self.posix_error());
+        }
+        Ok(Status::FAILURE)
+    }
+
     /// The file `source name` reads: `name` itself when it holds a `/`, otherwise the first regular file of that
-    /// name in a `PATH` entry, or (bash outside POSIX mode) `name` in the working directory.
-    fn find_source(&self, name: &str) -> String {
+    /// name in a `PATH` entry, or (outside POSIX mode, bash's `source_searches_cwd`) `name` in the working
+    /// directory; `None` when POSIX mode finds none (KNSH-106).
+    fn find_source(&self, name: &str) -> Option<String> {
         if name.contains('/') {
-            return name.to_owned();
+            return Some(name.to_owned());
         }
         if let Some(path) = self.state.variable("PATH") {
             for entry in path.as_encoded_bytes().split(|&byte| byte == b':') {
@@ -217,22 +233,26 @@ impl Interpreter {
                     .and_then(|canonical| self.fs.metadata(canonical.as_path()))
                     .is_ok_and(|metadata| metadata.kind == FileKind::File);
                 if regular {
-                    return candidate.display().to_string();
+                    return Some(candidate.display().to_string());
                 }
             }
         }
-        name.to_owned()
+        (!self.state.options().source_skips_cwd).then(|| name.to_owned())
     }
 
     /// Parses, checks and runs the text of `nested`. Its status is its last command's, or 0 if it ran none.
     fn run_text(&mut self, nested: &Run<'_>, kind: Kind, span: Span) -> Flow<Status> {
-        self.holding_nested(nested.source.len(), |shell| {
+        let result = self.holding_nested(nested.source.len(), |shell| {
             let script = match knsh_bash::parse_with(nested.source, shell.parse_options()) {
                 Ok(script) => script,
                 Err(error) => return shell.syntax_error(&error, nested, kind, span),
             };
             shell.run_parsed(&script, nested)
-        })
+        });
+        // KNSH-106: a usage error of a builtin the text ran (`eval 'pwd -Q'`) is not `eval`'s or `.`'s own: bash
+        // converts it to status 2 as that builtin ends, so it must not end the shell as the special builtin's.
+        self.usage_error = false;
+        result
     }
 
     /// Runs `body` while `len` more bytes of nested text are held, within [`MAX_NESTED_TEXT`]: past it the run
@@ -293,6 +313,11 @@ impl Interpreter {
             let _ = writeln!(text, "{place}: `{echoed}'");
         }
         self.write_shell(2, text.as_bytes());
+        // KNSH-106: in POSIX mode a syntax error in `eval` or `.` text ends a non-interactive shell with status 2,
+        // unless `command` runs the builtin.
+        if self.posix_fatal() && self.command_depth == 0 {
+            return Err(self.usage_exit());
+        }
         self.state.set_last_status(Status::new(2));
         Ok(Status::new(2))
     }

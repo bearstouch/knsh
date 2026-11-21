@@ -171,6 +171,8 @@ impl Interpreter {
         match enterable(&*self.fs, &target) {
             // Canonicalisation failed but `chdir` worked: bash then takes the directory from `getcwd`.
             Ok(physical_dir) => Ok(canonical.unwrap_or(physical_dir)),
+            // POSIX mode fails here (KNSH-106).
+            Err(errno) if self.state.options().posix() => Err(errno),
             Err(errno) => {
                 // Bash then tries the operand as written, from the real directory.
                 let real = self.fs.canonicalise(self.state.cwd()).map_err(|_| errno)?;

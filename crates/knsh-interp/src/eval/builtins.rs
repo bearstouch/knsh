@@ -206,7 +206,13 @@ impl Interpreter {
         let hashable = search == Search::Normal && own_path.is_none() && path.is_some() && !name.contains('/');
         if hashable && let Some(program) = self.state.hash_use(name) {
             // `hash -p` may have stored a relative path; it names a file from the working directory.
-            return Resolved::Program(self.state.cwd().join(program));
+            let program = self.state.cwd().join(program);
+            // KNSH-106: POSIX mode searches `PATH` again for a hashed program that is gone or not executable
+            // (bash's `search_for_command` with `posixly_correct`).
+            if !self.state.options().posix() || lookup::is_executable(&*self.fs, &program) {
+                return Resolved::Program(program);
+            }
+            self.state.hash_remove(name);
         }
         let resolved = lookup::find(&*self.fs, name, path.as_deref(), self.state.cwd());
         if hashable && let Resolved::Program(program) = &resolved {
@@ -455,7 +461,12 @@ impl Interpreter {
             return Ok(Status::SUCCESS);
         };
         let search = if standard { Search::Standard } else { Search::Normal };
-        self.invoke(name, rest, &[], search, span, run)
+        // KNSH-106: what runs through `command` is never a special builtin, and inside it `.` and `eval` errors do
+        // not end the shell (bash's `executing_command_builtin`).
+        self.command_depth += 1;
+        let result = self.invoke(name, rest, &[], search, span, run);
+        self.command_depth -= 1;
+        result
     }
 
     /// `type [-afptP] name …`.
@@ -537,6 +548,15 @@ impl Interpreter {
                 return true;
             }
         }
+        // KNSH-106: in POSIX mode a special builtin is reported before a function, as it is found first.
+        let special_first = self.runs_as_special(name);
+        if special_first {
+            self.describe_builtin(name, describe, span, run);
+            found = true;
+            if !all {
+                return true;
+            }
+        }
         if self.state.function(name).is_some() {
             // A sentence is followed by the definition, which callers refuse before describing (bash's
             // pretty-printer is not reproduced); `type -p` prints nothing for a function and stops there.
@@ -551,20 +571,25 @@ impl Interpreter {
                 return true;
             }
         }
-        if is_bash_builtin(name) {
-            let line = match describe {
-                Describe::Kind => Some("builtin".to_owned()),
-                Describe::Sentence => Some(format!("{name} is a shell builtin")),
-                Describe::Reusable => Some(name.to_owned()),
-                Describe::PathOnly => None,
-            };
-            self.describe_line(line, span, run);
+        if is_bash_builtin(name) && !special_first {
+            self.describe_builtin(name, describe, span, run);
             found = true;
             if !all {
                 return true;
             }
         }
         self.describe_file(name, describe, all, standard, span, run) || found
+    }
+
+    /// The line of [`Interpreter::describe`] for builtin `name`.
+    fn describe_builtin(&mut self, name: &str, describe: Describe, span: Span, run: &Run<'_>) {
+        let line = match describe {
+            Describe::Kind => Some("builtin".to_owned()),
+            Describe::Sentence => Some(format!("{name} is a shell builtin")),
+            Describe::Reusable => Some(name.to_owned()),
+            Describe::PathOnly => None,
+        };
+        self.describe_line(line, span, run);
     }
 
     /// The file part of [`Interpreter::describe`]: a name with a `/`, the hash table (unless `all`), then the
@@ -629,7 +654,9 @@ impl Interpreter {
     fn describes_a_function(&self, names: &[String], all: bool) -> bool {
         names.iter().any(|name| {
             let aliased = self.state.options().expand_aliases && self.state.alias(name).is_some();
-            self.state.function(name).is_some() && (all || !aliased)
+            // KNSH-106: in POSIX mode a special builtin hides a function of its name, unless `-a` lists both.
+            let hidden = aliased || self.runs_as_special(name);
+            self.state.function(name).is_some() && (all || !hidden)
         })
     }
 

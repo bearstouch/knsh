@@ -237,14 +237,33 @@ impl<'a> Expander<'a> {
     /// The arguments `parts` (one word, after brace expansion, spanning `span`) expand into: split on `IFS`, empty
     /// unquoted fields removed, matched against file names, quotes removed.
     pub(crate) fn arguments(&mut self, parts: &[Part], span: Span) -> Result<Vec<String>> {
+        self.fields(parts, span, true, true)
+    }
+
+    /// The words a redirection target expands into: as [`Expander::arguments`], except that POSIX mode splits no
+    /// field and, in a non-interactive shell, matches no file names (bash's `W_NOSPLIT` and `W_NOGLOB` on the
+    /// target, KNSH-106).
+    pub(crate) fn redirection_words(&mut self, parts: &[Part], span: Span) -> Result<Vec<String>> {
+        let posix = self.state.options().posix();
+        let glob = !posix || self.state.is_interactive();
+        self.fields(parts, span, !posix, glob)
+    }
+
+    /// [`Expander::arguments`], splitting fields only with `splitting` and matching file names only with
+    /// `globbing`.
+    fn fields(&mut self, parts: &[Part], span: Span, splitting: bool, globbing: bool) -> Result<Vec<String>> {
         let parts = self.tilde_word(parts, true, span)?;
         let mut fields = Fields::new();
         self.expand(&parts, false, false, &mut fields)?;
         let ifs = self.ifs();
         let options = self.state.options().clone();
-        let mut globbing: Option<glob::Options> = None;
+        let mut glob_cache: Option<glob::Options> = None;
         let mut out = Vec::new();
-        for mut field in fields.list.into_iter().flat_map(|field| split(field, &ifs)) {
+        let fields = fields
+            .list
+            .into_iter()
+            .flat_map(|field| if splitting { split(field, &ifs) } else { vec![field] });
+        for mut field in fields {
             if field.chars.is_empty() && !field.quoted {
                 continue;
             }
@@ -256,13 +275,13 @@ impl<'a> Expander<'a> {
                 }
             }
             let text: String = field.chars.iter().map(|c| c.ch).collect();
-            if options.noglob || !pattern::has_glob(&field.chars, options.extglob) {
+            if !globbing || options.noglob || !pattern::has_glob(&field.chars, options.extglob) {
                 out.push(text);
                 continue;
             }
-            let glob_options = match &globbing {
+            let glob_options = match &glob_cache {
                 Some(glob_options) => glob_options,
-                None => globbing.insert(self.glob_options(span)?),
+                None => glob_cache.insert(self.glob_options(span)?),
             };
             let mut matches = glob::glob(self.fs, self.state.cwd(), &field.chars, glob_options, span)?;
             if !matches.is_empty() {
@@ -494,10 +513,23 @@ impl<'a> Expander<'a> {
         Ok(fields.joined())
     }
 
-    /// `$((…))`: the body expanded, then evaluated.
+    /// `$((…))`: the body expanded, then evaluated. In POSIX mode its errors end a non-interactive shell (bash's
+    /// `expand_wdesc_fatal`, KNSH-106).
     fn arithmetic(&mut self, body: Span, span: Span) -> Result<i64> {
         let text = self.arithmetic_text(body)?;
-        self.evaluate(&text).map_err(|failure| failed(failure, span))
+        self.evaluate(&text)
+            .map_err(|failure| self.posix_fatal(failed(failure, span)))
+    }
+
+    /// `error` as POSIX mode has it: a discarding error ends a non-interactive shell instead (KNSH-106), where
+    /// bash 5.2 jumps to `FORCE_EOF` or returns `expand_wdesc_fatal` in POSIX mode.
+    fn posix_fatal(&self, error: ExpandError) -> ExpandError {
+        match error {
+            ExpandError::Discard(message) if self.state.options().posix() && !self.state.is_interactive() => {
+                ExpandError::Fatal(message)
+            }
+            other => other,
+        }
     }
 
     /// Appends `value` to `out`: a string as one piece; `"$@"` and the unquoted lists as one field per item;
@@ -571,10 +603,14 @@ impl<'a> Expander<'a> {
     fn assign_default(&mut self, name: &str, value: &str, span: Span) -> Result<()> {
         match self.state.assign(name, OsString::from(value), false) {
             Ok(()) => Ok(()),
-            Err(AssignError::Readonly) => Err(ExpandError::Discard(format!("{name}: readonly variable"))),
+            Err(AssignError::Readonly) => {
+                Err(self.posix_fatal(ExpandError::Discard(format!("{name}: readonly variable"))))
+            }
             Err(AssignError::Arithmetic(failure)) => Err(failed(failure, span)),
             Err(AssignError::Unsupported(feature)) => Err(InterpError::Unsupported { feature, span }.into()),
-            Err(AssignError::Invalid) => Err(ExpandError::Discard(format!("{name}: bad substitution"))),
+            Err(AssignError::Invalid) => {
+                Err(self.posix_fatal(ExpandError::Discard(format!("{name}: bad substitution"))))
+            }
             Err(AssignError::BadSubscript | AssignError::Kind) => Err(InterpError::Unsupported {
                 feature: Unsupported::Array,
                 span,
@@ -734,8 +770,23 @@ impl<'a> Expander<'a> {
     fn brace(&mut self, body: Span, span: Span, quoted: bool, out: &mut Fields) -> Result<()> {
         let text = word::text(body, self.source)?;
         let whole = word::text(span, self.source)?;
-        match param::parse(text, body) {
-            Parsed::Bad => Err(ExpandError::Discard(format!("{whole}: bad substitution"))),
+        let parsed = param::parse(text, body);
+        if quoted
+            && self.state.options().posix()
+            && let Parsed::Param {
+                op: param::Op::Default { word: default, .. },
+                ..
+            } = &parsed
+            && posix_delimits_differently(word::text(*default, self.source)?)
+        {
+            return Err(InterpError::Unsupported {
+                feature: Unsupported::PosixMode,
+                span,
+            }
+            .into());
+        }
+        match parsed {
+            Parsed::Bad => Err(self.posix_fatal(ExpandError::Discard(format!("{whole}: bad substitution")))),
             Parsed::Unsupported(feature) => Err(InterpError::Unsupported { feature, span }.into()),
             Parsed::Length(name) => {
                 let length = match self.lookup(&name, span)? {
@@ -1172,13 +1223,17 @@ impl<'a> Expander<'a> {
 
     // ---- Tilde expansion ----
 
-    /// Tilde expansion of a word: a leading `~` prefix, and (as arguments) the forms after the `=` of a word
-    /// spelled like an assignment.
+    /// Tilde expansion of a word: a leading `~` prefix, and (as arguments, outside POSIX mode) the forms after the
+    /// `=` of a word spelled like an assignment. POSIX mode leaves those to real assignments (KNSH-106: bash's
+    /// `W_ASSIGNMENT` words only when not `posixly_correct`).
     fn tilde_word(&mut self, parts: &[Part], arguments: bool, span: Span) -> Result<Vec<Part>> {
         let Some(Part::Text(first)) = parts.first() else {
             return Ok(parts.to_vec());
         };
-        if arguments && let Some(value_start) = assignment_value_start(first) {
+        if arguments
+            && !self.state.options().posix()
+            && let Some(value_start) = assignment_value_start(first)
+        {
             return self.tilde_text(parts, Some(value_start), true, span);
         }
         self.tilde_text(parts, Some(0), false, span)
@@ -1282,6 +1337,25 @@ pub(crate) fn failed(failure: Failure, span: Span) -> ExpandError {
         Failure::Unsupported(feature) => InterpError::Unsupported { feature, span }.into(),
         Failure::Readonly(name) => ExpandError::Discard(format!("{name}: readonly variable")),
     }
+}
+
+/// Whether the word of a double-quoted `${name-word}` (or `+`, `=`, `?`) would end elsewhere in bash's POSIX mode:
+/// there a `'` inside it is an ordinary character (bash 5.2's `parse_matched_pair` with `posixly_correct`), so a `}`
+/// or `"` between two of them, which the parser read as quoted, would end the expansion or the string instead
+/// (KNSH-106). The parser has no POSIX mode, so such a word is refused rather than read differently.
+fn posix_delimits_differently(word: &str) -> bool {
+    let mut quoted = false;
+    let mut escaped = false;
+    for ch in word.chars() {
+        match ch {
+            _ if escaped => escaped = false,
+            '\\' if !quoted => escaped = true,
+            '\'' => quoted = !quoted,
+            '}' | '"' if quoted => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The variables an arithmetic expression inside a word reads and assigns.

@@ -286,6 +286,85 @@ pub struct ShellOptions {
     /// `shopt -s inherit_errexit`: command substitutions inherit `set -e` (KNSH-104). Held and reported; it acts with
     /// command substitution (KNSH-105). Subshells always inherit `set -e`, as in bash.
     pub inherit_errexit: bool,
+    /// `shopt -s shift_verbose`: `shift` past the last positional parameter says `shift count out of range`
+    /// (KNSH-106; POSIX mode turns it on).
+    pub shift_verbose: bool,
+    /// `set -o posix`: bash's POSIX mode (KNSH-106). Read with [`ShellOptions::posix`]; turned on with
+    /// [`ShellState::with_posix_mode`] or by the script (`set -o posix`, `POSIXLY_CORRECT`), which also make the
+    /// changes bash's `posix_initialize` makes.
+    pub(crate) posix: bool,
+    /// Bash's `source_searches_cwd` turned off: `.` and `source` look for a name without a `/` on `PATH` only
+    /// (POSIX mode, KNSH-106).
+    pub(crate) source_skips_cwd: bool,
+    /// The options POSIX mode changes, as they were before a temporary `POSIXLY_CORRECT=…` turned it on for one
+    /// builtin (bash's `save_posix_options`), to put back as it ends.
+    pub(crate) saved_posix: Option<PosixSaved>,
+}
+
+/// The temporaries of one function call (KNSH-106).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CallTemporaries {
+    /// The assignments written before the call, still the call's own (not made local).
+    names: BTreeSet<String>,
+    /// Those an assignment before a special builtin set in POSIX mode: given to the caller on return.
+    propagated: BTreeSet<String>,
+}
+
+/// The options bash's `posix_initialize` changes, saved by `save_posix_options` (KNSH-106).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // bash's `posix_vars` bitmap.
+pub(crate) struct PosixSaved {
+    expand_aliases: bool,
+    inherit_errexit: bool,
+    shift_verbose: bool,
+    source_skips_cwd: bool,
+}
+
+impl ShellOptions {
+    /// Whether bash's POSIX mode is on (`set -o posix`, KNSH-106).
+    #[must_use]
+    pub fn posix(&self) -> bool {
+        self.posix
+    }
+
+    /// Turns POSIX mode on or off as bash 5.2's `sv_strict_posix` does, then makes `posix_initialize`'s changes: on,
+    /// `expand_aliases`, `inherit_errexit` and `shift_verbose` are set and `.` stops searching the working
+    /// directory; off, the options saved by [`ShellOptions::save_posix`] come back, or else `expand_aliases` follows
+    /// `interactive`, `shift_verbose` is unset and `.` searches the working directory again (`inherit_errexit` stays,
+    /// as in bash).
+    pub(crate) fn initialize_posix(&mut self, on: bool, interactive: bool) {
+        self.posix = on;
+        if on {
+            self.expand_aliases = true;
+            self.inherit_errexit = true;
+            self.shift_verbose = true;
+            self.source_skips_cwd = true;
+        } else if let Some(saved) = self.saved_posix.take() {
+            self.expand_aliases = saved.expand_aliases;
+            self.inherit_errexit = saved.inherit_errexit;
+            self.shift_verbose = saved.shift_verbose;
+            self.source_skips_cwd = saved.source_skips_cwd;
+        } else {
+            self.expand_aliases = interactive;
+            self.shift_verbose = false;
+            self.source_skips_cwd = false;
+        }
+    }
+
+    /// Bash's `save_posix_options`: remembers the options POSIX mode changes (one level, as bash keeps).
+    pub(crate) fn save_posix(&mut self) {
+        self.saved_posix = Some(PosixSaved {
+            expand_aliases: self.expand_aliases,
+            inherit_errexit: self.inherit_errexit,
+            shift_verbose: self.shift_verbose,
+            source_skips_cwd: self.source_skips_cwd,
+        });
+    }
+}
+
+/// The variables whose assignment or removal turns POSIX mode on or off (bash's `sv_strict_posix`, KNSH-106).
+pub(crate) fn is_posix_variable(name: &str) -> bool {
+    matches!(name, "POSIXLY_CORRECT" | "POSIX_PEDANTIC")
 }
 
 /// `IFS` as bash sets it at start-up: space, tab, newline.
@@ -420,6 +499,10 @@ pub struct ShellState {
     globals: BTreeMap<String, Variable>,
     /// The scope of each function running, outermost first (KNSH-103).
     scopes: Vec<BTreeMap<String, Variable>>,
+    /// For each function scope, outermost first: the assignments written before the call that are still its
+    /// temporaries (not made local), and those of them an assignment before a special builtin set in POSIX mode,
+    /// which bash 5.2 hands to the caller as the function returns (KNSH-106: `var=20 return`).
+    call_temporaries: Vec<CallTemporaries>,
     /// Functions by name (KNSH-103).
     functions: BTreeMap<String, Function>,
     /// The call stack, outermost first: every function call and every file being sourced (KNSH-103).
@@ -484,6 +567,7 @@ impl ShellState {
             positional: Vec::new(),
             globals: BTreeMap::new(),
             scopes: Vec::new(),
+            call_temporaries: Vec::new(),
             functions: BTreeMap::new(),
             frames: Vec::new(),
             notes: RefCell::new(Vec::new()),
@@ -527,7 +611,55 @@ impl ShellState {
             }
         }
         self.start_up(inherited_level.as_deref());
+        // KNSH-106: bash starts in POSIX mode when either variable is in its environment, keeping its value.
+        if self.globals.keys().any(|name| is_posix_variable(name)) {
+            self.options.initialize_posix(true, self.interactive);
+        }
         self
+    }
+
+    /// The same state in bash's POSIX mode, as a shell started as `sh` or with `--posix` is
+    /// ([`posix_mode_requested`](crate::posix_mode_requested)): `POSIXLY_CORRECT` is set to `y` and the options
+    /// POSIX mode changes are changed (KNSH-106).
+    #[must_use]
+    pub fn with_posix_mode(mut self) -> Self {
+        self.set_posix_mode(true);
+        self
+    }
+
+    /// `set -o posix` (`on`) or `set +o posix`, as bash's `set_posix_mode`: nothing if already so; otherwise
+    /// `POSIXLY_CORRECT` is set to `y` (or removed), and POSIX mode follows it (KNSH-106).
+    pub(crate) fn set_posix_mode(&mut self, on: bool) {
+        if self.options.posix == on {
+            return;
+        }
+        self.bind_posix_variable(on);
+        self.options.initialize_posix(on, self.interactive);
+    }
+
+    /// Sets `POSIXLY_CORRECT` to `y` where it is visible (`on`), or removes it, as bash's `bind_variable` and
+    /// `unbind_variable_noref` do: without the read-only check of an assignment, and without turning POSIX mode on
+    /// or off a second time.
+    pub(crate) fn bind_posix_variable(&mut self, on: bool) {
+        let name = "POSIXLY_CORRECT";
+        let place = self.place(name).unwrap_or(Place::Global);
+        if on {
+            self.table_mut(place)
+                .entry(name.to_owned())
+                .or_insert_with(Variable::empty)
+                .value = Some(Value::Scalar("y".into()));
+        } else {
+            self.table_mut(place).remove(name);
+        }
+    }
+
+    /// After `name` was assigned or removed: bash's `sv_strict_posix` turns POSIX mode on while `POSIXLY_CORRECT`
+    /// (or `POSIX_PEDANTIC`) has a value, off otherwise (KNSH-106).
+    fn posix_variable_changed(&mut self, name: &str) {
+        if is_posix_variable(name) {
+            let set = self.find(name).is_some_and(|variable| variable.value.is_some());
+            self.options.initialize_posix(set, self.interactive);
+        }
     }
 
     /// Sets the variables bash sets at start-up, given the inherited `SHLVL` if any. `OLDPWD` is exported without a
@@ -933,6 +1065,7 @@ impl ShellState {
             .entry(name.to_owned())
             .or_insert_with(Variable::empty)
             .value = Some(value);
+        self.posix_variable_changed(name);
     }
 
     /// Records that the script changed `name` itself: a default bash would have set no longer applies, and changing
@@ -1329,6 +1462,7 @@ impl ShellState {
                 self.table_mut(place).remove(name);
             }
         }
+        self.posix_variable_changed(name);
         Ok(())
     }
 
@@ -1412,14 +1546,67 @@ impl ShellState {
             scope.insert(name.clone(), Variable::exported(value.clone()));
         }
         self.scopes.push(scope);
+        self.call_temporaries.push(CallTemporaries {
+            names: temporaries.iter().map(|(name, _)| name.clone()).collect(),
+            propagated: BTreeSet::new(),
+        });
+        // KNSH-106: `POSIXLY_CORRECT=y f` turns POSIX mode on for the call, the options saved to put back as it
+        // returns (bash's `assign_in_env` with `save_posix_options`, then `sv_strict_posix`).
+        if let Some((name, _)) = temporaries.iter().find(|(name, _)| is_posix_variable(name)) {
+            self.options.save_posix();
+            self.posix_variable_changed(name);
+        }
     }
 
-    /// Leaves the innermost function's scope, dropping its local variables.
+    /// Leaves the innermost function's scope, dropping its local variables. A temporary of the call that an
+    /// assignment before a special builtin set in POSIX mode is given to the caller (bash 5.2's
+    /// `push_posix_tempvar_internal` with `att_propagate`, KNSH-106).
     pub(crate) fn pop_scope(&mut self) {
+        let popped = self.scopes.pop();
+        let temporaries = self.call_temporaries.pop();
         // Leaving a scope that held `PATH` changes the visible `PATH`: bash's `sv_path` runs then too.
-        if self.scopes.pop().is_some_and(|scope| scope.contains_key("PATH")) {
+        if popped.as_ref().is_some_and(|scope| scope.contains_key("PATH")) {
             self.hashed.clear();
         }
+        let (Some(scope), Some(temporaries)) = (popped, temporaries) else {
+            return;
+        };
+        // KNSH-106: a `POSIXLY_CORRECT` of the call (temporary or local) going away turns POSIX mode off or back on
+        // as the caller's says (bash's `push_func_var` runs `sv_strict_posix` for each variable of the scope).
+        let posix_variable = scope.keys().find(|name| is_posix_variable(name)).cloned();
+        for name in temporaries.propagated {
+            let Some(variable) = scope.get(&name) else {
+                continue;
+            };
+            let place = self.place(&name).unwrap_or(Place::Global);
+            let held = self
+                .table_mut(place)
+                .entry(name.clone())
+                .or_insert_with(Variable::empty);
+            if held.attributes.readonly {
+                continue;
+            }
+            held.value.clone_from(&variable.value);
+            held.attributes.exported |= variable.attributes.exported;
+            self.noticed(&name);
+        }
+        if let Some(name) = posix_variable {
+            self.posix_variable_changed(&name);
+        }
+    }
+
+    /// Sets `name` to `value` for good and exported, as an assignment before a special builtin is in POSIX mode
+    /// (bash's `push_posix_temp_var`): where the variable is visible, as [`ShellState::set_temporary`] sets it. When
+    /// that is a temporary of the running function's call, it is handed to the caller as the function returns
+    /// (KNSH-106).
+    pub(crate) fn set_special_temporary(&mut self, name: &str, value: OsString) {
+        if let Some(Place::Scope(depth)) = self.place(name)
+            && let Some(temporaries) = self.call_temporaries.get_mut(depth)
+            && temporaries.names.contains(name)
+        {
+            temporaries.propagated.insert(name.to_owned());
+        }
+        self.set_temporary(name, value);
     }
 
     /// Whether a function is running (bash's `variable_context` is not 0).
@@ -1439,6 +1626,11 @@ impl ShellState {
             return Ok(());
         };
         if self.scopes[scope].contains_key(name) {
+            // A temporary of the call made local is the function's own from now on (bash's `local_p`).
+            if let Some(temporaries) = self.call_temporaries.get_mut(scope) {
+                temporaries.names.remove(name);
+                temporaries.propagated.remove(name);
+            }
             return Ok(());
         }
         let shadowed = self.find(name).map(|variable| variable.attributes);
@@ -1619,6 +1811,7 @@ impl ShellState {
                 table.remove(name);
             }
         }
+        self.posix_variable_changed(name);
     }
 
     /// Sets the visible variable `name` to `value`, exported, for one builtin's run (bash's temporary environment).
@@ -1626,6 +1819,10 @@ impl ShellState {
     pub(crate) fn set_temporary(&mut self, name: &str, value: OsString) {
         let place = self.place(name).unwrap_or(Place::Global);
         self.noticed(name);
+        if is_posix_variable(name) {
+            // Bash's `assign_in_env` saves the options POSIX mode changes, to put back as the builtin ends.
+            self.options.save_posix();
+        }
         let variable = self
             .table_mut(place)
             .entry(name.to_owned())
@@ -1638,6 +1835,7 @@ impl ShellState {
             held => *held = Some(Value::Scalar(value)),
         }
         variable.attributes.exported = true;
+        self.posix_variable_changed(name);
     }
 
     /// Sets the positional parameters (`set --`, `shift`, `source` with arguments, a function call).

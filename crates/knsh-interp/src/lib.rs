@@ -45,7 +45,14 @@
 //! and `>(…)` as `/dev/fd/N`, closed after their command), here-documents (`<<`, `<<-`, quoted delimiters) and
 //! `coproc` (named and `COPROC` arrays, `NAME_PID`); each substitution and coprocess runs in a copy of the shell on a
 //! thread of its own, so its commands start through the same spawner. Scripts using `coproc` must be parsed with
-//! [`knsh_bash::ParseOptions::coproc`].
+//! [`knsh_bash::ParseOptions::coproc`]. KNSH-106 adds bash's POSIX mode, not as a dialect but as the flag
+//! [`ShellOptions::posix`] read where bash 5.2 reads `posixly_correct`: a host starting a shell as `sh` or with
+//! `--posix` ([`posix_mode_requested`]) uses [`ShellState::with_posix_mode`]; `set -o posix` and `POSIXLY_CORRECT`
+//! turn it on from the script or the environment. Special builtins are found before functions, assignments before
+//! them persist, and their usage errors, redirection and assignment errors end a non-interactive shell (unless
+//! `command` runs them), as do the expansion, `.`, `eval`, `for` and function-name errors bash makes fatal there;
+//! tilde, redirection-word, `echo` (macOS `/bin/sh`'s), `trap`, `alias`, `export -p`, `shift`, `break`, `type`,
+//! `cd`, hash and job-status differences follow bash's list.
 //!
 //! # Boundaries
 //!
@@ -64,7 +71,7 @@
 //!   must start through the spawner): pipeline stages and background lists that the shell runs itself run on threads
 //!   of their own (decision 19). Children are known by handle, waited for by one thread each, and a job's process
 //!   group is signalled only while one of its members is held unreaped.
-//! - What later stories implement (POSIX mode, and a substitution inside the text the interpreter reads again
+//! - What later stories implement (a substitution inside the text the interpreter reads again
 //!   itself: `[[ … ]]`, `(( … ))`, `$(( … ))`) is refused with [`InterpError::Unsupported`] by a check of the whole
 //!   script before anything runs (substitution bodies included), or, when only an expansion's value reveals it (or
 //!   `eval` and `source` text), when it is reached. `[[ … ]]`, which
@@ -101,6 +108,8 @@
 //! - `specs/00-stories/KNSH-104-traps-signals-set-and-shopt-options.md`
 //! - `specs/00-stories/KNSH-105-process-substitution-coproc-and-here-documents.md`, `specs/09-reference/decisions.md`
 //!   (decision 6: `coproc` stays dynamic for the classifier)
+//! - `specs/00-stories/KNSH-106-posix-mode.md`, `specs/09-reference/decisions.md` (decision 22: `echo` in POSIX mode
+//!   as macOS's `/bin/sh`)
 //! - `specs/09-reference/defaults-and-limits.md` (the evaluation, arithmetic and expansion depth limits, the brace
 //!   and pathname expansion bounds, the `printf` and `read` bounds, and the command substitution output bound)
 
@@ -136,6 +145,7 @@ pub use error::{InterpError, Unsupported};
 pub use eval::{EVAL_STACK_SIZE, Interpreter, MAX_EVAL_DEPTH};
 pub use jobs::{JobSignals, MAX_REMEMBERED_JOBS};
 pub use observer::{DirectoryObserver, Osc7, osc7};
+pub use options::posix_mode_requested;
 pub use state::{ShellOptions, ShellState};
 pub use status::Status;
 pub use trap::ShellSignals;

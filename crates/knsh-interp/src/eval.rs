@@ -76,6 +76,7 @@ mod job;
 mod job_builtins;
 mod mapfile;
 mod nested;
+mod posix;
 mod printf_builtin;
 mod read;
 mod redirect;
@@ -367,6 +368,16 @@ pub struct Interpreter {
     /// The status of the last command substitution run while expanding the current simple command: a command
     /// without a name ends with it, as bash's does (`x=$(false)` is 1) (KNSH-105).
     substitution_status: Option<Status>,
+    /// The builtin that just ran failed with bash's `EX_USAGE` (an invalid option, a missing operand): a special
+    /// builtin failing so ends a non-interactive shell in POSIX mode (KNSH-106).
+    usage_error: bool,
+    /// `export` or `readonly` that just ran failed to make an assignment it was given (`export 1a=b`, a read-only
+    /// variable): bash's `EX_BADASSIGN`, which ends a non-interactive shell in POSIX mode with status 1 whether the
+    /// status is tested or not (KNSH-106).
+    bad_assignment: bool,
+    /// `command` builtins running (bash's `executing_command_builtin`): inside one, `.` not finding its file and a
+    /// syntax error in `eval` or `.` text do not end the shell in POSIX mode (KNSH-106).
+    command_depth: usize,
 }
 
 impl fmt::Debug for Interpreter {
@@ -436,6 +447,9 @@ impl Interpreter {
             skip_exit_trap: false,
             substituted_fds: Vec::new(),
             substitution_status: None,
+            usage_error: false,
+            bad_assignment: false,
+            command_depth: 0,
         }
         .with_checked_oldpwd()
     }
@@ -735,6 +749,17 @@ impl Interpreter {
         Ok(out)
     }
 
+    /// The words redirection target `command_word` expands into (KNSH-106: as [`Expander::redirection_words`]).
+    fn redirection_arguments(&mut self, command_word: &CommandWord, run: &Run<'_>) -> Flow<Vec<String>> {
+        let mut out = Vec::new();
+        let pieces = word::pieces(&command_word.word.segments, run.source, 0)?;
+        for parts in brace::expand(&pieces, command_word.span)? {
+            let result = self.expander(run, &[]).redirection_words(&parts, command_word.span);
+            out.extend(self.expanded(result, command_word.span, run)?);
+        }
+        Ok(out)
+    }
+
     /// The single string `command_word` expands into, without splitting.
     fn string(&mut self, command_word: &CommandWord, run: &Run<'_>) -> Flow<String> {
         let parts = word::parts(&command_word.word.segments, run.source, 0)?;
@@ -911,7 +936,7 @@ impl Interpreter {
         match command {
             Command::Simple(simple) => self.simple(simple, run),
             Command::Compound(compound) => self.compound(compound, run),
-            Command::FunctionDefinition(definition) => Ok(self.define_function(definition, run)),
+            Command::FunctionDefinition(definition) => self.define_function(definition, run),
             Command::Unsupported(construct) if construct.coproc.is_some() => self.coproc(construct, run),
             Command::Unsupported(construct) => match construct.arithmetic.as_deref() {
                 Some(parts) => self.arithmetic_command(construct, parts, run),
@@ -974,6 +999,10 @@ impl Interpreter {
                 run,
                 format_args!("`{name}': not a valid identifier"),
             );
+            // KNSH-106: in POSIX mode this ends a non-interactive shell with status 2.
+            if self.posix_fatal() {
+                return Err(self.usage_exit());
+            }
             return Ok(Status::FAILURE);
         }
         let values: Vec<String> = match &command.items {
@@ -1000,8 +1029,12 @@ impl Interpreter {
         for value in values {
             self.trace(head, command.variable.span, run)?;
             self.debug_trap(command.variable.span, run)?;
-            // Bash's `for` ends with 1 when it cannot assign its variable (read-only).
+            // Bash's `for` ends with 1 when it cannot assign its variable (read-only); in POSIX mode a
+            // non-interactive shell ends (KNSH-106).
             if let Some(failed) = self.assign_or_report(name, value.into(), false, command.variable.span, run)? {
+                if self.posix_fatal() && self.state.is_readonly(name) {
+                    return Err(self.posix_error());
+                }
                 return Ok(failed);
             }
             match loop_step(self.list(&command.body.body, run))? {
@@ -1219,22 +1252,34 @@ impl Interpreter {
             self.trace_assignment(assignment, &value, run)?;
             if words.is_empty() {
                 // Without a command each assignment takes effect at once, so the next one sees it. A failed one
-                // abandons the line, as bash's assignment error does outside POSIX mode.
+                // abandons the line, as bash's assignment error does outside POSIX mode; in POSIX mode it ends a
+                // non-interactive shell, unless `command` is running (KNSH-106).
                 let assigned =
                     self.assign_or_report(&assignment.name, value, assignment.append, assignment.span, run)?;
                 if assigned.is_some() {
+                    if self.posix_fatal() && self.command_depth == 0 {
+                        return Err(self.posix_error());
+                    }
                     self.state.set_last_status(Status::FAILURE);
                     return Err(Stop::Discard);
                 }
                 continue;
             }
-            // Bash reports a read-only variable and runs the command without it.
+            // Bash reports a read-only variable and runs the command without it. In POSIX mode the command does not
+            // run: a special builtin's error ends a non-interactive shell, any other abandons the line (KNSH-106).
             if self.state.is_readonly(&assignment.name) {
                 self.report(
                     assignment.span,
                     run,
                     format_args!("{}: readonly variable", assignment.name),
                 );
+                if self.state.options().posix() {
+                    if self.posix_fatal() && self.runs_as_special(&words[0]) {
+                        return Err(self.posix_error());
+                    }
+                    self.state.set_last_status(Status::FAILURE);
+                    return Err(Stop::Discard);
+                }
                 continue;
             }
             let value = if assignment.append {
@@ -1257,6 +1302,10 @@ impl Interpreter {
             self.trace_words(&words, !lists.is_empty(), simple.span, run)?;
         }
         let Some(saved) = self.redirect(&simple.redirections, run)? else {
+            // KNSH-106: a special builtin's redirection error ends a non-interactive shell in POSIX mode.
+            if self.posix_fatal() && words.first().is_some_and(|name| self.runs_as_special(name)) {
+                return Err(self.posix_error());
+            }
             return Ok(Status::FAILURE);
         };
         self.declaration_lists = lists;
@@ -1303,13 +1352,22 @@ impl Interpreter {
 
     /// The words of `simple` expanded. After a literal declaration builtin (`export`, `declare`, …) a word spelled
     /// like an assignment (`x=$y`) is expanded as an assignment's value: no word splitting or pathname expansion,
-    /// tildes after `=` and `:`, as bash does.
+    /// tildes after `=` and `:`, as bash does. In POSIX mode `command` before the builtin keeps that (bash skips
+    /// each literal `command` word to find the declaration builtin, KNSH-106).
     fn command_arguments(&mut self, simple: &SimpleCommand, run: &Run<'_>) -> Flow<Vec<String>> {
-        let declaration = simple
-            .words
-            .first()
-            .and_then(|first| alias::literal_text(first, run.source))
-            .is_some_and(|name| DECLARATION_BUILTINS.contains(&name));
+        let literal = |index: usize| {
+            simple
+                .words
+                .get(index)
+                .and_then(|word| alias::literal_text(word, run.source))
+        };
+        let mut builtin = 0;
+        if self.state.options().posix() {
+            while literal(builtin) == Some("command") {
+                builtin += 1;
+            }
+        }
+        let declaration = literal(builtin).is_some_and(|name| DECLARATION_BUILTINS.contains(&name));
         self.declaration_lists.clear();
         if !declaration {
             return self.arguments(&simple.words, run);
@@ -1330,7 +1388,7 @@ impl Interpreter {
             let pieces = word::pieces(&command_word.word.segments, run.source, 0)?;
             for parts in brace::expand(&pieces, command_word.span)? {
                 let value_start = match parts.first() {
-                    Some(scan::Part::Text(first)) if index > 0 => {
+                    Some(scan::Part::Text(first)) if index > builtin => {
                         word::assignment_value_start(first).map(|start| (first.clone(), start))
                     }
                     _ => None,
@@ -1364,8 +1422,12 @@ impl Interpreter {
             // KNSH-105: a command of assignments and redirections ends with its last command substitution's status.
             return Ok(self.substitution_status.take().unwrap_or(Status::SUCCESS));
         };
-        // Bash looks for a function before a builtin or a program (outside POSIX mode).
-        if self.state.function(name).is_some() {
+        // Bash looks for a function before a builtin or a program; in POSIX mode a special builtin comes first, and
+        // a function whose name holds a `/` is never run (KNSH-106).
+        if self.runs_as_special(name) {
+            return self.special_builtin(name, args, assignments, simple.span, run);
+        }
+        if self.state.function(name).is_some() && !(self.state.options().posix() && name.contains('/')) {
             if !self.declaration_lists.is_empty() {
                 // `declare x=(1 2)` with a function named `declare`: bash hands it the word as written, which
                 // the list read apart from its word is not.

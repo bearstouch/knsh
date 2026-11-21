@@ -22,6 +22,9 @@ enum Held {
     /// Not implemented, and its value differs in an interactive shell, where the line editor and history keep it
     /// (KNSH-107): this value in a non-interactive shell, refused in an interactive one.
     Editing(bool),
+    /// `set -o posix` (KNSH-106): [`ShellOptions::posix`], changed with bash's `posix_initialize`. The `set`
+    /// builtin sets or removes `POSIXLY_CORRECT` after the change, as bash's `set_posix_mode` does.
+    Posix,
 }
 
 /// One `set -o` option: its name, its letter (for `set -x` and `$-`), and what is held of it.
@@ -143,11 +146,10 @@ const SET_OPTIONS: &[SetOption] = &[
         letter: None,
         held: Held::Field(|options| &mut options.pipefail),
     },
-    // POSIX mode is KNSH-106.
     SetOption {
         name: "posix",
         letter: None,
-        held: Held::Fixed(false),
+        held: Held::Posix,
     },
     SetOption {
         name: "privileged",
@@ -172,7 +174,7 @@ const SET_OPTIONS: &[SetOption] = &[
 ];
 
 /// Bash 5.2's `shopt` options (alphabetical, its listing order), with what is held of each: the ones KNSH-098 to
-/// KNSH-104 implement, and every other at bash 5.2's default for `bash -c`.
+/// KNSH-104 (and `shift_verbose`, KNSH-106) implement, and every other at bash 5.2's default for `bash -c`.
 const SHOPT_OPTIONS: &[(&str, Held)] = &[
     ("assoc_expand_once", Held::Fixed(false)),
     ("autocd", Held::Fixed(false)),
@@ -228,7 +230,7 @@ const SHOPT_OPTIONS: &[(&str, Held)] = &[
     ("progcomp_alias", Held::Fixed(false)),
     ("promptvars", Held::Fixed(true)),
     ("restricted_shell", Held::Fixed(false)),
-    ("shift_verbose", Held::Fixed(false)),
+    ("shift_verbose", Held::Field(|options| &mut options.shift_verbose)),
     ("sourcepath", Held::Fixed(true)),
     ("varredir_close", Held::Fixed(false)),
     ("xpg_echo", Held::Field(|options| &mut options.xpg_echo)),
@@ -253,6 +255,7 @@ fn value(held: Held, options: &ShellOptions, interactive: bool) -> Result<bool, 
         }
         Held::Editing(_) if interactive => Err(OptionError::Refused(Unsupported::ShellOption)),
         Held::Fixed(value) | Held::Editing(value) => Ok(value),
+        Held::Posix => Ok(options.posix),
     }
 }
 
@@ -261,6 +264,13 @@ fn change(held: Held, options: &mut ShellOptions, interactive: bool, on: bool) -
     match held {
         Held::Field(field) => {
             *field(options) = on;
+            Ok(())
+        }
+        Held::Posix => {
+            // Bash's `set_posix_mode` does nothing when the mode is already so.
+            if options.posix != on {
+                options.initialize_posix(on, interactive);
+            }
             Ok(())
         }
         Held::Fixed(_) | Held::Editing(_) if value(held, options, interactive)? == on => Ok(()),
@@ -489,6 +499,54 @@ pub(crate) fn shopt_refusal(args: &[String]) -> Option<Unsupported> {
     })
 }
 
+/// Whether a shell started with `argv0` and the arguments `args` (after `argv0`) starts in bash's POSIX mode
+/// (KNSH-106), as bash 5.2's `shell.c` decides: the file name of `argv0` (without the `-` of a login shell) is `sh`,
+/// whatever the options say (bash's `act_like_sh` takes effect after them), or the long options before the first
+/// other word include `--posix`, or the short options after them turn on `-o posix` (`+o posix` turns it off
+/// again). A host then starts the shell with
+/// [`ShellState::with_posix_mode`](crate::ShellState::with_posix_mode); `POSIXLY_CORRECT` in the environment is
+/// read by [`ShellState::with_environment`](crate::ShellState::with_environment) itself.
+#[must_use]
+pub fn posix_mode_requested(argv0: &std::ffi::OsStr, args: &[std::ffi::OsString]) -> bool {
+    let name = argv0.as_encoded_bytes();
+    let name = name.rsplit(|&byte| byte == b'/').next().unwrap_or(name);
+    let name = name.strip_prefix(b"-").unwrap_or(name);
+    let act_like_sh = name == b"sh";
+    let mut posix = false;
+    let mut rest = args;
+    // Bash's `parse_long_options`: words starting with `--`, up to `--` itself.
+    while let Some((arg, after)) = rest.split_first() {
+        let arg = arg.as_encoded_bytes();
+        if arg == b"--" || !arg.starts_with(b"--") {
+            break;
+        }
+        posix |= arg == b"--posix";
+        rest = after;
+    }
+    // Then `parse_shell_options`: `-o name` and `+o name` among the short options.
+    while let Some((arg, after)) = rest.split_first() {
+        let bytes = arg.as_encoded_bytes();
+        let on = match bytes.first() {
+            Some(b'-') => true,
+            Some(b'+') => false,
+            _ => break,
+        };
+        if bytes.len() == 1 || bytes == b"--" {
+            break;
+        }
+        rest = after;
+        if bytes[1..].contains(&b'o')
+            && let Some((name, after)) = rest.split_first()
+        {
+            if name.as_encoded_bytes() == b"posix" {
+                posix = on;
+            }
+            rest = after;
+        }
+    }
+    posix || act_like_sh
+}
+
 /// `$-`: the letters of the options that are on, in bash's order (`flags.c`'s `shell_flags`), with `i` in an
 /// interactive shell, then `c` for a shell running a `-c` string (every non-interactive run here).
 pub(crate) fn dash_flags(options: &ShellOptions, interactive: bool) -> String {
@@ -581,13 +639,45 @@ mod tests {
         assert_eq!(shopt(&options, "bogus"), Err(OptionError::Unknown));
     }
 
+    fn os(args: &[&str]) -> Vec<std::ffi::OsString> {
+        args.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    // KNSH-106 acceptance: a shell started as `sh` (by any path, as a login shell too) starts in POSIX mode.
+    #[test]
+    fn argv0_sh_enables_posix_mode() {
+        for argv0 in ["sh", "/bin/sh", "-sh", "/usr/local/bin/sh"] {
+            assert!(posix_mode_requested(argv0.as_ref(), &[]), "{argv0}");
+        }
+        for argv0 in ["bash", "/bin/bash", "knsh", "-bash", "shell", "zsh", "/bin/sh/x"] {
+            assert!(!posix_mode_requested(argv0.as_ref(), &os(&["-c", "true"])), "{argv0}");
+        }
+    }
+
+    // KNSH-106 acceptance: `--posix` (a long option, before the others) and `-o posix` start in POSIX mode.
+    #[test]
+    fn posix_flag_enables_posix_mode() {
+        let knsh = std::ffi::OsStr::new("knsh");
+        assert!(posix_mode_requested(knsh, &os(&["--posix", "-c", "true"])));
+        assert!(posix_mode_requested(knsh, &os(&["--norc", "--posix", "script"])));
+        assert!(posix_mode_requested(knsh, &os(&["-o", "posix", "-c", "true"])));
+        assert!(posix_mode_requested(knsh, &os(&["-eo", "posix", "-c", "true"])));
+        // Not an option: after the command string, the script name or `--`, and `+o` turns it off.
+        assert!(!posix_mode_requested(knsh, &os(&["-c", "true", "--posix"])));
+        assert!(!posix_mode_requested(knsh, &os(&["script", "--posix"])));
+        assert!(!posix_mode_requested(knsh, &os(&["--", "--posix"])));
+        assert!(!posix_mode_requested(knsh, &os(&["-o", "posix", "+o", "posix"])));
+        assert!(posix_mode_requested("sh".as_ref(), &os(&["+o", "posix"])));
+    }
+
     // KNSH-104: literal forms refused before the script runs.
     #[test]
     fn literal_refusals() {
         assert_eq!(set_refusal(&[]), Some(Unsupported::ShellVariable));
         assert_eq!(set_refusal(&strings(&["-eux", "-o", "pipefail"])), None);
         assert_eq!(set_refusal(&strings(&["-a"])), Some(Unsupported::ShellOption));
-        assert_eq!(set_refusal(&strings(&["-o", "posix"])), Some(Unsupported::ShellOption));
+        assert_eq!(set_refusal(&strings(&["-o", "posix"])), None);
+        assert_eq!(set_refusal(&strings(&["-o", "nolog"])), Some(Unsupported::ShellOption));
         assert_eq!(set_refusal(&strings(&["--", "-a"])), None);
         assert_eq!(set_refusal(&strings(&["-e", "x", "-a"])), None);
         assert_eq!(set_refusal(&strings(&["-q"])), None);
@@ -596,8 +686,9 @@ mod tests {
             Some(Unsupported::ShellOption)
         );
         assert_eq!(shopt_refusal(&strings(&["-s", "extglob", "bogus"])), None);
+        assert_eq!(shopt_refusal(&strings(&["-so", "posix"])), None);
         assert_eq!(
-            shopt_refusal(&strings(&["-so", "posix"])),
+            shopt_refusal(&strings(&["-so", "nolog"])),
             Some(Unsupported::ShellOption)
         );
         assert_eq!(shopt_refusal(&strings(&["nocasematch"])), None);

@@ -84,17 +84,22 @@ impl Interpreter {
             run,
             format_args!("return: can only `return' from a function or sourced script"),
         );
+        // Bash's `EX_USAGE` (KNSH-106: it ends the shell in POSIX mode).
+        self.usage_error = true;
         Ok(Status::new(2))
     }
 
     /// `break [n]` and `continue [n]` (`name`).
     pub(super) fn loop_builtin(&mut self, name: &str, args: &[String], span: Span, run: &Run<'_>) -> Flow<Status> {
         if self.loops == 0 {
-            self.report(
-                span,
-                run,
-                format_args!("{name}: only meaningful in a `for', `while', or `until' loop"),
-            );
+            // Bash's `check_loop_level` says nothing in POSIX mode (KNSH-106).
+            if !self.state.options().posix() {
+                self.report(
+                    span,
+                    run,
+                    format_args!("{name}: only meaningful in a `for', `while', or `until' loop"),
+                );
+            }
             return Ok(Status::SUCCESS);
         }
         let args = operands(args);
@@ -172,7 +177,13 @@ impl Interpreter {
         let count = usize::try_from(count).unwrap_or(usize::MAX);
         let positional = self.state.positional();
         if count > positional.len() {
-            // Bash says nothing unless `shopt -s shift_verbose`.
+            // Bash says nothing unless `shopt -s shift_verbose`, which POSIX mode sets (KNSH-106).
+            if self.state.options().shift_verbose {
+                match args.first() {
+                    Some(first) => self.report(span, run, format_args!("shift: {first}: shift count out of range")),
+                    None => self.report(span, run, format_args!("shift: shift count out of range")),
+                }
+            }
             return Ok(Status::FAILURE);
         }
         let rest = positional[count..].to_vec();
@@ -183,11 +194,15 @@ impl Interpreter {
     /// `echo [-neE] args`: the arguments separated by spaces, then a newline. `-n` drops the newline, `-e` (or
     /// `shopt -s xpg_echo`) interprets backslash escapes, `-E` stops that; any leading word of only those letters is
     /// options, as in bash.
+    ///
+    /// In POSIX mode `echo` takes no options and interprets the escapes, as macOS's `/bin/sh` (its bash 3.2, built
+    /// for UNIX 03) does whatever `xpg_echo` says, and as bash 5.2 does with `xpg_echo` on (KNSH-106).
     pub(super) fn echo_builtin(&mut self, args: &[String], span: Span, run: &Run<'_>) -> Status {
-        let mut escapes = self.state.options().xpg_echo;
+        let posix = self.state.options().posix();
+        let mut escapes = self.state.options().xpg_echo || posix;
         let mut newline = true;
         let mut rest = args;
-        while let Some(letters) = rest.first().and_then(|first| echo_options(first)) {
+        while let Some(letters) = rest.first().filter(|_| !posix).and_then(|first| echo_options(first)) {
             for letter in letters.chars() {
                 match letter {
                     'n' => newline = false,

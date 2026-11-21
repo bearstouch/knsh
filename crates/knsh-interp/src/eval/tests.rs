@@ -558,7 +558,7 @@ fn unsupported_constructs_are_refused_before_anything_runs() {
         ("true; FUNCNAME=x", Unsupported::ShellVariable),
         // KNSH-104: options the interpreter does not implement; `set` alone would list bash's own variables.
         ("true; set -a", Unsupported::ShellOption),
-        ("true; set -o posix", Unsupported::ShellOption),
+        ("true; set -o nolog", Unsupported::ShellOption),
         ("true; set", Unsupported::ShellVariable),
     ];
     for (line, feature) in cases {
@@ -1326,6 +1326,7 @@ fn moving_a_descriptor_onto_itself_keeps_it() {
 mod builtins;
 mod functions_arrays;
 mod jobs;
+mod posix;
 mod substitution;
 mod test_printf_read;
 mod traps_options;

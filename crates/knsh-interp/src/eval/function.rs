@@ -4,7 +4,8 @@
 //! - Defining a function keeps its body with the text it was parsed from (a function defined by `eval` or in a
 //!   sourced file outlives that text), and its file for `BASH_SOURCE`. A name bash refuses (quoted, holding an
 //!   expansion, all digits) is bash's `not a valid identifier`, status 1; a read-only function is `readonly
-//!   function`, status 1.
+//!   function`, status 1. In POSIX mode (KNSH-106) the name must be an identifier and not a special builtin's, or
+//!   a non-interactive shell ends with status 2, as bash's `execute_intern_function` does.
 //! - A call pushes a scope (holding the assignments written before it, exported, as bash's temporary environment),
 //!   a call-stack frame (`FUNCNAME`, `BASH_SOURCE`, `BASH_LINENO`) and the arguments as positional parameters
 //!   (`$0` unchanged); it resets the loop count, so `break` inside it is not the caller's (bash 4.4 and later); and
@@ -93,13 +94,30 @@ impl Interpreter {
     }
 
     /// `name () body` and `function name body`: keeps the function; 0, or 1 after bash's error.
-    pub(super) fn define_function(&mut self, definition: &FunctionDefinition, run: &Run<'_>) -> Status {
+    pub(super) fn define_function(&mut self, definition: &FunctionDefinition, run: &Run<'_>) -> Flow<Status> {
         let text = definition.name.span.text(run.source).unwrap_or_default().to_owned();
         let literal = super::alias::literal_text(&definition.name, run.source);
-        let Some(name) = literal.filter(|name| !name.bytes().all(|byte| byte.is_ascii_digit())) else {
+        let posix = self.state.options().posix();
+        let valid = literal.filter(|name| {
+            // Bash's `check_identifier (name, posixly_correct)`: POSIX mode wants an identifier.
+            !name.bytes().all(|byte| byte.is_ascii_digit()) && (!posix || is_name(name))
+        });
+        let Some(name) = valid else {
             self.report(definition.span, run, format_args!("`{text}': not a valid identifier"));
-            return Status::FAILURE;
+            if posix && !self.state.is_interactive() {
+                return Err(self.usage_exit());
+            }
+            return Ok(Status::FAILURE);
         };
+        if posix && super::posix::is_special_builtin(name) {
+            // POSIX interpretation 383: a special builtin cannot be redefined.
+            self.report(definition.span, run, format_args!("`{name}': is a special builtin"));
+            if self.state.is_interactive() {
+                self.state.set_last_status(Status::new(2));
+                return Err(Stop::Discard);
+            }
+            return Err(self.usage_exit());
+        }
         let body = Arc::new(FunctionBody {
             body: definition.body.clone(),
             source: run.source_arc(),
@@ -107,10 +125,10 @@ impl Interpreter {
             line_base: run.line_base,
         });
         if self.state.define_function(name, body).is_ok() {
-            Status::SUCCESS
+            Ok(Status::SUCCESS)
         } else {
             self.report(definition.span, run, format_args!("{name}: readonly function"));
-            Status::FAILURE
+            Ok(Status::FAILURE)
         }
     }
 

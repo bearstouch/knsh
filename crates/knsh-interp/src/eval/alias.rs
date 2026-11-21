@@ -143,37 +143,39 @@ impl Interpreter {
         };
         let mut status = Status::SUCCESS;
         if operands.is_empty() || options.contains('p') {
+            // `-p` always lists reusably; without it POSIX mode leaves `alias ` out (KNSH-106).
+            let reusable = options.contains('p') || !self.state.options().posix();
             let listing: String = self
                 .state
                 .aliases()
                 .iter()
-                .map(|(name, value)| alias_line(name, value))
+                .map(|(name, value)| alias_line(name, value, reusable))
                 .collect();
             status = self.print("alias", listing.as_bytes(), span, run);
             if operands.is_empty() {
                 return status;
             }
         }
+        let reusable = options.contains('p') || !self.state.options().posix();
         for operand in operands {
-            match operand.split_once('=').filter(|(name, _)| !name.is_empty()) {
-                Some((name, value)) => {
-                    if legal_alias_name(name) {
-                        self.state.set_alias(name, value.to_owned());
-                    } else {
-                        self.report(span, run, format_args!("alias: `{name}': invalid alias name"));
-                        status = Status::FAILURE;
-                    }
+            if let Some((name, value)) = operand.split_once('=').filter(|(name, _)| !name.is_empty()) {
+                if legal_alias_name(name) {
+                    self.state.set_alias(name, value.to_owned());
+                } else {
+                    self.report(span, run, format_args!("alias: `{name}': invalid alias name"));
+                    status = Status::FAILURE;
                 }
-                None => {
-                    if let Some(line) = self.state.alias(operand).map(|value| alias_line(operand, value)) {
-                        if self.print("alias", line.as_bytes(), span, run) != Status::SUCCESS {
-                            status = Status::FAILURE;
-                        }
-                    } else {
-                        self.report(span, run, format_args!("alias: {operand}: not found"));
-                        status = Status::FAILURE;
-                    }
+            } else if let Some(line) = self
+                .state
+                .alias(operand)
+                .map(|value| alias_line(operand, value, reusable))
+            {
+                if self.print("alias", line.as_bytes(), span, run) != Status::SUCCESS {
+                    status = Status::FAILURE;
                 }
+            } else {
+                self.report(span, run, format_args!("alias: {operand}: not found"));
+                status = Status::FAILURE;
             }
         }
         status
@@ -205,8 +207,12 @@ impl Interpreter {
     }
 }
 
-/// One alias as `alias` prints it: `alias name='value'`.
-fn alias_line(name: &str, value: &str) -> String {
+/// One alias as `alias` prints it: `alias name='value'`, or without `reusable` (POSIX mode, bash's `AL_REUSABLE`
+/// unset) `name='value'`.
+fn alias_line(name: &str, value: &str, reusable: bool) -> String {
+    if !reusable {
+        return format!("{name}={}\n", quote::single(value));
+    }
     // Bash puts `-- ` before a name that starts with `-`, so the line can be read back.
     let guard = if name.starts_with('-') { "-- " } else { "" };
     format!("alias {guard}{name}={}\n", quote::single(value))
@@ -224,6 +230,8 @@ mod tests {
         for name in ["", "a/b", "a b", "a$", "a=b", "a'b", "a;b"] {
             assert!(!legal_alias_name(name), "{name}");
         }
-        assert_eq!(alias_line("q", "it's"), "alias q='it'\\''s'\n");
+        assert_eq!(alias_line("q", "it's", true), "alias q='it'\\''s'\n");
+        // KNSH-106: POSIX mode without `-p`.
+        assert_eq!(alias_line("ll", "ls -l", false), "ll='ls -l'\n");
     }
 }

@@ -66,6 +66,8 @@ impl Interpreter {
                 self.report(span, run, format_args!("{name}: -{bad}: invalid option"));
                 // Bash's `builtin_usage`: the usage line has no name or line number before it.
                 self.report_plain(format_args!("{name}: usage: {name} {usage}"));
+                // Bash's `EX_USAGE` (KNSH-106: a special builtin's ends the shell in POSIX mode).
+                self.usage_error = true;
                 return Err(Status::new(2));
             }
             letters.push_str(options);
@@ -282,7 +284,7 @@ impl Interpreter {
                     let _ = writeln!(text, "{pid}");
                 }
             } else {
-                text.push_str(&job.line(mark, options.contains('l')));
+                text.push_str(&job.line(mark, options.contains('l'), self.state.options().posix()));
                 text.push('\n');
             }
             if job.is_done() {
@@ -423,12 +425,12 @@ impl Interpreter {
                 continue;
             };
             if job.is_done() {
-                text.push_str(&job.line(mark, false));
+                text.push_str(&job.line(mark, false, self.state.options().posix()));
                 text.push('\n');
                 ended.push(number);
             } else if job.is_stopped() && !job.notified {
                 job.notified = true;
-                text.push_str(&job.line(mark, false));
+                text.push_str(&job.line(mark, false, self.state.options().posix()));
                 text.push('\n');
             }
         }
