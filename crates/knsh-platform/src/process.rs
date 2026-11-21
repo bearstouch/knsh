@@ -110,6 +110,9 @@ pub struct SpawnRequest {
     /// Every source is read before any target is written, so `1>&2 2>&1` swaps rather than collapses. Empty for
     /// every other caller.
     pub placements: Vec<Placement>,
+    /// The file mode creation mask set in the child before it executes (a shell's `umask`, KNSH-101), or `None` to
+    /// keep the caller's.
+    pub umask: Option<u32>,
 }
 
 /// Most descriptor numbers a [`Placement`] may target: 0 to `MAX_PLACED_FD`. Below macOS's default soft limit on open
@@ -148,6 +151,7 @@ impl SpawnRequest {
             cwd: None,
             stdio: Stdio::Null,
             inherit: Vec::new(),
+            umask: None,
             placements: Vec::new(),
         }
     }

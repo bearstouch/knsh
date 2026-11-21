@@ -23,6 +23,7 @@
 //! recorded in `specs/09-reference/decisions.md`).
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 
 use knsh_bash::{CommandWord, IoNumber, Redirect, RedirectionOperator, Span};
 use knsh_platform::{ChildDescriptor, MAX_PLACED_FD, OpenMode, PlatformError, StandardStream};
@@ -119,8 +120,16 @@ enum Dest {
 /// A redirection's failure: bash's message, without the `name: line n: ` prefix.
 type Refusal = String;
 
+/// `EBADF` on macOS: writing to a closed descriptor.
+const EBADF: i32 = 9;
+
+/// `EIO`: a write that failed without an `errno`.
+const fn libc_eio() -> i32 {
+    5
+}
+
 /// The text bash gives for `errno` (`strerror`): the system's message without std's ` (os error n)` suffix.
-fn strerror(errno: i32) -> String {
+pub(crate) fn strerror(errno: i32) -> String {
     let text = std::io::Error::from_raw_os_error(errno).to_string();
     match text.rfind(" (os error ") {
         Some(at) => text[..at].to_owned(),
@@ -216,6 +225,28 @@ impl Interpreter {
                 let _ = self.descriptors.write_all(&file, bytes);
             }
             Some(ChildDescriptor::Standard(StandardStream::Input)) | None => {}
+        }
+    }
+
+    /// Writes `bytes` where the shell's descriptor `fd` points, as a builtin's output does (KNSH-101): `Err` with the
+    /// `errno` when it fails, `EBADF` for a closed descriptor, so the builtin reports bash's `write error`.
+    pub(super) fn write_out(&mut self, fd: u32, bytes: &[u8]) -> Result<(), i32> {
+        let to_shared = |writer: &super::SharedWriter| {
+            let mut writer = writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            writer
+                .write_all(bytes)
+                .and_then(|()| writer.flush())
+                .map_err(|error| error.raw_os_error().unwrap_or(libc_eio()))
+        };
+        match self.fds.get(fd).cloned() {
+            Some(ChildDescriptor::Standard(StandardStream::Error)) => to_shared(&self.diagnostics),
+            Some(ChildDescriptor::Standard(StandardStream::Output)) => to_shared(&self.output),
+            Some(ChildDescriptor::Open(file)) => self
+                .descriptors
+                .write_all(&file, bytes)
+                .map_err(|error| error.errno().unwrap_or(libc_eio())),
+            // The shell's standard input is not opened for writing.
+            Some(ChildDescriptor::Standard(StandardStream::Input)) | None => Err(EBADF),
         }
     }
 
@@ -382,11 +413,19 @@ impl Interpreter {
                     }
                 }
                 Some(slot) => {
+                    // Bash's `redir_varassign` fails on a read-only variable (KNSH-101): checked before a number is
+                    // taken, so nothing stays open.
+                    if self.state.is_readonly(&name) {
+                        return Err(format!("{name}: cannot assign fd to variable"));
+                    }
                     let Some(fd) = self.fds.free_from(NAMED_FD_BASE) else {
                         return Err(format!("{{{name}}}: Too many open files"));
                     };
                     self.fds.replace(fd, Some(slot));
-                    self.state.set_variable(&name, fd.to_string());
+                    if self.state.assign(&name, fd.to_string().into(), false).is_err() {
+                        self.fds.replace(fd, None);
+                        return Err(format!("{name}: cannot assign fd to variable"));
+                    }
                 }
             },
         }
@@ -413,8 +452,12 @@ impl Interpreter {
             return Err(": No such file or directory".to_owned());
         }
         let path = self.state.cwd().join(word);
-        self.descriptors
-            .open(&path, mode)
+        // KNSH-101: a file created gets the shell's umask, once the shell has one of its own.
+        let opened = match self.state.umask() {
+            Some(umask) => self.descriptors.open_masked(&path, mode, umask),
+            None => self.descriptors.open(&path, mode),
+        };
+        opened
             .map(ChildDescriptor::Open)
             .map_err(|error| open_refusal(word, mode, &error))
     }

@@ -18,7 +18,13 @@
 //! `PIPESTATUS`, `pipefail` and `lastpipe` as [`ShellOptions`]), `( … )` subshells, background jobs (`&`, `$!`), the
 //! job builtins `wait` (with `-n`), `jobs`, `fg`, `bg` and `disown`, the `time` keyword, and job control (`set -m`
 //! as [`ShellOptions::monitor`]; an interactive shell with its terminal through [`Interpreter::with_job_control`],
-//! and [`JobSignals`] for the supervisor's pause, FR-SES-10).
+//! and [`JobSignals`] for the supervisor's pause, FR-SES-10). KNSH-101 adds the core builtins: `cd` (with `CDPATH`,
+//! `-L`, `-P` and `OLDPWD`; the host is told of each change through a [`DirectoryObserver`], [`Osc7`] writing
+//! OSC 7), `pwd`, `export`, `unset`, `readonly`, `declare` and `typeset` (variable attributes but arrays), `local`
+//! (an error outside a function until KNSH-103), `shift`, `set` for the positional parameters, `exit`, `return`,
+//! `break`, `continue`, `true`, `false`, `:`, `echo` (with [`ShellOptions::xpg_echo`]), `eval`, `source` and `.`,
+//! `command`, `builtin`, `type`, `hash` (bash's command hash table), `alias` and `unalias` (expanded with
+//! [`ShellOptions::expand_aliases`]), `umask` (passed to every command and redirection) and `exec` with a command.
 //!
 //! # Boundaries
 //!
@@ -37,11 +43,14 @@
 //!   must start through the spawner): pipeline stages and background lists that the shell runs itself run on threads
 //!   of their own (decision 19). Children are known by handle, waited for by one thread each, and a job's process
 //!   group is signalled only while one of its members is held unreaped.
-//! - What later stories implement (command substitution, here-documents, functions, arrays, most builtins) is
-//!   refused with [`InterpError::Unsupported`] by a check of the
-//!   whole script before anything runs, or, when only an expansion's value reveals it, when that expansion runs. Builtins whose
-//!   external program behaves the same for literal arguments (`echo`, `printf`, `true`, `false`, `test`, `[`) run as
-//!   that program until KNSH-101 and KNSH-102.
+//! - What later stories implement (command substitution, here-documents, functions, arrays, `read`, `trap`, `set`
+//!   options) is refused with [`InterpError::Unsupported`] by a check of the whole script before anything runs, or,
+//!   when only an expansion's value reveals it (or `eval` and `source` text), when it is reached. Builtins whose
+//!   external program behaves the same for literal arguments (`printf`, `test`, `[`) run as that program until
+//!   KNSH-102.
+//! - `eval`, `source` and alias text are parsed, checked and evaluated by the same parser and evaluator as the
+//!   script, so every program in them starts through the same spawner (KNSH-108). `cd` changes the interpreter's
+//!   working directory, never the process's, and `exec cmd` runs the program and then ends the shell (decision 20).
 //! - Nesting is bounded by an explicit, documented limit ([`MAX_EVAL_DEPTH`]) that fails with
 //!   [`InterpError::DepthExceeded`], on an evaluation thread whose stack ([`EVAL_STACK_SIZE`]) holds that many
 //!   levels. Loops have no iteration limit, as in bash. Brace and pathname expansion are bounded in words, size and
@@ -61,6 +70,8 @@
 //! - `specs/00-stories/KNSH-098-word-splitting-quote-removal-and-pathname-expansion.md`
 //! - `specs/00-stories/KNSH-100-pipelines-subshells-and-job-control.md`, FR-SES-10 (pause of every job's group),
 //!   `specs/09-reference/decisions.md` (decision 19: subshells are copies)
+//! - `specs/00-stories/KNSH-101-core-builtins.md`, NFR-COMPAT-10 (OSC 7), `specs/09-reference/decisions.md`
+//!   (decision 20: `exec` runs, then ends the shell)
 //! - `specs/09-reference/defaults-and-limits.md` (the evaluation, arithmetic and expansion depth limits, and the
 //!   brace and pathname expansion bounds)
 
@@ -77,8 +88,10 @@ mod expand;
 mod glob;
 mod jobs;
 mod lookup;
+mod observer;
 mod param;
 mod pattern;
+mod quote;
 mod scan;
 mod state;
 mod status;
@@ -88,5 +101,6 @@ pub use arith::{Failure as ArithmeticError, MAX_ARITH_DEPTH, evaluate_arithmetic
 pub use error::{InterpError, Unsupported};
 pub use eval::{EVAL_STACK_SIZE, Interpreter, MAX_EVAL_DEPTH};
 pub use jobs::{JobSignals, MAX_REMEMBERED_JOBS};
+pub use observer::{DirectoryObserver, Osc7, osc7};
 pub use state::{ShellOptions, ShellState};
 pub use status::Status;

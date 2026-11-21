@@ -164,7 +164,8 @@ fn and_or_lists_short_circuit_like_bash() {
     let mut h = Harness::new();
     h.on("x", &[exited(0)]);
     assert_eq!(h.status("false && x; true || x"), 0);
-    assert_eq!(h.ran(), ["false", "true"]);
+    // `true` and `false` are builtins (KNSH-101): nothing ran.
+    assert_eq!(h.ran(), Vec::<String>::new());
 }
 
 // NFR-COMPAT-01: `a && b || c` is `(a && b) || c`, and the status is the last pipeline run.
@@ -196,7 +197,7 @@ fn negation_inverts_exit_status() {
 fn case_without_match_returns_zero() {
     let mut h = Harness::new();
     assert_eq!(h.status("false; case a in b) x;; c|d) x;; esac"), 0);
-    assert_eq!(h.ran(), ["false"]);
+    assert_eq!(h.ran(), Vec::<String>::new());
     assert_eq!(h.status("false; case a in esac"), 0);
 }
 
@@ -239,7 +240,7 @@ fn missing_command_returns_127() {
     assert_eq!(h.diagnostics.text(), "knsh: line 2: nope_zz: command not found\n");
     assert_eq!(h.status("./missing"), 127);
     assert!(h.diagnostics.text().ends_with("./missing: No such file or directory\n"));
-    assert_eq!(h.ran(), ["true"]);
+    assert_eq!(h.ran(), Vec::<String>::new());
 }
 
 // NFR-COMPAT-09: found but not executable is 126.
@@ -326,7 +327,8 @@ fn deep_recursion_fails_with_error_not_crash() {
             h.interpreter.run(&past_limit, "true"),
             Err(InterpError::DepthExceeded { limit: MAX_EVAL_DEPTH })
         );
-        assert_eq!(h.ran(), ["true"]);
+        // The innermost command is the builtin `true` (KNSH-101): no program ran.
+        assert_eq!(h.ran(), Vec::<String>::new());
     });
 }
 
@@ -337,7 +339,7 @@ fn evaluator_enforces_the_depth_limit_itself() {
     let mut h = Harness::new();
     h.interpreter.max_depth = 4;
     let script = nested_groups(10);
-    let run = Run { source: "true" };
+    let run = Run::new("true");
     assert_eq!(
         h.interpreter.list(&script.items, &run),
         Err(Stop::Error(InterpError::DepthExceeded { limit: 4 }))
@@ -361,7 +363,7 @@ fn if_runs_the_first_true_branch_and_is_zero_without_one() {
     assert_eq!(h.status("if false; then a; elif true; then a; else b; fi"), 7);
     assert_eq!(h.status("if false; then a; fi"), 0);
     assert_eq!(h.status("if false; then a; else false; fi"), 1);
-    assert_eq!(h.ran(), ["false", "true", "a", "false", "false", "false"]);
+    assert_eq!(h.ran(), ["a"]);
 }
 
 #[test]
@@ -371,7 +373,7 @@ fn for_loops_set_the_variable_and_keep_the_last_body_status() {
     assert_eq!(h.status("for v in one 'two 2' three; do a \"v\"; done"), 6);
     assert_eq!(h.interpreter.state().variable("v"), Some(std::ffi::OsStr::new("three")));
     assert_eq!(h.status("false; for v in; do a; done"), 0);
-    assert_eq!(h.ran(), ["a", "a", "a", "false"]);
+    assert_eq!(h.ran(), ["a", "a", "a"]);
 }
 
 #[test]
@@ -502,19 +504,22 @@ fn unsupported_constructs_are_refused_before_anything_runs() {
         ("true; (( x )) > out", Unsupported::Redirection),
         ("true; cat <<EOF\nx\nEOF\n", Unsupported::HereDocument),
         ("true; { true; } <<-EOF\nx\nEOF\n", Unsupported::HereDocument),
-        ("true; exec ls", Unsupported::Builtin),
-        ("true; exec -a x ls", Unsupported::Builtin),
         // KNSH-100: without clocks `time` cannot report; PIPESTATUS is read, never assigned; an index needing
         // arithmetic is an array access (KNSH-103).
         ("time true", Unsupported::Time),
         ("true; PIPESTATUS=1", Unsupported::ShellVariable),
         ("true; echo ${PIPESTATUS[$x]}", Unsupported::Array),
         ("true | { echo $(ls); }", Unsupported::CommandSubstitution),
-        ("true & (cd /)", Unsupported::Builtin),
+        ("true & (trap '' INT)", Unsupported::Builtin),
         ("f() { true; }", Unsupported::FunctionDefinition),
-        ("true; cd /", Unsupported::Builtin),
-        ("if true; then export X; fi", Unsupported::Builtin),
+        ("true; read x", Unsupported::Builtin),
+        ("if true; then shopt -s extglob; fi", Unsupported::Builtin),
         ("mapfile x", Unsupported::Builtin),
+        // KNSH-101: forms of the core builtins that later stories implement.
+        ("true; set -e", Unsupported::Builtin),
+        ("true; set", Unsupported::Builtin),
+        ("true; declare -a x", Unsupported::Array),
+        ("true; local -n x", Unsupported::Nameref),
     ];
     for (line, feature) in cases {
         assert_eq!(refused(h.run(line)), *feature, "{line}");
@@ -531,7 +536,8 @@ fn stateless_builtins_run_as_their_programs() {
         h.on(program, &[exited(0)]);
     }
     assert_eq!(h.status("echo hi; test -n x; printf x; true"), 0);
-    assert_eq!(h.ran(), ["echo", "test", "printf", "true"]);
+    // `echo` and `true` are builtins the interpreter runs itself (KNSH-101).
+    assert_eq!(h.ran(), ["test", "printf"]);
 }
 
 // Fail closed: a builtin whose program would act differently for these arguments is refused, never run as the
@@ -540,10 +546,6 @@ fn stateless_builtins_run_as_their_programs() {
 fn builtin_forms_the_programs_do_not_share_are_refused() {
     let mut h = Harness::new();
     for line in [
-        "echo -e 'a\\nb'",
-        "echo -n -n x",
-        "echo -nE x",
-        r"echo 'a\c'",
         "printf -v x %s y",
         "printf '%q' x",
         "printf '%-5Q' x",
@@ -559,7 +561,7 @@ fn builtin_forms_the_programs_do_not_share_are_refused() {
         h.on(program, &[exited(0)]);
     }
     assert_eq!(h.status("echo -n x; echo - -x; printf '%s %%q\\n' a; test -e x"), 0);
-    assert_eq!(h.ran(), ["echo", "echo", "printf", "test"]);
+    assert_eq!(h.ran(), ["printf", "test"]);
 }
 
 // Bash never searches `PATH` for a builtin: another `echo` on `PATH`, or `PATH` unset, changes nothing.
@@ -567,12 +569,12 @@ fn builtin_forms_the_programs_do_not_share_are_refused() {
 fn builtins_ignore_path() {
     let mut h = Harness::new();
     h.fs.add_dir_all(Path::new("/evil")).unwrap();
-    h.fs.write(Path::new("/evil/echo"), b"", 0o755).unwrap();
-    h.on("echo", &[exited(0)]);
-    assert_eq!(h.status("PATH=/evil echo hi"), 0);
-    assert_eq!(h.status("PATH=/nowhere; echo hi"), 0);
+    h.fs.write(Path::new("/evil/printf"), b"", 0o755).unwrap();
+    h.on("printf", &[exited(0)]);
+    assert_eq!(h.status("PATH=/evil printf hi"), 0);
+    assert_eq!(h.status("PATH=/nowhere; printf hi"), 0);
     let programs: Vec<_> = h.commands.runs().into_iter().map(|run| run.program).collect();
-    assert_eq!(programs, [Path::new("/bin/echo"), Path::new("/bin/echo")]);
+    assert_eq!(programs, [Path::new("/bin/printf"), Path::new("/bin/printf")]);
 }
 
 // A failure to start a command that is not the command's fault stops the script.
@@ -690,8 +692,8 @@ fn arithmetic_for_loops_like_bash() {
     assert_eq!(h.status("for ((n = 2; n; n--)) { false; }"), 1);
     // An arithmetic error ends the loop with status 1.
     assert_eq!(h.status("for ((j = 0; j < 1/0; j++)); do tool; done"), 1);
-    // Three `tool` runs and two `false` runs: the last loop's body never ran.
-    assert_eq!(h.commands.runs().len(), 5);
+    // Three `tool` runs (`false` is a builtin): the last loop's body never ran.
+    assert_eq!(h.commands.runs().len(), 3);
 }
 
 // Bash (`-c`): an expansion error abandons the rest of its line with status 1; the next line runs.
@@ -701,8 +703,8 @@ fn expansion_errors_discard_the_rest_of_the_line() {
     h.on("tool", &[exited(0)]);
     let status = h.status("tool one; echo $((1/0)); tool same-line\ntool next \"$?\"\nif true; then\n  tool ${x!}\n  tool inside\nfi\ntool after");
     assert_eq!(status, 0);
-    // `true` (the `if` condition) ran; nothing else of the `if` did.
-    let expected: [&[&str]; 4] = [&["one"], &["next", "1"], &[], &["after"]];
+    // Nothing of the `if` but its condition (the builtin `true`) ran.
+    let expected: [&[&str]; 3] = [&["one"], &["next", "1"], &["after"]];
     assert_eq!(args(&h), expected);
     assert_eq!(
         h.diagnostics.text(),
@@ -731,11 +733,11 @@ fn nounset_ends_the_script_with_status_one() {
 fn refusals_found_by_expansion_stop_the_script_there() {
     let mut h = Harness::new();
     h.on("tool", &[exited(0)]);
-    h.interpreter.state_mut().set_variable("cmd", "cd");
-    assert_eq!(refused(h.run("tool; $cmd /; tool")), Unsupported::Builtin);
-    assert_eq!(refused(h.run("echo -e${cmd:+n} x")), Unsupported::Builtin);
+    h.interpreter.state_mut().set_variable("cmd", "read");
+    assert_eq!(refused(h.run("tool; $cmd x; tool")), Unsupported::Builtin);
+    assert_eq!(refused(h.run("set -${cmd:+e}")), Unsupported::Builtin);
     // A builtin produced by brace or pathname expansion too (KNSH-098).
-    assert_eq!(refused(h.run("{c,x}d /")), Unsupported::Builtin);
+    assert_eq!(refused(h.run("{tra,x}p x")), Unsupported::Builtin);
     assert_eq!(h.ran(), ["tool"]);
 }
 
@@ -891,7 +893,7 @@ fn empty_ifs_disables_splitting() {
     // Nothing splits, but an unquoted empty expansion still vanishes.
     assert_eq!(args(&h), [vec![" a b ", "", " x y "]]);
     // Unset, IFS is bash's default.
-    h.interpreter.state_mut().unset_variable("IFS");
+    h.interpreter.state_mut().unset("IFS").unwrap();
     assert_eq!(h.status("tool $v"), 0);
     assert_eq!(args(&h)[1], ["a", "b"]);
 }
@@ -1079,9 +1081,8 @@ fn noclobber_blocks_overwrite() {
     assert_eq!(h.ran(), Vec::<String>::new());
     assert_eq!(h.status("x >new; x >/dev/null; x >>f"), 0);
     assert_eq!(h.ran(), ["x", "x", "x"]);
-    h.on("echo", &[exited(0)]);
     assert_eq!(h.status("echo $- >flags"), 0);
-    assert_eq!(h.commands.runs()[3].args, ["hBCc"]);
+    assert_eq!(h.file("flags").as_deref(), Some("hBCc\n"));
 }
 
 // NFR-COMPAT-02: `>|` truncates even under `set -C`.
@@ -1307,4 +1308,5 @@ fn moving_a_descriptor_onto_itself_keeps_it() {
     assert_eq!(h.table(0)[3], (4, "/work/f".to_owned()));
 }
 
+mod builtins;
 mod jobs;

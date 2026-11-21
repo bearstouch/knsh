@@ -51,6 +51,14 @@ tests (`crates/knsh-interp/src/expand/tests.rs`, `src/arith/tests.rs`); forms bo
 | `{01..03}`, `{1..9..2}`, `{a..e..2}` (KNSH-098) | No padding (`1 2 3`); a step leaves the word as written | Zero padding to the widest end; steps |
 | `**` with `globstar` (KNSH-098) | No such option: `**` is `*` | Any depth of directories |
 | `.*` (KNSH-098) | Also matches `.` and `..` | Never matches `.` and `..` (`globskipdots`, on by default) |
+| `exit abc` (KNSH-101) | Exits with 255 | Exits with 2 |
+| `return` outside a function or sourced file (KNSH-101) | Status 1 | Status 2 |
+| A builtin's invalid option (`cd -x`, KNSH-101) | Status 1, usage `cd [-L\|-P] [dir]` | Status 2, usage `cd [-L\|[-P [-e]] [-@]] [dir]` |
+| A syntax error in `eval` or `source` text (KNSH-101) | Status 1 | Status 2 |
+| `echo -e '\e'` (KNSH-101) | `\e` as written | Escape |
+| `declare -l`, `declare -u` (KNSH-101) | Invalid option | Lower and upper case |
+| `declare x` then `declare -p x`, `${x-unset}` (KNSH-101) | `declare -- x=""`, empty | `declare -- x`, `unset` |
+| `type -t` of a name not found among others (KNSH-101) | Status 0 | Status 1 (bash 5.2's `type.def`; pending a 5.2 run, KNSH-109) |
 
 Known differences of the native interpreter from bash 5.2 (KNSH-098): in the C locale bash matches `?` and bracket
 expressions against bytes and the interpreter against characters, so they differ for non-ASCII text only (`?`
@@ -83,6 +91,26 @@ job, so a later `wait` for its process id is `not a child of this shell` (127); 
 with KNSH-107); `time` adds the shell's own CPU time and that of every child its process reaped meanwhile, which in
 a process running several shells includes the others'. The terminal modes a stopped job had are not saved for its
 `fg` (the shell restores its own).
+
+Known differences of the native interpreter from bash 5.2 in the core builtins (KNSH-101): `exec cmd` runs the
+program through the spawner and the shell then ends with its status, so the program has a process id of its own, not
+the shell's ([decision 20](../09-reference/decisions.md)); `cd` checks a directory as `chdir` would but cannot know
+the user it runs as, so it accepts a directory any execute bit allows; a redirection that creates a file removes the
+process's umask as well as the shell's, so a shell umask less restrictive than the process's (`umask 000` under a
+process umask of `022`) is not honoured in full (a more restrictive one always is; commands get the shell's umask
+exactly); the interpreter never reads the process's umask, so until its host gives it (`ShellState::with_umask`)
+commands and redirections keep the process's own and `umask` printing it or applying a symbolic mode is refused; aliases are expanded when a simple command runs, with the aliases defined before its line, so an alias
+whose text only parses together with the words around it (`alias x='if true; then'`) is refused, as is one in a
+pipeline that is not a single simple command; `eval` and `source` parse their whole text before running it, so for
+a syntax error the lines before its line run and then bash's report follows, while an error bash would report
+differently (an unterminated quote, a construct the parser does not read) is refused; a `{name}>file` redirection to
+a read-only variable gives only bash's second message (`name: cannot assign fd to variable`); `exit` in an
+interactive shell with stopped jobs exits at once (bash first warns `There are stopped jobs.`); `command -p`
+searches macOS's standard path (`/usr/bin:/bin:/usr/sbin:/sbin`). Refused until the story that implements them:
+`set` with options or without arguments (KNSH-104), `declare -a`, `-A`, `-n` and `name[…]` (KNSH-103), `local` and
+`declare -f` with functions (KNSH-103), `. /dev/stdin` and other descriptors as files, a sourced file that is not
+UTF-8, and the listings that would include variables bash maintains itself (`declare -p` and `declare` without
+names, `readonly -p`, `declare -i` without names).
 | Messages under `bash -c` | `bash: message` (no line number on one-line scripts) | `bash: line n: message` |
 | Arithmetic error token after trailing blanks (`$(( 1 + ))`) | `error token is " "` | The last token read: `error token is "+ "` |
 | `base#` with no digits (`$((2#))`) | 0 | Error `invalid integer constant` |

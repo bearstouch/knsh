@@ -28,9 +28,11 @@
 //! call), against an explicit limit, so a deep tree ends in [`InterpError::DepthExceeded`] rather than a stack
 //! overflow. Loops do not nest: a loop runs any number of iterations at the same depth.
 
-use std::ffi::{OsStr, OsString};
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::io::Write;
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use knsh_bash::{
@@ -39,8 +41,8 @@ use knsh_bash::{
     UnsupportedCommand,
 };
 use knsh_platform::{
-    ChildHandle, Collation, CommandOutcome, CommandRequest, CommandSpawner, Descriptors, ExitStatus, Fs, JobTerminal,
-    ShellTimes, Started, UserHomes,
+    ChildHandle, Collation, CommandOutcome, CommandSpawner, Descriptors, ExitStatus, Fs, JobTerminal, ShellTimes,
+    UserHomes,
 };
 
 use crate::arith::Failure;
@@ -49,15 +51,21 @@ use crate::check;
 use crate::error::{InterpError, Unsupported};
 use crate::expand::{ExpandError, Expander};
 use crate::jobs::{JobSignals, Jobs, Parent, Registry};
-use crate::lookup::{self, Missing, Refusal, Resolved};
+use crate::observer::DirectoryObserver;
 use crate::pattern::Pattern;
 use crate::scan;
-use crate::state::{ShellState, is_name};
+use crate::state::{AssignError, ShellState, is_name};
 use crate::status::Status;
 use crate::word;
 
+mod alias;
+mod builtins;
+mod cd;
+mod control;
+mod declare;
 mod job;
 mod job_builtins;
+mod nested;
 mod redirect;
 
 use job::JobContext;
@@ -81,8 +89,8 @@ pub const MAX_EVAL_DEPTH: usize = 1000;
 pub const EVAL_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// Builtins run as their external program for now: for the arguments a script without expansions can pass, the
-/// programs in `/bin` and `/usr/bin` behave as bash's builtins do. KNSH-101 and KNSH-102 replace them.
-const EXTERNAL_BUILTINS: &[&str] = &["[", "echo", "false", "printf", "test", "true"];
+/// programs in `/bin` and `/usr/bin` behave as bash's builtins do. KNSH-102 replaces them.
+const EXTERNAL_BUILTINS: &[&str] = &["[", "printf", "test"];
 
 /// Where the programs standing in for [`EXTERNAL_BUILTINS`] are looked up, whatever `PATH` says: bash runs its
 /// builtin without searching `PATH`, so a `PATH` entry holding another `echo` (or `PATH` unset) must not change what
@@ -100,12 +108,58 @@ pub(crate) fn is_refused_builtin(name: &str) -> bool {
         || LATER_BUILTINS.contains(&name)
 }
 
-/// Builtins the interpreter runs itself: `let` (KNSH-097), `:` and `exec` with redirections only (KNSH-099), and
-/// the job builtins `wait`, `jobs`, `fg`, `bg` and `disown` (KNSH-100).
-const NATIVE_BUILTINS: &[&str] = &["let", ":", "exec", "wait", "jobs", "fg", "bg", "disown"];
+/// Builtins the interpreter runs itself: `let` (KNSH-097), the job builtins `wait`, `jobs`, `fg`, `bg` and `disown`
+/// (KNSH-100), and the core builtins (KNSH-101).
+pub(crate) const NATIVE_BUILTINS: &[&str] = &[
+    ".", ":", "alias", "bg", "break", "builtin", "cd", "command", "continue", "declare", "disown", "echo", "eval",
+    "exec", "exit", "export", "false", "fg", "hash", "jobs", "let", "local", "pwd", "readonly", "return", "set",
+    "shift", "source", "true", "type", "typeset", "umask", "unalias", "unset", "wait",
+];
 
-/// Whether `exec` with `args` only changes the shell's descriptors (no arguments, or only `--`): the form the
-/// interpreter runs. `exec cmd` replaces the shell and is refused until KNSH-101.
+/// The declaration builtins, whose arguments spelled like assignments are expanded as assignments (bash's
+/// `W_ASSIGNARG` words).
+const DECLARATION_BUILTINS: &[&str] = &["declare", "export", "local", "readonly", "typeset"];
+
+/// Whether `name` is a builtin the interpreter runs itself.
+pub(crate) fn is_native_builtin(name: &str) -> bool {
+    NATIVE_BUILTINS.contains(&name)
+}
+
+/// Whether `name` is a bash 5.2 builtin, whether or not the interpreter runs it (`type`, `command -v`, `builtin`).
+pub(crate) fn is_bash_builtin(name: &str) -> bool {
+    knsh_bash::is_builtin(name) || LATER_BUILTINS.contains(&name)
+}
+
+/// The feature a later story implements that builtin `name` with literal `args` needs, if any: `set` with options
+/// or without arguments (KNSH-104), arrays and name references in the declaration builtins (KNSH-103).
+pub(crate) fn refused_form(name: &str, args: &[String]) -> Option<Unsupported> {
+    match name {
+        "set" => match args.first().map(String::as_str) {
+            None => Some(Unsupported::Builtin),
+            Some("--" | "-") => None,
+            Some(first) if first.starts_with(['-', '+']) => Some(Unsupported::Builtin),
+            Some(_) => None,
+        },
+        "declare" | "typeset" | "readonly" | "export" | "local" => {
+            let letters: String = args
+                .iter()
+                .take_while(|arg| arg.as_str() != "--" && arg.len() > 1 && arg.starts_with(['-', '+']))
+                .flat_map(|arg| arg.chars().skip(1))
+                .collect();
+            if letters.contains(['a', 'A']) {
+                Some(Unsupported::Array)
+            } else if letters.contains('n') && name != "export" {
+                Some(Unsupported::Nameref)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether `exec` with `args` only changes the shell's descriptors (no arguments, or only `--`): its redirections
+/// then last for the shell's life (KNSH-099). With a command, `exec` runs it and the shell ends (KNSH-101).
 pub(crate) fn exec_redirects_only(args: &[String]) -> bool {
     matches!(args, [] | [_]) && args.first().is_none_or(|arg| arg == "--")
 }
@@ -114,22 +168,11 @@ pub(crate) fn exec_redirects_only(args: &[String]) -> bool {
 /// other than bash's builtin, so it must be refused until the builtin is implemented. Conservative: it refuses every
 /// form the programs in `/bin` and `/usr/bin` were seen to treat differently, and a few more.
 ///
-/// - `echo`: bash takes any leading `-n`, `-e` and `-E` words (`-ne`, `-n -n`) as options and prints backslashes
-///   as written; `/bin/echo` on macOS takes only one leading `-n` and stops at a `\c`.
 /// - `printf`: bash's `-v` (sets a variable) and `--`, and the `%q`, `%Q` and `%(…)T` conversions.
 /// - `test` and `[`: the unary `-N`, `-v`, `-R`, `-a` and `-o`, which the programs reject or read as binary
 ///   operators (the binary `-a` and `-o` are refused with them).
 pub(crate) fn external_builtin_differs(name: &str, args: &[String]) -> bool {
     match name {
-        "echo" => {
-            let mut options = args.iter().take_while(|arg| is_echo_option(arg));
-            let options_differ = match (options.next(), options.next()) {
-                (None, _) => false,
-                (Some(only), None) => only != "-n",
-                (Some(_), Some(_)) => true,
-            };
-            options_differ || args.iter().any(|arg| arg.contains('\\'))
-        }
         "printf" => args
             .first()
             .is_some_and(|format| format.starts_with('-') || has_bash_only_conversion(format)),
@@ -138,12 +181,6 @@ pub(crate) fn external_builtin_differs(name: &str, args: &[String]) -> bool {
             .any(|arg| matches!(arg.as_str(), "-N" | "-v" | "-R" | "-a" | "-o")),
         _ => false,
     }
-}
-
-/// Whether bash's `echo` reads `arg` as options: `-` followed only by `n`, `e` and `E`.
-fn is_echo_option(arg: &str) -> bool {
-    arg.strip_prefix('-')
-        .is_some_and(|letters| !letters.is_empty() && letters.chars().all(|ch| matches!(ch, 'n' | 'e' | 'E')))
 }
 
 /// Whether the `printf` format `format` holds a conversion only bash's builtin knows: `%q`, `%Q` or `%(…)T`, after
@@ -173,6 +210,22 @@ pub(crate) enum Stop {
     Discard,
     /// The shell exits with this status (already reported).
     Exit(Status),
+    /// `break`: leave this many enclosing loops; the last one left ends with `status` (KNSH-101).
+    Break {
+        /// Loops still to leave, at least 1.
+        levels: usize,
+        /// The status of the loop left last: 0, or 1 after `break 0`.
+        status: Status,
+    },
+    /// `continue`: go on with the next iteration of the loop this many levels out (KNSH-101).
+    Continue {
+        /// Loops out, at least 1 (the innermost).
+        levels: usize,
+        /// The status if this leaves a subshell instead.
+        status: Status,
+    },
+    /// `return` from a sourced file (functions: KNSH-103), with this status.
+    Return(Status),
 }
 
 impl From<InterpError> for Stop {
@@ -267,6 +320,26 @@ pub struct Interpreter {
     /// A subshell on a thread of its own, a member of a job of its parent: where it reports that its foreground job
     /// stopped under job control (KNSH-100).
     parent: Option<Parent>,
+    /// Loops currently running, for `break` and `continue` (KNSH-101). A subshell starts with its parent's count,
+    /// as bash's forked subshell does.
+    loops: usize,
+    /// Files being sourced, for `return` (KNSH-101).
+    sourcing: usize,
+    /// Bytes of `eval`, `source` and alias text being run at once, each held with its parsed tree until it ends
+    /// (KNSH-101): bounded by [`nested::MAX_NESTED_TEXT`], so text that runs itself again (`. ./self.sh`) cannot
+    /// hold a tree per level up to the nesting limit.
+    nested_bytes: usize,
+    /// Told after each `cd` changes the working directory: OSC 7 and `cwd.changed` (KNSH-101, NFR-COMPAT-10).
+    /// Never in a subshell, whose directory is not the shell's.
+    observer: Option<Arc<dyn DirectoryObserver>>,
+    /// The aliases as they were when the line being run was read: bash expands an alias only in lines read after it
+    /// was defined (KNSH-101).
+    visible_aliases: Arc<BTreeMap<String, String>>,
+    /// Aliases being expanded, which are not expanded again inside their own text.
+    alias_guard: Vec<String>,
+    /// `exec cmd` started its program as the shell's foreground job: the shell ends with the job's status once
+    /// it is waited for (KNSH-101).
+    exit_after_job: bool,
 }
 
 impl fmt::Debug for Interpreter {
@@ -317,7 +390,35 @@ impl Interpreter {
             pipe_stderr: false,
             is_subshell: false,
             parent: None,
+            loops: 0,
+            sourcing: 0,
+            nested_bytes: 0,
+            observer: None,
+            visible_aliases: Arc::new(BTreeMap::new()),
+            alias_guard: Vec::new(),
+            exit_after_job: false,
         }
+        .with_checked_oldpwd()
+    }
+
+    /// Drops an inherited `OLDPWD` that does not name a directory, as bash's `set_pwd` does at start-up (it stays
+    /// exported, without a value).
+    fn with_checked_oldpwd(mut self) -> Self {
+        let named = self.state.variable("OLDPWD").map(Path::new).map(Path::to_path_buf);
+        if let Some(path) = named
+            && !(path.is_absolute() && cd::is_directory(&*self.fs, &path))
+        {
+            self.state.clear_value("OLDPWD");
+        }
+        self
+    }
+
+    /// The same interpreter telling `observer` each time `cd` changes the working directory (KNSH-101): the host
+    /// writes OSC 7 there ([`Osc7`](crate::Osc7)) and publishes `cwd.changed` while recording (NFR-COMPAT-10).
+    #[must_use]
+    pub fn with_directory_observer(mut self, observer: Arc<dyn DirectoryObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// The same interpreter writing what the shell itself sends to the spawner's standard output to `output` (its
@@ -345,6 +446,8 @@ impl Interpreter {
     pub fn with_job_control(mut self, terminal: Option<Arc<dyn JobTerminal>>) -> Self {
         self.state.set_interactive(true);
         self.state.options_mut().monitor = true;
+        // KNSH-101: bash expands aliases in an interactive shell.
+        self.state.options_mut().expand_aliases = true;
         self.terminal = terminal;
         self
     }
@@ -413,11 +516,18 @@ impl Interpreter {
     fn run_here(&mut self, script: &Script, source: &str) -> Result<Status, InterpError> {
         check::check(&script.items, source, self.max_depth, self.times.is_some())?;
         self.depth = 0;
-        let run = Run { source };
+        self.loops = 0;
+        self.sourcing = 0;
+        self.nested_bytes = 0;
+        self.exit_after_job = false;
+        let run = Run::new(source);
         match self.script(&script.items, &run) {
             Ok(status) => Ok(status),
-            // Bash exits: the script ends here with this status.
-            Err(Stop::Exit(status)) => {
+            // Bash exits: the script ends here with this status. `break`, `continue` and `return` never get here
+            // (outside a loop or a sourced file they are reported and stop nothing), but would end it the same way.
+            Err(
+                Stop::Exit(status) | Stop::Break { status, .. } | Stop::Continue { status, .. } | Stop::Return(status),
+            ) => {
                 self.state.set_last_status(status);
                 Ok(status)
             }
@@ -428,12 +538,21 @@ impl Interpreter {
 
     /// Writes one of the shell's own error messages, as bash 5 does: `name: line n: message`, to the shell's
     /// descriptor 2 as the redirections in force leave it (KNSH-099). A failed write is ignored, as bash ignores it.
+    ///
+    /// Inside `source` the name is the file's, as bash names its errors after `BASH_SOURCE`; inside `eval` lines
+    /// count on from the `eval` command's line (KNSH-101).
     fn report(&mut self, span: Span, run: &Run<'_>, message: fmt::Arguments<'_>) {
-        let line = run
-            .source
-            .get(..span.start)
-            .map_or(1, |before| before.matches('\n').count() + 1);
-        let text = format!("{}: line {line}: {message}\n", self.state.name());
+        let line = run.line(span);
+        let text = match run.origin {
+            Some(origin) => format!("{origin}: line {line}: {message}\n"),
+            None => format!("{}: line {line}: {message}\n", self.state.name()),
+        };
+        self.write_shell(2, text.as_bytes());
+    }
+
+    /// Writes one of the shell's messages without a name or line number (a usage line: `cd: usage: …`).
+    fn report_plain(&mut self, message: fmt::Arguments<'_>) {
+        let text = format!("{message}\n");
         self.write_shell(2, text.as_bytes());
     }
 
@@ -512,6 +631,10 @@ impl Interpreter {
                 Err(Stop::Exit(Status::FAILURE))
             }
             Err(Failure::Unsupported(feature)) => Err(unsupported(feature, span).into()),
+            Err(Failure::Readonly(variable)) => {
+                self.report(span, run, format_args!("{variable}: readonly variable"));
+                Ok(None)
+            }
         }
     }
 
@@ -536,7 +659,19 @@ impl Interpreter {
         let mut status = self.state.last_status();
         // The end of the last item on a line being discarded.
         let mut discarding: Option<usize> = None;
+        // The end of the item before, to tell where a line starts.
+        let mut previous_end: Option<usize> = None;
         for item in items {
+            let starts_line = previous_end.is_none_or(|end| {
+                run.source
+                    .get(end..item.and_or.span.start)
+                    .is_none_or(|between| between.contains('\n'))
+            });
+            previous_end = Some(item.and_or.span.end);
+            if starts_line && self.state.options().expand_aliases {
+                // Bash reads a whole line, expanding aliases as they are when it reads it (KNSH-101).
+                self.visible_aliases = Arc::new(self.state.aliases().clone());
+            }
             if let Some(end) = discarding {
                 let between = run.source.get(end..item.and_or.span.start).unwrap_or("\n");
                 if !between.contains('\n') {
@@ -659,23 +794,50 @@ impl Interpreter {
             Some(items) => self.arguments(&items.words, run)?,
             None => self.state.positional().to_vec(),
         };
+        self.loops += 1;
+        let result = self.for_items(&name, values, command, run);
+        self.loops -= 1;
+        result
+    }
+
+    fn for_items(&mut self, name: &str, values: Vec<String>, command: &ForCommand, run: &Run<'_>) -> Flow<Status> {
         let mut status = Status::SUCCESS;
         for value in values {
-            self.state.set_variable(&name, value);
-            status = self.list(&command.body.body, run)?;
+            // Bash's `for` ends with 1 when it cannot assign its variable (read-only).
+            if let Some(failed) = self.assign_or_report(name, value.into(), false, command.variable.span, run)? {
+                return Ok(failed);
+            }
+            match loop_step(self.list(&command.body.body, run))? {
+                Step::Next(done) => status = done,
+                Step::Leave(done) => return Ok(done),
+            }
         }
         Ok(status)
     }
 
     /// `while` (`is_while`) or `until`: the condition, then the body while the condition succeeds (or fails).
     fn loop_command(&mut self, command: &LoopCommand, is_while: bool, run: &Run<'_>) -> Flow<Status> {
+        self.loops += 1;
+        let result = self.loop_body(command, is_while, run);
+        self.loops -= 1;
+        result
+    }
+
+    fn loop_body(&mut self, command: &LoopCommand, is_while: bool, run: &Run<'_>) -> Flow<Status> {
         let mut status = Status::SUCCESS;
         loop {
-            let condition = self.list(&command.condition, run)?;
+            // `break` and `continue` in the condition act on this loop too, as in bash.
+            let condition = match loop_step(self.list(&command.condition, run))? {
+                Step::Next(condition) => condition,
+                Step::Leave(done) => return Ok(done),
+            };
             if condition.is_success() != is_while {
                 return Ok(status);
             }
-            status = self.list(&command.body.body, run)?;
+            match loop_step(self.list(&command.body.body, run))? {
+                Step::Next(done) => status = done,
+                Step::Leave(done) => return Ok(done),
+            }
         }
     }
 
@@ -755,6 +917,15 @@ impl Interpreter {
         if !blank(init) && self.arithmetic_span(init, span, run)?.is_none() {
             return Ok(Status::FAILURE);
         }
+        self.loops += 1;
+        let result = self.arithmetic_for_loop([test, update], body, span, run);
+        self.loops -= 1;
+        result
+    }
+
+    fn arithmetic_for_loop(&mut self, header: [Span; 2], body: &LoopBody, span: Span, run: &Run<'_>) -> Flow<Status> {
+        let [test, update] = header;
+        let blank = |part: Span| part.text(run.source).is_none_or(|text| text.trim().is_empty());
         let mut status = Status::SUCCESS;
         loop {
             if !blank(test) {
@@ -764,7 +935,11 @@ impl Interpreter {
                     Some(_) => {}
                 }
             }
-            status = self.list(&body.body, run)?;
+            // `continue` still runs the update expression, as in bash.
+            match loop_step(self.list(&body.body, run))? {
+                Step::Next(done) => status = done,
+                Step::Leave(done) => return Ok(done),
+            }
             if !blank(update) && self.arithmetic_span(update, span, run)?.is_none() {
                 return Ok(Status::FAILURE);
             }
@@ -795,7 +970,10 @@ impl Interpreter {
         if let Some(span) = here_document(&simple.redirections) {
             return Err(unsupported(Unsupported::HereDocument, span).into());
         }
-        let words = self.arguments(&simple.words, run)?;
+        if let Some(result) = self.alias_command(simple, run) {
+            return result;
+        }
+        let words = self.command_arguments(simple, run)?;
         let mut assignments: Vec<(String, OsString)> = Vec::with_capacity(simple.assignments.len());
         for assignment in &simple.assignments {
             let parts = word::parts(&assignment.word.segments, run.source, assignment.value.start)?;
@@ -803,6 +981,26 @@ impl Interpreter {
                 .expander(run, &assignments)
                 .assignment_value(&parts, assignment.span);
             let value = OsString::from(self.expanded(result, assignment.span, run)?);
+            if words.is_empty() {
+                // Without a command each assignment takes effect at once, so the next one sees it. A failed one
+                // abandons the line, as bash's assignment error does outside POSIX mode.
+                let assigned =
+                    self.assign_or_report(&assignment.name, value, assignment.append, assignment.span, run)?;
+                if assigned.is_some() {
+                    self.state.set_last_status(Status::FAILURE);
+                    return Err(Stop::Discard);
+                }
+                continue;
+            }
+            // Bash reports a read-only variable and runs the command without it.
+            if self.state.is_readonly(&assignment.name) {
+                self.report(
+                    assignment.span,
+                    run,
+                    format_args!("{}: readonly variable", assignment.name),
+                );
+                continue;
+            }
             let value = if assignment.append {
                 let mut prior = assignments
                     .iter()
@@ -817,29 +1015,87 @@ impl Interpreter {
             } else {
                 value
             };
-            if words.is_empty() {
-                // Without a command each assignment takes effect at once, so the next one sees it.
-                self.state.set_variable(&assignment.name, value);
-            } else {
-                assignments.push((assignment.name.clone(), value));
-            }
-        }
-        if let [name, args @ ..] = words.as_slice()
-            && name == "exec"
-            && !exec_redirects_only(args)
-        {
-            return Err(unsupported(Unsupported::Builtin, simple.span).into());
+            assignments.push((assignment.name.clone(), value));
         }
         let Some(saved) = self.redirect(&simple.redirections, run)? else {
             return Ok(Status::FAILURE);
         };
         let result = self.simple_body(simple, &words, &assignments, run);
-        match words.first() {
+        let keeps = matches!(words.as_slice(), [name, args @ ..] if name == "exec" && exec_redirects_only(args));
+        if keeps && result.is_ok() {
             // `exec` without a command: its redirections are the shell's from now on.
-            Some(name) if name == "exec" && result.is_ok() => drop(saved),
-            Some(_) | None => self.restore(saved),
+            drop(saved);
+        } else {
+            self.restore(saved);
         }
         result
+    }
+
+    /// Assigns `value` to `name` (`append`: `name+=value`) as the shell does: `Ok(None)` when done, `Ok(Some(1))`
+    /// after reporting a read-only variable; an arithmetic error of an integer variable abandons the line.
+    fn assign_or_report(
+        &mut self,
+        name: &str,
+        value: OsString,
+        append: bool,
+        span: Span,
+        run: &Run<'_>,
+    ) -> Flow<Option<Status>> {
+        match self.state.assign(name, value, append) {
+            Ok(()) => Ok(None),
+            Err(AssignError::Readonly) => {
+                self.report(span, run, format_args!("{name}: readonly variable"));
+                Ok(Some(Status::FAILURE))
+            }
+            Err(AssignError::Invalid) => {
+                self.report(span, run, format_args!("`{name}': not a valid identifier"));
+                Ok(Some(Status::FAILURE))
+            }
+            Err(AssignError::Arithmetic(failure)) => {
+                let result = Err(crate::expand::failed(failure, span));
+                self.expanded(result, span, run)
+            }
+            Err(AssignError::Unsupported(feature)) => Err(unsupported(feature, span).into()),
+        }
+    }
+
+    /// The words of `simple` expanded. After a literal declaration builtin (`export`, `declare`, …) a word spelled
+    /// like an assignment (`x=$y`) is expanded as an assignment's value: no word splitting or pathname expansion,
+    /// tildes after `=` and `:`, as bash does.
+    fn command_arguments(&mut self, simple: &SimpleCommand, run: &Run<'_>) -> Flow<Vec<String>> {
+        let declaration = simple
+            .words
+            .first()
+            .and_then(|first| alias::literal_text(first, run.source))
+            .is_some_and(|name| DECLARATION_BUILTINS.contains(&name));
+        if !declaration {
+            return self.arguments(&simple.words, run);
+        }
+        let mut out = Vec::with_capacity(simple.words.len());
+        for (index, command_word) in simple.words.iter().enumerate() {
+            let pieces = word::pieces(&command_word.word.segments, run.source, 0)?;
+            for parts in brace::expand(&pieces, command_word.span)? {
+                let value_start = match parts.first() {
+                    Some(scan::Part::Text(first)) if index > 0 => {
+                        word::assignment_value_start(first).map(|start| (first.clone(), start))
+                    }
+                    _ => None,
+                };
+                if let Some((first, start)) = value_start {
+                    let mut value_parts = parts.clone();
+                    value_parts[0] = scan::Part::Text(first[start..].to_owned());
+                    let result = self
+                        .expander(run, &[])
+                        .assignment_value(&value_parts, command_word.span);
+                    let value = self.expanded(result, command_word.span, run)?;
+                    out.push(format!("{}{value}", &first[..start]));
+                } else {
+                    let result = self.expander(run, &[]).arguments(&parts, command_word.span);
+                    out.extend(self.expanded(result, command_word.span, run)?);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The command of a simple command once its words, assignments and redirections are done.
@@ -853,73 +1109,10 @@ impl Interpreter {
         let Some((name, args)) = words.split_first() else {
             return Ok(Status::SUCCESS);
         };
-        if name == ":" || name == "exec" {
-            return Ok(Status::SUCCESS);
+        if name == "exec" {
+            return self.exec_builtin(args, assignments, simple.span, run);
         }
-        if let Some(result) = self.job_builtin(name, args, simple.span, run) {
-            return result;
-        }
-        if name == "let" {
-            // `a=1 let …` gives `let` a temporary scope bash's arithmetic reads and assigns in, and restores after:
-            // not emulated, so refused rather than evaluated against the wrong variables.
-            if !assignments.is_empty() {
-                return Err(unsupported(Unsupported::Builtin, simple.span).into());
-            }
-            return self.let_builtin(args, simple.span, run);
-        }
-        if is_refused_builtin(name) || external_builtin_differs(name, args) {
-            return Err(unsupported(Unsupported::Builtin, simple.span).into());
-        }
-        // A builtin is never searched on `PATH`. Any other name is looked up with the command's own `PATH=…`
-        // assignment, if it has one, as bash does.
-        let path = if EXTERNAL_BUILTINS.contains(&name.as_str()) {
-            Some(OsStr::new(BUILTIN_PROGRAM_PATH))
-        } else {
-            assignments
-                .iter()
-                .rev()
-                .find(|(assigned, _)| assigned == "PATH")
-                .map(|(_, value)| value.as_os_str())
-                .or_else(|| self.state.variable("PATH"))
-        };
-        match lookup::find(&*self.fs, name, path, self.state.cwd()) {
-            Resolved::Program(program) => {
-                let request = CommandRequest {
-                    program,
-                    argv0: name.into(),
-                    args: args.iter().map(OsString::from).collect(),
-                    env: self.state.environment(assignments),
-                    cwd: self.state.cwd().to_path_buf(),
-                    descriptors: self.fds.child_table(),
-                };
-                let outcome = match self.start_command(&request)? {
-                    Started::Refused(outcome) => outcome,
-                    // A pipeline stage: the pipeline waits for it with the others.
-                    Started::Running(child) if self.sink == Sink::Open => {
-                        self.sink = Sink::Started(child);
-                        return Ok(Status::SUCCESS);
-                    }
-                    Started::Running(child) => self.wait_alone(child)?,
-                };
-                Ok(self.outcome_status(outcome, name, simple.span, run))
-            }
-            Resolved::NotFound(missing) => {
-                let reason = match missing {
-                    Missing::NotOnPath => "command not found",
-                    Missing::NoSuchFile => "No such file or directory",
-                };
-                self.report(simple.span, run, format_args!("{name}: {reason}"));
-                Ok(Status::NOT_FOUND)
-            }
-            Resolved::NotExecutable(refusal) => {
-                let reason = match refusal {
-                    Refusal::Directory => "Is a directory",
-                    Refusal::PermissionDenied => "Permission denied",
-                };
-                self.report(simple.span, run, format_args!("{name}: {reason}"));
-                Ok(Status::NOT_EXECUTABLE)
-            }
-        }
+        self.invoke(name, args, assignments, builtins::Search::Normal, simple.span, run)
     }
 
     /// The status of a command that ran, reporting `exec` failures as bash does.
@@ -939,10 +1132,63 @@ impl Interpreter {
     }
 }
 
-/// What one run of a script reads besides the shell state.
+/// What one run of a script reads besides the shell state: the main script, an `eval` string, a sourced file or an
+/// alias's text (KNSH-101).
 struct Run<'a> {
     /// The text the script's spans index.
     source: &'a str,
+    /// The name the shell's messages start with instead of `$0`: a sourced file's name.
+    origin: Option<&'a str>,
+    /// Lines before the text's first line, in the file messages number lines of (an `eval` string's lines count
+    /// on from its command's line).
+    line_base: usize,
+}
+
+impl<'a> Run<'a> {
+    /// The main script `source`.
+    const fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            origin: None,
+            line_base: 0,
+        }
+    }
+
+    /// The line `span` starts on, as messages number it.
+    fn line(&self, span: Span) -> usize {
+        let within = self
+            .source
+            .get(..span.start)
+            .map_or(1, |before| before.matches('\n').count() + 1);
+        self.line_base + within
+    }
+}
+
+/// What a loop does after one run of its body or condition (KNSH-101).
+enum Step {
+    /// Goes on: the body ended with this status, or `continue` was run for this loop.
+    Next(Status),
+    /// Ends with this status: `break` was run for this loop.
+    Leave(Status),
+}
+
+/// How one run of a loop's body or condition ends the loop or not: `break n` and `continue n` for an outer loop go
+/// on outwards, one level fewer.
+fn loop_step(result: Flow<Status>) -> Flow<Step> {
+    match result {
+        Ok(status) => Ok(Step::Next(status)),
+        Err(Stop::Break { levels, status }) if levels <= 1 => Ok(Step::Leave(status)),
+        Err(Stop::Break { levels, status }) => Err(Stop::Break {
+            levels: levels - 1,
+            status,
+        }),
+        Err(Stop::Continue { levels, status }) if levels <= 1 => Ok(Step::Next(status)),
+        Err(Stop::Continue { levels, status }) => Err(Stop::Continue {
+            levels: levels - 1,
+            status,
+        }),
+        Err(stop) => Err(stop),
+    }
 }
 
 const fn unsupported(feature: Unsupported, span: Span) -> InterpError {

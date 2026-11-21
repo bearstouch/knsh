@@ -37,7 +37,7 @@ use crate::glob;
 use crate::param::{self, CaseKind, DefaultKind, Name, Op, Parsed, ReplaceMode, Subscript};
 use crate::pattern::{self, Flags, Pattern};
 use crate::scan::{self, Mode, Part};
-use crate::state::{DEFAULT_IFS, LastBackground, PIPESTATUS, ShellState, refuses_assignment};
+use crate::state::{AssignError, DEFAULT_IFS, LastBackground, PIPESTATUS, ShellState, refuses_assignment};
 use crate::word::{self, WordChar, assignment_value_start};
 
 /// Deepest nesting of `${…}` and `$((…))` inside one another. The parser's own limits keep real scripts far below
@@ -484,8 +484,24 @@ impl<'a> Expander<'a> {
     }
 
     /// Whether variable `name` is exported (or is one of the command's own assignments, which are).
-    fn is_exported(&self, name: &str) -> bool {
-        self.overlay.iter().any(|(assigned, _)| assigned == name) || self.state.is_exported(name)
+    /// The attribute letters of variable `name` for `${name@a}`: a command's own assignment is exported.
+    fn attribute_letters(&self, name: &str) -> String {
+        let mut attributes = self.state.attributes(name).unwrap_or_default();
+        if self.overlay.iter().any(|(assigned, _)| assigned == name) {
+            attributes.exported = true;
+        }
+        attributes.letters()
+    }
+
+    /// `${name=word}`'s assignment of `value`: bash's errors discard the line.
+    fn assign_default(&mut self, name: &str, value: &str, span: Span) -> Result<()> {
+        match self.state.assign(name, OsString::from(value), false) {
+            Ok(()) => Ok(()),
+            Err(AssignError::Readonly) => Err(ExpandError::Discard(format!("{name}: readonly variable"))),
+            Err(AssignError::Arithmetic(failure)) => Err(failed(failure, span)),
+            Err(AssignError::Unsupported(feature)) => Err(InterpError::Unsupported { feature, span }.into()),
+            Err(AssignError::Invalid) => Err(ExpandError::Discard(format!("{name}: bad substitution"))),
+        }
     }
 
     /// The value of parameter `name`, or `None` if it is unset.
@@ -713,9 +729,12 @@ impl<'a> Expander<'a> {
                     .into());
                 }
                 let value = self.require(value, target, label)?;
-                let exported = matches!(target, Name::Variable(name) if self.is_exported(name));
+                let letters = match target {
+                    Name::Variable(name) => self.attribute_letters(name),
+                    _ => String::new(),
+                };
                 value
-                    .map(|value| value.map(|text| Ok(transform(*op, text, target, exported))))
+                    .map(|value| value.map(|text| Ok(transform(*op, text, target, &letters))))
                     .transpose()?
             }
         };
@@ -766,8 +785,14 @@ impl<'a> Expander<'a> {
                     return Err(ExpandError::Discard(format!("${label}: cannot assign in this way")));
                 };
                 let assigned = self.word_string(word, quoted)?;
-                self.state.set_variable(variable, assigned.as_str());
-                out.push_str(&assigned, quoted, true);
+                self.assign_default(variable, &assigned, word)?;
+                // Bash expands to the value the variable holds after the assignment (`-i`, `-l`, `-u` apply).
+                let held = self
+                    .state
+                    .variable(variable)
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                out.push_str(&held, quoted, true);
                 Ok(())
             }
             DefaultKind::Error if missing => {
@@ -980,7 +1005,8 @@ impl<'a> Expander<'a> {
                 None => utf8(self.homes.current_home())?,
             },
             "+" => self.variable("PWD")?,
-            "-" => return Err(Unsupported::DirectoryStack),
+            // KNSH-101: `~-` is `$OLDPWD`, left as written while it is unset.
+            "-" => self.variable("OLDPWD")?,
             _ if is_directory_stack(prefix) => return Err(Unsupported::DirectoryStack),
             user => utf8(self.homes.home_of(user))?,
         })
@@ -994,11 +1020,12 @@ fn is_directory_stack(prefix: &str) -> bool {
 }
 
 /// The expansion error for an arithmetic failure inside a word at `span`.
-fn failed(failure: Failure, span: Span) -> ExpandError {
+pub(crate) fn failed(failure: Failure, span: Span) -> ExpandError {
     match failure {
         Failure::Error(message) => ExpandError::Discard(message),
         Failure::Unbound(name) => ExpandError::Fatal(format!("{name}: unbound variable")),
         Failure::Unsupported(feature) => InterpError::Unsupported { feature, span }.into(),
+        Failure::Readonly(name) => ExpandError::Discard(format!("{name}: readonly variable")),
     }
 }
 
@@ -1020,10 +1047,12 @@ impl arith::Variables for ArithVariables<'_, '_> {
         if refuses_assignment(name) {
             return Err(Failure::Unsupported(Unsupported::ShellVariable));
         }
-        self.expander
-            .state
-            .set_variable(name, OsString::from(value.to_string()));
-        Ok(())
+        arith::assigned(
+            name,
+            self.expander
+                .state
+                .assign(name, OsString::from(value.to_string()), false),
+        )
     }
 }
 
@@ -1198,7 +1227,7 @@ fn modify_case(text: &str, pattern: &Pattern, kind: CaseKind, all: bool) -> Stri
 }
 
 /// `${x@op}` for one value of parameter `target`.
-fn transform(op: char, text: &str, target: &Name, exported: bool) -> String {
+fn transform(op: char, text: &str, target: &Name, letters: &str) -> String {
     match op {
         'U' => text.to_uppercase(),
         'L' => text.to_lowercase(),
@@ -1211,11 +1240,11 @@ fn transform(op: char, text: &str, target: &Name, exported: bool) -> String {
         }
         'E' => decode_escapes(text),
         'A' => match target {
-            Name::Variable(name) if exported => format!("declare -x {name}={}", quote(text)),
+            Name::Variable(name) if !letters.is_empty() => format!("declare -{letters} {name}={}", quote(text)),
             Name::Variable(name) => format!("{name}={}", quote(text)),
             Name::Positional(_) | Name::Special(_) | Name::Pipestatus(_) => String::new(),
         },
-        'a' => if exported { "x" } else { "" }.to_owned(),
+        'a' => letters.to_owned(),
         // `Q`, and `K` and `k`, which quote a scalar the same way.
         _ => quote(text),
     }
