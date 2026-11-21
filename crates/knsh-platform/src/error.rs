@@ -108,6 +108,8 @@ pub enum Operation {
     Clone,
     /// Reading the volume a path is on (`statfs`; checkpoint storage layout, KNSH-078).
     VolumeInfo,
+    /// Controlling a terminal for job control (`tcsetpgrp`, `tcgetattr`, `tcsetattr`; KNSH-100).
+    Terminal,
 }
 
 impl Operation {
@@ -158,6 +160,7 @@ impl Operation {
             Self::CodeSigning => "read code signature",
             Self::CodeRequirement => "compile code requirement",
             Self::Clone => "clone file",
+            Self::Terminal => "terminal control",
             Self::VolumeInfo => "read volume information",
         }
     }

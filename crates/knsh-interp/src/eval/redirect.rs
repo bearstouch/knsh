@@ -65,6 +65,11 @@ impl FdTable {
         self.slots.get(&fd)
     }
 
+    /// Sets (or with `None` closes) `fd`: a pipeline stage's standard input and output (KNSH-100).
+    pub(crate) fn set(&mut self, fd: u32, slot: Option<ChildDescriptor>) {
+        self.replace(fd, slot);
+    }
+
     /// Sets (or with `None` closes) `fd`, returning what it held.
     fn replace(&mut self, fd: u32, slot: Option<ChildDescriptor>) -> Option<ChildDescriptor> {
         match slot {
@@ -185,6 +190,12 @@ impl Interpreter {
                 }
             }
         }
+        // `|&` after the command: its standard error joins its standard output, after its own redirections
+        // (KNSH-100).
+        if std::mem::take(&mut self.pipe_stderr) {
+            let output = self.fds.get(1).cloned();
+            saved.previous.push((2, self.fds.replace(2, output)));
+        }
         Ok(Some(saved))
     }
 
@@ -199,12 +210,8 @@ impl Interpreter {
     /// A failed write is ignored, as bash ignores it; a closed descriptor (or standard input) swallows the bytes.
     pub(super) fn write_shell(&mut self, fd: u32, bytes: &[u8]) {
         match self.fds.get(fd).cloned() {
-            Some(ChildDescriptor::Standard(StandardStream::Error)) => {
-                let _ = self.diagnostics.write_all(bytes);
-            }
-            Some(ChildDescriptor::Standard(StandardStream::Output)) => {
-                let _ = self.output.write_all(bytes);
-            }
+            Some(ChildDescriptor::Standard(StandardStream::Error)) => super::write_shared(&self.diagnostics, bytes),
+            Some(ChildDescriptor::Standard(StandardStream::Output)) => super::write_shared(&self.output, bytes),
             Some(ChildDescriptor::Open(file)) => {
                 let _ = self.descriptors.write_all(&file, bytes);
             }

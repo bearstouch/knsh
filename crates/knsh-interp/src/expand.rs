@@ -34,10 +34,10 @@ use knsh_platform::{Collation, Fs, UserHomes};
 use crate::arith::{self, Failure};
 use crate::error::{InterpError, Unsupported};
 use crate::glob;
-use crate::param::{self, CaseKind, DefaultKind, Name, Op, Parsed, ReplaceMode};
+use crate::param::{self, CaseKind, DefaultKind, Name, Op, Parsed, ReplaceMode, Subscript};
 use crate::pattern::{self, Flags, Pattern};
 use crate::scan::{self, Mode, Part};
-use crate::state::{DEFAULT_IFS, ShellState, is_always_unemulated};
+use crate::state::{DEFAULT_IFS, LastBackground, PIPESTATUS, ShellState, refuses_assignment};
 use crate::word::{self, WordChar, assignment_value_start};
 
 /// Deepest nesting of `${…}` and `$((…))` inside one another. The parser's own limits keep real scripts far below
@@ -369,7 +369,7 @@ impl<'a> Expander<'a> {
                     // `$1` is named `$1` in bash's message; `$x` is named `x`.
                     let label = match &parsed {
                         Name::Variable(variable) => variable.clone(),
-                        Name::Positional(_) | Name::Special(_) => format!("${parsed}"),
+                        Name::Positional(_) | Name::Special(_) | Name::Pipestatus(_) => format!("${parsed}"),
                     };
                     let value = self.require(value, &parsed, &label)?;
                     self.emit(value, quoted, out);
@@ -467,6 +467,10 @@ impl<'a> Expander<'a> {
         if self.state.is_unemulated(name) {
             return Err(Unsupported::ShellVariable);
         }
+        // `$PIPESTATUS` is its first element, as for any bash array (KNSH-100).
+        if name == PIPESTATUS {
+            return Ok(self.state.pipestatus().first().map(ToString::to_string));
+        }
         let value = self
             .overlay
             .iter()
@@ -503,28 +507,64 @@ impl<'a> Expander<'a> {
                 '?' => Some(Value::Str(state.last_status().to_string())),
                 '$' => Some(Value::Str(state.pid().to_string())),
                 '-' => Some(Value::Str(self.flags())),
-                // No background job has run (`&` is refused until KNSH-100), so `$!` is unset.
+                '!' => match state.last_background() {
+                    None => None,
+                    Some(LastBackground::Process(pid)) => Some(Value::Str(pid.to_string())),
+                    Some(LastBackground::InShell) => {
+                        return Err(InterpError::Unsupported {
+                            feature: Unsupported::InShellProcessId,
+                            span,
+                        }
+                        .into());
+                    }
+                },
                 _ => None,
             },
+            Name::Pipestatus(subscript) => {
+                let statuses: Vec<String> = state.pipestatus().iter().map(ToString::to_string).collect();
+                match *subscript {
+                    Subscript::All { star } => Some(Value::List { items: statuses, star }),
+                    Subscript::Index(index) => {
+                        let at = if index < 0 {
+                            usize::try_from(index.unsigned_abs())
+                                .ok()
+                                .and_then(|back| statuses.len().checked_sub(back))
+                        } else {
+                            usize::try_from(index).ok()
+                        };
+                        at.and_then(|at| statuses.get(at).cloned()).map(Value::Str)
+                    }
+                }
+            }
         })
     }
 
     /// `$-`: the option letters of a shell started as `bash -c` (`h` hashing, `B` brace expansion, `c`), with `f`
-    /// under `set -f`, `u` under `set -u` and `C` under `set -C`, in bash's order.
+    /// under `set -f`, `i` in an interactive shell, `m` under `set -m`, `u` under `set -u` and `C` under `set -C`, in
+    /// bash's order.
     fn flags(&self) -> String {
+        let options = self.state.options();
         let mut flags = String::new();
-        if self.state.options().noglob {
+        if options.noglob {
             flags.push('f');
         }
         flags.push('h');
-        if self.state.options().nounset {
+        if self.state.is_interactive() {
+            flags.push('i');
+        }
+        if options.monitor {
+            flags.push('m');
+        }
+        if options.nounset {
             flags.push('u');
         }
         flags.push('B');
-        if self.state.options().noclobber {
+        if options.noclobber {
             flags.push('C');
         }
-        flags.push('c');
+        if !self.state.is_interactive() {
+            flags.push('c');
+        }
         flags
     }
 
@@ -715,6 +755,13 @@ impl<'a> Expander<'a> {
             DefaultKind::Alternative if !missing => self.word(word, quoted, out),
             DefaultKind::Alternative => Ok(()),
             DefaultKind::Assign if missing => {
+                if let Name::Pipestatus(_) = target {
+                    return Err(InterpError::Unsupported {
+                        feature: Unsupported::Array,
+                        span: word,
+                    }
+                    .into());
+                }
                 let Name::Variable(variable) = target else {
                     return Err(ExpandError::Discard(format!("${label}: cannot assign in this way")));
                 };
@@ -970,7 +1017,7 @@ impl arith::Variables for ArithVariables<'_, '_> {
     }
 
     fn set(&mut self, name: &str, value: i64) -> std::result::Result<(), Failure> {
-        if is_always_unemulated(name) {
+        if refuses_assignment(name) {
             return Err(Failure::Unsupported(Unsupported::ShellVariable));
         }
         self.expander
@@ -1166,7 +1213,7 @@ fn transform(op: char, text: &str, target: &Name, exported: bool) -> String {
         'A' => match target {
             Name::Variable(name) if exported => format!("declare -x {name}={}", quote(text)),
             Name::Variable(name) => format!("{name}={}", quote(text)),
-            Name::Positional(_) | Name::Special(_) => String::new(),
+            Name::Positional(_) | Name::Special(_) | Name::Pipestatus(_) => String::new(),
         },
         'a' => if exported { "x" } else { "" }.to_owned(),
         // `Q`, and `K` and `k`, which quote a scalar the same way.

@@ -5,6 +5,12 @@
 //! unreaped (running or a zombie) its id, which is also the group id, cannot be reused by the system. Once reaped,
 //! the group is forgotten and signalling it is refused, so a reused id is never signalled (CLAUDE.md
 //! "Concurrency").
+//!
+//! A shell's commands (KNSH-100) start through [`Processes::spawn_child`] instead, which lets the caller choose the
+//! group: the caller's own (a shell without job control, as bash runs a script), a new one (the first process of a
+//! job), or the group of a job already running (the later processes of a pipeline). A job's group may be signalled
+//! while this instance holds any of its members unreaped: the system never reuses the id of a process group that
+//! still has a member, so the id cannot name anything else.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -223,6 +229,102 @@ pub enum ExitStatus {
     Signalled(i32),
 }
 
+/// Which process group a child started with [`Processes::spawn_child`] belongs to (KNSH-100).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum GroupMembership {
+    /// The caller's own group: how a shell without job control starts every command (bash `set +m`, every
+    /// script). A signal to the caller's group, such as the supervisor's pause (FR-SES-10), reaches the child too.
+    #[default]
+    Inherit,
+    /// Leader of a new group whose id is the child's process id: the first process of a job under job control.
+    Lead,
+    /// A member of `group`, which must be a group this instance holds an unreaped member of: a later process of the
+    /// same job (`a | b` puts `b` in `a`'s group).
+    Join(ProcessGroupId),
+}
+
+/// How a child started with [`Processes::spawn_child`] treats the signals a shell's job control is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ChildSignals {
+    /// As the caller has them.
+    #[default]
+    Inherit,
+    /// `SIGINT`, `SIGQUIT`, `SIGTSTP`, `SIGTTIN` and `SIGTTOU` at their default action: a job under job control,
+    /// whose interactive shell ignores them itself (an ignored signal stays ignored across `exec`).
+    Default,
+    /// `SIGINT` and `SIGQUIT` ignored: an asynchronous command (`cmd &`) of a shell without job control, as bash
+    /// starts it, so an interrupt at the terminal does not reach it.
+    IgnoreInterrupt,
+}
+
+/// How [`Processes::spawn_child`] places a child among process groups and the terminal.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChildOptions {
+    /// The child's process group.
+    pub group: GroupMembership,
+    /// A terminal to hand to the child's new group before it executes (`tcsetpgrp` in the child, with `SIGTTOU`
+    /// blocked, as bash does), so a foreground job never reads the terminal before it owns it. Only with
+    /// [`GroupMembership::Lead`]; ignored otherwise. A failure to hand it over is ignored, as bash ignores it.
+    pub terminal: Option<SharedFd>,
+    /// The signals the child starts with.
+    pub signals: ChildSignals,
+}
+
+/// A child started by [`Processes::spawn_child`] and not yet known to be reaped: what the caller waits for.
+///
+/// It names the child by process id and by a generation private to the instance that started it, so a handle kept
+/// after its child was reaped never reaches another process that was given the same id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChildHandle {
+    pid: i32,
+    generation: u64,
+    group: Option<ProcessGroupId>,
+}
+
+impl ChildHandle {
+    /// A handle for `pid`, started in `generation`, in `group` (`None`: the caller's group). Only backends make
+    /// handles.
+    pub(crate) const fn new(pid: i32, generation: u64, group: Option<ProcessGroupId>) -> Self {
+        Self { pid, generation, group }
+    }
+
+    /// The child's process id, for display only (`$!`, `jobs -l`): never signal it, it may be reused once reaped.
+    #[must_use]
+    pub const fn pid(self) -> i32 {
+        self.pid
+    }
+
+    /// The generation the backend tagged the child with.
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    /// The process group the child was placed in, or `None` for the caller's own ([`GroupMembership::Inherit`]).
+    #[must_use]
+    pub const fn group(self) -> Option<ProcessGroupId> {
+        self.group
+    }
+}
+
+/// What [`Processes::wait_child`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChildEvent {
+    /// The child ended and was reaped; its handle is spent.
+    Exited(ExitStatus),
+    /// A signal with this number stopped the child (`SIGTSTP` from the terminal's Ctrl-Z, `SIGSTOP`).
+    Stopped(i32),
+    /// A stopped child was continued (`SIGCONT`).
+    Continued,
+}
+
+/// The error of a [`Processes`] method a backend does not provide.
+const fn not_provided(operation: crate::error::Operation) -> PlatformError {
+    PlatformError::Os {
+        operation,
+        errno: libc::ENOTSUP,
+    }
+}
+
 /// Starts and controls processes. Object safe: hold it as `Arc<dyn Processes>`.
 pub trait Processes: Send + Sync {
     /// Starts `request.program` as the leader of a new process group and keeps a handle to it.
@@ -271,4 +373,41 @@ pub trait Processes: Send + Sync {
     ///
     /// As [`Processes::wait`].
     fn try_wait(&self, group: ProcessGroupId) -> Result<Option<ExitStatus>, PlatformError>;
+
+    /// Starts `request.program` placed as `options` says and keeps it unreaped until [`Processes::wait_child`]
+    /// reports its exit (KNSH-100). `request.stdio`, `inherit` and `placements` apply as for [`Processes::spawn`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Processes::spawn`]; [`PlatformError::UnknownProcessGroup`] for [`GroupMembership::Join`] of a group this
+    /// instance holds no unreaped member of. A backend without it fails with `ENOTSUP` ([`PlatformError::Os`]).
+    fn spawn_child(&self, request: &SpawnRequest, options: &ChildOptions) -> Result<ChildHandle, PlatformError> {
+        let _ = (request, options);
+        Err(not_provided(crate::error::Operation::Spawn))
+    }
+
+    /// Blocks until `child` stops, continues or exits, and reports which. An exit reaps the child; the handle is
+    /// spent afterwards. One thread waits for a given child at a time.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::UnknownProcessGroup`] for a handle this instance did not give or whose child was reaped;
+    /// [`PlatformError::Os`] with [`Operation::Wait`](crate::Operation::Wait). `ENOTSUP` without a backend.
+    fn wait_child(&self, child: ChildHandle) -> Result<ChildEvent, PlatformError> {
+        let _ = child;
+        Err(not_provided(crate::error::Operation::Wait))
+    }
+
+    /// Sends `signal` to every process in `group`, a group of children started by [`Processes::spawn_child`]: only
+    /// while this instance holds a member of it unreaped (so the id still names that group), or a group from
+    /// [`Processes::spawn`] it still holds.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::UnknownProcessGroup`] otherwise; [`PlatformError::Os`] with
+    /// [`Operation::Signal`](crate::Operation::Signal) if the system refuses. `ENOTSUP` without a backend.
+    fn signal_job(&self, group: ProcessGroupId, signal: Signal) -> Result<(), PlatformError> {
+        let _ = (group, signal);
+        Err(not_provided(crate::error::Operation::Signal))
+    }
 }

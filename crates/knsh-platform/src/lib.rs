@@ -208,6 +208,8 @@
 //! - FR-AGT-13, decision 3 (Endpoint Security descendant client, KNSH-094)
 //! - NFR-COMPAT-01, NFR-COMPAT-09 (external commands of the native interpreter and their exit statuses, KNSH-096)
 //! - NFR-COMPAT-02 (home directories for the interpreter's tilde expansion, KNSH-097)
+//! - NFR-COMPAT-02, FR-SES-10 (children placed in process groups, stops reported, job groups signalled only while a
+//!   member is held, pipes, the terminal's foreground group and the `time` clocks, KNSH-100)
 //! - FR-POL-11 (canonical paths), NFR-PRIV-02 (no secrets or output in logs), CLAUDE.md "Persistence" and
 //!   "Concurrency" (atomic replace; never signal a reused pid)
 
@@ -226,6 +228,7 @@ mod error;
 mod file_events;
 mod fs;
 mod holders;
+mod job;
 pub mod launchd;
 mod log;
 mod lookup;
@@ -258,7 +261,7 @@ pub use ancestry::{AuditToken, ProcessIdentity, ProcessKey, ProcessTree};
 pub use clock::{Clock, Monotonic};
 pub use collation::{ByteCollation, Collation, is_c_locale, tie_break};
 pub use command::{
-    ChildDescriptor, CommandOutcome, CommandRequest, CommandSpawner, ProcessCommandSpawner, StandardStream,
+    ChildDescriptor, CommandOutcome, CommandRequest, CommandSpawner, ProcessCommandSpawner, StandardStream, Started,
 };
 pub use control::{
     AfterMessage, BYTES_KEY, BundleVersion, CodeSigning, ConnectionId, ControlHandler, ControlPeer, JSON_KEY,
@@ -274,14 +277,15 @@ pub use error::{Operation, PlatformError, SqliteCode};
 pub use file_events::{FileEvent, FileEventFlags, FileEventSink, FileEventStream, FileEvents};
 pub use fs::{FileKind, Fs, Metadata};
 pub use holders::{HeldFile, HoldKind, MAX_HELD_FILES, MAX_PROCESSES, ProcessEntry, WriteHolders};
+pub use job::{CpuTimes, JobTerminal, ShellTimes, signals};
 pub use launchd::{LaunchAgent, PeerCredentials, ServiceManager, SocketActivation, install_agent, uninstall_agent};
 pub use log::{Field, Level, SystemLog, Value, render};
 pub use policy_source::{EditableProfile, FileState, PolicyDirectory};
 pub use presence::{Authenticated, NotAuthenticated, PromptReason, UserPresence};
 pub use probe::{ProbeFailure, SystemProbe};
 pub use process::{
-    ExitStatus, MAX_PLACED_FD, Placement, PlacementSource, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest,
-    Stdio,
+    ChildEvent, ChildHandle, ChildOptions, ChildSignals, ExitStatus, GroupMembership, MAX_PLACED_FD, Placement,
+    PlacementSource, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest, Stdio,
 };
 pub use random::Random;
 pub use resolver::{MAX_ADDRESSES, Resolver};

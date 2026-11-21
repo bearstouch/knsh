@@ -23,6 +23,13 @@ pub enum FakeOpened {
     },
     /// A here-string holding these bytes.
     HereString(Vec<u8>),
+    /// One end of the `n`th pipe made (from 0): the write end when `write`, else the read end (KNSH-100).
+    Pipe {
+        /// Which pipe.
+        n: usize,
+        /// Which end.
+        write: bool,
+    },
 }
 
 /// Largest file the fake reads back when appending, far above anything a test writes.
@@ -41,6 +48,8 @@ pub struct FakeDescriptors {
     /// What each live descriptor number stands for. A number is reused once its descriptor is closed; opening again
     /// replaces the entry.
     opened: Mutex<BTreeMap<i32, FakeOpened>>,
+    /// Pipes made so far.
+    pipes: Mutex<usize>,
 }
 
 fn os(errno: i32) -> PlatformError {
@@ -57,6 +66,7 @@ impl FakeDescriptors {
         Self {
             fs,
             opened: Mutex::new(BTreeMap::new()),
+            pipes: Mutex::new(0),
         }
     }
 
@@ -123,6 +133,17 @@ impl Descriptors for FakeDescriptors {
 
     fn here_string(&self, text: &[u8]) -> Result<SharedFd, PlatformError> {
         self.hand_out(FakeOpened::HereString(text.to_vec()))
+    }
+
+    fn pipe(&self) -> Result<(SharedFd, SharedFd), PlatformError> {
+        let n = {
+            let mut pipes = lock(&self.pipes);
+            *pipes += 1;
+            *pipes - 1
+        };
+        let read = self.hand_out(FakeOpened::Pipe { n, write: false })?;
+        let write = self.hand_out(FakeOpened::Pipe { n, write: true })?;
+        Ok((read, write))
     }
 
     fn write_all(&self, fd: &SharedFd, bytes: &[u8]) -> Result<(), PlatformError> {

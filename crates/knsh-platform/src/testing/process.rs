@@ -6,7 +6,9 @@ use std::sync::Mutex;
 
 use super::lock;
 use crate::error::{Operation, PlatformError};
-use crate::process::{ExitStatus, ProcessGroupId, Processes, Signal, SpawnRequest};
+use crate::process::{
+    ChildEvent, ChildHandle, ChildOptions, ExitStatus, GroupMembership, ProcessGroupId, Processes, Signal, SpawnRequest,
+};
 
 /// First group id handed out; low ids are left alone so a fake id never looks like `init` or the test runner.
 const FIRST_GROUP: i32 = 10_000;
@@ -29,6 +31,9 @@ struct Running {
     script: Script,
     /// Set by the first terminating signal for [`Script::RunsUntilSignalled`].
     ended_by: Option<i32>,
+    /// The group a child of [`Processes::spawn_child`] is in (`None` for the caller's); a [`Processes::spawn`] group
+    /// is its own.
+    group: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -124,8 +129,55 @@ impl Processes for ScriptedProcesses {
         }
         let id = state.next_group;
         state.next_group += 1;
-        state.running.insert(id, Running { script, ended_by: None });
+        state.running.insert(
+            id,
+            Running {
+                script,
+                ended_by: None,
+                group: Some(id),
+            },
+        );
         Ok(ProcessGroupId::from_raw(id))
+    }
+
+    fn spawn_child(&self, request: &SpawnRequest, options: &ChildOptions) -> Result<ChildHandle, PlatformError> {
+        if let GroupMembership::Join(group) = options.group {
+            let state = lock(&self.state);
+            if !state
+                .running
+                .values()
+                .any(|running| running.group == Some(group.as_raw()))
+            {
+                return Err(PlatformError::UnknownProcessGroup);
+            }
+        }
+        let id = self.spawn(request)?.as_raw();
+        let group = match options.group {
+            GroupMembership::Inherit => None,
+            GroupMembership::Lead => Some(id),
+            GroupMembership::Join(group) => Some(group.as_raw()),
+        };
+        if let Some(running) = lock(&self.state).running.get_mut(&id) {
+            running.group = group;
+        }
+        Ok(ChildHandle::new(id, 0, group.map(ProcessGroupId::from_raw)))
+    }
+
+    fn wait_child(&self, child: ChildHandle) -> Result<ChildEvent, PlatformError> {
+        self.wait(ProcessGroupId::from_raw(child.pid())).map(ChildEvent::Exited)
+    }
+
+    fn signal_job(&self, group: ProcessGroupId, signal: Signal) -> Result<(), PlatformError> {
+        let mut state = lock(&self.state);
+        if !state
+            .running
+            .values()
+            .any(|running| running.group == Some(group.as_raw()))
+        {
+            return Err(PlatformError::UnknownProcessGroup);
+        }
+        state.signals.push((group, signal));
+        Ok(())
     }
 
     fn signal(&self, group: ProcessGroupId, signal: Signal) -> Result<(), PlatformError> {

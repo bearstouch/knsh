@@ -16,5 +16,11 @@ knsh-platform = { path = "../knsh-platform" }
 [dev-dependencies]
 knsh-platform = { path = "../knsh-platform", features = ["testing"] }
 
+# Job control end to end (KNSH-100): its own `main`, so the test binary can also be the interactive shell it drives
+# under a pseudo-terminal.
+[[test]]
+name = "job_control"
+harness = false
+
 [lints]
 workspace = true

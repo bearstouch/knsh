@@ -1,4 +1,4 @@
-//! The check of a whole script before it runs (KNSH-096, KNSH-097, KNSH-098): every construct a later story
+//! The check of a whole script before it runs (KNSH-096 to KNSH-100): every construct a later story
 //! implements is refused here, with its span, so a script the interpreter cannot evaluate runs none of its commands.
 //!
 //! Expansions are read but not performed: each `${…}` body is parsed, and the words and expressions inside it are
@@ -22,7 +22,7 @@ use crate::expand::MAX_EXPANSION_DEPTH;
 use crate::param::{self, Name, Op, Parsed};
 use crate::pattern;
 use crate::scan::{self, Mode, Part};
-use crate::state::{is_always_unemulated, lists_always_unemulated};
+use crate::state::{is_always_unemulated, lists_always_unemulated, refuses_assignment};
 use crate::word::{self, Context, WordChar};
 
 /// Checks `items` (a script's top-level list) against `source`, nesting at most `max_depth` lists.
@@ -31,14 +31,22 @@ use crate::word::{self, Context, WordChar};
 ///
 /// [`InterpError::Unsupported`] for the first unsupported construct in source order, [`InterpError::DepthExceeded`]
 /// past `max_depth`, [`InterpError::SourceMismatch`] if a span does not index `source`.
-pub(crate) fn check(items: &[ListItem], source: &str, max_depth: usize) -> Result<(), InterpError> {
-    Checker { source, max_depth }.list(items, 0)
+/// `times`: whether the interpreter has clocks for the `time` keyword, which is refused without them.
+pub(crate) fn check(items: &[ListItem], source: &str, max_depth: usize, times: bool) -> Result<(), InterpError> {
+    Checker {
+        source,
+        max_depth,
+        times,
+    }
+    .list(items, 0)
 }
 
 /// The walk's fixed inputs.
 struct Checker<'a> {
     source: &'a str,
     max_depth: usize,
+    /// The interpreter has clocks for `time`.
+    times: bool,
 }
 
 const fn refuse(feature: Unsupported, span: Span) -> InterpError {
@@ -53,11 +61,6 @@ impl Checker<'_> {
         }
         for item in items {
             self.and_or(&item.and_or, depth + 1)?;
-            if item.is_background()
-                && let Some(separator) = item.separator
-            {
-                return Err(refuse(Unsupported::Background, separator.span));
-            }
         }
         Ok(())
     }
@@ -69,14 +72,12 @@ impl Checker<'_> {
     }
 
     fn pipeline(&self, pipeline: &Pipeline, depth: usize) -> Result<(), InterpError> {
-        if let Some(time) = pipeline.time {
+        if let Some(time) = pipeline.time
+            && !self.times
+        {
             return Err(refuse(Unsupported::Time, time.span()));
         }
-        self.command(&pipeline.first, depth)?;
-        match pipeline.rest.first() {
-            Some(part) => Err(refuse(Unsupported::Pipeline, part.operator_span)),
-            None => Ok(()),
-        }
+        pipeline.commands().try_for_each(|command| self.command(command, depth))
     }
 
     fn command(&self, command: &Command, depth: usize) -> Result<(), InterpError> {
@@ -117,7 +118,7 @@ impl Checker<'_> {
     fn simple(&self, simple: &SimpleCommand) -> Result<(), InterpError> {
         for assignment in &simple.assignments {
             // Bash maintains these itself, and refuses some (`UID`, `PPID`) as read-only, running nothing.
-            if is_always_unemulated(&assignment.name) {
+            if refuses_assignment(&assignment.name) {
                 return Err(refuse(Unsupported::ShellVariable, assignment.span));
             }
             let parts = word::parts(&assignment.word.segments, self.source, assignment.value.start)?;
@@ -160,7 +161,7 @@ impl Checker<'_> {
                 | RedirectionOperator::AppendAll => Context::Argument,
             };
             if let Some(variable) = &redirect.variable
-                && is_always_unemulated(&variable.name)
+                && refuses_assignment(&variable.name)
             {
                 return Err(refuse(Unsupported::ShellVariable, variable.span));
             }
@@ -171,7 +172,6 @@ impl Checker<'_> {
 
     fn compound(&self, compound: &CompoundCommand, depth: usize) -> Result<(), InterpError> {
         match &compound.kind {
-            CompoundKind::Subshell(_) => return Err(refuse(Unsupported::Subshell, compound.span)),
             CompoundKind::For(command) => {
                 self.word(&command.variable, Context::Plain)?;
                 for item in command.items.iter().flat_map(|items| &items.words) {
@@ -188,7 +188,11 @@ impl Checker<'_> {
                     self.list(&clause.body, depth)?;
                 }
             }
-            CompoundKind::Group(_) | CompoundKind::If(_) | CompoundKind::While(_) | CompoundKind::Until(_) => {
+            CompoundKind::Subshell(_)
+            | CompoundKind::Group(_)
+            | CompoundKind::If(_)
+            | CompoundKind::While(_)
+            | CompoundKind::Until(_) => {
                 for list in compound.kind.lists() {
                     self.list(list, depth)?;
                 }

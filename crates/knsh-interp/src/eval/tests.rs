@@ -51,6 +51,11 @@ struct Harness {
 impl Harness {
     /// `/bin` holds [`PROGRAMS`]; `true` exits 0 and `false` 1; `PATH=/bin`.
     fn new() -> Self {
+        Self::with(|interpreter| interpreter)
+    }
+
+    /// As [`Harness::new`], with the interpreter changed by `configure` (job control, clocks).
+    fn with(configure: impl FnOnce(Interpreter) -> Interpreter) -> Self {
         let fs = Arc::new(MemFs::new());
         fs.add_dir_all(Path::new("/bin")).unwrap();
         fs.add_dir_all(Path::new("/work")).unwrap();
@@ -77,6 +82,7 @@ impl Harness {
             Box::new(diagnostics.clone()),
         )
         .with_output(Box::new(output.clone()));
+        let interpreter = configure(interpreter);
         Self {
             interpreter,
             commands,
@@ -115,6 +121,8 @@ impl Harness {
                     ChildDescriptor::Open(file) => match self.descriptors.opened(file) {
                         Some(FakeOpened::File { path, .. }) => path.display().to_string(),
                         Some(FakeOpened::HereString(text)) => format!("<<<{}", String::from_utf8_lossy(&text)),
+                        Some(FakeOpened::Pipe { n, write: true }) => format!("|{n}>"),
+                        Some(FakeOpened::Pipe { n, write: false }) => format!("<{n}|"),
                         None => "unknown".to_owned(),
                     },
                 };
@@ -496,10 +504,13 @@ fn unsupported_constructs_are_refused_before_anything_runs() {
         ("true; { true; } <<-EOF\nx\nEOF\n", Unsupported::HereDocument),
         ("true; exec ls", Unsupported::Builtin),
         ("true; exec -a x ls", Unsupported::Builtin),
-        ("true | true", Unsupported::Pipeline),
-        ("true &", Unsupported::Background),
-        ("(true)", Unsupported::Subshell),
+        // KNSH-100: without clocks `time` cannot report; PIPESTATUS is read, never assigned; an index needing
+        // arithmetic is an array access (KNSH-103).
         ("time true", Unsupported::Time),
+        ("true; PIPESTATUS=1", Unsupported::ShellVariable),
+        ("true; echo ${PIPESTATUS[$x]}", Unsupported::Array),
+        ("true | { echo $(ls); }", Unsupported::CommandSubstitution),
+        ("true & (cd /)", Unsupported::Builtin),
         ("f() { true; }", Unsupported::FunctionDefinition),
         ("true; cd /", Unsupported::Builtin),
         ("if true; then export X; fi", Unsupported::Builtin),
@@ -1295,3 +1306,5 @@ fn moving_a_descriptor_onto_itself_keeps_it() {
     assert_eq!(h.status("exec 4>f; exec 4>&4-; x"), 0);
     assert_eq!(h.table(0)[3], (4, "/work/f".to_owned()));
 }
+
+mod jobs;

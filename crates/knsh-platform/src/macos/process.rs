@@ -10,6 +10,12 @@
 //! Waiting must not hold that lock while it blocks, or nobody could signal a running group. [`SystemProcesses::wait`]
 //! therefore blocks in `waitid(…, WNOWAIT)`, which reports the exit without reaping, and only then takes the lock,
 //! removes the entry and reaps.
+//!
+//! A shell's children ([`Processes::spawn_child`], KNSH-100) are kept the same way in a second map of the same
+//! table, with the group each joined. A job's group is signalled only while one of its members is in that map: a
+//! process group id is not reused while the group has a member, and a member this instance has not reaped is still
+//! a member (exited or not). Joining a group is checked and done under the lock, so the group cannot lose its last
+//! held member in between.
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
@@ -21,7 +27,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::error::{Operation, PlatformError};
 use crate::process::{
-    ExitStatus, MAX_PLACED_FD, PlacementSource, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest, Stdio,
+    ChildEvent, ChildHandle, ChildOptions, ChildSignals, ExitStatus, GroupMembership, MAX_PLACED_FD, PlacementSource,
+    ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest, Stdio,
 };
 
 /// Starts processes in new process groups and signals only the groups it holds.
@@ -41,6 +48,33 @@ struct Table {
     next_generation: u64,
     /// Unreaped leaders by group id, with the generation they were spawned in.
     entries: HashMap<i32, (u64, Child)>,
+    /// Unreaped children of [`Processes::spawn_child`] by process id (KNSH-100).
+    children: HashMap<i32, HeldChild>,
+}
+
+/// A child of [`Processes::spawn_child`], unreaped.
+#[derive(Debug)]
+struct HeldChild {
+    /// The generation it was spawned in.
+    generation: u64,
+    /// The process.
+    child: Child,
+    /// The group it was placed in, `None` for the caller's.
+    group: Option<i32>,
+}
+
+impl Table {
+    /// Whether `group` is a group this instance may signal: a leader of [`Processes::spawn`] or a member of
+    /// [`Processes::spawn_child`] in it is unreaped.
+    fn holds_group(&self, group: i32) -> bool {
+        self.entries.contains_key(&group) || self.children.values().any(|held| held.group == Some(group))
+    }
+
+    /// The next generation.
+    fn generation(&mut self) -> u64 {
+        self.next_generation += 1;
+        self.next_generation
+    }
 }
 
 impl SystemProcesses {
@@ -363,39 +397,242 @@ fn wait_exit_without_reaping(pid: i32) -> Result<(), PlatformError> {
     }
 }
 
+/// The command for `request`, with its descriptors set up and `membership` placing it in a group. Job setup
+/// (`job`) runs in the child before the descriptor setup, which may execute the program itself.
+fn build_command(
+    request: &SpawnRequest,
+    membership: GroupMembership,
+    job: Option<&ChildOptions>,
+) -> Result<Command, PlatformError> {
+    if !request.program.is_absolute() {
+        return Err(PlatformError::InvalidPath);
+    }
+    let mut command = Command::new(&request.program);
+    command
+        .args(&request.args)
+        .env_clear()
+        .envs(request.env.iter().map(|(k, v)| (k, v)));
+    match membership {
+        // `setpgid(0, group)` in the child before exec (and before the closures below).
+        GroupMembership::Lead => {
+            command.process_group(0);
+        }
+        GroupMembership::Join(group) => {
+            command.process_group(group.as_raw());
+        }
+        GroupMembership::Inherit => {}
+    }
+    if let Some(argv0) = &request.argv0 {
+        command.arg0(argv0);
+    }
+    if let Some(cwd) = &request.cwd {
+        command.current_dir(cwd);
+    }
+    let [stdin, stdout, stderr] = standard_descriptors(&request.stdio)?;
+    command.stdin(stdin).stdout(stdout).stderr(stderr);
+    if let Some(options) = job {
+        child_job_setup(&mut command, options);
+    }
+    child_descriptors(&mut command, request)?;
+    Ok(command)
+}
+
+/// Signals whose disposition [`ChildSignals::Default`] resets: what an interactive shell ignores for itself.
+const JOB_SIGNALS: [i32; 5] = [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU];
+
+/// In the child, after std placed it in its group and before exec: hands it the terminal (a foreground job's leader)
+/// and sets its signals as `options` says (KNSH-100).
+fn child_job_setup(command: &mut Command, options: &ChildOptions) {
+    let terminal = match options.group {
+        GroupMembership::Lead => options.terminal.as_ref().map(AsRawFd::as_raw_fd),
+        GroupMembership::Inherit | GroupMembership::Join(_) => None,
+    };
+    let signals = options.signals;
+    // SAFETY: the closure runs in the forked child before `exec`. It only calls `sigemptyset`, `sigaddset`,
+    // `pthread_sigmask`, `tcsetpgrp`, `getpgrp` and `sigaction`, all async-signal-safe, on stack values and on the
+    // terminal descriptor, which the child inherited at the fork (the `SharedFd` in `options` outlives the spawn).
+    unsafe {
+        command.pre_exec(move || {
+            if let Some(fd) = terminal {
+                // With `SIGTTOU` blocked a process outside the foreground group may still set it, so a shell that
+                // does not ignore `SIGTTOU` itself does not stop its child here. A failure is ignored, as bash's
+                // `give_terminal_to` ignores it.
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                let mut old: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&raw mut set);
+                libc::sigaddset(&raw mut set, libc::SIGTTOU);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, &raw mut old);
+                libc::tcsetpgrp(fd, libc::getpgrp());
+                libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut());
+            }
+            let (wanted, chosen): (&[i32], libc::sighandler_t) = match signals {
+                ChildSignals::Inherit => (&[], libc::SIG_DFL),
+                ChildSignals::Default => (&JOB_SIGNALS, libc::SIG_DFL),
+                ChildSignals::IgnoreInterrupt => (&[libc::SIGINT, libc::SIGQUIT], libc::SIG_IGN),
+            };
+            for &signal in wanted {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = chosen;
+                if libc::sigaction(signal, &raw const action, std::ptr::null_mut()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+/// The process id of a spawned `child`.
+fn child_pid(child: &Child) -> Result<i32, PlatformError> {
+    i32::try_from(child.id()).map_err(|_| PlatformError::Os {
+        operation: Operation::Spawn,
+        errno: libc::ERANGE,
+    })
+}
+
+/// What `waitid` reported for a child: the `si_code` and `si_status` of the report.
+fn wait_report(pid: i32, flags: libc::c_int) -> Result<Option<(libc::c_int, libc::c_int)>, PlatformError> {
+    let id = libc::id_t::try_from(pid).map_err(|_| PlatformError::UnknownProcessGroup)?;
+    loop {
+        // SAFETY: an all-zero `siginfo_t` is a valid value (it is a plain C struct of integers and pointers).
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a valid, writable `siginfo_t` for the duration of the call; `waitid` touches no other
+        // memory.
+        let rc = unsafe { libc::waitid(libc::P_PID, id, &raw mut info, flags) };
+        if rc == 0 {
+            // With `WNOHANG` and nothing to report, `si_pid` stays zero.
+            return Ok((info.si_pid != 0).then_some((info.si_code, info.si_status)));
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::ECHILD) => return Err(PlatformError::UnknownProcessGroup),
+            _ => return Err(PlatformError::from_io(Operation::Wait, &error)),
+        }
+    }
+}
+
 impl Processes for SystemProcesses {
     fn spawn(&self, request: &SpawnRequest) -> Result<ProcessGroupId, PlatformError> {
-        if !request.program.is_absolute() {
-            return Err(PlatformError::InvalidPath);
-        }
-        let mut command = Command::new(&request.program);
-        command
-            .args(&request.args)
-            .env_clear()
-            .envs(request.env.iter().map(|(k, v)| (k, v)))
-            // A new group led by the child itself (`setpgid(0, 0)` in the child before exec).
-            .process_group(0);
-        if let Some(argv0) = &request.argv0 {
-            command.arg0(argv0);
-        }
-        if let Some(cwd) = &request.cwd {
-            command.current_dir(cwd);
-        }
-        let [stdin, stdout, stderr] = standard_descriptors(&request.stdio)?;
-        command.stdin(stdin).stdout(stdout).stderr(stderr);
-        child_descriptors(&mut command, request)?;
+        // A new group led by the child itself (`setpgid(0, 0)` in the child before exec).
+        let mut command = build_command(request, GroupMembership::Lead, None)?;
         let child = command
             .spawn()
             .map_err(|error| PlatformError::from_io(Operation::Spawn, &error))?;
-        let pid = i32::try_from(child.id()).map_err(|_| PlatformError::Os {
-            operation: Operation::Spawn,
-            errno: libc::ERANGE,
-        })?;
+        let pid = child_pid(&child)?;
         let mut table = self.table();
-        table.next_generation += 1;
-        let generation = table.next_generation;
+        let generation = table.generation();
         table.entries.insert(pid, (generation, child));
         Ok(ProcessGroupId::from_raw(pid))
+    }
+
+    fn spawn_child(&self, request: &SpawnRequest, options: &ChildOptions) -> Result<ChildHandle, PlatformError> {
+        let mut command = build_command(request, options.group, Some(options))?;
+        let spawn = |command: &mut Command| {
+            let child = command
+                .spawn()
+                .map_err(|error| PlatformError::from_io(Operation::Spawn, &error))?;
+            let pid = child_pid(&child)?;
+            Ok::<_, PlatformError>((child, pid))
+        };
+        let (mut table, child, pid, group) = match options.group {
+            // Checked and spawned under the lock: the group keeps a held member until the new one is in it.
+            GroupMembership::Join(group) => {
+                let table = self.table();
+                if !table.holds_group(group.as_raw()) {
+                    return Err(PlatformError::UnknownProcessGroup);
+                }
+                let (child, pid) = spawn(&mut command)?;
+                (table, child, pid, Some(group.as_raw()))
+            }
+            GroupMembership::Lead => {
+                let (child, pid) = spawn(&mut command)?;
+                (self.table(), child, pid, Some(pid))
+            }
+            GroupMembership::Inherit => {
+                let (child, pid) = spawn(&mut command)?;
+                (self.table(), child, pid, None)
+            }
+        };
+        let generation = table.generation();
+        table.children.insert(
+            pid,
+            HeldChild {
+                generation,
+                child,
+                group,
+            },
+        );
+        Ok(ChildHandle::new(pid, generation, group.map(ProcessGroupId::from_raw)))
+    }
+
+    fn wait_child(&self, handle: ChildHandle) -> Result<ChildEvent, PlatformError> {
+        let pid = handle.pid();
+        let held = |table: &Table| {
+            table
+                .children
+                .get(&pid)
+                .is_some_and(|held| held.generation == handle.generation())
+        };
+        if !held(&self.table()) {
+            return Err(PlatformError::UnknownProcessGroup);
+        }
+        loop {
+            // Blocks without the lock and without consuming anything: the child stays unreaped, so its id and its
+            // group's id stay reserved while other threads signal the job.
+            let report = wait_report(pid, libc::WEXITED | libc::WSTOPPED | libc::WCONTINUED | libc::WNOWAIT)?;
+            match report {
+                Some((libc::CLD_STOPPED, _)) => {
+                    // Consume the stop (and only a stop: without `WEXITED` this never reaps).
+                    if let Some((_, signal)) = wait_report(pid, libc::WSTOPPED | libc::WNOHANG)? {
+                        return Ok(ChildEvent::Stopped(signal));
+                    }
+                }
+                Some((libc::CLD_CONTINUED, _)) => {
+                    if wait_report(pid, libc::WCONTINUED | libc::WNOHANG)?.is_some() {
+                        return Ok(ChildEvent::Continued);
+                    }
+                }
+                Some(_) => {
+                    let mut table = self.table();
+                    if !held(&table) {
+                        return Err(PlatformError::UnknownProcessGroup);
+                    }
+                    let Some(mut entry) = table.children.remove(&pid) else {
+                        return Err(PlatformError::UnknownProcessGroup);
+                    };
+                    drop(table);
+                    // The child has exited (reported above), so this returns at once.
+                    let status = entry
+                        .child
+                        .wait()
+                        .map_err(|error| PlatformError::from_io(Operation::Wait, &error))?;
+                    return Ok(ChildEvent::Exited(convert(status)));
+                }
+                // Not possible without `WNOHANG`; ask again.
+                None => {}
+            }
+        }
+    }
+
+    fn signal_job(&self, group: ProcessGroupId, signal: Signal) -> Result<(), PlatformError> {
+        // Under the lock, so the last held member cannot be reaped (and the group id freed) before `killpg`.
+        let table = self.table();
+        if !table.holds_group(group.as_raw()) {
+            return Err(PlatformError::UnknownProcessGroup);
+        }
+        // SAFETY: `killpg` takes plain integers and touches no memory. A member of the group is unreaped, so the id
+        // still names the group this instance's children are in.
+        let rc = unsafe { libc::killpg(group.as_raw(), signal.number()) };
+        drop(table);
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(PlatformError::from_io(
+                Operation::Signal,
+                &std::io::Error::last_os_error(),
+            ))
+        }
     }
 
     fn signal(&self, group: ProcessGroupId, signal: Signal) -> Result<(), PlatformError> {
@@ -791,5 +1028,133 @@ mod tests {
         );
         let error = processes.spawn(&SpawnRequest::new("/nonexistent/knsh")).unwrap_err();
         assert!(error.is_not_found(), "{error:?}");
+    }
+
+    /// The process group of `pid`.
+    fn group_of(pid: i32) -> i32 {
+        // SAFETY: `getpgid` takes a plain integer and touches no memory.
+        unsafe { libc::getpgid(pid) }
+    }
+
+    fn options(group: GroupMembership) -> ChildOptions {
+        ChildOptions {
+            group,
+            terminal: None,
+            signals: ChildSignals::Default,
+        }
+    }
+
+    // KNSH-100: a child stays in the caller's group, leads its own, or joins a held one; joining a group with no
+    // held member is refused.
+    #[test]
+    fn spawn_child_places_children_in_groups() {
+        let processes = SystemProcesses::new();
+        let sleep = SpawnRequest::new("/bin/sleep").arg("5");
+        let inherit = processes.spawn_child(&sleep, &ChildOptions::default()).unwrap();
+        assert_eq!(inherit.group(), None);
+        // SAFETY: `getpgrp` has no preconditions and touches no memory.
+        assert_eq!(group_of(inherit.pid()), unsafe { libc::getpgrp() });
+        let leader = processes.spawn_child(&sleep, &options(GroupMembership::Lead)).unwrap();
+        let group = leader.group().unwrap();
+        assert_eq!(group.as_raw(), leader.pid());
+        assert_eq!(group_of(leader.pid()), leader.pid());
+        let member = processes
+            .spawn_child(&sleep, &options(GroupMembership::Join(group)))
+            .unwrap();
+        assert_eq!(member.group(), Some(group));
+        assert_eq!(group_of(member.pid()), leader.pid());
+        // The leader ends; the member still holds the group, so it can be signalled.
+        processes.signal_job(group, Signal::Kill).unwrap();
+        assert_eq!(
+            processes.wait_child(leader).unwrap(),
+            ChildEvent::Exited(ExitStatus::Signalled(libc::SIGKILL))
+        );
+        assert_eq!(
+            processes.wait_child(member).unwrap(),
+            ChildEvent::Exited(ExitStatus::Signalled(libc::SIGKILL))
+        );
+        // CLAUDE.md "Concurrency": no member held, so neither signalling nor joining the old id is allowed.
+        assert_eq!(
+            processes.signal_job(group, Signal::Kill),
+            Err(PlatformError::UnknownProcessGroup)
+        );
+        assert_eq!(
+            processes.spawn_child(&sleep, &options(GroupMembership::Join(group))),
+            Err(PlatformError::UnknownProcessGroup)
+        );
+        assert_eq!(processes.wait_child(leader), Err(PlatformError::UnknownProcessGroup));
+        // A child in the caller's group is no job group: never signalled through it.
+        // SAFETY: as above.
+        let own = ProcessGroupId::from_raw(unsafe { libc::getpgrp() });
+        assert_eq!(
+            processes.signal_job(own, Signal::Continue),
+            Err(PlatformError::UnknownProcessGroup)
+        );
+        // SAFETY: `kill` on a child this test started and has not reaped (its id cannot be reused).
+        unsafe { libc::kill(inherit.pid(), libc::SIGKILL) };
+        assert!(matches!(processes.wait_child(inherit).unwrap(), ChildEvent::Exited(_)));
+    }
+
+    // KNSH-100: stops and continues are reported, then the exit; a stop is never mistaken for an exit.
+    #[test]
+    fn wait_child_reports_stops_and_continues() {
+        let processes = SystemProcesses::new();
+        let child = processes
+            .spawn_child(
+                &SpawnRequest::new("/bin/sleep").arg("5"),
+                &options(GroupMembership::Lead),
+            )
+            .unwrap();
+        let group = child.group().unwrap();
+        processes.signal_job(group, Signal::Stop).unwrap();
+        assert_eq!(processes.wait_child(child).unwrap(), ChildEvent::Stopped(libc::SIGSTOP));
+        processes.signal_job(group, Signal::Continue).unwrap();
+        assert_eq!(processes.wait_child(child).unwrap(), ChildEvent::Continued);
+        processes.signal_job(group, Signal::Terminate).unwrap();
+        assert_eq!(
+            processes.wait_child(child).unwrap(),
+            ChildEvent::Exited(ExitStatus::Signalled(libc::SIGTERM))
+        );
+        let ends = processes
+            .spawn_child(&SpawnRequest::new("/usr/bin/true"), &ChildOptions::default())
+            .unwrap();
+        assert_eq!(
+            processes.wait_child(ends).unwrap(),
+            ChildEvent::Exited(ExitStatus::Exited(0))
+        );
+    }
+
+    // KNSH-100: an asynchronous command without job control ignores SIGINT; a job-control child has it at default.
+    #[test]
+    fn child_signals_are_set_before_exec() {
+        let processes = SystemProcesses::new();
+        let sleep = SpawnRequest::new("/bin/sleep").arg("5");
+        let ignoring = processes
+            .spawn_child(
+                &sleep,
+                &ChildOptions {
+                    group: GroupMembership::Lead,
+                    terminal: None,
+                    signals: ChildSignals::IgnoreInterrupt,
+                },
+            )
+            .unwrap();
+        let group = ignoring.group().unwrap();
+        processes.signal_job(group, Signal::Interrupt).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        processes.signal_job(group, Signal::Terminate).unwrap();
+        assert_eq!(
+            processes.wait_child(ignoring).unwrap(),
+            ChildEvent::Exited(ExitStatus::Signalled(libc::SIGTERM)),
+            "SIGINT was ignored"
+        );
+        let default = processes.spawn_child(&sleep, &options(GroupMembership::Lead)).unwrap();
+        processes
+            .signal_job(default.group().unwrap(), Signal::Interrupt)
+            .unwrap();
+        assert_eq!(
+            processes.wait_child(default).unwrap(),
+            ChildEvent::Exited(ExitStatus::Signalled(libc::SIGINT))
+        );
     }
 }

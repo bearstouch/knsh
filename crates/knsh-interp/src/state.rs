@@ -55,6 +55,17 @@ pub struct ShellOptions {
     /// `set -C` (`set -o noclobber`): `>` and `&>` refuse to overwrite an existing regular file; `>|` still does
     /// (KNSH-099).
     pub noclobber: bool,
+    /// `set -o pipefail`: a pipeline's status is that of its last command to fail, or 0 when every command
+    /// succeeded (KNSH-100).
+    pub pipefail: bool,
+    /// `shopt -s lastpipe`: while job control is off, the last command of a pipeline runs in the shell itself, so
+    /// its assignments last (KNSH-100).
+    pub lastpipe: bool,
+    /// `set -m`: job control. Each pipeline and background list runs as a job in a process group of its own; an
+    /// interactive shell ([`Interpreter::with_job_control`](crate::Interpreter::with_job_control)) also hands its
+    /// terminal to the foreground job and reports stopped jobs. Off, every command stays in the shell's own process
+    /// group, as bash runs a script (KNSH-100).
+    pub monitor: bool,
 }
 
 /// `IFS` as bash sets it at start-up: space, tab, newline.
@@ -93,7 +104,6 @@ const UNEMULATED: &[&str] = &[
     "OLDPWD",
     "OPTERR",
     "OPTIND",
-    "PIPESTATUS",
     "PPID",
     "RANDOM",
     "SECONDS",
@@ -125,6 +135,27 @@ pub(crate) fn is_always_unemulated(name: &str) -> bool {
     UNEMULATED.contains(&name)
 }
 
+/// The array of the last pipeline's statuses, which the shell keeps itself (KNSH-100). It is read like any variable
+/// (`$PIPESTATUS`, `${PIPESTATUS[@]}`); assigning it is refused, as bash would overwrite it after the next pipeline
+/// and the interpreter has no arrays to hold another value (KNSH-103).
+pub(crate) const PIPESTATUS: &str = "PIPESTATUS";
+
+/// Whether assigning `name` must be refused: a variable bash maintains itself, or `PIPESTATUS`.
+pub(crate) fn refuses_assignment(name: &str) -> bool {
+    is_always_unemulated(name) || name == PIPESTATUS
+}
+
+/// What `$!` names: the last background job's last command (KNSH-100).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LastBackground {
+    /// A process with this id.
+    Process(i32),
+    /// A command the shell runs itself (a compound command or a list): bash's would be a forked subshell's process
+    /// id, which does not exist here, so reading `$!` is refused rather than given a number that may name a
+    /// stranger's process.
+    InShell,
+}
+
 /// Whether `${!prefix*}` could list one of the variables bash always maintains itself, whatever the state.
 pub(crate) fn lists_always_unemulated(prefix: &str) -> bool {
     UNEMULATED.iter().any(|name| name.starts_with(prefix))
@@ -150,6 +181,12 @@ pub struct ShellState {
     cwd: PathBuf,
     /// `$$`.
     pid: u32,
+    /// `PIPESTATUS`: the statuses of the last foreground pipeline's commands, in order (KNSH-100).
+    pipestatus: Vec<Status>,
+    /// `$!`, unset until a job runs in the background.
+    last_background: Option<LastBackground>,
+    /// Whether this is an interactive shell (`i` in `$-`).
+    interactive: bool,
 }
 
 impl ShellState {
@@ -174,6 +211,9 @@ impl ShellState {
             options: ShellOptions::default(),
             cwd,
             pid: std::process::id(),
+            pipestatus: vec![Status::SUCCESS],
+            last_background: None,
+            interactive: false,
         };
         state.start_up(None);
         Ok(state)
@@ -304,6 +344,40 @@ impl ShellState {
     /// Sets `$?`.
     pub(crate) fn set_last_status(&mut self, status: Status) {
         self.last_status = status;
+    }
+
+    /// `PIPESTATUS`: the status of each command of the last foreground pipeline, in order, before `!` and
+    /// `pipefail` (KNSH-100). A simple command or a subshell is a pipeline of one; a compound command run in the
+    /// shell (`{ …; }`, `if`, loops) leaves it as its last pipeline set it, as in bash. This is what fills an
+    /// execution record's `pipestatus` field.
+    #[must_use]
+    pub fn pipestatus(&self) -> &[Status] {
+        &self.pipestatus
+    }
+
+    /// Sets `PIPESTATUS`.
+    pub(crate) fn set_pipestatus(&mut self, statuses: Vec<Status>) {
+        self.pipestatus = statuses;
+    }
+
+    /// Whether this is an interactive shell.
+    pub(crate) fn is_interactive(&self) -> bool {
+        self.interactive
+    }
+
+    /// Marks the shell interactive or not.
+    pub(crate) fn set_interactive(&mut self, interactive: bool) {
+        self.interactive = interactive;
+    }
+
+    /// `$!`.
+    pub(crate) fn last_background(&self) -> Option<LastBackground> {
+        self.last_background
+    }
+
+    /// Sets `$!`.
+    pub(crate) fn set_last_background(&mut self, last: LastBackground) {
+        self.last_background = Some(last);
     }
 
     /// The `set` and `shopt` options.

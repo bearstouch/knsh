@@ -1,4 +1,4 @@
-//! KNSH-096, KNSH-097 and KNSH-098 integration tests: scripts run under the native interpreter (real processes
+//! KNSH-096 to KNSH-100 integration tests: scripts run under the native interpreter (real processes
 //! through `SystemProcesses`, real lookups and directory listings through `RealFs`, the system's collation) and under
 //! `/bin/bash`; standard output and exit status must match (NFR-COMPAT-01, NFR-COMPAT-02).
 //!
@@ -139,6 +139,8 @@ fn run_knsh_full(
 ) -> (String, u8) {
     let (mut reader, writer) = std::io::pipe().unwrap();
     let null = || SharedFd::new(OwnedFd::from(std::fs::File::open("/dev/null").unwrap()));
+    // KNSH-100: what the shell writes to standard output itself (`jobs`) goes into the same pipe as its commands'.
+    let own_output = std::fs::File::from(OwnedFd::from(writer.try_clone().unwrap()));
     let stdio = Stdio::Passed(Box::new([null(), SharedFd::new(OwnedFd::from(writer)), null()]));
     let spawner = ProcessCommandSpawner::new(Arc::new(SystemProcesses::new()), stdio);
     let environment = std::iter::once(("PATH", PATH))
@@ -158,9 +160,9 @@ fn run_knsh_full(
         Arc::new(SystemCollation::new()),
         Arc::new(SystemDescriptors::new()),
         Box::new(std::io::sink()),
-    );
+    )
+    .with_output(Box::new(own_output));
     let parsed = knsh_bash::parse_with(script, knsh_bash::ParseOptions::default().with_extglob(extglob)).unwrap();
-    // KNSH-099: what the shell writes to standard output itself goes nowhere, as for bash's captured stderr here.
     let status = interpreter.run(&parsed, script).unwrap();
     // The interpreter holds the spawner, which holds the pipe's write end: drop it so the read sees end of file.
     drop(interpreter);
@@ -189,9 +191,10 @@ fn fifty_line_script_matches_bash() {
 fn signalled_command_is_128_plus_signal() {
     let script = "/bin/kill -9 0\n";
     let dir = temp_dir("signal");
-    // `kill 0` signals the caller's own process group: the native spawner puts every command in a new group, so
-    // only the command dies. Under bash it would kill bash too, so compare against the documented value instead.
-    let knsh = run_knsh(script, &dir);
+    // `kill 0` signals the caller's own process group. Without job control a command stays in the shell's group, as
+    // in bash (KNSH-100), where it would kill the test runner too; under `set -m` it leads a group of its own, so
+    // only the command dies. Compared against the documented value.
+    let knsh = run_knsh_full(script, &dir, &[], |options| options.monitor = true, &[]);
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(knsh, (String::new(), 137));
 }
@@ -401,5 +404,70 @@ fn noclobber_matches_bash() {
     std::fs::remove_dir_all(&bash_dir).unwrap();
     std::fs::remove_dir_all(&knsh_dir).unwrap();
     assert_eq!(bash.0, "refused\na\nc\nnull-ok\n");
+    assert_eq!(knsh, bash);
+}
+
+/// Pipelines, `PIPESTATUS`, subshells, background jobs and `wait` (KNSH-100), in forms bash 3.2 and 5.2 agree on.
+/// `yes | head` checks that no copy of a pipe's read end is left open in the shell: `yes` must die of `SIGPIPE`.
+const PIPELINES: &str = r#"printf 'a\nb\nc\n' | /usr/bin/sort -r
+printf 'x y\n' | /usr/bin/tr ' ' '\n' | /usr/bin/wc -l | /usr/bin/tr -d ' '
+false | true; echo "${PIPESTATUS[@]}" $?
+true | false; echo "$PIPESTATUS" "${#PIPESTATUS[@]}" "${PIPESTATUS[1]}" "${PIPESTATUS[*]}"
+! false | false; echo $? "${PIPESTATUS[@]}"
+{ false | true; }; echo "${PIPESTATUS[@]}"
+( /bin/sh -c 'exit 3' ); echo "${PIPESTATUS[@]}" $?
+false; /bin/sleep 0 & echo "${PIPESTATUS[@]}"
+(( 0 )); echo "${PIPESTATUS[@]}"
+v=1; ( v=2; echo "in $v" ); echo "out $v"
+x=1 | x=2; echo "x=$x"
+echo grouped | { /bin/cat; echo after-cat; }
+{ echo one; echo two; } | /usr/bin/sort -r
+( echo sub-a; echo sub-b ) | /usr/bin/tail -n 1
+if true; then echo in-if; fi | /usr/bin/tr a-z A-Z
+for w in p q; do echo "$w"; done | /usr/bin/sort -r
+echo upper | /usr/bin/tr a-z A-Z > out.txt; /bin/cat out.txt
+/usr/bin/yes | /usr/bin/head -n 2; echo "${PIPESTATUS[@]}"
+( echo to-stderr >&2 ) 2>&1 | /usr/bin/tr a-z A-Z
+/bin/sleep 0.1 & wait $!; echo "waited $?"
+/bin/sh -c 'exit 4' & p=$!; wait $p; echo "status $?"
+/bin/sh -c 'exit 6' & /bin/sh -c 'exit 7' & wait; echo "all $?"
+/bin/sh -c 'exit 2' | /bin/sh -c 'exit 5' & wait $!; echo "last $?"
+/bin/echo bg-out & wait
+wait 999999; echo "notchild $?"
+/bin/sleep 0.3 & jobs; wait; jobs; echo jobs-done
+w=1 & wait; echo "w=${w-unset}"
+false && echo no & wait; echo after-list
+"#;
+
+// NFR-COMPAT-02, KNSH-100: pipelines, PIPESTATUS, subshells, `&` and `wait` match bash with real processes and pipes.
+#[test]
+fn pipeline_script_matches_bash() {
+    let bash_dir = temp_dir("bash-pipes");
+    let knsh_dir = temp_dir("knsh-pipes");
+    let bash = run_bash(PIPELINES, &bash_dir);
+    let knsh = run_knsh(PIPELINES, &knsh_dir);
+    std::fs::remove_dir_all(&bash_dir).unwrap();
+    std::fs::remove_dir_all(&knsh_dir).unwrap();
+    assert!(bash.0.contains("141 0\n"), "bash output: {}", bash.0);
+    assert!(
+        bash.0.contains("[1]+  Running                 /bin/sleep 0.3 &\n"),
+        "bash output: {}",
+        bash.0
+    );
+    assert_eq!(knsh, bash);
+}
+
+// NFR-COMPAT-02, KNSH-100: under `set -o pipefail` a pipeline's status is its last failing command's.
+#[test]
+fn pipefail_matches_bash() {
+    let script = "false | true; echo $?; true | false | true; echo $?; (/bin/sh -c 'exit 2') | (/bin/sh -c 'exit 3') | true; echo $?; \
+                  true | true; echo $?; ! false | true; echo $?\n";
+    let bash_dir = temp_dir("bash-pipefail");
+    let knsh_dir = temp_dir("knsh-pipefail");
+    let bash = run_bash_full(script, &bash_dir, &[], &["-o", "pipefail"], &[]);
+    let knsh = run_knsh_full(script, &knsh_dir, &[], |options| options.pipefail = true, &[]);
+    std::fs::remove_dir_all(&bash_dir).unwrap();
+    std::fs::remove_dir_all(&knsh_dir).unwrap();
+    assert_eq!(bash.0, "1\n1\n3\n0\n0\n");
     assert_eq!(knsh, bash);
 }

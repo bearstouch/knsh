@@ -102,7 +102,7 @@ impl From<PlatformError> for InterpError {
 /// Bash features the interpreter refuses until the story that implements them, which each variant names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Unsupported {
-    /// `$(…)`, `` `…` `` (KNSH-100, which runs them in a child shell and captures their output).
+    /// `$(…)`, `` `…` `` (KNSH-105, which runs them in a child shell and captures their output).
     CommandSubstitution,
     /// `<(…)`, `>(…)` (KNSH-105).
     ProcessSubstitution,
@@ -132,13 +132,11 @@ pub enum Unsupported {
     Redirection,
     /// A here-document, `<<` or `<<-` (KNSH-105).
     HereDocument,
-    /// A pipeline of more than one command (KNSH-100).
-    Pipeline,
-    /// A list run in the background with `&` (KNSH-100).
-    Background,
-    /// A subshell `( … )` (KNSH-100).
-    Subshell,
-    /// The `time` keyword (KNSH-100).
+    /// `$!` after a background job whose last command the shell runs itself (`{ …; } &`, `a && b &`): bash's value
+    /// is a forked subshell's process id, which does not exist here, and any number given instead could name another
+    /// process.
+    InShellProcessId,
+    /// The `time` keyword in an interpreter given no clocks ([`Interpreter::with_times`](crate::Interpreter::with_times)).
     Time,
     /// A function definition (KNSH-103).
     FunctionDefinition,
@@ -152,7 +150,7 @@ pub enum Unsupported {
 impl fmt::Display for Unsupported {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CommandSubstitution => f.write_str("command substitution (KNSH-100)"),
+            Self::CommandSubstitution => f.write_str("command substitution (KNSH-105)"),
             Self::ProcessSubstitution => f.write_str("process substitution (KNSH-105)"),
             Self::BraceBuiltExpansion => f.write_str("an expansion formed by brace expansion"),
             Self::UnsplitJoin => {
@@ -166,10 +164,8 @@ impl fmt::Display for Unsupported {
             Self::NonUtf8FileName => f.write_str("a file name that is not UTF-8"),
             Self::Redirection => f.write_str("a redirection of an arithmetic command"),
             Self::HereDocument => f.write_str("here-document (KNSH-105)"),
-            Self::Pipeline => f.write_str("pipeline (KNSH-100)"),
-            Self::Background => f.write_str("background list (KNSH-100)"),
-            Self::Subshell => f.write_str("subshell (KNSH-100)"),
-            Self::Time => f.write_str("the time keyword (KNSH-100)"),
+            Self::InShellProcessId => f.write_str("$! of a background job the shell runs itself"),
+            Self::Time => f.write_str("the time keyword without clocks"),
             Self::FunctionDefinition => f.write_str("function definition (KNSH-103)"),
             Self::Builtin => f.write_str("this builtin (KNSH-101, KNSH-102)"),
             Self::Construct(construct) => write!(f, "{construct}"),

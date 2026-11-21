@@ -192,6 +192,15 @@ impl Descriptors for SystemDescriptors {
         self.temp_file(text)
     }
 
+    fn pipe(&self) -> Result<(SharedFd, SharedFd), PlatformError> {
+        // std's pipe is close-on-exec at both ends; a child gets an end only as a placement.
+        let (reader, writer) = std::io::pipe().map_err(|error| PlatformError::from_io(Operation::Pipe, &error))?;
+        Ok((
+            SharedFd::new(OwnedFd::from(reader)),
+            SharedFd::new(OwnedFd::from(writer)),
+        ))
+    }
+
     fn write_all(&self, fd: &SharedFd, bytes: &[u8]) -> Result<(), PlatformError> {
         let mut rest = bytes;
         while !rest.is_empty() {
