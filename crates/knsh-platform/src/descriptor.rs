@@ -54,6 +54,14 @@ pub trait Descriptors: Send + Sync {
     /// [`PlatformError::Os`] if no pipe or temporary file could be made or written.
     fn here_string(&self, text: &[u8]) -> Result<SharedFd, PlatformError>;
 
+    /// A new pipe, `(read end, write end)`, both close-on-exec: the connection between two commands of a pipeline
+    /// (KNSH-100).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Os`] with [`Operation::Pipe`](crate::Operation::Pipe) (`EMFILE`, `ENFILE`).
+    fn pipe(&self) -> Result<(SharedFd, SharedFd), PlatformError>;
+
     /// Writes all of `bytes` to `fd`: the shell's own messages when its standard error is redirected
     /// (`let 1/0 2>err`).
     ///

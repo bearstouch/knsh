@@ -45,6 +45,8 @@ tests (`crates/knsh-interp/src/expand/tests.rs`, `src/arith/tests.rs`); forms bo
 | `cmd <<<$x` (unquoted expansion in a here-string, KNSH-099) | Split on `IFS` and joined with spaces | Not split |
 | `{name}>file` (KNSH-099) | `{name}` is an ordinary word | Opens a descriptor from 10 up and stores its number in `name` |
 | `&>>file` (KNSH-099) | Syntax error | Appends standard output and error |
+| `a \|& b` (KNSH-100) | Syntax error | Standard error joins the pipe, after `a`'s own redirections |
+| `wait -n`, `shopt -s lastpipe` (KNSH-100) | No such option | First job to end; the last command of a pipeline runs in the shell without job control |
 | `${!x}` with `x` unset or empty | Expands to nothing | Error `x: invalid indirect expansion` or `: invalid variable name`, line abandoned |
 | `{01..03}`, `{1..9..2}`, `{a..e..2}` (KNSH-098) | No padding (`1 2 3`); a step leaves the word as written | Zero padding to the widest end; steps |
 | `**` with `globstar` (KNSH-098) | No such option: `**` is `*` | Any depth of directories |
@@ -68,6 +70,19 @@ is dropped; a program that vanishes between lookup and `exec` while descriptors 
 127 (126 if it cannot be executed) without bash's message. `{name}>file` is read only when the line is parsed with
 `knsh_bash::ParseOptions::redirection_variables`, which the native interpreter's caller sets (bash 3.2 reads
 `{name}` as a word, so without the option the line is refused).
+
+Known differences of the native interpreter from bash 5.2 in pipelines, subshells and job control (KNSH-100): a
+subshell is a copy of the interpreter, not a forked process ([decision 19](../09-reference/decisions.md)), so a
+background job whose last command the shell runs itself (`{ …; } &`, `a && b &`, `x=1 &`) has no process id and
+reading `$!` after it is refused rather than given a number that may belong to another process; under job control
+such a command (a compound pipeline stage, a subshell) cannot be stopped as a whole: its programs stop, and Ctrl-Z
+reports the job stopped once none of its programs runs; `jobs` and `fg` show the command's source text with blanks
+collapsed, where bash reprints it from its own parse; `jobs` in a pipeline stage lists the subshell's jobs (none), not
+the shell's; the state of a job a signal ended is macOS's `strsignal` text (`Terminated: 15`); `disown` forgets a
+job, so a later `wait` for its process id is `not a child of this shell` (127); `$-` has no `H` (history arrives
+with KNSH-107); `time` adds the shell's own CPU time and that of every child its process reaped meanwhile, which in
+a process running several shells includes the others'. The terminal modes a stopped job had are not saved for its
+`fg` (the shell restores its own).
 | Messages under `bash -c` | `bash: message` (no line number on one-line scripts) | `bash: line n: message` |
 | Arithmetic error token after trailing blanks (`$(( 1 + ))`) | `error token is " "` | The last token read: `error token is "+ "` |
 | `base#` with no digits (`$((2#))`) | 0 | Error `invalid integer constant` |

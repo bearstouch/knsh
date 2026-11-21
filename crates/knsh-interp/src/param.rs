@@ -23,6 +23,50 @@ pub(crate) enum Name {
     Positional(usize),
     /// `@ * # ? - $ !`.
     Special(char),
+    /// `${PIPESTATUS[…]}`: the one array the interpreter reads before arrays exist (KNSH-100; arrays are
+    /// KNSH-103).
+    Pipestatus(Subscript),
+}
+
+/// The subscript of `${PIPESTATUS[…]}`: what the interpreter reads without evaluating an arithmetic expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Subscript {
+    /// `[@]`, or `[*]` when `star`.
+    All {
+        /// `[*]`.
+        star: bool,
+    },
+    /// `[n]`, a decimal number, from the end when negative (bash 4.3 and later).
+    Index(i64),
+}
+
+impl Subscript {
+    /// The subscript `text` (between the brackets) spells, or `None` for one that needs arithmetic (`[$i]`,
+    /// `[1+1]`), which is refused with the other arrays.
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "@" => Some(Self::All { star: false }),
+            "*" => Some(Self::All { star: true }),
+            _ => {
+                let digits = text.strip_prefix('-').unwrap_or(text);
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                text.parse().ok().map(Self::Index)
+            }
+        }
+    }
+}
+
+/// The `PIPESTATUS` subscript at the start of `rest` (which starts with `[`) and its length with the brackets, when
+/// `name` is `PIPESTATUS`.
+fn pipestatus_subscript(name: &Name, rest: &str) -> Option<(Subscript, usize)> {
+    if *name != Name::Variable(crate::state::PIPESTATUS.to_owned()) {
+        return None;
+    }
+    let inner = rest.strip_prefix('[')?;
+    let close = inner.find(']')?;
+    Some((Subscript::parse(&inner[..close])?, close + 2))
 }
 
 impl Name {
@@ -42,9 +86,9 @@ impl Name {
         }
     }
 
-    /// Whether this is `$@` or `$*`, which expand to the positional parameters.
+    /// Whether this is `$@` or `$*`, which expand to the positional parameters, or `${PIPESTATUS[@]}`.
     pub(crate) const fn is_list(&self) -> bool {
-        matches!(self, Self::Special('@' | '*'))
+        matches!(self, Self::Special('@' | '*') | Self::Pipestatus(Subscript::All { .. }))
     }
 }
 
@@ -54,6 +98,10 @@ impl std::fmt::Display for Name {
             Self::Variable(name) => f.write_str(name),
             Self::Positional(n) => write!(f, "{n}"),
             Self::Special(ch) => write!(f, "{ch}"),
+            Self::Pipestatus(Subscript::All { star }) => {
+                write!(f, "PIPESTATUS[{}]", if *star { '*' } else { '@' })
+            }
+            Self::Pipestatus(Subscript::Index(index)) => write!(f, "PIPESTATUS[{index}]"),
         }
     }
 }
@@ -227,7 +275,15 @@ fn length_or_hash(body: &str, at: &dyn Fn(usize, usize) -> Span) -> Parsed {
         // Bash reads everything after `#name` as part of the name: anything more is a bad substitution.
         return match leading_name(rest) {
             Some((name, len)) if len == rest.len() => Parsed::Length(name),
-            Some((_, len)) if rest.as_bytes().get(len) == Some(&b'[') => Parsed::Unsupported(Unsupported::Array),
+            Some((name, len)) if rest.as_bytes().get(len) == Some(&b'[') => {
+                match pipestatus_subscript(&name, &rest[len..]) {
+                    Some((subscript, taken)) if len + taken == rest.len() => {
+                        Parsed::Length(Name::Pipestatus(subscript))
+                    }
+                    Some(_) => Parsed::Bad,
+                    None => Parsed::Unsupported(Unsupported::Array),
+                }
+            }
             Some(_) | None => Parsed::Bad,
         };
     }
@@ -277,7 +333,18 @@ fn indirect(body: &str, at: &dyn Fn(usize, usize) -> Span) -> Parsed {
 /// The operator after the name, which ends at `from` in `body`.
 fn with_op(name: Name, indirect: bool, body: &str, from: usize, at: &dyn Fn(usize, usize) -> Span) -> Parsed {
     if body.as_bytes().get(from) == Some(&b'[') {
-        return Parsed::Unsupported(Unsupported::Array);
+        let rest = body.get(from..).unwrap_or("");
+        return match pipestatus_subscript(&name, rest) {
+            Some((subscript, taken)) if !indirect => match operator(body, from + taken, at) {
+                Some(op) => Parsed::Param {
+                    name: Name::Pipestatus(subscript),
+                    indirect,
+                    op,
+                },
+                None => Parsed::Bad,
+            },
+            Some(_) | None => Parsed::Unsupported(Unsupported::Array),
+        };
     }
     match operator(body, from, at) {
         Some(op) => Parsed::Param { name, indirect, op },

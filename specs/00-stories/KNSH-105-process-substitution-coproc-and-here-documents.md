@@ -9,11 +9,14 @@
 **Description.** As a script author, I want `<( )`, `>( )`, `coproc` and here-documents to work as in bash, so that
 advanced scripts run.
 
-Scope: process substitution via `/dev/fd/N`, `coproc` with named and default (`COPROC`) arrays, here-documents with
-and without expansion, `<<-` tab stripping. In phase 2 these were classified as dynamic when fed to shells or
+Scope: command substitution `$( )` and backquotes (moved here from KNSH-100: it captures a subshell's output as
+process substitution does), process substitution via `/dev/fd/N`, `coproc` with named and default (`COPROC`) arrays,
+here-documents with and without expansion, `<<-` tab stripping. In phase 2 these were classified as dynamic when fed to shells or
 interpreters (decision 6); in native mode each command they run is decided individually (KNSH-108).
 
 **Acceptance criteria**
+- [ ] `$(cmd)` and `` `cmd` `` give the command's output without its trailing newlines, split and globbed as bash
+      does, and `$?` after an assignment is the substitution's status.
 - [ ] `diff <(a) <(b)` works and descriptors are closed after use.
 - [ ] `coproc` exposes read/write descriptors and the PID like bash.
 - [ ] Quoted delimiters disable expansion in here-documents.

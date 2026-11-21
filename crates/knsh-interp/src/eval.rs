@@ -10,8 +10,9 @@
 //!   ran; `case` is its arm's last status, or 0 when no pattern matched or the arm is empty.
 //! - A command not found is 127, found but not executable 126, killed by signal `n` `128 + n`.
 //!
-//! External commands are found with [`crate::lookup`] through [`Fs`] and run through [`CommandSpawner`], the one
-//! seam every command passes through (KNSH-108 wraps it to decide on each). The shell's own error messages go to
+//! External commands are found with [`crate::lookup`] through [`Fs`] and started through [`CommandSpawner`], the one
+//! seam every command passes through (KNSH-108 wraps it to decide on each); pipelines, subshells and jobs are in
+//! `eval::job` (KNSH-100). The shell's own error messages go to
 //! the injected diagnostics writer as `name: line n: message`, bash 5's format.
 //!
 //! - `(( expression ))` is 0 when the expression is not zero, 1 when it is zero or fails; `let` likewise for its
@@ -30,15 +31,16 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use knsh_bash::{
     AndOr, AndOrOperator, ArithmeticParts, CaseClause, CaseCommand, CaseTerminatorKind, Command, CommandWord,
-    CompoundKind, ForCommand, IfCommand, ListItem, LoopBody, LoopCommand, Pipeline, Script, SimpleCommand, Span,
+    CompoundKind, ForCommand, IfCommand, ListItem, LoopBody, LoopCommand, Script, SimpleCommand, Span,
     UnsupportedCommand,
 };
 use knsh_platform::{
-    Collation, CommandOutcome, CommandRequest, CommandSpawner, Descriptors, ExitStatus, Fs, UserHomes,
+    ChildHandle, Collation, CommandOutcome, CommandRequest, CommandSpawner, Descriptors, ExitStatus, Fs, JobTerminal,
+    ShellTimes, Started, UserHomes,
 };
 
 use crate::arith::Failure;
@@ -46,6 +48,7 @@ use crate::brace;
 use crate::check;
 use crate::error::{InterpError, Unsupported};
 use crate::expand::{ExpandError, Expander};
+use crate::jobs::{JobSignals, Jobs, Parent, Registry};
 use crate::lookup::{self, Missing, Refusal, Resolved};
 use crate::pattern::Pattern;
 use crate::scan;
@@ -53,8 +56,11 @@ use crate::state::{ShellState, is_name};
 use crate::status::Status;
 use crate::word;
 
+mod job;
+mod job_builtins;
 mod redirect;
 
+use job::JobContext;
 use redirect::FdTable;
 pub(crate) use redirect::here_document;
 
@@ -94,8 +100,9 @@ pub(crate) fn is_refused_builtin(name: &str) -> bool {
         || LATER_BUILTINS.contains(&name)
 }
 
-/// Builtins the interpreter runs itself: `let` (KNSH-097), `:` and `exec` with redirections only (KNSH-099).
-const NATIVE_BUILTINS: &[&str] = &["let", ":", "exec"];
+/// Builtins the interpreter runs itself: `let` (KNSH-097), `:` and `exec` with redirections only (KNSH-099), and
+/// the job builtins `wait`, `jobs`, `fg`, `bg` and `disown` (KNSH-100).
+const NATIVE_BUILTINS: &[&str] = &["let", ":", "exec", "wait", "jobs", "fg", "bg", "disown"];
 
 /// Whether `exec` with `args` only changes the shell's descriptors (no arguments, or only `--`): the form the
 /// interpreter runs. `exec cmd` replaces the shell and is refused until KNSH-101.
@@ -174,8 +181,46 @@ impl From<InterpError> for Stop {
     }
 }
 
+impl From<knsh_platform::PlatformError> for Stop {
+    fn from(error: knsh_platform::PlatformError) -> Self {
+        Self::Error(InterpError::Platform(error))
+    }
+}
+
 /// The evaluator's result.
 type Flow<T> = Result<T, Stop>;
+
+/// Where the program a pipeline stage starts goes (KNSH-100).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Sink {
+    /// Not evaluating a stage: a program started is waited for at once.
+    #[default]
+    Off,
+    /// Evaluating a stage that has started nothing yet: a program started is kept here, not waited for.
+    Open,
+    /// The stage's program.
+    Started(ChildHandle),
+}
+
+impl Sink {
+    /// The program kept, if any.
+    const fn started(self) -> Option<ChildHandle> {
+        match self {
+            Self::Started(child) => Some(child),
+            Self::Off | Self::Open => None,
+        }
+    }
+}
+
+/// A writer the shell and its subshells (pipeline stages on other threads) share.
+type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
+/// Writes `bytes` to `writer`, ignoring a failure as bash ignores it.
+fn write_shared(writer: &SharedWriter, bytes: &[u8]) {
+    let mut writer = writer.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = writer.write_all(bytes);
+    let _ = writer.flush();
+}
 
 /// The native interpreter: shell state plus the injected effects it runs commands through.
 pub struct Interpreter {
@@ -189,13 +234,17 @@ pub struct Interpreter {
     homes: Arc<dyn UserHomes>,
     /// The order of pathname expansion results.
     collation: Arc<dyn Collation>,
-    /// Where redirections open their files (KNSH-099).
+    /// Where redirections open their files (KNSH-099) and pipes are made (KNSH-100).
     descriptors: Arc<dyn Descriptors>,
+    /// The clocks of the `time` keyword, if given (KNSH-100).
+    times: Option<Arc<dyn ShellTimes>>,
+    /// The terminal of an interactive shell with job control (KNSH-100).
+    terminal: Option<Arc<dyn JobTerminal>>,
     /// The spawner's standard error, for the shell's own messages while its descriptor 2 is that (bash's standard
-    /// error).
-    diagnostics: Box<dyn Write + Send>,
-    /// The spawner's standard output, for what the shell itself writes there (its messages after `2>&1`).
-    output: Box<dyn Write + Send>,
+    /// error). Shared with the shell's subshells.
+    diagnostics: SharedWriter,
+    /// The spawner's standard output, for what the shell itself writes there (its messages after `2>&1`, `jobs`).
+    output: SharedWriter,
     /// The shell's descriptor table: what each number holds for the script (KNSH-099). Kept across runs, so
     /// `exec 3>file` lasts as long as the shell.
     fds: FdTable,
@@ -203,6 +252,21 @@ pub struct Interpreter {
     max_depth: usize,
     /// Lists currently entered.
     depth: usize,
+    /// The shell's jobs (KNSH-100).
+    jobs: Jobs,
+    /// The job whose commands the shell is starting or running, if any: a pipeline stage, a background list or a
+    /// subshell places every program it starts in that job (KNSH-100).
+    placement: Option<JobContext>,
+    /// While a pipeline stage that is a simple command is evaluated: where its program goes once started, so the
+    /// stage does not wait for it.
+    sink: Sink,
+    /// The stage is followed by `|&`: its next redirections are followed by `2>&1`, as bash does.
+    pipe_stderr: bool,
+    /// This is a subshell: a copy of a shell, which never does job control.
+    is_subshell: bool,
+    /// A subshell on a thread of its own, a member of a job of its parent: where it reports that its foreground job
+    /// stopped under job control (KNSH-100).
+    parent: Option<Parent>,
 }
 
 impl fmt::Debug for Interpreter {
@@ -240,20 +304,65 @@ impl Interpreter {
             homes,
             collation,
             descriptors,
-            diagnostics,
-            output: Box::new(std::io::sink()),
+            times: None,
+            terminal: None,
+            diagnostics: Arc::new(Mutex::new(diagnostics)),
+            output: Arc::new(Mutex::new(Box::new(std::io::sink()))),
             fds: FdTable::standard(),
             max_depth: MAX_EVAL_DEPTH,
             depth: 0,
+            jobs: Jobs::new(Arc::new(Registry::default())),
+            placement: None,
+            sink: Sink::Off,
+            pipe_stderr: false,
+            is_subshell: false,
+            parent: None,
         }
     }
 
     /// The same interpreter writing what the shell itself sends to the spawner's standard output to `output` (its
-    /// messages after `2>&1`), so they land where commands' output does.
+    /// messages after `2>&1`, the output of `jobs`), so they land where commands' output does.
     #[must_use]
     pub fn with_output(mut self, output: Box<dyn Write + Send>) -> Self {
-        self.output = output;
+        self.output = Arc::new(Mutex::new(output));
         self
+    }
+
+    /// The same interpreter reading `times` for the `time` keyword (KNSH-100). Without clocks a script using `time`
+    /// is refused before it runs ([`Unsupported::Time`]).
+    #[must_use]
+    pub fn with_times(mut self, times: Arc<dyn ShellTimes>) -> Self {
+        self.times = Some(times);
+        self
+    }
+
+    /// The same interpreter as an interactive shell with job control (`bash -i`, KNSH-100): `set -m` is on, `$-`
+    /// holds `i` and `m`, each job runs in a process group of its own, a background job is announced as `[n] pid`,
+    /// and with `terminal` (the shell's controlling terminal, already taken for job control) each foreground job is
+    /// given the terminal, so Ctrl-Z stops it and the shell reports it stopped. The host calls
+    /// [`Interpreter::notify_jobs`] before each prompt.
+    #[must_use]
+    pub fn with_job_control(mut self, terminal: Option<Arc<dyn JobTerminal>>) -> Self {
+        self.state.set_interactive(true);
+        self.state.options_mut().monitor = true;
+        self.terminal = terminal;
+        self
+    }
+
+    /// A handle that stops and continues every job's process group: the supervisor's pause and resume (FR-SES-10).
+    #[must_use]
+    pub fn job_signals(&self) -> JobSignals {
+        JobSignals::new(Arc::clone(&self.jobs.registry), Arc::clone(&self.spawner))
+    }
+
+    /// Reports the background jobs that ended or stopped since the last report, as an interactive bash does before
+    /// each prompt (`[1]+  Done                    sleep 1`), and forgets those that ended.
+    ///
+    /// # Errors
+    ///
+    /// [`InterpError::Platform`] if waiting for a job's process failed.
+    pub fn notify_jobs(&mut self) -> Result<(), InterpError> {
+        self.notify()
     }
 
     /// The same interpreter with nesting limit `max_depth` instead of [`MAX_EVAL_DEPTH`]. A limit above
@@ -302,7 +411,7 @@ impl Interpreter {
 
     /// [`Interpreter::run`] on the current thread.
     fn run_here(&mut self, script: &Script, source: &str) -> Result<Status, InterpError> {
-        check::check(&script.items, source, self.max_depth)?;
+        check::check(&script.items, source, self.max_depth, self.times.is_some())?;
         self.depth = 0;
         let run = Run { source };
         match self.script(&script.items, &run) {
@@ -436,12 +545,12 @@ impl Interpreter {
                 }
                 discarding = None;
             }
-            if item.is_background()
-                && let Some(separator) = item.separator
-            {
-                return Err(unsupported(Unsupported::Background, separator.span).into());
-            }
-            match self.and_or(&item.and_or, run) {
+            let result = if item.is_background() {
+                self.background(&item.and_or, run)
+            } else {
+                self.and_or(&item.and_or, run)
+            };
+            match result {
                 Ok(done) => status = done,
                 Err(Stop::Discard) => {
                     status = Status::FAILURE;
@@ -464,12 +573,11 @@ impl Interpreter {
     fn list_items(&mut self, items: &[ListItem], run: &Run<'_>) -> Flow<Status> {
         let mut status = self.state.last_status();
         for item in items {
-            if item.is_background()
-                && let Some(separator) = item.separator
-            {
-                return Err(unsupported(Unsupported::Background, separator.span).into());
-            }
-            status = self.and_or(&item.and_or, run)?;
+            status = if item.is_background() {
+                self.background(&item.and_or, run)?
+            } else {
+                self.and_or(&item.and_or, run)?
+            };
         }
         Ok(status)
     }
@@ -489,31 +597,10 @@ impl Interpreter {
         Ok(status)
     }
 
-    /// A pipeline of one command, possibly negated. Sets `$?`.
-    fn pipeline(&mut self, pipeline: &Pipeline, run: &Run<'_>) -> Flow<Status> {
-        if let Some(time) = pipeline.time {
-            return Err(unsupported(Unsupported::Time, time.span()).into());
-        }
-        if let Some(part) = pipeline.rest.first() {
-            return Err(unsupported(Unsupported::Pipeline, part.operator_span).into());
-        }
-        let status = self.command(&pipeline.first, run)?;
-        let status = if pipeline.is_negated() {
-            status.negated()
-        } else {
-            status
-        };
-        self.state.set_last_status(status);
-        Ok(status)
-    }
-
     fn command(&mut self, command: &Command, run: &Run<'_>) -> Flow<Status> {
         match command {
             Command::Simple(simple) => self.simple(simple, run),
             Command::Compound(compound) => {
-                if let CompoundKind::Subshell(_) = compound.kind {
-                    return Err(unsupported(Unsupported::Subshell, compound.span).into());
-                }
                 if let Some(span) = here_document(&compound.redirections) {
                     return Err(unsupported(Unsupported::HereDocument, span).into());
                 }
@@ -523,7 +610,8 @@ impl Interpreter {
                 };
                 let result = match &compound.kind {
                     CompoundKind::Group(group) => self.list(&group.body, run),
-                    CompoundKind::Subshell(_) => Err(unsupported(Unsupported::Subshell, compound.span).into()),
+                    // Reached only in a subshell already (a pipeline stage, `( … )` alone): the body runs here.
+                    CompoundKind::Subshell(subshell) => self.list(&subshell.body, run),
                     CompoundKind::If(command) => self.if_command(command, run),
                     CompoundKind::For(command) => self.for_command(command, run),
                     CompoundKind::While(command) => self.loop_command(command, true, run),
@@ -768,6 +856,9 @@ impl Interpreter {
         if name == ":" || name == "exec" {
             return Ok(Status::SUCCESS);
         }
+        if let Some(result) = self.job_builtin(name, args, simple.span, run) {
+            return result;
+        }
         if name == "let" {
             // `a=1 let …` gives `let` a temporary scope bash's arithmetic reads and assigns in, and restores after:
             // not emulated, so refused rather than evaluated against the wrong variables.
@@ -801,7 +892,15 @@ impl Interpreter {
                     cwd: self.state.cwd().to_path_buf(),
                     descriptors: self.fds.child_table(),
                 };
-                let outcome = self.spawner.run(&request).map_err(InterpError::from)?;
+                let outcome = match self.start_command(&request)? {
+                    Started::Refused(outcome) => outcome,
+                    // A pipeline stage: the pipeline waits for it with the others.
+                    Started::Running(child) if self.sink == Sink::Open => {
+                        self.sink = Sink::Started(child);
+                        return Ok(Status::SUCCESS);
+                    }
+                    Started::Running(child) => self.wait_alone(child)?,
+                };
                 Ok(self.outcome_status(outcome, name, simple.span, run))
             }
             Resolved::NotFound(missing) => {

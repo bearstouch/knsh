@@ -9,13 +9,21 @@
 //! Every external command of a script goes through this one trait. That is the seam KNSH-108 uses: a spawner that
 //! wraps another one sees each resolved command before it starts, and can submit it for a decision (and refuse it)
 //! before delegating. [`ProcessCommandSpawner`] is the plain implementation over [`Processes`].
+//!
+//! Pipelines, background jobs and job control (KNSH-100) need commands that run side by side: the interpreter
+//! starts each with [`CommandSpawner::start`], placed in a process group as [`ChildOptions`] says, and waits for it
+//! with [`CommandSpawner::wait`], which also reports stops (Ctrl-Z). [`CommandSpawner::run`] starts one command in
+//! the caller's group and waits for it to end.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::error::{Operation, PlatformError};
-use crate::process::{ExitStatus, Placement, PlacementSource, Processes, SharedFd, SpawnRequest, Stdio};
+use crate::process::{
+    ChildEvent, ChildHandle, ChildOptions, ExitStatus, Placement, PlacementSource, ProcessGroupId, Processes, SharedFd,
+    Signal, SpawnRequest, Stdio,
+};
 
 /// One external command, resolved by the interpreter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,24 +108,66 @@ pub enum CommandOutcome {
     NotExecutable,
 }
 
-/// Starts one external command and waits for it. Object safe: hold it as `Arc<dyn CommandSpawner>`.
+/// What [`CommandSpawner::start`] did with a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Started {
+    /// The command is running: wait for it with [`CommandSpawner::wait`].
+    Running(ChildHandle),
+    /// It never ran: [`CommandOutcome::NotFound`] or [`CommandOutcome::NotExecutable`], with the meaning those have
+    /// for [`CommandSpawner::run`] (a refusal by a deciding wrapper included, KNSH-108).
+    Refused(CommandOutcome),
+}
+
+/// Starts external commands and waits for them. Object safe: hold it as `Arc<dyn CommandSpawner>`.
 ///
 /// Implementations may refuse a command before it starts (KNSH-108) by returning
-/// [`CommandOutcome::NotExecutable`] after reporting the reason themselves.
+/// [`Started::Refused`] with [`CommandOutcome::NotExecutable`] after reporting the reason themselves.
 pub trait CommandSpawner: Send + Sync {
-    /// Runs `request` to completion.
+    /// Starts `request` placed as `options` says, without waiting for it.
     ///
     /// # Errors
     ///
     /// A failure that is not the program's fault and has no bash exit status, for example no process could be
-    /// created (`EAGAIN`) or waiting failed. The interpreter stops the script on it.
-    fn run(&self, request: &CommandRequest) -> Result<CommandOutcome, PlatformError>;
+    /// created (`EAGAIN`), or [`PlatformError::UnknownProcessGroup`] for a group to join that is gone. The
+    /// interpreter stops the script on it.
+    fn start(&self, request: &CommandRequest, options: &ChildOptions) -> Result<Started, PlatformError>;
+
+    /// Blocks until `child` stops, continues or ends. After [`ChildEvent::Exited`] the handle is spent.
+    ///
+    /// # Errors
+    ///
+    /// Waiting failed, or the handle is not one this spawner gave out and still holds.
+    fn wait(&self, child: ChildHandle) -> Result<ChildEvent, PlatformError>;
+
+    /// Sends `signal` to the process group `group` of commands this spawner started, while it holds one of them
+    /// unreaped (job control's `fg`, `bg`, and the supervisor's pause, FR-SES-10).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::UnknownProcessGroup`] when no member is held any more; the system's refusal otherwise.
+    fn signal_job(&self, group: ProcessGroupId, signal: Signal) -> Result<(), PlatformError>;
+
+    /// Runs `request` to completion in the caller's process group: [`CommandSpawner::start`] with default options,
+    /// then [`CommandSpawner::wait`] until it ends (stops are waited through).
+    ///
+    /// # Errors
+    ///
+    /// As [`CommandSpawner::start`] and [`CommandSpawner::wait`].
+    fn run(&self, request: &CommandRequest) -> Result<CommandOutcome, PlatformError> {
+        match self.start(request, &ChildOptions::default())? {
+            Started::Refused(outcome) => Ok(outcome),
+            Started::Running(child) => loop {
+                match self.wait(child)? {
+                    ChildEvent::Exited(status) => return Ok(CommandOutcome::Finished(status)),
+                    ChildEvent::Stopped(_) | ChildEvent::Continued => {}
+                }
+            },
+        }
+    }
 }
 
-/// [`CommandSpawner`] over [`Processes`]: each command starts in its own process group with the given standard
-/// descriptors, and the call blocks until the group leader exits.
-///
-/// Job control (foreground process groups, `SIGINT` forwarding) belongs to KNSH-100 and is not done here.
+/// [`CommandSpawner`] over [`Processes`]: each command starts with the given standard descriptors, in the process
+/// group its [`ChildOptions`] name (the caller's own by default, as bash runs a script's commands).
 #[derive(Clone)]
 pub struct ProcessCommandSpawner {
     /// Starts and waits for the processes.
@@ -143,7 +193,7 @@ impl std::fmt::Debug for ProcessCommandSpawner {
 }
 
 impl CommandSpawner for ProcessCommandSpawner {
-    fn run(&self, request: &CommandRequest) -> Result<CommandOutcome, PlatformError> {
+    fn start(&self, request: &CommandRequest, options: &ChildOptions) -> Result<Started, PlatformError> {
         let spawn = SpawnRequest {
             program: request.program.clone(),
             argv0: Some(request.argv0.clone()),
@@ -154,15 +204,22 @@ impl CommandSpawner for ProcessCommandSpawner {
             inherit: Vec::new(),
             placements: placements(&request.descriptors),
         };
-        let group = match self.processes.spawn(&spawn) {
-            Ok(group) => group,
+        match self.processes.spawn_child(&spawn, options) {
+            Ok(child) => Ok(Started::Running(child)),
             Err(PlatformError::Os {
                 operation: Operation::Spawn,
                 errno,
-            }) => return exec_failure(errno),
-            Err(error) => return Err(error),
-        };
-        self.processes.wait(group).map(CommandOutcome::Finished)
+            }) => exec_failure(errno).map(Started::Refused),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn wait(&self, child: ChildHandle) -> Result<ChildEvent, PlatformError> {
+        self.processes.wait_child(child)
+    }
+
+    fn signal_job(&self, group: ProcessGroupId, signal: Signal) -> Result<(), PlatformError> {
+        self.processes.signal_job(group, signal)
     }
 }
 
@@ -196,11 +253,11 @@ fn placements(descriptors: &[(i32, ChildDescriptor)]) -> Vec<Placement> {
 
 /// The outcome of a spawn that failed with `errno`, as bash's `shell_execve` reports it: `ENOENT` is 127, every
 /// other refusal by `exec` is 126. Running out of processes or descriptors is not an `exec` refusal and stays an
-/// error.
+/// error, and so does a backend without [`Processes::spawn_child`] (`ENOTSUP`).
 fn exec_failure(errno: i32) -> Result<CommandOutcome, PlatformError> {
     match errno {
         libc::ENOENT => Ok(CommandOutcome::NotFound),
-        libc::EAGAIN | libc::EMFILE | libc::ENFILE | libc::ENOMEM => Err(PlatformError::Os {
+        libc::EAGAIN | libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOTSUP => Err(PlatformError::Os {
             operation: Operation::Spawn,
             errno,
         }),

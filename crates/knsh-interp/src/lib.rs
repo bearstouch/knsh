@@ -14,7 +14,11 @@
 //! `{name}` descriptors, closing with `-`, moving with `n-`, `set -C` as [`ShellOptions::noclobber`]), applied left to
 //! right on the shell's own descriptor table and undone after each command, `exec` with redirections only (kept for
 //! the shell's life) and `:`; `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd/N` name the shell's
-//! descriptors, and `/dev/tcp` and `/dev/udp` are refused (FR-NET-08).
+//! descriptors, and `/dev/tcp` and `/dev/udp` are refused (FR-NET-08). KNSH-100 adds pipelines (`|`, `|&`,
+//! `PIPESTATUS`, `pipefail` and `lastpipe` as [`ShellOptions`]), `( … )` subshells, background jobs (`&`, `$!`), the
+//! job builtins `wait` (with `-n`), `jobs`, `fg`, `bg` and `disown`, the `time` keyword, and job control (`set -m`
+//! as [`ShellOptions::monitor`]; an interactive shell with its terminal through [`Interpreter::with_job_control`],
+//! and [`JobSignals`] for the supervisor's pause, FR-SES-10).
 //!
 //! # Boundaries
 //!
@@ -29,8 +33,12 @@
 //!   (bash's `strcoll` order), redirection files opened through [`knsh_platform::Descriptors`], and commands run
 //!   through [`knsh_platform::CommandSpawner`] with exactly the shell's descriptor table, so tests run without
 //!   processes or a real filesystem and no descriptor of the interpreter's own process reaches a command. That spawner is where KNSH-108 inserts a decision before each command.
-//! - What later stories implement (command substitution, here-documents, pipelines and subshells, functions, arrays,
-//!   most builtins) is refused with [`InterpError::Unsupported`] by a check of the
+//! - A subshell is a copy of the interpreter, never a forked process (the process is multithreaded, and every program
+//!   must start through the spawner): pipeline stages and background lists that the shell runs itself run on threads
+//!   of their own (decision 19). Children are known by handle, waited for by one thread each, and a job's process
+//!   group is signalled only while one of its members is held unreaped.
+//! - What later stories implement (command substitution, here-documents, functions, arrays, most builtins) is
+//!   refused with [`InterpError::Unsupported`] by a check of the
 //!   whole script before anything runs, or, when only an expansion's value reveals it, when that expansion runs. Builtins whose
 //!   external program behaves the same for literal arguments (`echo`, `printf`, `true`, `false`, `test`, `[`) run as
 //!   that program until KNSH-101 and KNSH-102.
@@ -51,6 +59,8 @@
 //! - `specs/00-stories/KNSH-097-parameter-variable-and-arithmetic-expansion.md`
 //! - `specs/04-non-functional-requirements/compatibility.md` (NFR-COMPAT-05: the bash 3.2 and 5.2 differences)
 //! - `specs/00-stories/KNSH-098-word-splitting-quote-removal-and-pathname-expansion.md`
+//! - `specs/00-stories/KNSH-100-pipelines-subshells-and-job-control.md`, FR-SES-10 (pause of every job's group),
+//!   `specs/09-reference/decisions.md` (decision 19: subshells are copies)
 //! - `specs/09-reference/defaults-and-limits.md` (the evaluation, arithmetic and expansion depth limits, and the
 //!   brace and pathname expansion bounds)
 
@@ -65,6 +75,7 @@ mod error;
 mod eval;
 mod expand;
 mod glob;
+mod jobs;
 mod lookup;
 mod param;
 mod pattern;
@@ -76,5 +87,6 @@ mod word;
 pub use arith::{Failure as ArithmeticError, MAX_ARITH_DEPTH, evaluate_arithmetic};
 pub use error::{InterpError, Unsupported};
 pub use eval::{EVAL_STACK_SIZE, Interpreter, MAX_EVAL_DEPTH};
+pub use jobs::{JobSignals, MAX_REMEMBERED_JOBS};
 pub use state::{ShellOptions, ShellState};
 pub use status::Status;

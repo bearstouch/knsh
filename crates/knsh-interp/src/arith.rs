@@ -90,7 +90,7 @@ impl Variables for StateVariables<'_> {
     }
 
     fn set(&mut self, name: &str, value: i64) -> Result<()> {
-        if crate::state::is_always_unemulated(name) {
+        if crate::state::refuses_assignment(name) {
             return Err(Failure::Unsupported(Unsupported::ShellVariable));
         }
         self.state.set_variable(name, value.to_string());
