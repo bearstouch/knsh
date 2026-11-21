@@ -1,10 +1,10 @@
 //! Redirection files over [`MemFs`] (KNSH-099).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use super::{MemFs, lock};
 use crate::descriptor::{Descriptors, OpenMode, TerminalInput, TerminalSettings, reaches_descriptor_table};
@@ -44,6 +44,21 @@ pub enum FakeOpened {
 /// Largest file the fake reads back when appending, far above anything a test writes.
 const READ_LIMIT: u64 = 1 << 24;
 
+/// How long a read of an empty data pipe whose writer is still alive waits before failing with `EIO`: far above any
+/// test's own work, so a test that would wait forever fails instead of hanging.
+const PIPE_WAIT_LIMIT: Duration = Duration::from_secs(20);
+
+/// What a data pipe holds ([`FakeDescriptors::with_data_pipes`]).
+#[derive(Debug)]
+struct PipeBuffer {
+    /// Written and not yet read.
+    data: VecDeque<u8>,
+    /// The write end: once every clone of it is gone, a reader that has taken everything sees end of file.
+    writer: Weak<OwnedFd>,
+    /// The read end: once it is gone, a write fails with `EPIPE`.
+    reader: Weak<OwnedFd>,
+}
+
 /// [`Descriptors`] over a [`MemFs`]: opening creates or truncates the file there, and writes through a descriptor
 /// append to it, so a test reads back what a redirection produced with [`MemFs::contents`]. `/dev/null` exists and
 /// swallows writes. A path reaching `/dev/fd` is refused with `EPERM`, as the real backend refuses it.
@@ -65,6 +80,10 @@ pub struct FakeDescriptors {
     terminals: Mutex<BTreeSet<i32>>,
     /// Each [`Descriptors::set_terminal_input`] call on a terminal, and each restore (`None`), in order.
     terminal_changes: Mutex<Vec<Option<TerminalInput>>>,
+    /// Pipes carry what is written to them ([`FakeDescriptors::with_data_pipes`]), by pipe number.
+    data_pipes: Option<Mutex<BTreeMap<usize, PipeBuffer>>>,
+    /// Notified when a data pipe is written.
+    pipe_written: Condvar,
 }
 
 fn os(errno: i32) -> PlatformError {
@@ -85,6 +104,57 @@ impl FakeDescriptors {
             offsets: Mutex::new(BTreeMap::new()),
             terminals: Mutex::new(BTreeSet::new()),
             terminal_changes: Mutex::new(Vec::new()),
+            data_pipes: None,
+            pipe_written: Condvar::new(),
+        }
+    }
+
+    /// The same fake with pipes that carry data (KNSH-105): what is written to a pipe's write end is read from its
+    /// read end, a read waits while the pipe is empty and a clone of its write end is alive, and sees end of file
+    /// once none is; a write after every read end is gone fails with `EPIPE`. Without it pipes carry nothing and
+    /// their reader sees end of file at once, so a pipe a scripted command keeps open never blocks a test.
+    #[must_use]
+    pub fn with_data_pipes(mut self) -> Self {
+        self.data_pipes = Some(Mutex::new(BTreeMap::new()));
+        self
+    }
+
+    /// Reads from data pipe `n` into `buffer`, waiting while it is empty and written to.
+    fn read_pipe(
+        &self,
+        pipes: &Mutex<BTreeMap<usize, PipeBuffer>>,
+        n: usize,
+        buffer: &mut [u8],
+    ) -> Result<usize, PlatformError> {
+        let deadline = Instant::now() + PIPE_WAIT_LIMIT;
+        let mut held = lock(pipes);
+        loop {
+            let Some(pipe) = held.get_mut(&n) else {
+                return Ok(0);
+            };
+            if !pipe.data.is_empty() {
+                let count = pipe.data.len().min(buffer.len());
+                for (slot, byte) in buffer.iter_mut().zip(pipe.data.drain(..count)) {
+                    *slot = byte;
+                }
+                return Ok(count);
+            }
+            if pipe.writer.strong_count() == 0 || buffer.is_empty() {
+                return Ok(0);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(PlatformError::Os {
+                    operation: Operation::Read,
+                    errno: libc::EIO,
+                });
+            }
+            // A writer's end going away is not announced: look again shortly.
+            let wait = (deadline - now).min(Duration::from_millis(2));
+            held = self
+                .pipe_written
+                .wait_timeout(held, wait)
+                .map_or_else(|poisoned| poisoned.into_inner().0, |(guard, _)| guard);
         }
     }
 
@@ -217,6 +287,16 @@ impl Descriptors for FakeDescriptors {
         };
         let read = self.hand_out(FakeOpened::Pipe { n, write: false })?;
         let write = self.hand_out(FakeOpened::Pipe { n, write: true })?;
+        if let Some(pipes) = &self.data_pipes {
+            lock(pipes).insert(
+                n,
+                PipeBuffer {
+                    data: VecDeque::new(),
+                    writer: write.downgrade(),
+                    reader: read.downgrade(),
+                },
+            );
+        }
         Ok((read, write))
     }
 
@@ -225,6 +305,22 @@ impl Descriptors for FakeDescriptors {
             operation: Operation::Write,
             errno: libc::EBADF,
         };
+        if let (Some(pipes), Some(FakeOpened::Pipe { n, write: true })) = (&self.data_pipes, self.opened(fd)) {
+            let mut held = lock(pipes);
+            let Some(pipe) = held.get_mut(&n) else {
+                return Err(bad);
+            };
+            if pipe.reader.strong_count() == 0 {
+                return Err(PlatformError::Os {
+                    operation: Operation::Write,
+                    errno: libc::EPIPE,
+                });
+            }
+            pipe.data.extend(bytes);
+            drop(held);
+            self.pipe_written.notify_all();
+            return Ok(());
+        }
         let Some(FakeOpened::File { path, mode }) = self.opened(fd) else {
             return Err(bad);
         };
@@ -243,6 +339,9 @@ impl Descriptors for FakeDescriptors {
     /// `EAGAIN` rather than block the test forever: a caller that waits with [`Descriptors::wait_readable`] first
     /// never gets there.
     fn read(&self, fd: &SharedFd, buffer: &mut [u8]) -> Result<usize, PlatformError> {
+        if let (Some(pipes), Some(FakeOpened::Pipe { n, write: false })) = (&self.data_pipes, self.opened(fd)) {
+            return self.read_pipe(pipes, n, buffer);
+        }
         let (data, held_open) = self.readable(fd)?;
         let mut offsets = lock(&self.offsets);
         let offset = offsets.entry(fd.as_raw_fd()).or_insert(0);
@@ -261,6 +360,11 @@ impl Descriptors for FakeDescriptors {
 
     /// Ready unless held-open input has nothing left; never waits.
     fn wait_readable(&self, fd: &SharedFd, _timeout: Duration) -> Result<bool, PlatformError> {
+        if let (Some(pipes), Some(FakeOpened::Pipe { n, write: false })) = (&self.data_pipes, self.opened(fd)) {
+            return Ok(lock(pipes)
+                .get(&n)
+                .is_none_or(|pipe| !pipe.data.is_empty() || pipe.writer.strong_count() == 0));
+        }
         let (data, held_open) = self.readable(fd)?;
         let offset = lock(&self.offsets).get(&fd.as_raw_fd()).copied().unwrap_or(0);
         Ok(!(held_open && offset >= data.len()))
@@ -371,5 +475,35 @@ mod tests {
             descriptors.opened(&here),
             Some(FakeOpened::HereString(b"text\n".to_vec()))
         );
+    }
+
+    // KNSH-105: data pipes carry what is written, wait while a writer lives, and end once none does.
+    #[test]
+    fn data_pipes_carry_data_until_every_writer_is_gone() {
+        let fs = Arc::new(MemFs::new());
+        let descriptors = Arc::new(FakeDescriptors::new(fs).with_data_pipes());
+        let (read, write) = descriptors.pipe().unwrap();
+        descriptors.write_all(&write, b"ab").unwrap();
+        let mut buffer = [0_u8; 8];
+        assert_eq!(descriptors.read(&read, &mut buffer).unwrap(), 2);
+        assert_eq!(&buffer[..2], b"ab");
+        let writer = {
+            let descriptors = Arc::clone(&descriptors);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                descriptors.write_all(&write, b"c").unwrap();
+                drop(write);
+            })
+        };
+        assert_eq!(descriptors.read(&read, &mut buffer).unwrap(), 1);
+        writer.join().unwrap();
+        assert_eq!(descriptors.read(&read, &mut buffer).unwrap(), 0);
+        // Writing with no reader left is a broken pipe.
+        let (read, write) = descriptors.pipe().unwrap();
+        drop(read);
+        assert!(matches!(
+            descriptors.write_all(&write, b"x"),
+            Err(PlatformError::Os { errno: libc::EPIPE, .. })
+        ));
     }
 }

@@ -81,6 +81,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
 /// line was lexed: the nesting limit counts from the same depth, and the bash 3.2 rules for comments and here-documents
 /// inside substitutions still apply.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Independent shell options, each mirroring one `ParseOptions` field.
 pub(crate) struct LexContext {
     /// Quotes and substitutions enclosing the source, counted towards [`MAX_NESTING_DEPTH`].
     pub(crate) depth: usize,
@@ -97,6 +98,8 @@ pub(crate) struct LexContext {
     /// Whether array assignments are read ([`ParseOptions::arrays`](crate::ParseOptions::arrays)). Read by the
     /// parser.
     pub(crate) arrays: bool,
+    /// Whether `coproc` is read ([`ParseOptions::coproc`](crate::ParseOptions::coproc)). Read by the parser.
+    pub(crate) coproc: bool,
 }
 
 /// Lexes the part of `input` at `range`, in `context`. Spans are offsets into `input`, and the lexer never reads past
@@ -575,6 +578,7 @@ impl<'a> Lexer<'a> {
             // A body holds no commands of its own: its substitutions are parsed by the parser, with its options.
             redirection_variables: false,
             arrays: false,
+            coproc: false,
         };
         let mut lexer = Lexer::new(self.src.get(..body.end).unwrap_or(self.src), body.start, context);
         lexer.enter(operator)?;

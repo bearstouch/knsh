@@ -4,9 +4,11 @@
 
 use knsh_bash::{Segment, SegmentKind, Span};
 
-use crate::error::{InterpError, Unsupported};
+use knsh_bash::HereDocument;
+
+use crate::error::InterpError;
 use crate::expand::decode_ansi_c;
-use crate::scan::Part;
+use crate::scan::{Part, Subst, SubstKind};
 use crate::state::is_name;
 
 /// One character of a word after expansion, with what bash needs to know about it later.
@@ -60,13 +62,22 @@ pub(crate) fn parts(segments: &[Segment], source: &str, from: usize) -> Result<V
 ///
 /// # Errors
 ///
-/// [`InterpError::Unsupported`] for a command or process substitution; [`InterpError::SourceMismatch`] if a span
-/// does not index `source`.
+/// [`InterpError::SourceMismatch`] if a span does not index `source`.
 pub(crate) fn pieces(segments: &[Segment], source: &str, from: usize) -> Result<Vec<Piece>, InterpError> {
+    pieces_in(segments, source, from, false)
+}
+
+/// [`pieces`], inside double quotes when `in_double_quotes` (which changes how a backtick body is un-escaped).
+fn pieces_in(
+    segments: &[Segment],
+    source: &str,
+    from: usize,
+    in_double_quotes: bool,
+) -> Result<Vec<Piece>, InterpError> {
     let mut out = Vec::new();
     for segment in segments.iter().filter(|segment| segment.span.end > from) {
         let span = Span::new(segment.span.start.max(from), segment.span.end);
-        let Some(part) = segment_part(segment, source, from)? else {
+        let Some(part) = segment_part(segment, source, from, in_double_quotes)? else {
             continue;
         };
         out.push(Piece {
@@ -78,10 +89,16 @@ pub(crate) fn pieces(segments: &[Segment], source: &str, from: usize) -> Result<
 }
 
 /// The part one segment is, or `None` for a line continuation.
-fn segment_part(segment: &Segment, source: &str, from: usize) -> Result<Option<Part>, InterpError> {
-    let refuse = |feature| {
-        Err(InterpError::Unsupported {
-            feature,
+fn segment_part(
+    segment: &Segment,
+    source: &str,
+    from: usize,
+    in_double_quotes: bool,
+) -> Result<Option<Part>, InterpError> {
+    let substitution = |kind| {
+        Part::Subst(Subst {
+            kind,
+            body: segment.body,
             span: segment.span,
         })
     };
@@ -99,7 +116,11 @@ fn segment_part(segment: &Segment, source: &str, from: usize) -> Result<Option<P
         SegmentKind::SingleQuoted => Part::Quoted(text(segment.body, source)?.to_owned()),
         // In the C locale `$"…"` is plain double quoting; translation catalogues are not supported by design.
         SegmentKind::DoubleQuoted(inner) | SegmentKind::Locale(inner) => {
-            Part::Double(quoted_parts(parts(inner, source, from)?))
+            let inner = pieces_in(inner, source, from, true)?
+                .into_iter()
+                .map(|piece| piece.part)
+                .collect();
+            Part::Double(quoted_parts(inner))
         }
         SegmentKind::AnsiC => Part::Quoted(decode_ansi_c(text(segment.body, source)?)),
         SegmentKind::Parameter => Part::Param {
@@ -114,13 +135,66 @@ fn segment_part(segment: &Segment, source: &str, from: usize) -> Result<Option<P
             body: segment.body,
             span: segment.span,
         },
-        SegmentKind::CommandSubstitution | SegmentKind::Backtick => {
-            return refuse(Unsupported::CommandSubstitution);
-        }
-        SegmentKind::InputProcessSubstitution | SegmentKind::OutputProcessSubstitution => {
-            return refuse(Unsupported::ProcessSubstitution);
-        }
+        SegmentKind::CommandSubstitution => substitution(SubstKind::Command),
+        SegmentKind::Backtick => substitution(SubstKind::Backtick { in_double_quotes }),
+        SegmentKind::InputProcessSubstitution => substitution(SubstKind::Input),
+        SegmentKind::OutputProcessSubstitution => substitution(SubstKind::Output),
     }))
+}
+
+/// The parts of here-document `document`'s body (KNSH-105), as one double-quoted part: a quoted body is its text;
+/// an unquoted one is read like the inside of double quotes (`"` is literal, `\` escapes only `$`, `` ` ``, `\` and
+/// newline), so it is expanded but never split or matched against file names. For `<<-`, the tabs at the start of
+/// each line are removed first: each physical line of a quoted body, each line after line continuations are joined
+/// in an unquoted one, as bash strips them while it reads the lines.
+///
+/// # Errors
+///
+/// [`InterpError::SourceMismatch`] if a span does not index `source`.
+pub(crate) fn here_document_parts(document: &HereDocument, source: &str) -> Result<Part, InterpError> {
+    if document.quoted {
+        let body = text(document.body, source)?;
+        let body = if document.strip_tabs {
+            strip_leading_tabs(body, &mut true)
+        } else {
+            body.to_owned()
+        };
+        return Ok(Part::Double(vec![Part::Quoted(body)]));
+    }
+    let mut out = Vec::new();
+    // Whether the text read so far ends a line (or the body starts): its leading tabs are stripped.
+    let mut line_start = true;
+    for segment in &document.segments {
+        match &segment.kind {
+            SegmentKind::Literal if document.strip_tabs => {
+                let body = strip_leading_tabs(text(segment.span, source)?, &mut line_start);
+                out.push(Part::Text(body));
+                continue;
+            }
+            // A continuation joins two lines into one: the next line's tabs are not at a line's start.
+            SegmentKind::LineContinuation => continue,
+            _ => {}
+        }
+        line_start = false;
+        if let Some(part) = segment_part(segment, source, 0, false)? {
+            out.push(part);
+        }
+    }
+    Ok(Part::Double(quoted_parts(out)))
+}
+
+/// `text` without the tabs at the start of each line, `line_start` telling whether it starts at a line's start and
+/// left telling whether it ends at one.
+fn strip_leading_tabs(text: &str, line_start: &mut bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if *line_start && ch == '\t' {
+            continue;
+        }
+        *line_start = ch == '\n';
+        out.push(ch);
+    }
+    out
 }
 
 /// Inside double quotes, literal text is quoted.
@@ -133,7 +207,8 @@ fn quoted_parts(parts: Vec<Part>) -> Vec<Part> {
             | Part::Double(_)
             | Part::Param { .. }
             | Part::Brace { .. }
-            | Part::Arith { .. }) => other,
+            | Part::Arith { .. }
+            | Part::Subst(_)) => other,
         })
         .collect()
 }
@@ -150,7 +225,7 @@ pub(crate) fn literal(parts: &[Part]) -> Option<String> {
         match part {
             Part::Text(text) | Part::Quoted(text) => out.push_str(text),
             Part::Double(inner) => out.push_str(&literal(inner)?),
-            Part::Param { .. } | Part::Brace { .. } | Part::Arith { .. } => return None,
+            Part::Param { .. } | Part::Brace { .. } | Part::Arith { .. } | Part::Subst(_) => return None,
         }
     }
     Some(out)
@@ -184,11 +259,25 @@ mod tests {
         parts(&words(line)[index].word.segments, line, 0)
     }
 
-    fn refused(line: &str, index: usize) -> Unsupported {
-        match word_parts(line, index) {
-            Err(InterpError::Unsupported { feature, .. }) => feature,
+    /// The kind of the substitution `line`'s word `index` is (alone, or alone in double quotes).
+    fn substitution(line: &str, index: usize) -> SubstKind {
+        match word_parts(line, index).unwrap().as_slice() {
+            [Part::Subst(subst)] => subst.kind,
+            [Part::Double(inner)] => match inner.as_slice() {
+                [Part::Subst(subst)] => subst.kind,
+                other => panic!("{line}: {other:?}"),
+            },
             other => panic!("{line}: {other:?}"),
         }
+    }
+
+    /// The text `line`'s first here-document expands from, as parts.
+    fn here_document(line: &str) -> Part {
+        let script = knsh_bash::parse(line).unwrap();
+        let Command::Simple(simple) = &script.items[0].and_or.first.first else {
+            panic!("not a simple command: {line}");
+        };
+        here_document_parts(simple.redirections[0].here_document.as_ref().unwrap(), line).unwrap()
     }
 
     #[test]
@@ -217,12 +306,49 @@ h "" $"loc""#;
         assert_eq!(literal(&found), None);
     }
 
+    // KNSH-105: substitutions are parts, a backtick knowing whether it is inside double quotes.
     #[test]
-    fn refuses_substitutions_and_ansi_c_quotes() {
-        assert_eq!(refused("echo $(ls)", 1), Unsupported::CommandSubstitution);
-        assert_eq!(refused("echo `ls`", 1), Unsupported::CommandSubstitution);
-        assert_eq!(refused(r#"echo "$(ls)""#, 1), Unsupported::CommandSubstitution);
-        assert_eq!(refused("cat <(ls)", 1), Unsupported::ProcessSubstitution);
+    fn substitutions_become_parts() {
+        assert_eq!(substitution("echo $(ls)", 1), SubstKind::Command);
+        assert_eq!(
+            substitution("echo `ls`", 1),
+            SubstKind::Backtick {
+                in_double_quotes: false
+            }
+        );
+        assert_eq!(
+            substitution(r#"echo "`ls`""#, 1),
+            SubstKind::Backtick { in_double_quotes: true }
+        );
+        assert_eq!(substitution(r#"echo "$(ls)""#, 1), SubstKind::Command);
+        assert_eq!(substitution("cat <(ls)", 1), SubstKind::Input);
+        assert_eq!(substitution("tee >(ls)", 1), SubstKind::Output);
+        assert_eq!(literal(&word_parts("echo $(ls)", 1).unwrap()), None);
+    }
+
+    // KNSH-105: `<<-` strips the tabs starting each line; an unquoted body's continuation joins lines first.
+    #[test]
+    fn here_document_bodies_strip_tabs_like_bash() {
+        let Part::Double(parts) = here_document("cat <<-'E'\n\ta\n\t\tb\\\n\tc\n\tE\n") else {
+            panic!()
+        };
+        assert_eq!(parts, [Part::Quoted("a\nb\\\nc\n".into())]);
+        let Part::Double(parts) = here_document("cat <<-E\n\ta $x\n\tb\\\n\tc\nE\n") else {
+            panic!()
+        };
+        let text: String = parts
+            .iter()
+            .map(|part| match part {
+                Part::Quoted(text) => text.clone(),
+                Part::Param { name, .. } => format!("<{name}>"),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(text, "a <x>\nb\tc\n");
+        let Part::Double(parts) = here_document("cat <<E\n\ta\nE\n") else {
+            panic!()
+        };
+        assert_eq!(parts, [Part::Quoted("\ta\n".into())]);
     }
 
     // KNSH-098: `$'…'` is quoted text with its escapes decoded, cut at a NUL as bash keeps strings.

@@ -1,4 +1,4 @@
-//! Redirections and the shell's descriptor table (KNSH-099; NFR-COMPAT-02).
+//! Redirections and the shell's descriptor table (KNSH-099, KNSH-105; NFR-COMPAT-02).
 //!
 //! The interpreter does not move descriptors of its own process around: it keeps the shell's table ([`FdTable`]),
 //! which says what each number holds for the script (one of the spawner's standard descriptors, or a file the shell
@@ -15,6 +15,11 @@
 //! stand, so `2>/dev/null` before it silences it), those already applied are undone, and the command does not run
 //! (status 1).
 //!
+//! A here-document (KNSH-105) is read like a here-string: its body (expanded as double-quoted text unless the
+//! delimiter was quoted, tabs at line starts removed for `<<-`) becomes a descriptor reading exactly that text, on
+//! standard input unless a number is given. A coprocess's ends are held close-on-exec ([`FdTable::set_private`]):
+//! the shell's redirections duplicate them, commands never receive them.
+//!
 //! Bash's special names are the shell's own table here: `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd/N`
 //! duplicate descriptor 0, 1, 2 or `N` (on macOS bash opens the real `/dev/fd`, which in bash's process is the same
 //! table; in the interpreter's process it is not, so the real one is never opened). `/dev/tcp/…` and `/dev/udp/…`,
@@ -22,10 +27,10 @@
 //! its own, and everything an agent's commands reach goes through the sandbox and the proxy (FR-NET-08, decision
 //! recorded in `specs/09-reference/decisions.md`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 
-use knsh_bash::{CommandWord, IoNumber, Redirect, RedirectionOperator, Span};
+use knsh_bash::{CommandWord, IoNumber, Redirect, RedirectionOperator};
 use knsh_platform::{ChildDescriptor, MAX_PLACED_FD, OpenMode, PlatformError, StandardStream};
 
 use super::{Flow, Interpreter, Run, unsupported};
@@ -41,10 +46,18 @@ const _: () = assert!(MAX_FD as i64 == MAX_PLACED_FD as i64);
 /// Where `{name}>file` descriptors start, as in bash (`SHELL_FD_BASE`).
 const NAMED_FD_BASE: u32 = 10;
 
+/// Where process substitution and coprocess descriptors are placed: the highest free number below this, as bash's
+/// `/dev/fd/63`, `/dev/fd/62`, … (KNSH-105).
+pub(crate) const SUBSTITUTION_FD_TOP: u32 = 64;
+
 /// The shell's descriptors: what each number holds for the script. A number not listed is closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FdTable {
     slots: BTreeMap<u32, ChildDescriptor>,
+    /// Numbers the shell holds close-on-exec, as bash holds a coprocess's ends (KNSH-105): usable by the shell's own
+    /// redirections and builtins, never given to a command. A number loses the mark when anything else is put
+    /// there.
+    private: BTreeSet<u32>,
 }
 
 impl FdTable {
@@ -58,7 +71,10 @@ impl FdTable {
         .into_iter()
         .map(|(fd, stream)| (fd, ChildDescriptor::Standard(stream)))
         .collect();
-        Self { slots }
+        Self {
+            slots,
+            private: BTreeSet::new(),
+        }
     }
 
     /// What `fd` holds, if it is open.
@@ -71,8 +87,23 @@ impl FdTable {
         self.replace(fd, slot);
     }
 
+    /// Puts `slot` at `fd`, held by the shell alone: never given to a command (a coprocess's ends, KNSH-105).
+    pub(crate) fn set_private(&mut self, fd: u32, slot: ChildDescriptor) {
+        self.replace(fd, Some(slot));
+        self.private.insert(fd);
+    }
+
+    /// The highest closed number below `top` and from 10 up (bash's `SHELL_FD_BASE`), for a descriptor the shell
+    /// places itself (KNSH-105).
+    pub(crate) fn free_below(&self, top: u32) -> Option<u32> {
+        (NAMED_FD_BASE..top.min(MAX_FD + 1))
+            .rev()
+            .find(|fd| !self.slots.contains_key(fd))
+    }
+
     /// Sets (or with `None` closes) `fd`, returning what it held.
     fn replace(&mut self, fd: u32, slot: Option<ChildDescriptor>) -> Option<ChildDescriptor> {
+        self.private.remove(&fd);
         match slot {
             Some(slot) => self.slots.insert(fd, slot),
             None => self.slots.remove(&fd),
@@ -84,10 +115,11 @@ impl FdTable {
         (base..=MAX_FD).find(|fd| !self.slots.contains_key(fd))
     }
 
-    /// The table a command receives: every open number, in order.
+    /// The table a command receives: every open number but the shell's own, in order.
     pub(crate) fn child_table(&self) -> Vec<(i32, ChildDescriptor)> {
         self.slots
             .iter()
+            .filter(|(fd, _)| !self.private.contains(fd))
             .filter_map(|(&fd, slot)| Some((i32::try_from(fd).ok()?, slot.clone())))
             .collect()
     }
@@ -265,15 +297,13 @@ impl Interpreter {
             Some(IoNumber { value: Some(fd), .. }) => Some(fd),
         };
         let default = match redirect.operator {
-            Op::Input | Op::ReadWrite | Op::DuplicateInput | Op::HereString => 0,
-            Op::Output
-            | Op::Append
-            | Op::Clobber
-            | Op::DuplicateOutput
-            | Op::OutputAll
-            | Op::AppendAll
+            Op::Input
+            | Op::ReadWrite
+            | Op::DuplicateInput
+            | Op::HereString
             | Op::HereDocument
-            | Op::HereDocumentStripTabs => 1,
+            | Op::HereDocumentStripTabs => 0,
+            Op::Output | Op::Append | Op::Clobber | Op::DuplicateOutput | Op::OutputAll | Op::AppendAll => 1,
         };
         let dest = match (&redirect.variable, explicit) {
             (Some(variable), _) => Dest::Variable(variable.name.clone()),
@@ -286,20 +316,20 @@ impl Interpreter {
             OpenMode::Truncate
         };
         match redirect.operator {
+            // KNSH-105: the body, expanded unless its delimiter was quoted, read as a here-string's text is.
             Op::HereDocument | Op::HereDocumentStripTabs => {
-                Err(unsupported(Unsupported::HereDocument, redirect.span).into())
+                let Some(document) = &redirect.here_document else {
+                    return Err(unsupported(Unsupported::HereDocument, redirect.span).into());
+                };
+                let body = crate::word::here_document_parts(document, run.source)?;
+                let result = self.expander(run, &[]).here_document(&body, redirect.span);
+                let text = self.expanded(result, redirect.span, run)?;
+                Ok(self.here_text(dest, text.as_bytes(), saved))
             }
             Op::HereString => {
                 let mut text = self.string(&redirect.target, run)?;
                 text.push('\n');
-                let slot = match self.descriptors.here_string(text.as_bytes()) {
-                    Ok(fd) => ChildDescriptor::Open(fd),
-                    Err(error) => {
-                        let reason = error.errno().map_or_else(|| error.to_string(), strerror);
-                        return Ok(Err(format!("cannot create temp file for here-document: {reason}")));
-                    }
-                };
-                Ok(self.place(dest, Some(slot), saved))
+                Ok(self.here_text(dest, text.as_bytes(), saved))
             }
             Op::DuplicateInput | Op::DuplicateOutput => {
                 let word = match self.target_word(&redirect.target, run)? {
@@ -342,6 +372,18 @@ impl Interpreter {
                 Ok(self.place(if both { Dest::Both } else { dest }, Some(slot), saved))
             }
         }
+    }
+
+    /// Puts a descriptor reading exactly `text` at `dest`: a here-string or here-document.
+    fn here_text(&mut self, dest: Dest, text: &[u8], saved: &mut Saved) -> Result<(), Refusal> {
+        let slot = match self.descriptors.here_string(text) {
+            Ok(fd) => ChildDescriptor::Open(fd),
+            Err(error) => {
+                let reason = error.errno().map_or_else(|| error.to_string(), strerror);
+                return Err(format!("cannot create temp file for here-document: {reason}"));
+            }
+        };
+        self.place(dest, Some(slot), saved)
     }
 
     /// `n>&word` and `n<&word`: `-` closes `n`, a number `m` (or `m-`, which then closes `m`) duplicates it, and for
@@ -476,17 +518,4 @@ impl Interpreter {
 /// The target as written, for messages.
 fn written<'s>(target: &CommandWord, run: &Run<'s>) -> &'s str {
     target.span.text(run.source).unwrap_or_default()
-}
-
-/// The span of the first here-document among `redirects`, if any: refused until KNSH-105.
-pub(crate) fn here_document(redirects: &[Redirect]) -> Option<Span> {
-    redirects
-        .iter()
-        .find(|redirect| {
-            matches!(
-                redirect.operator,
-                RedirectionOperator::HereDocument | RedirectionOperator::HereDocumentStripTabs
-            )
-        })
-        .map(|redirect| redirect.span)
 }

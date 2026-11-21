@@ -43,6 +43,13 @@ impl SharedFd {
     pub fn try_clone_owned(&self) -> std::io::Result<OwnedFd> {
         self.0.try_clone()
     }
+
+    /// A handle that tells whether any clone of this descriptor is still alive, without keeping it open: the fake
+    /// pipes of [`FakeDescriptors`](crate::testing::FakeDescriptors) see end of file once every writer is gone.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn downgrade(&self) -> std::sync::Weak<OwnedFd> {
+        Arc::downgrade(&self.0)
+    }
 }
 
 impl AsRawFd for SharedFd {

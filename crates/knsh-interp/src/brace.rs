@@ -70,7 +70,12 @@ pub(crate) fn expand(pieces: &[Piece], span: Span) -> Result<Vec<Vec<Part>>, Int
     for (index, piece) in pieces.iter().enumerate() {
         match &piece.part {
             Part::Text(text) => toks.extend(text.chars().map(Tok::Char)),
-            Part::Quoted(_) | Part::Double(_) | Part::Param { .. } | Part::Brace { .. } | Part::Arith { .. } => {
+            Part::Quoted(_)
+            | Part::Double(_)
+            | Part::Param { .. }
+            | Part::Brace { .. }
+            | Part::Arith { .. }
+            | Part::Subst(_) => {
                 toks.push(Tok::Piece(index));
             }
         }

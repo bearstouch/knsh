@@ -61,18 +61,37 @@ impl Harness {
 
     /// As [`Harness::with`], `configure` also given the fake descriptors (to make standard input, KNSH-102).
     fn with_descriptors(configure: impl FnOnce(Interpreter, &FakeDescriptors) -> Interpreter) -> Self {
+        Self::build(false, configure)
+    }
+
+    /// As [`Harness::new`], with pipes that carry data and scripted commands that keep none of their descriptors
+    /// open, so the shell reads what its own builtins write into a pipe (KNSH-105: command substitution, coprocesses).
+    fn with_data_pipes() -> Self {
+        Self::build(true, |interpreter, _| interpreter)
+    }
+
+    fn build(data_pipes: bool, configure: impl FnOnce(Interpreter, &FakeDescriptors) -> Interpreter) -> Self {
         let fs = Arc::new(MemFs::new());
         fs.add_dir_all(Path::new("/bin")).unwrap();
         fs.add_dir_all(Path::new("/work")).unwrap();
         for program in PROGRAMS {
             fs.write(&Path::new("/bin").join(program), b"", 0o755).unwrap();
         }
-        let commands = Arc::new(ScriptedCommands::new());
+        let commands = Arc::new(if data_pipes {
+            ScriptedCommands::new().releasing_descriptors()
+        } else {
+            ScriptedCommands::new()
+        });
         commands.on("/bin/true", exited(0));
         commands.on("/bin/false", exited(1));
         let diagnostics = Buffer::default();
         let output = Buffer::default();
-        let descriptors = Arc::new(FakeDescriptors::new(fs.clone()));
+        let descriptors = FakeDescriptors::new(fs.clone());
+        let descriptors = Arc::new(if data_pipes {
+            descriptors.with_data_pipes()
+        } else {
+            descriptors
+        });
         let state = ShellState::new("knsh", "/work")
             .unwrap()
             .with_environment([("PATH".into(), "/bin".into())]);
@@ -105,11 +124,12 @@ impl Harness {
         }
     }
 
-    /// Runs `line`, read as bash 5.2 reads it (`{name}>file` is a redirection, KNSH-099).
+    /// Runs `line`, read as bash 5.2 reads it (`{name}>file` is a redirection, KNSH-099; `coproc`, KNSH-105).
     fn run(&mut self, line: &str) -> Result<Status, InterpError> {
         let options = ParseOptions::default()
             .with_redirection_variables(true)
-            .with_arrays(true);
+            .with_arrays(true)
+            .with_coproc(true);
         let script = parse_with(line, options).unwrap();
         self.interpreter.run(&script, line)
     }
@@ -504,22 +524,28 @@ fn a_prefix_path_assignment_is_used_for_lookup() {
 fn unsupported_constructs_are_refused_before_anything_runs() {
     let mut h = Harness::new();
     let cases: &[(&str, Unsupported)] = &[
-        ("true; echo $(ls)", Unsupported::CommandSubstitution),
+        // KNSH-105: what a substitution's or here-document's body holds is checked with the script.
+        ("true; echo $(echo $RANDOM)", Unsupported::ShellVariable),
+        ("true; echo `echo \\`echo $RANDOM\\``", Unsupported::ShellVariable),
+        ("true; cat <(echo $RANDOM)", Unsupported::ShellVariable),
+        ("true; cat <<EOF\n$RANDOM\nEOF\n", Unsupported::ShellVariable),
+        ("true; coproc cat | x", Unsupported::Coproc),
+        ("true; ! coproc cat", Unsupported::Coproc),
+        ("true; coproc cat &", Unsupported::Coproc),
+        ("true; coproc RANDOM { cat; }", Unsupported::ShellVariable),
         ("true; echo $RANDOM", Unsupported::ShellVariable),
         ("true; echo ${#LINENO}", Unsupported::ShellVariable),
         ("true; echo ${!BASH*}", Unsupported::ShellVariable),
         ("true; echo ${x@P}", Unsupported::PromptExpansion),
         ("true; (( x )) > out", Unsupported::Redirection),
-        ("true; cat <<EOF\nx\nEOF\n", Unsupported::HereDocument),
-        ("true; { true; } <<-EOF\nx\nEOF\n", Unsupported::HereDocument),
         // KNSH-100: without clocks `time` cannot report; PIPESTATUS is read, never assigned.
         ("time true", Unsupported::Time),
         ("true; PIPESTATUS=1", Unsupported::ShellVariable),
-        ("true | { echo $(ls); }", Unsupported::CommandSubstitution),
+        ("true | { echo $(echo $RANDOM); }", Unsupported::ShellVariable),
         ("true & (ulimit -n)", Unsupported::Builtin),
         // KNSH-104: a `SIGCHLD` trap, and a trap's text, are checked before anything runs.
         ("true; trap x CHLD", Unsupported::Trap),
-        ("true; trap 'echo $(ls)' EXIT", Unsupported::CommandSubstitution),
+        ("true; trap 'echo $(echo $RANDOM)' EXIT", Unsupported::ShellVariable),
         // KNSH-102: `[[ … ]]` with what bash's parser rejects, or a command substitution inside.
         ("true; [[ a b ]]", Unsupported::Conditional),
         ("true; [[ $(ls) ]]", Unsupported::CommandSubstitution),
@@ -1300,5 +1326,6 @@ fn moving_a_descriptor_onto_itself_keeps_it() {
 mod builtins;
 mod functions_arrays;
 mod jobs;
+mod substitution;
 mod test_printf_read;
 mod traps_options;

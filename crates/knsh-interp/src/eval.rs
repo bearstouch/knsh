@@ -80,13 +80,13 @@ mod printf_builtin;
 mod read;
 mod redirect;
 mod set_shopt;
+mod substitution;
 pub(crate) mod test;
 pub(crate) mod traps;
 mod xtrace;
 
-use job::JobContext;
+use job::{JobContext, seed};
 use redirect::FdTable;
-pub(crate) use redirect::here_document;
 
 /// Deepest nesting of lists the evaluator follows: compound command bodies, conditions and case arms today, and
 /// function calls, `source` and `eval` once later stories add them. Past it the run fails with
@@ -361,6 +361,12 @@ pub struct Interpreter {
     terminating: Option<i32>,
     /// The shell is ending by a signal whose default action bash takes without running the `EXIT` trap.
     skip_exit_trap: bool,
+    /// The descriptors process substitutions placed in the shell's table (`/dev/fd/63`, …), with what each holds,
+    /// oldest first: each is closed once the command whose word made it is done (KNSH-105).
+    substituted_fds: Vec<(u32, SharedFd)>,
+    /// The status of the last command substitution run while expanding the current simple command: a command
+    /// without a name ends with it, as bash's does (`x=$(false)` is 1) (KNSH-105).
+    substitution_status: Option<Status>,
 }
 
 impl fmt::Debug for Interpreter {
@@ -428,6 +434,8 @@ impl Interpreter {
             signals: Some(crate::trap::ShellSignals::default()),
             terminating: None,
             skip_exit_trap: false,
+            substituted_fds: Vec::new(),
+            substitution_status: None,
         }
         .with_checked_oldpwd()
     }
@@ -620,6 +628,7 @@ impl Interpreter {
         self.skip_exit_trap = false;
         let run = Run::new(source);
         let result = self.script(&script.items, &run);
+        self.close_substituted(0);
         let end = Span::new(source.len(), source.len());
         self.flush_notes(end, &run);
         let (status, exits) = match result {
@@ -691,8 +700,17 @@ impl Interpreter {
         })
     }
 
-    /// An expander over the shell state, with the command's own assignments `overlay`.
+    /// An expander over the shell state, with the command's own assignments `overlay`, running command and process
+    /// substitutions in copies of this shell (KNSH-105).
     fn expander<'s>(&'s mut self, run: &Run<'s>, overlay: &'s [(String, OsString)]) -> Expander<'s> {
+        let host = substitution::Host {
+            seed: seed!(self),
+            fds: &mut self.fds,
+            substituted: &mut self.substituted_fds,
+            status: &mut self.substitution_status,
+            origin: run.origin,
+            line_base: run.line_base,
+        };
         Expander::new(
             &mut self.state,
             &*self.homes,
@@ -701,6 +719,7 @@ impl Interpreter {
             run.source,
             overlay,
         )
+        .with_substitutions(Box::new(host))
     }
 
     /// The arguments `words` expand into: each brace-expanded, then each resulting word expanded in turn.
@@ -893,6 +912,7 @@ impl Interpreter {
             Command::Simple(simple) => self.simple(simple, run),
             Command::Compound(compound) => self.compound(compound, run),
             Command::FunctionDefinition(definition) => Ok(self.define_function(definition, run)),
+            Command::Unsupported(construct) if construct.coproc.is_some() => self.coproc(construct, run),
             Command::Unsupported(construct) => match construct.arithmetic.as_deref() {
                 Some(parts) => self.arithmetic_command(construct, parts, run),
                 None if is_conditional(construct) => self.conditional_command(construct, run),
@@ -903,10 +923,15 @@ impl Interpreter {
 
     /// A compound command with its redirections, which hold for the whole body and are undone after it, however
     /// it ends.
+    /// Process substitutions in its redirections and words are closed once it is done (KNSH-105).
     fn compound(&mut self, compound: &CompoundCommand, run: &Run<'_>) -> Flow<Status> {
-        if let Some(span) = here_document(&compound.redirections) {
-            return Err(unsupported(Unsupported::HereDocument, span).into());
-        }
+        let mark = self.substituted_fds.len();
+        let result = self.compound_body(compound, run);
+        self.close_substituted(mark);
+        result
+    }
+
+    fn compound_body(&mut self, compound: &CompoundCommand, run: &Run<'_>) -> Flow<Status> {
         let Some(saved) = self.redirect(&compound.redirections, run)? else {
             return Ok(Status::FAILURE);
         };
@@ -1046,9 +1071,10 @@ impl Interpreter {
     fn clause_matches(&mut self, clause: &CaseClause, subject: &str, run: &Run<'_>) -> Flow<bool> {
         for pattern_word in &clause.patterns {
             let parts = word::parts(&pattern_word.word.segments, run.source, 0)?;
-            let mut expander = self.expander(run, &[]);
-            let flags = expander.pattern_flags();
-            let result = expander.pattern(&parts, pattern_word.span);
+            let (flags, result) = {
+                let mut expander = self.expander(run, &[]);
+                (expander.pattern_flags(), expander.pattern(&parts, pattern_word.span))
+            };
             let chars = self.expanded(result, pattern_word.span, run)?;
             if Pattern::new(&chars, flags).matches_str(subject) {
                 return Ok(true);
@@ -1148,15 +1174,18 @@ impl Interpreter {
     /// A simple command: its words are expanded, then its assignments, then its redirections are applied (left to
     /// right); assignments alone set shell variables; otherwise the command runs with them in its environment and
     /// the redirected descriptors. The redirections are undone afterwards, except for `exec` without a command.
+    ///
+    /// The descriptors its process substitutions placed are closed once it is done, as bash closes them (KNSH-105).
     fn simple(&mut self, simple: &SimpleCommand, run: &Run<'_>) -> Flow<Status> {
-        if let Some(span) = here_document(&simple.redirections) {
-            return Err(unsupported(Unsupported::HereDocument, span).into());
-        }
-        if let Some(result) = self.alias_command(simple, run) {
-            return result;
-        }
-        let result = self.simple_command(simple, run);
-        self.flush_notes(simple.span, run);
+        let mark = self.substituted_fds.len();
+        let result = if let Some(result) = self.alias_command(simple, run) {
+            result
+        } else {
+            let result = self.simple_command(simple, run);
+            self.flush_notes(simple.span, run);
+            result
+        };
+        self.close_substituted(mark);
         result
     }
 
@@ -1164,6 +1193,7 @@ impl Interpreter {
     fn simple_command(&mut self, simple: &SimpleCommand, run: &Run<'_>) -> Flow<Status> {
         // KNSH-104: bash runs the `DEBUG` trap before it expands the command.
         self.debug_trap(simple.span, run)?;
+        self.substitution_status = None;
         let words = self.command_arguments(simple, run)?;
         let lists = std::mem::take(&mut self.declaration_lists);
         let mut assignments: Vec<(String, OsString)> = Vec::with_capacity(simple.assignments.len());
@@ -1331,7 +1361,8 @@ impl Interpreter {
         run: &Run<'_>,
     ) -> Flow<Status> {
         let Some((name, args)) = words.split_first() else {
-            return Ok(Status::SUCCESS);
+            // KNSH-105: a command of assignments and redirections ends with its last command substitution's status.
+            return Ok(self.substitution_status.take().unwrap_or(Status::SUCCESS));
         };
         // Bash looks for a function before a builtin or a program (outside POSIX mode).
         if self.state.function(name).is_some() {

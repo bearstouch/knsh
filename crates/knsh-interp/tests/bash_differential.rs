@@ -169,7 +169,9 @@ fn run_knsh_full(
     .with_standard_descriptors(standard);
     let options = knsh_bash::ParseOptions::default()
         .with_extglob(extglob)
-        .with_arrays(true);
+        .with_arrays(true)
+        // KNSH-105: `coproc` is read as bash 4 and later read it (bash 3.2 scripts here never use the word).
+        .with_coproc(true);
     let parsed = knsh_bash::parse_with(script, options).unwrap();
     let status = interpreter.run(&parsed, script).unwrap();
     // The interpreter holds the spawner, which holds the pipe's write end: drop it so the read sees end of file.
@@ -726,4 +728,84 @@ fn errexit_runs_the_exit_trap_like_bash() {
     std::fs::remove_dir_all(&knsh_dir).unwrap();
     assert_eq!(bash, ("bye 1\n".to_owned(), 1));
     assert_eq!(knsh, bash);
+}
+
+/// KNSH-105: command substitution, process substitution and here-documents, with real programs on both sides.
+/// `coproc` is not here: bash 3.2 has none.
+const SUBSTITUTIONS: &str = r#"x=$(printf 'a\n\n\n'); echo "[$x]"
+y=`echo back`; echo $y
+echo `echo \`echo nested\``
+set -- $(printf 'one  two\n'); echo $# "$1"
+echo "$(printf 'keep  spaces')"
+touch f1 f2; echo $(echo 'f*'); echo "$(echo 'f*')"
+v=1; w=$(v=2; echo $v); echo $v $w
+x=$(exit 3); echo "status $?"
+echo $(exit 4) $?
+x=$(false) y=1; echo "assign $?"
+printf 'line1\nline2\n\n' > data; echo "$(< data)"
+diff <(printf 'a\nb\n') <(printf 'a\nc\n'); echo "diff $?"
+cat <(echo one) <(echo two)
+echo <(true) <(true)
+while read -r l; do echo "got $l"; done < <(printf 'p\nq\n')
+n=0; while read -r l; do n=$((n+1)); done < <(printf '1\n2\n3\n'); echo "count $n"
+exec 4< <(echo from-four); read -r four <&4; echo "$four"; exec 4<&-
+cat <<EOF
+x is $v and $(echo sub) and `echo tick` and $((1+2))
+\$literal "quoted" 'single' \\ back
+EOF
+cat <<'EOF'
+$v $(echo no) `echo no` \$x
+EOF
+cat <<-EOF
+		tabbed $v
+	  spaced
+	EOF
+cat <<-'EOF'
+	quoted tabbed
+	EOF
+f() { cat; }; f <<EOF
+to function
+EOF
+{ cat; } <<EOF
+to group
+EOF
+cat 3<<EOF <&3
+fd three
+EOF
+r=$(echo outer $(echo inner) `echo tick`); echo $r
+c=$(ls /nonexistent-knsh-dir 2>&1 >/dev/null | wc -l); echo "errors $((c))"
+set -e
+z=$(false; echo yes); echo "$z"
+q=$(false)
+echo never
+"#;
+
+// KNSH-105, NFR-COMPAT-02: substitutions and here-documents match bash, real programs reading `/dev/fd/N`.
+#[test]
+fn substitution_and_here_document_script_matches_bash() {
+    let bash_dir = temp_dir("bash-substitution");
+    let knsh_dir = temp_dir("knsh-substitution");
+    let bash = run_bash(SUBSTITUTIONS, &bash_dir);
+    let knsh = run_knsh(SUBSTITUTIONS, &knsh_dir);
+    std::fs::remove_dir_all(&bash_dir).unwrap();
+    std::fs::remove_dir_all(&knsh_dir).unwrap();
+    assert!(bash.0.contains("< b\n---\n> c\n"), "bash output: {}", bash.0);
+    assert_eq!(knsh, bash);
+}
+
+// KNSH-105: a coprocess of a real program talks through its array, and sees end of file once the shell closes its
+// input: no copy of the shell's ends is left with the program or anywhere else. Bash 3.2 has no `coproc`; the
+// expected output is bash 5.2's (`execute_coproc`), pending a run against bash 5.2 itself (KNSH-109).
+#[test]
+fn coproc_of_a_real_program_ends_when_its_input_closes() {
+    let script = "coproc tr a-z A-Z\n\
+                  echo ping >&${COPROC[1]}\n\
+                  eval \"exec ${COPROC[1]}>&-\"\n\
+                  read -r reply <&${COPROC[0]}; echo \"$reply\"\n\
+                  wait $COPROC_PID; echo \"status $?\"\n\
+                  read -r more <&${COPROC[0]}; echo \"eof $?\"\n";
+    let dir = temp_dir("knsh-coproc");
+    let knsh = run_knsh(script, &dir);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(knsh, ("PING\nstatus 0\neof 1\n".to_owned(), 0));
 }

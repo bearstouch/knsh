@@ -6,8 +6,9 @@
 //! escape, a quote or a nested expansion is skipped as a whole, so its characters never end the enclosing body.
 //!
 //! The result is a list of [`Part`]s, the same form parser segments are turned into, so one engine expands both.
-//! Command substitutions cannot occur here: the parser refuses them inside these bodies (KNSH-031), and a stray one
-//! is refused again rather than read.
+//! Command substitutions cannot occur in `${…}` and `$((…))`: the parser refuses them there (KNSH-031). Inside
+//! `[[ … ]]` and `(( … ))`, which the parser keeps opaque, one is refused rather than read, as is a stray one
+//! anywhere: only the parser delimits a substitution's body (KNSH-105 runs those it read, [`Part::Subst`]).
 
 use knsh_bash::Span;
 
@@ -45,6 +46,35 @@ pub(crate) enum Part {
         /// The whole expansion.
         span: Span,
     },
+    /// `$(…)`, `` `…` ``, `<(…)` or `>(…)` (KNSH-105): run when expanded, its body parsed again as bash does.
+    Subst(Subst),
+}
+
+/// A command or process substitution in a word (KNSH-105).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Subst {
+    /// Which form.
+    pub(crate) kind: SubstKind,
+    /// Between the delimiters, as written.
+    pub(crate) body: Span,
+    /// The whole substitution.
+    pub(crate) span: Span,
+}
+
+/// The forms of [`Subst`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubstKind {
+    /// `$(…)`.
+    Command,
+    /// `` `…` ``, inside double quotes or not (which changes how its body is un-escaped).
+    Backtick {
+        /// Inside `"…"` or `$"…"`, not a here-document body.
+        in_double_quotes: bool,
+    },
+    /// `<(…)`: the body's output, read through `/dev/fd/N`.
+    Input,
+    /// `>(…)`: the body's input, written through `/dev/fd/N`.
+    Output,
 }
 
 /// How quotes are read in the text being scanned.

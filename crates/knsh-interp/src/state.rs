@@ -450,6 +450,9 @@ pub struct ShellState {
     /// Names of [`UNEMULATED_WHEN_UNSET`] variables the script assigned, declared or unset itself: from then on
     /// their state is the script's, not the default bash would have given them.
     touched: BTreeSet<String>,
+    /// `NAME_PID` of each coprocess the shell runs itself, which has no process id (KNSH-105): reading it is refused
+    /// while the script has not set it itself.
+    in_shell_pids: BTreeSet<String>,
     /// The command hash table: names found on `PATH`, by name (KNSH-101).
     hashed: BTreeMap<String, Hashed>,
     /// Entries added to the hash table so far, to order them.
@@ -494,6 +497,7 @@ impl ShellState {
             last_background: None,
             interactive: false,
             touched: BTreeSet::new(),
+            in_shell_pids: BTreeSet::new(),
             hashed: BTreeMap::new(),
             hash_seq: 0,
             aliases: BTreeMap::new(),
@@ -937,6 +941,7 @@ impl ShellState {
         if UNEMULATED_WHEN_UNSET.contains(&name) && !self.touched.contains(name) {
             self.touched.insert(name.to_owned());
         }
+        self.in_shell_pids.remove(name);
         if name == "PATH" {
             self.hashed.clear();
         }
@@ -1718,6 +1723,13 @@ impl ShellState {
     pub(crate) fn is_unemulated(&self, name: &str) -> bool {
         is_always_unemulated(name)
             || (UNEMULATED_WHEN_UNSET.contains(&name) && self.find(name).is_none() && !self.touched.contains(name))
+            || (self.in_shell_pids.contains(name) && self.find(name).is_none())
+    }
+
+    /// Marks `name` as the `NAME_PID` of a coprocess the shell runs itself, which has no process id: reading it is
+    /// refused until the script sets it (KNSH-105).
+    pub(crate) fn mark_in_shell_pid(&mut self, name: &str) {
+        self.in_shell_pids.insert(name.to_owned());
     }
 
     /// Whether `${!prefix*}` could list a variable whose reading [`ShellState::is_unemulated`] refuses: bash would

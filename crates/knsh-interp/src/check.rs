@@ -1,10 +1,11 @@
-//! The check of a whole script before it runs (KNSH-096 to KNSH-104): every construct a later story
+//! The check of a whole script before it runs (KNSH-096 to KNSH-105): every construct a later story
 //! implements is refused here, with its span, so a script the interpreter cannot evaluate runs none of its commands.
 //! A function's body is checked where the function is defined, as its commands are written there (KNSH-103).
 //!
 //! Expansions are read but not performed: each `${…}` body is parsed, and the words and expressions inside it are
-//! scanned, so an array, a command substitution or a variable bash maintains itself is refused wherever it is
-//! written. Brace expansion, which depends only on the text, is performed, so a word past its bounds runs nothing.
+//! scanned, so a variable bash maintains itself is refused wherever it is written. The body of each command and
+//! process substitution, and of each unquoted here-document, is checked too, as a script of its own (KNSH-105).
+//! Brace expansion, which depends only on the text, is performed, so a word past its bounds runs nothing.
 //! What depends on a value or the filesystem (a variable named only at run time, a command name produced by an
 //! expansion or a pattern) is refused when the expansion happens instead.
 //!
@@ -12,8 +13,8 @@
 //! than the limit is refused before evaluation and the check itself never overflows the stack.
 
 use knsh_bash::{
-    AndOr, ArithmeticParts, Command, CommandWord, CompoundCommand, CompoundKind, ListItem, ParseOptions, Pipeline,
-    Redirect, RedirectionOperator, SimpleCommand, Span, UnsupportedCommand,
+    AndOr, ArithmeticParts, Command, CommandWord, CompoundCommand, CompoundKind, CoprocParts, ListItem, ParseOptions,
+    Pipeline, Redirect, RedirectionOperator, SimpleCommand, Span, UnsupportedCommand,
 };
 
 use crate::brace;
@@ -24,8 +25,8 @@ use crate::eval::{is_conditional, is_refused_builtin, refused_form, trailing_red
 use crate::expand::MAX_EXPANSION_DEPTH;
 use crate::param::{self, Name, Op, Parsed, Subscript};
 use crate::pattern;
-use crate::scan::{self, Mode, Part};
-use crate::state::{is_always_unemulated, lists_always_unemulated, refuses_assignment};
+use crate::scan::{self, Mode, Part, Subst, SubstKind};
+use crate::state::{is_always_unemulated, is_name, lists_always_unemulated, refuses_assignment};
 use crate::word::{self, Context, WordChar};
 
 /// Checks `items` (a script's top-level list) against `source`, nesting at most `max_depth` lists.
@@ -63,6 +64,16 @@ impl Checker<'_> {
             return Err(InterpError::DepthExceeded { limit: self.max_depth });
         }
         for item in items {
+            // KNSH-105: `coproc … &` would set the coprocess's variables in a background subshell only.
+            if item.is_background()
+                && let Some(coproc) = item
+                    .and_or
+                    .pipelines()
+                    .flat_map(Pipeline::commands)
+                    .find(|command| is_coproc(command))
+            {
+                return Err(refuse(Unsupported::Coproc, coproc.span()));
+            }
             self.and_or(&item.and_or, depth + 1)?;
         }
         Ok(())
@@ -79,6 +90,11 @@ impl Checker<'_> {
             && !self.times
         {
             return Err(refuse(Unsupported::Time, time.span()));
+        }
+        // KNSH-105: a coprocess is run only as a pipeline of its own (bash would run it in a stage's subshell).
+        let alone = pipeline.rest.is_empty() && pipeline.time.is_none() && !pipeline.is_negated();
+        if !alone && let Some(coproc) = pipeline.commands().find(|command| is_coproc(command)) {
+            return Err(refuse(Unsupported::Coproc, coproc.span()));
         }
         pipeline.commands().try_for_each(|command| self.command(command, depth))
     }
@@ -99,6 +115,9 @@ impl Checker<'_> {
     /// evaluator reads it (KNSH-102); anything else opaque is refused.
     fn opaque(&self, unsupported: &UnsupportedCommand, depth: usize) -> Result<(), InterpError> {
         let construct = || refuse(Unsupported::Construct(unsupported.construct), unsupported.span);
+        if let Some(parts) = unsupported.coproc.as_deref() {
+            return self.coproc(parts, depth);
+        }
         match unsupported.arithmetic.as_deref() {
             None if is_conditional(unsupported) => self.conditional(unsupported.span),
             None => Err(construct()),
@@ -121,6 +140,21 @@ impl Checker<'_> {
                 }
             }
         }
+    }
+
+    /// `coproc [NAME] command` (KNSH-105): its name must be one the shell may assign (bash's message for an invalid
+    /// one is not reproduced), and its command is checked as any command.
+    fn coproc(&self, parts: &CoprocParts, depth: usize) -> Result<(), InterpError> {
+        if let Some(name) = parts.name {
+            let text = word::text(name, self.source)?;
+            if !is_name(text) {
+                return Err(refuse(Unsupported::Coproc, name));
+            }
+            if refuses_assignment(text) {
+                return Err(refuse(Unsupported::ShellVariable, name));
+            }
+        }
+        self.command(&parts.command, depth)
     }
 
     /// A `[[ … ]]` spanning `span`: its expression must read as bash reads it, each word's expansions are checked,
@@ -197,7 +231,8 @@ impl Checker<'_> {
         }
         let options = ParseOptions::default()
             .with_redirection_variables(true)
-            .with_arrays(true);
+            .with_arrays(true)
+            .with_coproc(true);
         if let Ok(script) = knsh_bash::parse_with(text, options) {
             check(&script.items, text, self.max_depth, self.times).map_err(|error| traps::at_command(error, span))?;
         }
@@ -229,13 +264,19 @@ impl Checker<'_> {
         Ok(())
     }
 
-    /// A command's redirections (KNSH-099): here-documents are refused (KNSH-105), a `{name}` variable bash
-    /// maintains itself too; each target is checked as an argument word (a here-string's as a plain word).
+    /// A command's redirections (KNSH-099): a `{name}` variable bash maintains itself is refused; each target is
+    /// checked as an argument word (a here-string's as a plain word), a here-document's body as double-quoted text.
     fn redirections(&self, redirects: &[Redirect]) -> Result<(), InterpError> {
         for redirect in redirects {
             let context = match redirect.operator {
+                // KNSH-105: an unquoted body is expanded as double-quoted text; the delimiter never is.
                 RedirectionOperator::HereDocument | RedirectionOperator::HereDocumentStripTabs => {
-                    return Err(refuse(Unsupported::HereDocument, redirect.span));
+                    let Some(document) = &redirect.here_document else {
+                        return Err(refuse(Unsupported::HereDocument, redirect.span));
+                    };
+                    let body = word::here_document_parts(document, self.source)?;
+                    self.parts(std::slice::from_ref(&body), false, 0)?;
+                    continue;
                 }
                 RedirectionOperator::HereString => Context::Plain,
                 RedirectionOperator::Input
@@ -340,7 +381,30 @@ impl Checker<'_> {
                     let inner = scan::scan(self.source, *body, Mode::Double).map_err(|error| at(error, *span))?;
                     self.parts(&inner, true, depth + 1)?;
                 }
+                Part::Subst(subst) => self.substitution(subst, depth + 1)?,
             }
+        }
+        Ok(())
+    }
+
+    /// The body of a command or process substitution (KNSH-105), parsed as the evaluator parses it when it runs it
+    /// and checked as a script, `depth` expansions deep: what it holds that the interpreter refuses is refused now,
+    /// placed at the substitution. Text that does not parse with the default options is left for the evaluator,
+    /// which reads it with the options set by then.
+    fn substitution(&self, subst: &Subst, depth: usize) -> Result<(), InterpError> {
+        if depth > MAX_EXPANSION_DEPTH {
+            return Err(InterpError::DepthExceeded {
+                limit: MAX_EXPANSION_DEPTH,
+            });
+        }
+        let text = substitution_text(subst, self.source)?;
+        let options = ParseOptions::default()
+            .with_redirection_variables(true)
+            .with_arrays(true)
+            .with_coproc(true);
+        if let Ok(script) = knsh_bash::parse_with(&text, options) {
+            check(&script.items, &text, self.max_depth, self.times)
+                .map_err(|error| traps::at_command(error, subst.span))?;
         }
         Ok(())
     }
@@ -414,13 +478,31 @@ fn has_pattern(parts: &[Part]) -> bool {
                     expanded: false,
                 })),
                 Part::Double(inner) => chars(inner, true, out),
-                Part::Param { .. } | Part::Brace { .. } | Part::Arith { .. } => {}
+                Part::Param { .. } | Part::Brace { .. } | Part::Arith { .. } | Part::Subst(_) => {}
             }
         }
     }
     let mut view = Vec::new();
     chars(parts, false, &mut view);
     pattern::has_glob(&view, true)
+}
+
+/// The text bash runs for `subst` (written in `source`): its body, un-escaped for a backtick (KNSH-105).
+///
+/// # Errors
+///
+/// [`InterpError::SourceMismatch`] if its span does not index `source`.
+pub(crate) fn substitution_text(subst: &Subst, source: &str) -> Result<String, InterpError> {
+    let body = word::text(subst.body, source)?;
+    Ok(match subst.kind {
+        SubstKind::Backtick { in_double_quotes } => knsh_bash::backtick_text(body, in_double_quotes).into_owned(),
+        SubstKind::Command | SubstKind::Input | SubstKind::Output => body.to_owned(),
+    })
+}
+
+/// Whether `command` is `coproc …` read with [`ParseOptions::coproc`] (KNSH-105).
+pub(crate) fn is_coproc(command: &Command) -> bool {
+    matches!(command, Command::Unsupported(unsupported) if unsupported.coproc.is_some())
 }
 
 /// `error`, with a refusal placed at `span` when the scanner could only place it within its own text.

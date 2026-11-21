@@ -102,10 +102,15 @@ impl From<PlatformError> for InterpError {
 /// Bash features the interpreter refuses until the story that implements them, which each variant names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Unsupported {
-    /// `$(…)`, `` `…` `` (KNSH-105, which runs them in a child shell and captures their output).
+    /// `$(…)` or `` `…` `` where the interpreter does not run it (KNSH-105): inside `[[ … ]]`, `(( … ))`, `$(( … ))`
+    /// or `${…}`, whose text it reads again without the parser, or in a prompt string (`PS4`).
     CommandSubstitution,
-    /// `<(…)`, `>(…)` (KNSH-105).
+    /// `<(…)` or `>(…)` where the interpreter does not run it, as for [`Unsupported::CommandSubstitution`].
     ProcessSubstitution,
+    /// A `coproc` the interpreter does not run as bash does (KNSH-105): not a pipeline of its own (in a pipeline, a
+    /// `!` or `time` pipeline, or started with `&`), a name that is not an identifier, or one whose array cannot be
+    /// assigned.
+    Coproc,
     /// An unquoted `$*` or `$@` of several parameters where bash does not split (an assignment, a `case` word, the
     /// word of `${x:=…}`), with an `IFS` whose first character is not a space: bash joins the parameters there with
     /// a separator that depends on the context and its version, which is not emulated (KNSH-109 settles it against
@@ -134,7 +139,8 @@ pub enum Unsupported {
     /// A redirection after `(( … ))` or `for (( … ))`, which the parser keeps opaque, so its redirections are not
     /// read.
     Redirection,
-    /// A here-document, `<<` or `<<-` (KNSH-105).
+    /// A here-document whose body the parser did not attach to its redirection (never produced by
+    /// [`knsh_bash::parse`], which refuses such a line).
     HereDocument,
     /// `$!` after a background job whose last command the shell runs itself (`{ …; } &`, `a && b &`): bash's value
     /// is a forked subshell's process id, which does not exist here, and any number given instead could name another
@@ -206,8 +212,9 @@ pub enum Unsupported {
 impl fmt::Display for Unsupported {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CommandSubstitution => f.write_str("command substitution (KNSH-105)"),
-            Self::ProcessSubstitution => f.write_str("process substitution (KNSH-105)"),
+            Self::CommandSubstitution => f.write_str("command substitution in this context"),
+            Self::ProcessSubstitution => f.write_str("process substitution in this context"),
+            Self::Coproc => f.write_str("this coproc form"),
             Self::BraceBuiltExpansion => f.write_str("an expansion formed by brace expansion"),
             Self::UnsplitJoin => {
                 f.write_str("joining $* or $@ with a non-space IFS where bash does not split (KNSH-109)")
@@ -219,7 +226,7 @@ impl fmt::Display for Unsupported {
             Self::NonUtf8Value => f.write_str("a variable value that is not UTF-8"),
             Self::NonUtf8FileName => f.write_str("a file name that is not UTF-8"),
             Self::Redirection => f.write_str("a redirection of an arithmetic command"),
-            Self::HereDocument => f.write_str("here-document (KNSH-105)"),
+            Self::HereDocument => f.write_str("a here-document without its body"),
             Self::InShellProcessId => f.write_str("$! of a background job the shell runs itself"),
             Self::Time => f.write_str("the time keyword without clocks"),
             Self::FunctionPrint => f.write_str("printing a function definition (KNSH-103)"),
