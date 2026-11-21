@@ -17,9 +17,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use crate::descriptor::{Descriptors, OpenMode, reaches_descriptor_table};
+use crate::descriptor::{Descriptors, OpenMode, TerminalInput, TerminalSettings, reaches_descriptor_table};
 use crate::error::{Operation, PlatformError};
+use crate::fs::FileStatus;
 use crate::process::SharedFd;
 
 /// Here-strings up to this many bytes go through a pipe; longer ones through an unlinked temporary file. Well below
@@ -238,6 +240,124 @@ impl Descriptors for SystemDescriptors {
         }
         Ok(())
     }
+
+    fn read(&self, fd: &SharedFd, buffer: &mut [u8]) -> Result<usize, PlatformError> {
+        loop {
+            // SAFETY: `fd` is open for the duration of the call (the `SharedFd` holds it), and `buffer` is valid for
+            // writes of `buffer.len()` bytes.
+            let count = unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+            if let Ok(count) = usize::try_from(count) {
+                return Ok(count);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                return Err(PlatformError::from_io(Operation::Read, &error));
+            }
+        }
+    }
+
+    fn wait_readable(&self, fd: &SharedFd, timeout: Duration) -> Result<bool, PlatformError> {
+        // A timeout too long to add to the clock never runs out: wait in `i32::MAX` millisecond rounds.
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        loop {
+            let left = deadline.map_or(Duration::MAX, |deadline| {
+                deadline.saturating_duration_since(std::time::Instant::now())
+            });
+            // Rounded up, so a wait never ends before its time; `poll` takes at most `i32::MAX` milliseconds, and a
+            // longer wait goes round again.
+            let millis = i32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
+            let mut entry = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `entry` is one valid `pollfd` for the duration of the call; `fd` is held open by `SharedFd`.
+            let ready = unsafe { libc::poll(&raw mut entry, 1, millis) };
+            match ready {
+                0 if left.is_zero() || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) => {
+                    return Ok(false);
+                }
+                0 => {}
+                n if n > 0 => return Ok(true),
+                _ => {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EINTR) {
+                        return Err(PlatformError::from_io(Operation::Read, &error));
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_terminal(&self, fd: &SharedFd) -> bool {
+        // SAFETY: `isatty` reads nothing but the descriptor number, which `SharedFd` keeps open.
+        unsafe { libc::isatty(fd.as_raw_fd()) == 1 }
+    }
+
+    fn status(&self, fd: &SharedFd) -> Result<FileStatus, PlatformError> {
+        let file = std::fs::File::from(
+            fd.try_clone_owned()
+                .map_err(|error| PlatformError::from_io(Operation::Metadata, &error))?,
+        );
+        let meta = file
+            .metadata()
+            .map_err(|error| PlatformError::from_io(Operation::Metadata, &error))?;
+        Ok(super::fs::status_of(&meta))
+    }
+
+    fn set_terminal_input(
+        &self,
+        fd: &SharedFd,
+        input: TerminalInput,
+    ) -> Result<Option<TerminalSettings>, PlatformError> {
+        if !self.is_terminal(fd) {
+            return Ok(None);
+        }
+        let terminal = |result: libc::c_int| {
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(PlatformError::from_io(
+                    Operation::Terminal,
+                    &std::io::Error::last_os_error(),
+                ))
+            }
+        };
+        // SAFETY: an all-zero `termios` is a valid value of the plain C struct; `tcgetattr` overwrites it.
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `saved` is a valid, writable `termios` for the duration of the call; `fd` is held open.
+        terminal(unsafe { libc::tcgetattr(fd.as_raw_fd(), &raw mut saved) })?;
+        let mut changed = saved;
+        if !input.echo {
+            // Bash's `ttfd_noecho`.
+            changed.c_lflag &= !(libc::ECHO | libc::ECHOK | libc::ECHONL);
+        }
+        if !input.canonical {
+            // Bash's `ttfd_cbreak`: characters arrive one at a time, signals still work.
+            changed.c_lflag &= !libc::ICANON;
+            changed.c_lflag |= libc::ISIG | libc::IEXTEN;
+            changed.c_cc[libc::VMIN] = 1;
+            changed.c_cc[libc::VTIME] = 0;
+        }
+        // SAFETY: `changed` is a valid `termios` read for the duration of the call; `fd` is held open.
+        terminal(unsafe { libc::tcsetattr(fd.as_raw_fd(), libc::TCSADRAIN, &raw const changed) })?;
+        Ok(Some(TerminalSettings { saved: Some(saved) }))
+    }
+
+    fn restore_terminal(&self, fd: &SharedFd, saved: &TerminalSettings) -> Result<(), PlatformError> {
+        let Some(termios) = saved.saved else {
+            return Ok(());
+        };
+        // SAFETY: `termios` is a valid `termios` read for the duration of the call; `fd` is held open.
+        if unsafe { libc::tcsetattr(fd.as_raw_fd(), libc::TCSADRAIN, &raw const termios) } == 0 {
+            Ok(())
+        } else {
+            Err(PlatformError::from_io(
+                Operation::Terminal,
+                &std::io::Error::last_os_error(),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +445,44 @@ mod tests {
         descriptors.open_masked(&existing, OpenMode::Truncate, 0o077).unwrap();
         assert_eq!(mode(&existing), 0o644);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // KNSH-102: `read` reads a byte at a time, waits with a timeout, and stats and asks about its descriptor.
+    #[test]
+    fn reads_wait_and_stat_descriptors() {
+        let descriptors = SystemDescriptors::new();
+        let (reader, writer) = descriptors.pipe().unwrap();
+        assert!(!descriptors.wait_readable(&reader, Duration::from_millis(20)).unwrap());
+        descriptors.write_all(&writer, b"ab").unwrap();
+        assert!(descriptors.wait_readable(&reader, Duration::ZERO).unwrap());
+        // A timeout past what the clock can add (`read -t 18446744073709551615`) waits without end, never panics.
+        assert!(descriptors.wait_readable(&reader, Duration::MAX).unwrap());
+        let mut byte = [0_u8];
+        assert_eq!(descriptors.read(&reader, &mut byte).unwrap(), 1);
+        assert_eq!(&byte, b"a");
+        assert_eq!(descriptors.read(&reader, &mut byte).unwrap(), 1);
+        drop(writer);
+        // End of file is readable, and reads 0.
+        assert!(descriptors.wait_readable(&reader, Duration::from_secs(5)).unwrap());
+        assert_eq!(descriptors.read(&reader, &mut byte).unwrap(), 0);
+        assert_eq!(descriptors.status(&reader).unwrap().file_type, crate::FileType::Fifo);
+        assert!(!descriptors.is_terminal(&reader));
+        // Not a terminal: nothing to change or put back.
+        let input = TerminalInput {
+            echo: false,
+            canonical: false,
+        };
+        assert!(descriptors.set_terminal_input(&reader, input).unwrap().is_none());
+        let null = descriptors.open(Path::new("/dev/null"), OpenMode::Read).unwrap();
+        assert_eq!(
+            descriptors.status(&null).unwrap().file_type,
+            crate::FileType::CharacterDevice
+        );
+        let written = descriptors.open(Path::new("/dev/null"), OpenMode::Truncate).unwrap();
+        assert_eq!(
+            descriptors.read(&written, &mut byte).unwrap_err().errno(),
+            Some(libc::EBADF)
+        );
     }
 
     // KNSH-099: `noclobber` refuses an existing regular file, creates a missing one, and still writes to devices.

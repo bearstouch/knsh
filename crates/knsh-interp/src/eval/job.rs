@@ -123,6 +123,8 @@ impl Interpreter {
             collation: Arc::clone(&self.collation),
             descriptors: Arc::clone(&self.descriptors),
             times: self.times.clone(),
+            standard: self.standard.clone(),
+            local_time: self.local_time.clone(),
             terminal: None,
             diagnostics: Arc::clone(&self.diagnostics),
             output: Arc::clone(&self.output),

@@ -162,15 +162,25 @@
 //! | --- | --- | --- | --- |
 //! | [`Collation`] | Sort strings as `strcoll` does in a locale | `SystemCollation` (`newlocale`, `strcoll_l`); [`ByteCollation`] for the C locale anywhere | `FakeCollation` |
 //!
+//! KNSH-102 (the interpreter's `test`, `[[ … ]]`, `printf` and `read`) adds [`Fs::status`] and [`Fs::accessible`]
+//! (`stat`, `lstat`, `faccessat(AT_EACCESS)`), reading, waiting with a timeout, `isatty`, `fstat` and terminal input
+//! modes to [`Descriptors`], the `regex` module ([`regex_match`]: the system's `regcomp` and `regexec` in a locale
+//! installed for the calling thread only, decision 21; not a trait, as it is a pure computation by the same engine
+//! bash uses), and:
+//!
+//! | Trait | Effect | macOS backend | Fake ([`testing`]) |
+//! | --- | --- | --- | --- |
+//! | [`LocalTime`] | The time, and `strftime` of local time (`printf %(…)T`) | `SystemLocalTime` (`localtime_r`, `strftime_l`) | `FakeLocalTime` |
+//!
 //! Every trait is object safe and `Send + Sync`, so the daemon holds each effect as `Arc<dyn Trait>` and tests swap
 //! in a fake. All failures use the single crate error, [`PlatformError`], whose messages never echo paths or other
 //! input (NFR-PRIV-02).
 //!
 //! # Boundaries
 //!
-//! One of only two crates allowed to use `unsafe` (with `knsh-exec`), and within it only the `macos` backend and
-//! `sqlite` modules, plus the one function that zeroes a secret's buffer on drop (`secret`, KNSH-089): the crate root
-//! denies `unsafe_code` and those alone allow it. Every `unsafe` block needs a
+//! One of only two crates allowed to use `unsafe` (with `knsh-exec`), and within it only the `macos` backend,
+//! `sqlite` and `regex` (KNSH-102) modules, plus the one function that zeroes a secret's buffer on drop (`secret`,
+//! KNSH-089): the crate root denies `unsafe_code` and those alone allow it. Every `unsafe` block needs a
 //! `// SAFETY:` comment and every `unsafe fn` a `# Safety` doc section. The only third-party dependency is `libc`,
 //! and no other crate may depend on it (NFR-SUP-02). The workspace dependencies are `knsh-core`, for
 //! [`knsh_core::CanonicalPath`], [`knsh_core::Timestamp`] and [`knsh_core::Ulid`], and `knsh-json`, for the log
@@ -230,6 +240,7 @@ mod fs;
 mod holders;
 mod job;
 pub mod launchd;
+mod local_time;
 mod log;
 mod lookup;
 mod policy_source;
@@ -237,6 +248,9 @@ mod presence;
 pub mod probe;
 mod process;
 mod random;
+// `regcomp` and `regexec` with a per-thread locale (KNSH-102); macOS's `regex_t` layout until the Linux backend.
+#[allow(unsafe_code)]
+mod regex;
 mod resolver;
 mod secret;
 mod signing;
@@ -268,17 +282,18 @@ pub use control::{
     MAX_CONTROL_PAYLOAD, PeerGate, PeerRejection, SignatureFacts, SigningIdentifier, TeamId, TrustError, TrustStore,
     TrustedAuthority, peer_requirement,
 };
-pub use descriptor::{Descriptors, OpenMode, reaches_descriptor_table};
+pub use descriptor::{Descriptors, OpenMode, TerminalInput, TerminalSettings, reaches_descriptor_table};
 pub use endpoint_security::{
     DescendantClient, DescendantClients, ENDPOINT_SECURITY_MIN_MAJOR, ExecEvent, ExecHandler, ExecVerdict,
 };
 pub use engine_dirs::{EnginePaths, ensure_engine_dirs};
 pub use error::{Operation, PlatformError, SqliteCode};
 pub use file_events::{FileEvent, FileEventFlags, FileEventSink, FileEventStream, FileEvents};
-pub use fs::{FileKind, Fs, Metadata};
+pub use fs::{Access, FileKind, FileStatus, FileTime, FileType, Fs, Metadata};
 pub use holders::{HeldFile, HoldKind, MAX_HELD_FILES, MAX_PROCESSES, ProcessEntry, WriteHolders};
 pub use job::{CpuTimes, JobTerminal, ShellTimes, signals};
 pub use launchd::{LaunchAgent, PeerCredentials, ServiceManager, SocketActivation, install_agent, uninstall_agent};
+pub use local_time::{LocalTime, MAX_TIME_TEXT};
 pub use log::{Field, Level, SystemLog, Value, render};
 pub use policy_source::{EditableProfile, FileState, PolicyDirectory};
 pub use presence::{Authenticated, NotAuthenticated, PromptReason, UserPresence};
@@ -288,6 +303,7 @@ pub use process::{
     PlacementSource, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest, Stdio,
 };
 pub use random::Random;
+pub use regex::{RegexOutcome, regex_match};
 pub use resolver::{MAX_ADDRESSES, Resolver};
 pub use secret::{SecretStore, SecretValue};
 pub use signing::{

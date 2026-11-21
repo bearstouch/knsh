@@ -18,6 +18,7 @@ mod job;
 mod keychain;
 mod kqueue;
 mod launchd;
+mod local_time;
 mod log;
 mod presence;
 mod probe;
@@ -48,6 +49,7 @@ pub use keychain::{
 };
 pub use kqueue::{Kqueue, Token};
 pub use launchd::{Launchctl, LaunchdSockets, SystemPeerCredentials};
+pub use local_time::SystemLocalTime;
 pub use log::UnifiedLog;
 pub use presence::LocalAuthentication;
 pub use probe::SystemProbes;

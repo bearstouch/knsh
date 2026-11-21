@@ -25,6 +25,12 @@
 //! `break`, `continue`, `true`, `false`, `:`, `echo` (with [`ShellOptions::xpg_echo`]), `eval`, `source` and `.`,
 //! `command`, `builtin`, `type`, `hash` (bash's command hash table), `alias` and `unalias` (expanded with
 //! [`ShellOptions::expand_aliases`]), `umask` (passed to every command and redirection) and `exec` with a command.
+//! KNSH-102 adds `test` and `[` (bash's argument-count rules, file tests through [`knsh_platform::Fs::status`]),
+//! `[[ … ]]` (no splitting or pathname expansion, `==` patterns with extended-glob groups, `=~` through the system's
+//! POSIX regular expressions with `BASH_REMATCH`), `printf` (every bash conversion, `%q`, `%(…)T` through the host's
+//! [`knsh_platform::LocalTime`] given with [`Interpreter::with_local_time`], `-v`) and `read` (`-r -d -n -N -p -s
+//! -t -u`, `IFS` splitting, timeouts at status 142), reading the spawner's standard input given with
+//! [`Interpreter::with_standard_descriptors`].
 //!
 //! # Boundaries
 //!
@@ -43,11 +49,13 @@
 //!   must start through the spawner): pipeline stages and background lists that the shell runs itself run on threads
 //!   of their own (decision 19). Children are known by handle, waited for by one thread each, and a job's process
 //!   group is signalled only while one of its members is held unreaped.
-//! - What later stories implement (command substitution, here-documents, functions, arrays, `read`, `trap`, `set`
+//! - What later stories implement (command substitution, here-documents, functions, arrays, `read -a`, `trap`, `set`
 //!   options) is refused with [`InterpError::Unsupported`] by a check of the whole script before anything runs, or,
-//!   when only an expansion's value reveals it (or `eval` and `source` text), when it is reached. Builtins whose
-//!   external program behaves the same for literal arguments (`printf`, `test`, `[`) run as that program until
-//!   KNSH-102.
+//!   when only an expansion's value reveals it (or `eval` and `source` text), when it is reached. `[[ … ]]`, which
+//!   the parser keeps whole, is read again from its text with the same lexer, as `(( … ))` bodies are; one bash's
+//!   parser would reject is refused by that check.
+//! - Regular expressions are the system's `regcomp` and `regexec` ([`knsh_platform::regex_match`], decision 21):
+//!   the engine bash itself calls, so `=~` matches exactly as bash's; no new crate.
 //! - `eval`, `source` and alias text are parsed, checked and evaluated by the same parser and evaluator as the
 //!   script, so every program in them starts through the same spawner (KNSH-108). `cd` changes the interpreter's
 //!   working directory, never the process's, and `exec cmd` runs the program and then ends the shell (decision 20).
@@ -72,8 +80,10 @@
 //!   `specs/09-reference/decisions.md` (decision 19: subshells are copies)
 //! - `specs/00-stories/KNSH-101-core-builtins.md`, NFR-COMPAT-10 (OSC 7), `specs/09-reference/decisions.md`
 //!   (decision 20: `exec` runs, then ends the shell)
-//! - `specs/09-reference/defaults-and-limits.md` (the evaluation, arithmetic and expansion depth limits, and the
-//!   brace and pathname expansion bounds)
+//! - `specs/00-stories/KNSH-102-builtins-test-printf-read.md`, `specs/09-reference/decisions.md` (decision 21: system
+//!   regular expressions)
+//! - `specs/09-reference/defaults-and-limits.md` (the evaluation, arithmetic and expansion depth limits, the brace
+//!   and pathname expansion bounds, and the `printf` and `read` bounds)
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
@@ -82,6 +92,7 @@
 mod arith;
 mod brace;
 mod check;
+mod cond;
 mod error;
 mod eval;
 mod expand;
@@ -91,6 +102,7 @@ mod lookup;
 mod observer;
 mod param;
 mod pattern;
+mod printf;
 mod quote;
 mod scan;
 mod state;

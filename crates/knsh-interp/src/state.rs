@@ -180,7 +180,6 @@ const UNEMULATED: &[&str] = &[
     "BASH_COMMAND",
     "BASH_EXECUTION_STRING",
     "BASH_LINENO",
-    "BASH_REMATCH",
     "BASH_SOURCE",
     "BASH_SUBSHELL",
     "BASH_VERSINFO",
@@ -233,9 +232,14 @@ pub(crate) fn is_always_unemulated(name: &str) -> bool {
 /// and the interpreter has no arrays to hold another value (KNSH-103).
 pub(crate) const PIPESTATUS: &str = "PIPESTATUS";
 
-/// Whether assigning `name` must be refused: a variable bash maintains itself, or `PIPESTATUS`.
+/// The array `[[ string =~ regex ]]` sets to the match and its subexpressions (KNSH-102). It is read like
+/// `PIPESTATUS` (`$BASH_REMATCH`, `${BASH_REMATCH[1]}`, `${#BASH_REMATCH[@]}`); assigning it is refused for the same
+/// reason.
+pub(crate) const BASH_REMATCH: &str = "BASH_REMATCH";
+
+/// Whether assigning `name` must be refused: a variable bash maintains itself, `PIPESTATUS` or `BASH_REMATCH`.
 pub(crate) fn refuses_assignment(name: &str) -> bool {
-    is_always_unemulated(name) || name == PIPESTATUS
+    is_always_unemulated(name) || name == PIPESTATUS || name == BASH_REMATCH
 }
 
 /// What `$!` names: the last background job's last command (KNSH-100).
@@ -251,7 +255,8 @@ pub(crate) enum LastBackground {
 
 /// Whether `${!prefix*}` could list one of the variables bash always maintains itself, whatever the state.
 pub(crate) fn lists_always_unemulated(prefix: &str) -> bool {
-    UNEMULATED.iter().any(|name| name.starts_with(prefix))
+    // `BASH_REMATCH` is held as an array the listing does not see (KNSH-102).
+    UNEMULATED.iter().any(|name| name.starts_with(prefix)) || BASH_REMATCH.starts_with(prefix)
 }
 
 /// Everything a script reads and changes besides the filesystem and processes.
@@ -276,6 +281,9 @@ pub struct ShellState {
     pid: u32,
     /// `PIPESTATUS`: the statuses of the last foreground pipeline's commands, in order (KNSH-100).
     pipestatus: Vec<Status>,
+    /// `BASH_REMATCH`: the last `=~` match and its subexpressions, empty before any match and after one that failed
+    /// (KNSH-102).
+    bash_rematch: Vec<String>,
     /// `$!`, unset until a job runs in the background.
     last_background: Option<LastBackground>,
     /// Whether this is an interactive shell (`i` in `$-`).
@@ -317,6 +325,7 @@ impl ShellState {
             cwd,
             pid: std::process::id(),
             pipestatus: vec![Status::SUCCESS],
+            bash_rematch: Vec::new(),
             last_background: None,
             interactive: false,
             touched: BTreeSet::new(),
@@ -711,6 +720,18 @@ impl ShellState {
     #[must_use]
     pub fn pipestatus(&self) -> &[Status] {
         &self.pipestatus
+    }
+
+    /// `BASH_REMATCH`: what the last `[[ … =~ … ]]` matched, then each subexpression (empty for one that took no
+    /// part), or nothing before any match and after one that failed (KNSH-102).
+    #[must_use]
+    pub fn bash_rematch(&self) -> &[String] {
+        &self.bash_rematch
+    }
+
+    /// Sets `BASH_REMATCH`.
+    pub(crate) fn set_bash_rematch(&mut self, matched: Vec<String>) {
+        self.bash_rematch = matched;
     }
 
     /// Sets `PIPESTATUS`.

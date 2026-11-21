@@ -16,8 +16,9 @@ use knsh_bash::{
 };
 
 use crate::brace;
+use crate::cond;
 use crate::error::{InterpError, Unsupported};
-use crate::eval::{external_builtin_differs, is_refused_builtin, refused_form, trailing_redirection};
+use crate::eval::{is_conditional, is_refused_builtin, refused_form, trailing_redirection};
 use crate::expand::MAX_EXPANSION_DEPTH;
 use crate::param::{self, Name, Op, Parsed};
 use crate::pattern;
@@ -89,10 +90,12 @@ impl Checker<'_> {
         }
     }
 
-    /// `(( … ))` and `for (( … ))`, which the parser keeps opaque but describes; anything else opaque is refused.
+    /// `(( … ))` and `for (( … ))`, which the parser keeps opaque but describes, and `[[ … ]]`, read here as the
+    /// evaluator reads it (KNSH-102); anything else opaque is refused.
     fn opaque(&self, unsupported: &UnsupportedCommand, depth: usize) -> Result<(), InterpError> {
         let construct = || refuse(Unsupported::Construct(unsupported.construct), unsupported.span);
         match unsupported.arithmetic.as_deref() {
+            None if is_conditional(unsupported) => self.conditional(unsupported.span),
             None => Err(construct()),
             Some(ArithmeticParts::Command { expression, close }) => {
                 self.arithmetic(*expression, unsupported.span)?;
@@ -115,6 +118,22 @@ impl Checker<'_> {
         }
     }
 
+    /// A `[[ … ]]` spanning `span`: its expression must read as bash reads it, each word's expansions are checked,
+    /// and nothing may follow its `]]` (a redirection the parser kept inside the node).
+    fn conditional(&self, span: Span) -> Result<(), InterpError> {
+        let conditional = cond::parse(self.source, span)?;
+        let mut operands = Vec::new();
+        conditional.expr.operands(&mut operands);
+        for operand in operands {
+            let parts = scan::scan(self.source, operand.span, Mode::Unquoted).map_err(|error| at(error, span))?;
+            self.parts(&parts, false, 0)?;
+        }
+        match trailing_redirection(self.source, conditional.close.end, span) {
+            Some(redirect) => Err(refuse(Unsupported::Conditional, redirect)),
+            None => Ok(()),
+        }
+    }
+
     fn simple(&self, simple: &SimpleCommand) -> Result<(), InterpError> {
         for assignment in &simple.assignments {
             // Bash maintains these itself, and refuses some (`UID`, `PPID`) as read-only, running nothing.
@@ -133,8 +152,7 @@ impl Checker<'_> {
         // literal; the builtin refuses it again when it runs.
         if let (Some(Some(name)), Some(first)) = (literals.first(), simple.words.first()) {
             let args: Option<Vec<String>> = literals.iter().skip(1).cloned().collect();
-            let differs = args.as_ref().is_some_and(|args| external_builtin_differs(name, args));
-            if is_refused_builtin(name) || differs {
+            if is_refused_builtin(name) {
                 return Err(refuse(Unsupported::Builtin, first.span));
             }
             if let Some(feature) = args.as_deref().and_then(|args| refused_form(name, args)) {

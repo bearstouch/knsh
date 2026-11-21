@@ -41,8 +41,8 @@ use knsh_bash::{
     UnsupportedCommand,
 };
 use knsh_platform::{
-    ChildHandle, Collation, CommandOutcome, CommandSpawner, Descriptors, ExitStatus, Fs, JobTerminal, ShellTimes,
-    UserHomes,
+    ChildHandle, Collation, CommandOutcome, CommandSpawner, Descriptors, ExitStatus, Fs, JobTerminal, LocalTime,
+    SharedFd, ShellTimes, UserHomes,
 };
 
 use crate::arith::Failure;
@@ -61,12 +61,16 @@ use crate::word;
 mod alias;
 mod builtins;
 mod cd;
+mod conditional;
 mod control;
 mod declare;
 mod job;
 mod job_builtins;
 mod nested;
+mod printf_builtin;
+mod read;
 mod redirect;
+pub(crate) mod test;
 
 use job::JobContext;
 use redirect::FdTable;
@@ -88,15 +92,6 @@ pub const MAX_EVAL_DEPTH: usize = 1000;
 /// costs address space, not memory.
 pub const EVAL_STACK_SIZE: usize = 64 * 1024 * 1024;
 
-/// Builtins run as their external program for now: for the arguments a script without expansions can pass, the
-/// programs in `/bin` and `/usr/bin` behave as bash's builtins do. KNSH-102 replaces them.
-const EXTERNAL_BUILTINS: &[&str] = &["[", "printf", "test"];
-
-/// Where the programs standing in for [`EXTERNAL_BUILTINS`] are looked up, whatever `PATH` says: bash runs its
-/// builtin without searching `PATH`, so a `PATH` entry holding another `echo` (or `PATH` unset) must not change what
-/// runs.
-const BUILTIN_PROGRAM_PATH: &str = "/bin:/usr/bin";
-
 /// Bash 4 and 5 builtins that `knsh_bash::is_builtin` leaves out (it lists bash 3.2's), which must not be looked up
 /// on `PATH` either.
 const LATER_BUILTINS: &[&str] = &["compopt", "mapfile", "readarray"];
@@ -104,16 +99,15 @@ const LATER_BUILTINS: &[&str] = &["compopt", "mapfile", "readarray"];
 /// Whether `name` is a builtin the interpreter does not run yet: running a program of that name instead would not
 /// do what bash does (`cd`, `export`, `exit` change the shell itself).
 pub(crate) fn is_refused_builtin(name: &str) -> bool {
-    (knsh_bash::is_builtin(name) && !EXTERNAL_BUILTINS.contains(&name) && !NATIVE_BUILTINS.contains(&name))
-        || LATER_BUILTINS.contains(&name)
+    (knsh_bash::is_builtin(name) && !NATIVE_BUILTINS.contains(&name)) || LATER_BUILTINS.contains(&name)
 }
 
 /// Builtins the interpreter runs itself: `let` (KNSH-097), the job builtins `wait`, `jobs`, `fg`, `bg` and `disown`
-/// (KNSH-100), and the core builtins (KNSH-101).
+/// (KNSH-100), the core builtins (KNSH-101), and `test`, `[`, `printf` and `read` (KNSH-102).
 pub(crate) const NATIVE_BUILTINS: &[&str] = &[
-    ".", ":", "alias", "bg", "break", "builtin", "cd", "command", "continue", "declare", "disown", "echo", "eval",
-    "exec", "exit", "export", "false", "fg", "hash", "jobs", "let", "local", "pwd", "readonly", "return", "set",
-    "shift", "source", "true", "type", "typeset", "umask", "unalias", "unset", "wait",
+    ".", ":", "[", "alias", "bg", "break", "builtin", "cd", "command", "continue", "declare", "disown", "echo", "eval",
+    "exec", "exit", "export", "false", "fg", "hash", "jobs", "let", "local", "printf", "pwd", "read", "readonly",
+    "return", "set", "shift", "source", "test", "true", "type", "typeset", "umask", "unalias", "unset", "wait",
 ];
 
 /// The declaration builtins, whose arguments spelled like assignments are expanded as assignments (bash's
@@ -131,7 +125,8 @@ pub(crate) fn is_bash_builtin(name: &str) -> bool {
 }
 
 /// The feature a later story implements that builtin `name` with literal `args` needs, if any: `set` with options
-/// or without arguments (KNSH-104), arrays and name references in the declaration builtins (KNSH-103).
+/// or without arguments (KNSH-104), arrays and name references in the declaration builtins (KNSH-103), and
+/// `read -a` (KNSH-103).
 pub(crate) fn refused_form(name: &str, args: &[String]) -> Option<Unsupported> {
     match name {
         "set" => match args.first().map(String::as_str) {
@@ -154,6 +149,19 @@ pub(crate) fn refused_form(name: &str, args: &[String]) -> Option<Unsupported> {
                 None
             }
         }
+        // KNSH-102: `read -a` fills an array (KNSH-103).
+        "read" => args
+            .iter()
+            .take_while(|arg| arg.as_str() != "--" && arg.len() > 1 && arg.starts_with('-'))
+            .any(|arg| {
+                // Letters up to the first that takes a value (`-d a` names no array).
+                let letters = arg.trim_start_matches('-');
+                let end = letters
+                    .find(['d', 'i', 'n', 'N', 'p', 't', 'u'])
+                    .unwrap_or(letters.len());
+                letters[..end].contains('a')
+            })
+            .then_some(Unsupported::ReadOption),
         _ => None,
     }
 }
@@ -162,43 +170,6 @@ pub(crate) fn refused_form(name: &str, args: &[String]) -> Option<Unsupported> {
 /// then last for the shell's life (KNSH-099). With a command, `exec` runs it and the shell ends (KNSH-101).
 pub(crate) fn exec_redirects_only(args: &[String]) -> bool {
     matches!(args, [] | [_]) && args.first().is_none_or(|arg| arg == "--")
-}
-
-/// Whether running the builtin `name` (one of [`EXTERNAL_BUILTINS`]) as its program with `args` could do something
-/// other than bash's builtin, so it must be refused until the builtin is implemented. Conservative: it refuses every
-/// form the programs in `/bin` and `/usr/bin` were seen to treat differently, and a few more.
-///
-/// - `printf`: bash's `-v` (sets a variable) and `--`, and the `%q`, `%Q` and `%(…)T` conversions.
-/// - `test` and `[`: the unary `-N`, `-v`, `-R`, `-a` and `-o`, which the programs reject or read as binary
-///   operators (the binary `-a` and `-o` are refused with them).
-pub(crate) fn external_builtin_differs(name: &str, args: &[String]) -> bool {
-    match name {
-        "printf" => args
-            .first()
-            .is_some_and(|format| format.starts_with('-') || has_bash_only_conversion(format)),
-        "test" | "[" => args
-            .iter()
-            .any(|arg| matches!(arg.as_str(), "-N" | "-v" | "-R" | "-a" | "-o")),
-        _ => false,
-    }
-}
-
-/// Whether the `printf` format `format` holds a conversion only bash's builtin knows: `%q`, `%Q` or `%(…)T`, after
-/// any flags, width and precision.
-fn has_bash_only_conversion(format: &str) -> bool {
-    let mut chars = format.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '%' {
-            continue;
-        }
-        let conversion = chars
-            .by_ref()
-            .find(|ch| !matches!(ch, '-' | '+' | ' ' | '#' | '0'..='9' | '.' | '*'));
-        if matches!(conversion, Some('q' | 'Q' | '(')) {
-            return true;
-        }
-    }
-    false
 }
 
 /// How evaluation stopped early, inside the evaluator.
@@ -291,6 +262,11 @@ pub struct Interpreter {
     descriptors: Arc<dyn Descriptors>,
     /// The clocks of the `time` keyword, if given (KNSH-100).
     times: Option<Arc<dyn ShellTimes>>,
+    /// The spawner's standard input, output and error as descriptors, if given: what `read` reads, `test -t` asks
+    /// about and `/dev/stdin` stats while the shell's descriptor is one of them (KNSH-102).
+    standard: Option<Arc<[SharedFd; 3]>>,
+    /// The clock and local time of `printf %(…)T`, if given, with the time the shell started (`-2`) (KNSH-102).
+    local_time: Option<(Arc<dyn LocalTime>, i64)>,
     /// The terminal of an interactive shell with job control (KNSH-100).
     terminal: Option<Arc<dyn JobTerminal>>,
     /// The spawner's standard error, for the shell's own messages while its descriptor 2 is that (bash's standard
@@ -378,6 +354,8 @@ impl Interpreter {
             collation,
             descriptors,
             times: None,
+            standard: None,
+            local_time: None,
             terminal: None,
             diagnostics: Arc::new(Mutex::new(diagnostics)),
             output: Arc::new(Mutex::new(Box::new(std::io::sink()))),
@@ -427,6 +405,29 @@ impl Interpreter {
     pub fn with_output(mut self, output: Box<dyn Write + Send>) -> Self {
         self.output = Arc::new(Mutex::new(output));
         self
+    }
+
+    /// The same interpreter knowing the spawner's standard input, output and error as `standard` (the descriptors
+    /// its commands get as 0, 1 and 2 without redirections, such as those of
+    /// [`Stdio::Passed`](knsh_platform::Stdio::Passed)), so `read` reads standard input and `test -t 1` asks about
+    /// standard output (KNSH-102). Without them those are refused ([`Unsupported::StandardDescriptor`]).
+    #[must_use]
+    pub fn with_standard_descriptors(mut self, standard: [SharedFd; 3]) -> Self {
+        self.standard = Some(Arc::new(standard));
+        self
+    }
+
+    /// The same interpreter reading the time and converting it to local time through `local_time` for
+    /// `printf %(…)T` (KNSH-102); the shell's start (`%(…)T` of `-2`) is now. Without it `%(…)T` is refused
+    /// ([`Unsupported::PrintfLocale`]).
+    ///
+    /// # Errors
+    ///
+    /// [`InterpError::Platform`] if the clock could not be read.
+    pub fn with_local_time(mut self, local_time: Arc<dyn LocalTime>) -> Result<Self, InterpError> {
+        let started = local_time.now()?;
+        self.local_time = Some((local_time, started));
+        Ok(self)
     }
 
     /// The same interpreter reading `times` for the `time` keyword (KNSH-100). Without clocks a script using `time`
@@ -761,6 +762,7 @@ impl Interpreter {
             }
             Command::Unsupported(construct) => match construct.arithmetic.as_deref() {
                 Some(parts) => self.arithmetic_command(construct, parts, run),
+                None if is_conditional(construct) => self.conditional_command(construct, run),
                 None => Err(unsupported(Unsupported::Construct(construct.construct), construct.span).into()),
             },
         }
@@ -1193,6 +1195,14 @@ fn loop_step(result: Flow<Status>) -> Flow<Step> {
 
 const fn unsupported(feature: Unsupported, span: Span) -> InterpError {
     InterpError::Unsupported { feature, span }
+}
+
+/// Whether `construct` is a `[[ … ]]` (alone: as a function body it is the definition's node, refused with it).
+pub(crate) fn is_conditional(construct: &UnsupportedCommand) -> bool {
+    construct.construct
+        == knsh_bash::UnsupportedConstruct::Compound(knsh_bash::CompoundStart::ReservedWord(
+            knsh_bash::ReservedWord::DoubleLeftBracket,
+        ))
 }
 
 /// The span of what follows `end` within an opaque construct spanning `span`, if anything but blanks: a redirection.

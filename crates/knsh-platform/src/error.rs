@@ -81,6 +81,11 @@ pub enum Operation {
     FileEvents,
     /// Creating a pipe (`pipe`; the telemetry descriptor of integration mode, KNSH-019).
     Pipe,
+    /// Compiling or running a regular expression (`regcomp`, `regexec`: `[[ =~ ]]`, KNSH-102), or switching the
+    /// thread's locale for it.
+    Regex,
+    /// Converting a time to local time or formatting it (`localtime_r`, `strftime`: `printf %(…)T`, KNSH-102).
+    LocalTime,
     /// Reading or changing descriptor flags (`fcntl`: close-on-exec, non-blocking; KNSH-019).
     DescriptorFlags,
     /// Changing what a signal does to this process (`sigaction`; ignoring job-control signals while a hosted shell
@@ -108,7 +113,8 @@ pub enum Operation {
     Clone,
     /// Reading the volume a path is on (`statfs`; checkpoint storage layout, KNSH-078).
     VolumeInfo,
-    /// Controlling a terminal for job control (`tcsetpgrp`, `tcgetattr`, `tcsetattr`; KNSH-100).
+    /// Controlling a terminal for job control (`tcsetpgrp`, `tcgetattr`, `tcsetattr`; KNSH-100), or changing its
+    /// echo and line mode for `read -s` and `read -n` (KNSH-102).
     Terminal,
 }
 
@@ -149,6 +155,8 @@ impl Operation {
             Self::SystemInfo => "read system information",
             Self::FileEvents => "file events",
             Self::Pipe => "create pipe",
+            Self::Regex => "regular expression",
+            Self::LocalTime => "local time",
             Self::DescriptorFlags => "set descriptor flags",
             Self::SignalDisposition => "set signal disposition",
             Self::SandboxLog => "sandbox log",

@@ -1,5 +1,5 @@
-//! Replays the `arith_expr` (KNSH-097) and `word_expansion` (KNSH-098) fuzzing inputs as ordinary stable tests
-//! (NFR-SEC-05, `specs/07-testing/fuzzing.md`).
+//! Replays the `arith_expr` (KNSH-097), `word_expansion` (KNSH-098) and `builtin_conditional` (KNSH-102) fuzzing inputs
+//! as ordinary stable tests (NFR-SEC-05, `specs/07-testing/fuzzing.md`).
 //!
 //! The fuzz crate (`fuzz/`) is a separate, nightly-only workspace, so each target's property check is included here
 //! by path: the same code that libFuzzer runs decides pass or fail here. Every saved crash in
@@ -11,6 +11,8 @@
 
 #[path = "../../../fuzz/src/arith_checks.rs"]
 mod arith_checks;
+#[path = "../../../fuzz/src/builtin_checks.rs"]
+mod builtin_checks;
 #[path = "../../../fuzz/src/word_checks.rs"]
 mod word_checks;
 
@@ -105,5 +107,46 @@ fn hostile_words_satisfy_the_property() {
         let mut data = vec![flags];
         data.extend_from_slice(text.as_bytes());
         word_checks::word_expansion(&data);
+    }
+}
+
+#[test]
+fn builtin_conditional_regressions_replay() {
+    replay_target(
+        "regressions",
+        "builtin_conditional",
+        builtin_checks::builtin_conditional,
+    );
+}
+
+#[test]
+fn builtin_conditional_seed_corpus_replay() {
+    assert!(
+        replay_target("corpus", "builtin_conditional", builtin_checks::builtin_conditional) >= 20,
+        "fuzz/corpus/builtin_conditional/ shrank"
+    );
+}
+
+// Hostile shapes the fuzzer would take long to reach: deep nesting in `[[`, long `test` expressions, huge printf
+// fields, endless `read` input. Each ends in a result or a limit, quickly.
+#[test]
+fn hostile_builtin_inputs_satisfy_the_property() {
+    let cases: Vec<(u8, String)> = vec![
+        (0, "( ".repeat(400) + "a" + &" )".repeat(400)),
+        (0, "! ".repeat(2000) + "a"),
+        (0, "a && ".repeat(500) + "a"),
+        (0, "x =~ ".to_owned() + &"(".repeat(300) + &")".repeat(300)),
+        (1, "! ".repeat(3000) + "a"),
+        (1, "( ".repeat(500) + "a" + &" )".repeat(500)),
+        (1, "a -a ".repeat(500) + "a"),
+        (2, "'%999999999s'".to_owned()),
+        (2, "'%*s' 99999999".to_owned()),
+        (2, "'%.9999999f'".to_owned()),
+        (3, "\\".repeat(500)),
+    ];
+    for (form, text) in cases {
+        let mut data = vec![form];
+        data.extend_from_slice(text.as_bytes());
+        builtin_checks::builtin_conditional(&data);
     }
 }

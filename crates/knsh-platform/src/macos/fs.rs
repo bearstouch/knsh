@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use knsh_core::CanonicalPath;
 
 use crate::error::{Operation, PlatformError};
-use crate::fs::{FileKind, Fs, Metadata, require_absolute, split_target};
+use crate::fs::{Access, FileKind, FileStatus, FileTime, FileType, Fs, Metadata, require_absolute, split_target};
 
 /// How many temporary names [`RealFs::atomic_replace`] tries before giving up. A collision needs a stale temporary
 /// file from an earlier process with the same pid, so more than one retry is already rare.
@@ -80,6 +80,45 @@ fn last_os_error(operation: Operation) -> PlatformError {
 pub(super) fn c_path(path: &Path) -> Result<CString, PlatformError> {
     require_absolute(path)?;
     CString::new(path.as_os_str().as_bytes()).map_err(|_| PlatformError::InvalidPath)
+}
+
+/// The status the shell's file tests read, from what `stat(2)` returned (KNSH-102).
+pub(super) fn status_of(meta: &fs::Metadata) -> FileStatus {
+    let kind = meta.file_type();
+    let file_type = if kind.is_symlink() {
+        FileType::Symlink
+    } else if kind.is_dir() {
+        FileType::Directory
+    } else if kind.is_fifo() {
+        FileType::Fifo
+    } else if kind.is_socket() {
+        FileType::Socket
+    } else if kind.is_char_device() {
+        FileType::CharacterDevice
+    } else if kind.is_block_device() {
+        FileType::BlockDevice
+    } else {
+        FileType::Regular
+    };
+    let time = |seconds: i64, nanoseconds: i64| FileTime {
+        seconds,
+        nanoseconds: u32::try_from(nanoseconds).unwrap_or(0),
+    };
+    // SAFETY: `geteuid` and `getegid` take no arguments, touch no memory and cannot fail.
+    let (user, group) = unsafe { (libc::geteuid(), libc::getegid()) };
+    FileStatus {
+        file_type,
+        mode: meta.mode() & 0o7777,
+        uid: meta.uid(),
+        gid: meta.gid(),
+        len: meta.len(),
+        device: meta.dev(),
+        inode: meta.ino(),
+        accessed: time(meta.atime(), meta.atime_nsec()),
+        modified: time(meta.mtime(), meta.mtime_nsec()),
+        owned_by_effective_user: meta.uid() == user,
+        owned_by_effective_group: meta.gid() == group,
+    }
 }
 
 /// The kind of entry `file_type` (from `lstat`) names. Shared with `SystemVolumes`.
@@ -193,6 +232,29 @@ impl Fs for RealFs {
             mode: meta.permissions().mode() & 0o7777,
             uid: meta.uid(),
         })
+    }
+
+    fn status(&self, path: &Path, follow: bool) -> Result<FileStatus, PlatformError> {
+        require_absolute(path)?;
+        let meta = if follow {
+            fs::metadata(path)
+        } else {
+            fs::symlink_metadata(path)
+        };
+        Ok(status_of(&meta.map_err(os(Operation::Metadata))?))
+    }
+
+    fn accessible(&self, path: &Path, access: Access) -> Result<bool, PlatformError> {
+        require_absolute(path)?;
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| PlatformError::InvalidPath)?;
+        let mode = match access {
+            Access::Read => libc::R_OK,
+            Access::Write => libc::W_OK,
+            Access::Execute => libc::X_OK,
+        };
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call; `faccessat` only reads it.
+        let result = unsafe { libc::faccessat(libc::AT_FDCWD, c_path.as_ptr(), mode, libc::AT_EACCESS) };
+        Ok(result == 0)
     }
 
     fn canonicalise(&self, path: &Path) -> Result<CanonicalPath, PlatformError> {
@@ -528,6 +590,40 @@ mod tests {
         fs.set_mode(&link, 0o600).unwrap();
         assert_eq!(fs.metadata(&victim).unwrap().mode, 0o644, "symlink target was changed");
         assert!(fs.set_mode(&tmp.0.join("missing"), 0o700).unwrap_err().is_not_found());
+    }
+
+    // KNSH-102: what the shell's file tests read: types, symlinks followed or not, ownership, access.
+    #[test]
+    fn status_and_access_serve_file_tests() {
+        let fs = RealFs::new();
+        let tmp = TempDir::new("status");
+        let file = tmp.0.join("f");
+        fs::write(&file, b"data").unwrap();
+        fs::set_permissions(&file, Permissions::from_mode(0o640)).unwrap();
+        let link = tmp.0.join("l");
+        symlink(&file, &link).unwrap();
+        let status = fs.status(&file, true).unwrap();
+        assert_eq!(
+            (status.file_type, status.mode, status.len),
+            (FileType::Regular, 0o640, 4)
+        );
+        assert!(status.owned_by_effective_user);
+        assert_eq!(fs.status(&link, true).unwrap().inode, status.inode);
+        assert_eq!(fs.status(&link, false).unwrap().file_type, FileType::Symlink);
+        assert_eq!(fs.status(&tmp.0, true).unwrap().file_type, FileType::Directory);
+        assert_eq!(
+            fs.status(Path::new("/dev/null"), true).unwrap().file_type,
+            FileType::CharacterDevice
+        );
+        assert!(fs.status(&tmp.0.join("missing"), true).unwrap_err().is_not_found());
+        assert!(fs.accessible(&file, Access::Read).unwrap());
+        assert!(fs.accessible(&link, Access::Write).unwrap());
+        assert!(!fs.accessible(&file, Access::Execute).unwrap());
+        assert!(!fs.accessible(&tmp.0.join("missing"), Access::Read).unwrap());
+        assert_eq!(
+            fs.accessible(Path::new("rel"), Access::Read),
+            Err(PlatformError::InvalidPath)
+        );
     }
 
     #[test]

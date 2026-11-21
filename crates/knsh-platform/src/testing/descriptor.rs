@@ -1,14 +1,15 @@
 //! Redirection files over [`MemFs`] (KNSH-099).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::{MemFs, lock};
-use crate::descriptor::{Descriptors, OpenMode, reaches_descriptor_table};
+use crate::descriptor::{Descriptors, OpenMode, TerminalInput, TerminalSettings, reaches_descriptor_table};
 use crate::error::{Operation, PlatformError};
-use crate::fs::{FileKind, Fs};
+use crate::fs::{FileKind, FileStatus, FileTime, FileType, Fs};
 use crate::process::SharedFd;
 
 /// What one descriptor [`FakeDescriptors`] handed out stands for.
@@ -30,6 +31,14 @@ pub enum FakeOpened {
         /// Which end.
         write: bool,
     },
+    /// Input made by [`FakeDescriptors::input`]: these bytes, then end of file, or (when `held_open`) input that
+    /// never comes, as from a terminal nobody types at (KNSH-102).
+    Input {
+        /// What can be read.
+        data: Vec<u8>,
+        /// After `data`, reads wait forever instead of seeing end of file.
+        held_open: bool,
+    },
 }
 
 /// Largest file the fake reads back when appending, far above anything a test writes.
@@ -50,6 +59,12 @@ pub struct FakeDescriptors {
     opened: Mutex<BTreeMap<i32, FakeOpened>>,
     /// Pipes made so far.
     pipes: Mutex<usize>,
+    /// How far each live descriptor has been read (KNSH-102).
+    offsets: Mutex<BTreeMap<i32, usize>>,
+    /// Descriptors that are terminals (KNSH-102).
+    terminals: Mutex<BTreeSet<i32>>,
+    /// Each [`Descriptors::set_terminal_input`] call on a terminal, and each restore (`None`), in order.
+    terminal_changes: Mutex<Vec<Option<TerminalInput>>>,
 }
 
 fn os(errno: i32) -> PlatformError {
@@ -67,6 +82,57 @@ impl FakeDescriptors {
             fs,
             opened: Mutex::new(BTreeMap::new()),
             pipes: Mutex::new(0),
+            offsets: Mutex::new(BTreeMap::new()),
+            terminals: Mutex::new(BTreeSet::new()),
+            terminal_changes: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A descriptor to read `data` from, then end of file, or (with `held_open`) a wait that never ends: a shell's
+    /// standard input (KNSH-102).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Os`] if `/dev/null` could not be opened to stand for it.
+    pub fn input(&self, data: &[u8], held_open: bool) -> Result<SharedFd, PlatformError> {
+        self.hand_out(FakeOpened::Input {
+            data: data.to_vec(),
+            held_open,
+        })
+    }
+
+    /// Makes `fd` (handed out by this fake) a terminal (KNSH-102).
+    pub fn set_terminal(&self, fd: &SharedFd) {
+        lock(&self.terminals).insert(fd.as_raw_fd());
+    }
+
+    /// Each change [`Descriptors::set_terminal_input`] made to a terminal, and each restore (`None`), in order.
+    #[must_use]
+    pub fn terminal_changes(&self) -> Vec<Option<TerminalInput>> {
+        lock(&self.terminal_changes).clone()
+    }
+
+    /// The bytes `fd` stands for, and whether reading past them waits forever.
+    fn readable(&self, fd: &SharedFd) -> Result<(Vec<u8>, bool), PlatformError> {
+        let bad = PlatformError::Os {
+            operation: Operation::Read,
+            errno: libc::EBADF,
+        };
+        match self.opened(fd) {
+            Some(FakeOpened::File { path, mode }) => {
+                if matches!(mode, OpenMode::Truncate | OpenMode::Append | OpenMode::NoClobber) {
+                    return Err(bad);
+                }
+                if path == Path::new("/dev/null") {
+                    return Ok((Vec::new(), false));
+                }
+                Ok((self.fs.read(&path, READ_LIMIT)?, false))
+            }
+            Some(FakeOpened::HereString(data)) => Ok((data, false)),
+            Some(FakeOpened::Input { data, held_open }) => Ok((data, held_open)),
+            // Fake pipes carry no data: the reader sees end of file.
+            Some(FakeOpened::Pipe { write: false, .. }) => Ok((Vec::new(), false)),
+            Some(FakeOpened::Pipe { write: true, .. }) | None => Err(bad),
         }
     }
 
@@ -85,6 +151,9 @@ impl FakeDescriptors {
             .map_err(|error| PlatformError::from_io(Operation::Open, &error))?;
         let fd = SharedFd::new(OwnedFd::from(file));
         lock(&self.opened).insert(fd.as_raw_fd(), what);
+        // A reused number is a new descriptor: unread, and not a terminal.
+        lock(&self.offsets).remove(&fd.as_raw_fd());
+        lock(&self.terminals).remove(&fd.as_raw_fd());
         Ok(fd)
     }
 
@@ -168,6 +237,88 @@ impl Descriptors for FakeDescriptors {
         let mut data = self.fs.read(&path, READ_LIMIT)?;
         data.extend_from_slice(bytes);
         self.fs.write(&path, &data, 0o666)
+    }
+
+    /// Reads on from where the last read of this descriptor stopped. Past the end of held-open input it fails with
+    /// `EAGAIN` rather than block the test forever: a caller that waits with [`Descriptors::wait_readable`] first
+    /// never gets there.
+    fn read(&self, fd: &SharedFd, buffer: &mut [u8]) -> Result<usize, PlatformError> {
+        let (data, held_open) = self.readable(fd)?;
+        let mut offsets = lock(&self.offsets);
+        let offset = offsets.entry(fd.as_raw_fd()).or_insert(0);
+        let rest = data.get(*offset..).unwrap_or_default();
+        if rest.is_empty() && held_open {
+            return Err(PlatformError::Os {
+                operation: Operation::Read,
+                errno: libc::EAGAIN,
+            });
+        }
+        let count = rest.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&rest[..count]);
+        *offset += count;
+        Ok(count)
+    }
+
+    /// Ready unless held-open input has nothing left; never waits.
+    fn wait_readable(&self, fd: &SharedFd, _timeout: Duration) -> Result<bool, PlatformError> {
+        let (data, held_open) = self.readable(fd)?;
+        let offset = lock(&self.offsets).get(&fd.as_raw_fd()).copied().unwrap_or(0);
+        Ok(!(held_open && offset >= data.len()))
+    }
+
+    fn is_terminal(&self, fd: &SharedFd) -> bool {
+        lock(&self.terminals).contains(&fd.as_raw_fd())
+    }
+
+    /// A file's status from the [`MemFs`]; a terminal is a character device, a here-string, a pipe or other input
+    /// a FIFO.
+    fn status(&self, fd: &SharedFd) -> Result<FileStatus, PlatformError> {
+        let fifo = |file_type| FileStatus {
+            file_type,
+            mode: 0o600,
+            uid: self.fs.uid(),
+            gid: super::DEFAULT_GID,
+            len: 0,
+            device: 0,
+            inode: u64::try_from(fd.as_raw_fd()).unwrap_or(0),
+            accessed: FileTime::default(),
+            modified: FileTime::default(),
+            owned_by_effective_user: true,
+            owned_by_effective_group: true,
+        };
+        if self.is_terminal(fd) {
+            return Ok(fifo(FileType::CharacterDevice));
+        }
+        match self.opened(fd) {
+            Some(FakeOpened::File { path, .. }) if path == Path::new("/dev/null") => {
+                Ok(fifo(FileType::CharacterDevice))
+            }
+            Some(FakeOpened::File { path, .. }) => self.fs.status(&path, true),
+            Some(FakeOpened::HereString(_) | FakeOpened::Pipe { .. } | FakeOpened::Input { .. }) => {
+                Ok(fifo(FileType::Fifo))
+            }
+            None => Err(PlatformError::Os {
+                operation: Operation::Metadata,
+                errno: libc::EBADF,
+            }),
+        }
+    }
+
+    fn set_terminal_input(
+        &self,
+        fd: &SharedFd,
+        input: TerminalInput,
+    ) -> Result<Option<TerminalSettings>, PlatformError> {
+        if !self.is_terminal(fd) {
+            return Ok(None);
+        }
+        lock(&self.terminal_changes).push(Some(input));
+        Ok(Some(TerminalSettings::fake()))
+    }
+
+    fn restore_terminal(&self, _fd: &SharedFd, _saved: &TerminalSettings) -> Result<(), PlatformError> {
+        lock(&self.terminal_changes).push(None);
+        Ok(())
     }
 }
 

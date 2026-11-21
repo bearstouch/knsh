@@ -11,10 +11,44 @@
 //! refuses any path that reaches `/dev/fd` (directly, through `..`, or through a symlink such as `/dev/stdin`):
 //! bash's `/dev/fd/N` and `/dev/std*` names are the shell's own table, which the interpreter resolves itself.
 
+use std::fmt;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::error::PlatformError;
+use crate::fs::FileStatus;
 use crate::process::SharedFd;
+
+/// How `read` wants a terminal to deliver input while it reads (KNSH-102: `read -s`, `read -n`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TerminalInput {
+    /// Characters typed are echoed (`false` for `read -s`).
+    pub echo: bool,
+    /// Input arrives a line at a time (`false` for `read -n`, `-N` and `-d`, bash's `ttcbreak`).
+    pub canonical: bool,
+}
+
+/// A terminal's settings before [`Descriptors::set_terminal_input`] changed them, to put back with
+/// [`Descriptors::restore_terminal`].
+#[derive(Clone)]
+pub struct TerminalSettings {
+    /// The saved `termios`; `None` from a fake.
+    pub(crate) saved: Option<libc::termios>,
+}
+
+impl TerminalSettings {
+    /// Settings a fake hands out: nothing to put back.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) const fn fake() -> Self {
+        Self { saved: None }
+    }
+}
+
+impl fmt::Debug for TerminalSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TerminalSettings").finish_non_exhaustive()
+    }
+}
 
 /// How a redirection opens its file, by operator (bash's `redir_open` flags).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -81,6 +115,54 @@ pub trait Descriptors: Send + Sync {
     /// [`PlatformError::Os`] with [`Operation::Write`](crate::Operation::Write) (`EBADF` for a descriptor opened
     /// read-only, `EPIPE` for a pipe nobody reads).
     fn write_all(&self, fd: &SharedFd, bytes: &[u8]) -> Result<(), PlatformError>;
+
+    /// Reads at most `buffer.len()` bytes from `fd` into `buffer`, waiting until some are available: the count, 0 at
+    /// end of file. The `read` builtin reads this way, a byte at a time, so the rest of the input stays for the
+    /// commands after it (KNSH-102).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Os`] with [`Operation::Read`](crate::Operation::Read) (`EBADF` for a descriptor opened
+    /// write-only, `EIO`). An interrupted read is retried.
+    fn read(&self, fd: &SharedFd, buffer: &mut [u8]) -> Result<usize, PlatformError>;
+
+    /// Waits at most `timeout` for `fd` to have input (or end of file) to read: `true` when a read would not block,
+    /// `false` when the time ran out (`read -t`, KNSH-102). A zero timeout only checks.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Os`] with [`Operation::Read`](crate::Operation::Read) if `poll` fails.
+    fn wait_readable(&self, fd: &SharedFd, timeout: Duration) -> Result<bool, PlatformError>;
+
+    /// Whether `fd` is a terminal (`isatty`: `test -t`, and `read`'s prompt and silent mode, KNSH-102).
+    fn is_terminal(&self, fd: &SharedFd) -> bool;
+
+    /// `fstat(2)` of `fd`: what the shell's file tests read for `/dev/stdin` and `/dev/fd/N` (KNSH-102).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Os`] with [`Operation::Metadata`](crate::Operation::Metadata).
+    fn status(&self, fd: &SharedFd) -> Result<FileStatus, PlatformError>;
+
+    /// When `fd` is a terminal, sets it to deliver input as `input` asks and returns its settings before, to put back
+    /// with [`Descriptors::restore_terminal`]; `None` when it is not a terminal (nothing changed).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Os`] with [`Operation::Terminal`](crate::Operation::Terminal) if the settings could not be
+    /// read or changed.
+    fn set_terminal_input(
+        &self,
+        fd: &SharedFd,
+        input: TerminalInput,
+    ) -> Result<Option<TerminalSettings>, PlatformError>;
+
+    /// Puts back `saved`, the settings [`Descriptors::set_terminal_input`] returned for `fd`.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Os`] with [`Operation::Terminal`](crate::Operation::Terminal).
+    fn restore_terminal(&self, fd: &SharedFd, saved: &TerminalSettings) -> Result<(), PlatformError>;
 }
 
 /// Whether `path` (absolute, read component by component without following symlinks) names `/dev/fd` or anything
