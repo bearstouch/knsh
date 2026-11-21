@@ -96,7 +96,10 @@ impl Interpreter {
         }
         let text = args.join(" ");
         let nested = Run::nested(&text, run.origin, run.line(span).saturating_sub(1));
-        self.run_text(&nested, Kind::Eval, span)
+        self.trace_level += 1;
+        let result = self.run_text(&nested, Kind::Eval, span);
+        self.trace_level -= 1;
+        result
     }
 
     /// `source file [args …]` and `. file [args …]` (`name`).
@@ -168,7 +171,22 @@ impl Interpreter {
             line: run.line(span),
         });
         self.sourcing += 1;
+        self.trace_level += 1;
+        // KNSH-104: a sourced file does not inherit `DEBUG` without `set -T`; `RETURN` runs as it returns.
+        let debug = (!self.state.options().functrace)
+            .then(|| self.state.traps_mut().take(crate::trap::TrapId::Debug))
+            .flatten();
         let result = self.run_text(&nested, Kind::Source, span);
+        let result = match result {
+            Ok(status) | Err(Stop::Return(status)) => self.return_trap(status, span, run).map(|()| status),
+            other => other,
+        };
+        if let Some(debug) = debug {
+            self.state
+                .traps_mut()
+                .restore_if_unset(crate::trap::TrapId::Debug, debug);
+        }
+        self.trace_level -= 1;
         self.sourcing -= 1;
         self.state.pop_frame();
         if let Some(saved) = saved {

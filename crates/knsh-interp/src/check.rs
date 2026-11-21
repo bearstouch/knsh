@@ -1,4 +1,4 @@
-//! The check of a whole script before it runs (KNSH-096 to KNSH-103): every construct a later story
+//! The check of a whole script before it runs (KNSH-096 to KNSH-104): every construct a later story
 //! implements is refused here, with its span, so a script the interpreter cannot evaluate runs none of its commands.
 //! A function's body is checked where the function is defined, as its commands are written there (KNSH-103).
 //!
@@ -12,13 +12,14 @@
 //! than the limit is refused before evaluation and the check itself never overflows the stack.
 
 use knsh_bash::{
-    AndOr, ArithmeticParts, Command, CommandWord, CompoundCommand, CompoundKind, ListItem, Pipeline, Redirect,
-    RedirectionOperator, SimpleCommand, Span, UnsupportedCommand,
+    AndOr, ArithmeticParts, Command, CommandWord, CompoundCommand, CompoundKind, ListItem, ParseOptions, Pipeline,
+    Redirect, RedirectionOperator, SimpleCommand, Span, UnsupportedCommand,
 };
 
 use crate::brace;
 use crate::cond;
 use crate::error::{InterpError, Unsupported};
+use crate::eval::traps::{self, Form, Operation};
 use crate::eval::{is_conditional, is_refused_builtin, refused_form, trailing_redirection};
 use crate::expand::MAX_EXPANSION_DEPTH;
 use crate::param::{self, Name, Op, Parsed, Subscript};
@@ -174,8 +175,33 @@ impl Checker<'_> {
             if let Some(feature) = args.as_deref().and_then(|args| refused_form(name, args)) {
                 return Err(refuse(feature, first.span));
             }
+            if name == "trap"
+                && let Some(args) = args.as_deref()
+            {
+                self.trap_action(args, first.span)?;
+            }
         }
         self.redirections(&simple.redirections)
+    }
+
+    /// A literal `trap` command's action (KNSH-104): its text is checked as a script would be, so a trap the
+    /// interpreter cannot run refuses the script before anything runs; a `SIGCHLD` trap with a command is refused.
+    /// Text that does not parse with the default options is left for the builtin, which reads it with the options
+    /// set by then.
+    fn trap_action(&self, args: &[String], span: Span) -> Result<(), InterpError> {
+        let Form::Change(Operation::Set(text), specs) = traps::form(args) else {
+            return Ok(());
+        };
+        if specs.iter().any(|spec| traps::is_child_signal(spec)) {
+            return Err(refuse(Unsupported::Trap, span));
+        }
+        let options = ParseOptions::default()
+            .with_redirection_variables(true)
+            .with_arrays(true);
+        if let Ok(script) = knsh_bash::parse_with(text, options) {
+            check(&script.items, text, self.max_depth, self.times).map_err(|error| traps::at_command(error, span))?;
+        }
+        Ok(())
     }
 
     /// The subscript at `subscript` of an element assignment (of a command at `span`): its expansions, read both as

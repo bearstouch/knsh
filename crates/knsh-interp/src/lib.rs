@@ -34,6 +34,13 @@
 //! function, `declare -g`), sparse indexed and associative arrays (in bash 5.2's hash order) with every array
 //! expansion, subscript and slice, arrays in arithmetic, name references (`declare -n`), `read -a` and
 //! `mapfile`/`readarray`. Scripts must be parsed with [`knsh_bash::ParseOptions::arrays`] for array assignments.
+//! KNSH-104 adds `trap` (`EXIT`, `ERR`, `DEBUG`, `RETURN` and signals, with bash's inheritance by functions and
+//! subshells), `set` with every option letter and `-o` name of bash 5.2 and `shopt` (each option either implemented
+//! in [`ShellOptions`] or held at bash's default, changing it refused): `set -e` with bash's exemptions, `-x` with
+//! `PS4`, `-v`, `-n`, `-E` and `-T`. The host hands the shell the signals sent to it through [`ShellSignals`]
+//! ([`Interpreter::shell_signals`]) and the signals it was started ignoring through
+//! [`ShellState::with_ignored_signals`]; [`Interpreter::terminating_signal`] and [`Interpreter::finish`] end it as
+//! bash ends.
 //!
 //! # Boundaries
 //!
@@ -52,8 +59,8 @@
 //!   must start through the spawner): pipeline stages and background lists that the shell runs itself run on threads
 //!   of their own (decision 19). Children are known by handle, waited for by one thread each, and a job's process
 //!   group is signalled only while one of its members is held unreaped.
-//! - What later stories implement (command substitution, here-documents, functions, arrays, `read -a`, `trap`, `set`
-//!   options) is refused with [`InterpError::Unsupported`] by a check of the whole script before anything runs, or,
+//! - What later stories implement (command substitution, here-documents, process substitution, POSIX mode) is
+//!   refused with [`InterpError::Unsupported`] by a check of the whole script before anything runs, or,
 //!   when only an expansion's value reveals it (or `eval` and `source` text), when it is reached. `[[ … ]]`, which
 //!   the parser keeps whole, is read again from its text with the same lexer, as `(( … ))` bodies are; one bash's
 //!   parser would reject is refused by that check.
@@ -85,6 +92,7 @@
 //!   (decision 20: `exec` runs, then ends the shell)
 //! - `specs/00-stories/KNSH-102-builtins-test-printf-read.md`, `specs/09-reference/decisions.md` (decision 21: system
 //!   regular expressions)
+//! - `specs/00-stories/KNSH-104-traps-signals-set-and-shopt-options.md`
 //! - `specs/09-reference/defaults-and-limits.md` (the evaluation, arithmetic and expansion depth limits, the brace
 //!   and pathname expansion bounds, and the `printf` and `read` bounds)
 
@@ -103,6 +111,7 @@ mod glob;
 mod jobs;
 mod lookup;
 mod observer;
+mod options;
 mod param;
 mod pattern;
 mod printf;
@@ -110,6 +119,7 @@ mod quote;
 mod scan;
 mod state;
 mod status;
+mod trap;
 mod vars;
 mod word;
 
@@ -120,3 +130,4 @@ pub use jobs::{JobSignals, MAX_REMEMBERED_JOBS};
 pub use observer::{DirectoryObserver, Osc7, osc7};
 pub use state::{ShellOptions, ShellState};
 pub use status::Status;
+pub use trap::ShellSignals;

@@ -131,7 +131,11 @@ impl Interpreter {
         span: Span,
         run: &Run<'_>,
     ) -> Flow<Status> {
-        let Some(function) = self.state.function(name).map(|function| Arc::clone(&function.body)) else {
+        let Some((function, traced)) = self
+            .state
+            .function(name)
+            .map(|function| (Arc::clone(&function.body), function.trace))
+        else {
             return Err(unsupported(Unsupported::Builtin, span).into());
         };
         if self.sink == Sink::Open && self.forked_stage {
@@ -161,8 +165,19 @@ impl Interpreter {
         self.state.push_frame(frame);
         let loops = std::mem::take(&mut self.loops);
         let sink = std::mem::take(&mut self.sink);
+        // KNSH-104: the body does not inherit `DEBUG` and `RETURN` (without `set -T` or `declare -ft`), nor `ERR`
+        // (without `set -E`).
+        let taken = self.enter_function_traps(traced);
+        // A function that inherits `DEBUG` runs it once more as it starts, as bash's `execute_function` does.
+        let entered = if traced || self.state.options().functrace {
+            self.debug_trap(span, run)
+        } else {
+            Ok(())
+        };
         let body_run = Run::shared(&function.source, function.origin.as_deref(), function.line_base);
-        let result = if matches!(function.body.kind, CompoundKind::Subshell(_)) {
+        let result = if let Err(stop) = entered {
+            Err(stop)
+        } else if matches!(function.body.kind, CompoundKind::Subshell(_)) {
             // `f() ( … )`: the body is a subshell, as `( … )` alone.
             let pipeline = Pipeline {
                 time: None,
@@ -176,6 +191,12 @@ impl Interpreter {
             self.compound(&function.body, &body_run)
         };
         self.flush_notes(function.body.span, &body_run);
+        // KNSH-104: the `RETURN` trap runs as the function returns, still in its context.
+        let result = match result {
+            Ok(status) | Err(Stop::Return(status)) => self.return_trap(status, span, run).map(|()| status),
+            other => other,
+        };
+        self.leave_function_traps(taken);
         self.sink = sink;
         self.loops = loops;
         self.state.pop_frame();

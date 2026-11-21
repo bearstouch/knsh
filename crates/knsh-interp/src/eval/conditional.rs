@@ -78,7 +78,9 @@ impl Interpreter {
         if let Some(redirect) = trailing_redirection(run.source, conditional.close.end, construct.span) {
             return Err(unsupported(Unsupported::Conditional, redirect).into());
         }
-        Ok(match self.condition(&conditional.expr, construct.span, run)? {
+        // KNSH-104: the `DEBUG` trap runs before any word is expanded.
+        self.debug_trap(construct.span, run)?;
+        Ok(match self.condition(&conditional.expr, false, construct.span, run)? {
             Truth::Is(true) => Status::SUCCESS,
             Truth::Is(false) => Status::FAILURE,
             Truth::BadRegex => Status::new(2),
@@ -88,34 +90,87 @@ impl Interpreter {
     /// Bash's `execute_cond_node`: `!`, `&&` and `||` look only at whether a status is 0, so an invalid regular
     /// expression's 2 is false to them (`! a =~ (` is 0, `a =~ ( || b` runs `b`), and stays 2 only when it is the
     /// status the expression ends with.
-    fn condition(&mut self, expr: &Expr, span: Span, run: &Run<'_>) -> Flow<Truth> {
+    ///
+    /// `inverted`: an odd number of `!` stand directly before this node, which `set -x` writes before a term, as
+    /// bash's parser marks the term itself (KNSH-104).
+    fn condition(&mut self, expr: &Expr, inverted: bool, span: Span, run: &Run<'_>) -> Flow<Truth> {
         Ok(match expr {
-            Expr::Not(inner) => match self.condition(inner, span, run)? {
+            Expr::Not(inner) => match self.condition(inner, !inverted, span, run)? {
                 Truth::Is(value) => Truth::Is(!value),
                 Truth::BadRegex => Truth::Is(true),
             },
-            Expr::And(left, right) => match self.condition(left, span, run)? {
-                Truth::Is(true) => self.condition(right, span, run)?,
+            Expr::And(left, right) => match self.condition(left, false, span, run)? {
+                Truth::Is(true) => self.condition(right, false, span, run)?,
                 other @ (Truth::Is(false) | Truth::BadRegex) => other,
             },
-            Expr::Or(left, right) => match self.condition(left, span, run)? {
-                Truth::Is(false) | Truth::BadRegex => self.condition(right, span, run)?,
+            Expr::Or(left, right) => match self.condition(left, false, span, run)? {
+                Truth::Is(false) | Truth::BadRegex => self.condition(right, false, span, run)?,
                 Truth::Is(true) => Truth::Is(true),
             },
             Expr::Unary { op, operand } => {
                 let value = self.operand_string(*operand, run)?;
+                let bang = if inverted { "! " } else { "" };
+                self.trace(&format!("[[ {bang}{op} {} ]]", or_empty(&value)), span, run)?;
                 Truth::Is(self.unary_test(op, &value, operand.span, run)?)
             }
-            Expr::Binary { op, left, right } => self.binary_condition(op, *left, *right, span, run)?,
+            Expr::Binary { op, left, right } => self.binary_condition(op, *left, *right, inverted, span, run)?,
         })
     }
 
-    fn binary_condition(&mut self, op: &str, left: Operand, right: Operand, span: Span, run: &Run<'_>) -> Flow<Truth> {
+    /// Writes a binary term under `set -x`: `[[ left op right ]]`, an empty side as `''`.
+    fn trace_binary(
+        &mut self,
+        inverted: bool,
+        left: &str,
+        op: &str,
+        right: &str,
+        span: Span,
+        run: &Run<'_>,
+    ) -> Flow<()> {
+        let bang = if inverted { "! " } else { "" };
+        self.trace(
+            &format!("[[ {bang}{} {op} {} ]]", or_empty(left), or_empty(right)),
+            span,
+            run,
+        )
+    }
+
+    fn binary_condition(
+        &mut self,
+        op: &str,
+        left: Operand,
+        right: Operand,
+        inverted: bool,
+        span: Span,
+        run: &Run<'_>,
+    ) -> Flow<Truth> {
         let subject = self.operand_string(left, run)?;
         match right.kind {
-            OperandKind::Regex => return self.regex_condition(&subject, right, run),
+            OperandKind::Regex => {
+                if self.state.options().xtrace {
+                    let chars = self.operand_chars(right, run)?;
+                    if chars.iter().any(|c| c.quoted) {
+                        // Bash 3.2 and 5.2 write a regular expression's quoted characters differently.
+                        return Err(unsupported(Unsupported::Trap, span).into());
+                    }
+                    let text: String = chars.iter().map(|c| c.ch).collect();
+                    self.trace_binary(inverted, &subject, op, &text, span, run)?;
+                }
+                return self.regex_condition(&subject, right, run);
+            }
             OperandKind::Pattern => {
                 let chars = self.operand_chars(right, run)?;
+                if self.state.options().xtrace {
+                    // Bash writes the pattern with each quoted character backslash-escaped.
+                    let mut text = String::with_capacity(chars.len());
+                    for c in &chars {
+                        if c.quoted {
+                            text.push('\\');
+                        }
+                        text.push(c.ch);
+                    }
+                    self.trace_binary(inverted, &subject, op, &text, span, run)?;
+                }
                 let flags = Flags {
                     extglob: true,
                     nocase: false,
@@ -126,6 +181,7 @@ impl Interpreter {
             OperandKind::String => {}
         }
         let other = self.operand_string(right, run)?;
+        self.trace_binary(inverted, &subject, op, &other, span, run)?;
         if is_arithmetic_operator(op) {
             let Some(first) = self.arithmetic(&subject, "[[", span, run)? else {
                 return Ok(Truth::Is(false));
@@ -184,6 +240,11 @@ impl Interpreter {
         let result = self.expander(run, &[]).pattern(&parts, operand.span);
         self.expanded(result, operand.span, run)
     }
+}
+
+/// `text`, or `''` when it is empty, as bash's `xtrace_print_cond_term` writes an operand.
+fn or_empty(text: &str) -> &str {
+    if text.is_empty() { "''" } else { text }
 }
 
 #[cfg(test)]

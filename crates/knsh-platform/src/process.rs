@@ -261,6 +261,74 @@ pub enum ChildSignals {
     IgnoreInterrupt,
 }
 
+/// A set of signal numbers, 1 to 63: what a shell ignores (KNSH-104). `Copy`, so it crosses into a forked child
+/// without allocating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SignalSet(u64);
+
+impl SignalSet {
+    /// The empty set.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(0)
+    }
+
+    /// The bit of `signal`, or `None` outside 1 to 63.
+    fn bit(signal: i32) -> Option<u64> {
+        u32::try_from(signal)
+            .ok()
+            .filter(|number| (1..64).contains(number))
+            .map(|number| 1 << number)
+    }
+
+    /// Adds `signal`; a number outside 1 to 63 is ignored.
+    pub fn insert(&mut self, signal: i32) {
+        if let Some(bit) = Self::bit(signal) {
+            self.0 |= bit;
+        }
+    }
+
+    /// Removes `signal`.
+    pub fn remove(&mut self, signal: i32) {
+        if let Some(bit) = Self::bit(signal) {
+            self.0 &= !bit;
+        }
+    }
+
+    /// Whether `signal` is in the set.
+    #[must_use]
+    pub fn contains(self, signal: i32) -> bool {
+        Self::bit(signal).is_some_and(|bit| self.0 & bit != 0)
+    }
+
+    /// Whether the set is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Every signal in either set.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// The signals in the set, in increasing order.
+    pub fn iter(self) -> impl Iterator<Item = i32> {
+        (1..64).filter(move |&signal| self.contains(signal))
+    }
+}
+
+impl FromIterator<i32> for SignalSet {
+    fn from_iter<I: IntoIterator<Item = i32>>(iter: I) -> Self {
+        let mut set = Self::new();
+        for signal in iter {
+            set.insert(signal);
+        }
+        set
+    }
+}
+
 /// How [`Processes::spawn_child`] places a child among process groups and the terminal.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChildOptions {
@@ -272,6 +340,10 @@ pub struct ChildOptions {
     pub terminal: Option<SharedFd>,
     /// The signals the child starts with.
     pub signals: ChildSignals,
+    /// Signals the child starts ignoring, after [`ChildOptions::signals`] is applied: those a shell ignores with
+    /// `trap '' SIG` and those it was started ignoring, which bash's children inherit ignored (an ignored signal stays
+    /// ignored across `exec`), even under job control (KNSH-104).
+    pub ignore: SignalSet,
 }
 
 /// A child started by [`Processes::spawn_child`] and not yet known to be reaped: what the caller waits for.

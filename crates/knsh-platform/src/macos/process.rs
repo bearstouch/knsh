@@ -460,6 +460,7 @@ fn child_job_setup(command: &mut Command, options: &ChildOptions) {
         GroupMembership::Inherit | GroupMembership::Join(_) => None,
     };
     let signals = options.signals;
+    let ignore = options.ignore;
     // SAFETY: the closure runs in the forked child before `exec`. It only calls `sigemptyset`, `sigaddset`,
     // `pthread_sigmask`, `tcsetpgrp`, `getpgrp` and `sigaction`, all async-signal-safe, on stack values and on the
     // terminal descriptor, which the child inherited at the fork (the `SharedFd` in `options` outlives the spawn).
@@ -488,6 +489,14 @@ fn child_job_setup(command: &mut Command, options: &ChildOptions) {
                 if libc::sigaction(signal, &raw const action, std::ptr::null_mut()) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+            }
+            // KNSH-104: what the shell ignores, its child starts ignoring (after any reset to the default above).
+            // `SignalSet::iter` allocates nothing, so this stays safe between `fork` and `exec`.
+            for signal in ignore.iter() {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = libc::SIG_IGN;
+                // A signal that cannot be ignored (`SIGKILL`, `SIGSTOP`) is skipped, as bash's `sigaction` fails.
+                libc::sigaction(signal, &raw const action, std::ptr::null_mut());
             }
             Ok(())
         });
@@ -750,7 +759,7 @@ impl Processes for SystemProcesses {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::Placement;
+    use crate::process::{Placement, SignalSet};
 
     // CLAUDE.md "Concurrency": never signal a pid that may have been reused.
     #[test]
@@ -1075,6 +1084,7 @@ mod tests {
             group,
             terminal: None,
             signals: ChildSignals::Default,
+            ignore: SignalSet::new(),
         }
     }
 
@@ -1170,6 +1180,7 @@ mod tests {
                     group: GroupMembership::Lead,
                     terminal: None,
                     signals: ChildSignals::IgnoreInterrupt,
+                    ignore: SignalSet::new(),
                 },
             )
             .unwrap();
@@ -1189,6 +1200,35 @@ mod tests {
         assert_eq!(
             processes.wait_child(default).unwrap(),
             ChildEvent::Exited(ExitStatus::Signalled(libc::SIGINT))
+        );
+    }
+
+    // KNSH-104: a signal the shell ignores is ignored by its child too, even after a job-control reset to default.
+    #[test]
+    fn ignored_signals_reach_the_child() {
+        let processes = SystemProcesses::new();
+        let sleep = SpawnRequest::new("/bin/sleep").arg("5");
+        let mut ignore = SignalSet::new();
+        ignore.insert(libc::SIGINT);
+        ignore.insert(libc::SIGKILL);
+        let child = processes
+            .spawn_child(
+                &sleep,
+                &ChildOptions {
+                    ignore,
+                    ..options(GroupMembership::Lead)
+                },
+            )
+            .unwrap();
+        let group = child.group().unwrap();
+        processes.signal_job(group, Signal::Interrupt).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // `SIGKILL` cannot be ignored: asking for it is skipped, and it still ends the child.
+        processes.signal_job(group, Signal::Kill).unwrap();
+        assert_eq!(
+            processes.wait_child(child).unwrap(),
+            ChildEvent::Exited(ExitStatus::Signalled(libc::SIGKILL)),
+            "SIGINT was ignored"
         );
     }
 }

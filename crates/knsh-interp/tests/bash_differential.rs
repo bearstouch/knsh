@@ -644,3 +644,86 @@ fn functions_and_arrays_script_matches_bash() {
     assert_eq!(knsh.0, bash.0);
     assert_eq!(knsh, bash);
 }
+
+/// Traps, `set` and `shopt` in forms bash 3.2 and 5.2 agree on (KNSH-104): `set -e` and its exemptions, the
+/// `EXIT`, `DEBUG`, `ERR` and `RETURN` traps, `trap` listings, `$-`, `set -o`, `shopt` and `set -x` traces
+/// (written to standard output with `2>&1`, so they are compared too). No error messages: bash 3.2 numbers the
+/// lines of a `-c` script from 0.
+const TRAPS_AND_OPTIONS: &str = r#"set -e
+if false; then echo no; fi
+false || echo or-ran
+! true
+f() { false; echo in-f; }
+if f; then echo then; fi
+f && echo and
+( false; echo in-sub ) || echo sub-or
+{ false && true; }
+echo before-trap
+trap 'echo "exit trap $?"' EXIT
+trap 'echo int' INT
+trap '' QUIT
+trap
+trap -p INT
+trap - INT
+trap
+trap 'echo D' DEBUG
+:
+trap - DEBUG
+set +e
+trap 'echo "ERR $?"' ERR
+false
+g() { return 3; }
+g
+false || true
+trap - ERR
+set -o pipefail
+false | true
+echo pipefail $?
+set +o pipefail
+echo "flags $-"
+set -u
+echo "flags $-"
+set +u
+[ -o errexit ] || echo errexit-off
+shopt -s extglob nullglob
+shopt extglob nullglob dotglob
+shopt -p extglob
+shopt -u nullglob
+shopt -q nullglob || echo nullglob-off
+set -o | grep -E '^(errexit|pipefail|nounset|hashall) '
+{ set -x; echo traced "a b" ''; x=1; for i in 1 2; do :; done; case $x in *) ;; esac; eval 'echo e'; set +x; } 2>&1
+PS4='>> '
+{ set -x; echo ps4; set +x; } 2>&1
+h() { trap 'echo R' RETURN; echo in-h; }
+h
+set -n
+echo never
+exit 4
+"#;
+
+// KNSH-104, NFR-COMPAT-02: errexit exemptions, traps, option listings and traces match bash.
+#[test]
+fn traps_and_options_script_matches_bash() {
+    let bash_dir = temp_dir("bash-traps");
+    let knsh_dir = temp_dir("knsh-traps");
+    let bash = run_bash(TRAPS_AND_OPTIONS, &bash_dir);
+    let knsh = run_knsh(TRAPS_AND_OPTIONS, &knsh_dir);
+    std::fs::remove_dir_all(&bash_dir).unwrap();
+    std::fs::remove_dir_all(&knsh_dir).unwrap();
+    assert!(bash.0.contains("++ echo e"), "bash output: {}", bash.0);
+    assert_eq!(knsh, bash);
+}
+
+// KNSH-104: `set -e` ends the script through the `EXIT` trap, which sees the failing status.
+#[test]
+fn errexit_runs_the_exit_trap_like_bash() {
+    let script = "trap 'echo \"bye $?\"' EXIT\nset -e\ntrue && false\necho never\n";
+    let bash_dir = temp_dir("bash-errexit");
+    let knsh_dir = temp_dir("knsh-errexit");
+    let bash = run_bash(script, &bash_dir);
+    let knsh = run_knsh(script, &knsh_dir);
+    std::fs::remove_dir_all(&bash_dir).unwrap();
+    std::fs::remove_dir_all(&knsh_dir).unwrap();
+    assert_eq!(bash, ("bye 1\n".to_owned(), 1));
+    assert_eq!(knsh, bash);
+}

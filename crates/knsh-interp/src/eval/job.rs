@@ -115,6 +115,9 @@ impl Interpreter {
     fn subshell(&self, fds: super::FdTable, context: JobContext) -> Self {
         let mut state = self.state.clone();
         state.set_interactive(false);
+        // KNSH-104: bash's forked subshell resets its traps (ignored signals stay ignored).
+        let (functrace, errtrace) = (state.options().functrace, state.options().errtrace);
+        state.traps_mut().reset_for_subshell(functrace, errtrace);
         Self {
             state,
             fs: Arc::clone(&self.fs),
@@ -146,7 +149,22 @@ impl Interpreter {
             exit_after_job: false,
             declaration_lists: Vec::new(),
             forked_stage: false,
+            errexit_ignored: self.errexit_ignored,
+            // A subshell started from a trap is still inside it, as bash's forked subshell keeps the trap's
+            // `SIG_INPROGRESS` mark: `DEBUG` and `ERR` do not run again in it (or the trap would recurse).
+            traps_running: self.traps_running.clone(),
+            trace_level: self.trace_level,
+            signals: None,
+            terminating: None,
+            skip_exit_trap: false,
         }
+    }
+
+    /// A subshell (this shell) ends with `result`: its status, after its `EXIT` trap if it set one (KNSH-104).
+    pub(super) fn finish_subshell(&mut self, result: &Flow<Status>, run: &Run<'_>) -> Result<Status, InterpError> {
+        let status = subshell_status(result)?;
+        let end = Span::new(run.source.len(), run.source.len());
+        self.run_exit_trap(status, end, run)
     }
 
     /// Whether stops of this shell's programs concern it: it does job control, or it is a subshell inside a job
@@ -159,8 +177,14 @@ impl Interpreter {
     /// process group (taking the terminal for a foreground job) and the others join it; without job control it
     /// stays in the shell's group.
     pub(super) fn start_command(&mut self, request: &CommandRequest) -> Flow<Started> {
+        // KNSH-104: what the shell ignores (`trap ''`, and signals ignored at entry), its commands start ignoring.
+        let ignore = self.state.traps().ignored_signals();
         let Some(context) = self.placement.clone() else {
-            return Ok(self.spawner.start(request, &ChildOptions::default())?);
+            let options = ChildOptions {
+                ignore,
+                ..ChildOptions::default()
+            };
+            return Ok(self.spawner.start(request, &options)?);
         };
         if !context.controlled {
             let options = ChildOptions {
@@ -171,6 +195,7 @@ impl Interpreter {
                 } else {
                     ChildSignals::Inherit
                 },
+                ignore,
             };
             return Ok(self.spawner.start(request, &options)?);
         }
@@ -180,6 +205,7 @@ impl Interpreter {
             group: GroupMembership::Lead,
             terminal: context.terminal.clone(),
             signals: ChildSignals::Default,
+            ignore,
         };
         let started = match *group {
             Some(existing) => {
@@ -187,6 +213,7 @@ impl Interpreter {
                     group: GroupMembership::Join(existing),
                     terminal: None,
                     signals: ChildSignals::Default,
+                    ignore,
                 };
                 match self.spawner.start(request, &join) {
                     // Every member ended meanwhile: the group is gone, so this program leads a new one.
@@ -222,7 +249,24 @@ impl Interpreter {
 
     /// A foreground pipeline, timed if it starts with `time`. Sets `$?` and, unless it is a compound command run in
     /// the shell, `PIPESTATUS`.
+    ///
+    /// KNSH-104: under `set -n` nothing runs (status 0); a `!` pipeline runs where `set -e` ignores failures; after
+    /// the pipeline the signals handed over are acted on.
     pub(super) fn pipeline(&mut self, pipeline: &Pipeline, run: &Run<'_>) -> Flow<Status> {
+        if self.state.options().noexec && !self.state.is_interactive() {
+            return Ok(Status::SUCCESS);
+        }
+        let result = if pipeline.is_negated() {
+            self.ignoring_errexit(|shell| shell.pipeline_body(pipeline, run))
+        } else {
+            self.pipeline_body(pipeline, run)
+        };
+        let status = result?;
+        self.act_on_signals(pipeline.span, run)?;
+        Ok(status)
+    }
+
+    fn pipeline_body(&mut self, pipeline: &Pipeline, run: &Run<'_>) -> Flow<Status> {
         match pipeline.time {
             Some(time) => self.timed(pipeline, time, run),
             None => self.untimed(pipeline, run),
@@ -253,6 +297,12 @@ impl Interpreter {
         // `exec cmd` in the shell itself: the shell was replaced by the program, and ends with it.
         if std::mem::take(&mut self.exit_after_job) {
             return Err(Stop::Exit(status));
+        }
+        // KNSH-104: a command, `( … )`, `[[ … ]]`, `(( … ))` or longer pipeline failed: the `ERR` trap, then `set -e`
+        // (a compound command alone never triggers them itself, as in bash: its own commands do). A `!` pipeline's
+        // inverted status never does.
+        if !pipeline.is_negated() {
+            self.command_failed(status, pipeline.span, run)?;
         }
         Ok(status)
     }
@@ -374,7 +424,9 @@ impl Interpreter {
             }
             Command::Compound(compound) if matches!(compound.kind, CompoundKind::Subshell(_)) => {
                 let mut subshell = self.subshell(self.fds.clone(), context.clone());
-                subshell_status(&subshell.command(command, run))
+                let result = subshell.command(command, run);
+                subshell
+                    .finish_subshell(&result, run)
                     .map(|status| (status, None))
                     .map_err(Stop::Error)
             }
@@ -434,9 +486,9 @@ impl Interpreter {
             subshell.sink = Sink::Open;
             let result = subshell.simple(simple, run);
             let child = std::mem::take(&mut subshell.sink).started();
+            let status = subshell.finish_subshell(&result, run)?;
             // The subshell's copies of the pipe ends close now.
             drop(subshell);
-            let status = subshell_status(&result)?;
             return self.add_member(key, status, child);
         }
         let command = command.clone();
@@ -462,7 +514,8 @@ impl Interpreter {
                 let run = Run::shared(&source, origin.as_deref(), line_base);
                 // A panic must still be reported, or the shell would wait for this member forever.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    subshell_status(&task(&mut subshell, &run))
+                    let result = task(&mut subshell, &run);
+                    subshell.finish_subshell(&result, &run)
                 }))
                 .unwrap_or(Err(InterpError::EvaluationThread));
                 drop(subshell);
@@ -569,6 +622,9 @@ impl Interpreter {
     /// `and_or &`: started as a background job, `$!` set. Its status (and `$?`) is 0; `PIPESTATUS` is left as it
     /// was, as in bash. An interactive shell prints `[n] pid`.
     pub(super) fn background(&mut self, and_or: &AndOr, run: &Run<'_>) -> Flow<Status> {
+        if self.state.options().noexec && !self.state.is_interactive() {
+            return Ok(Status::SUCCESS);
+        }
         let key = if and_or.rest.is_empty() && and_or.first.time.is_none() {
             self.launch(&and_or.first, true, run)?
         } else {
@@ -605,6 +661,7 @@ impl Interpreter {
             self.write_shell(2, format!("[{number}]{pid}\n").as_bytes());
         }
         self.state.set_last_status(Status::SUCCESS);
+        self.act_on_signals(and_or.span, run)?;
         Ok(Status::SUCCESS)
     }
 
