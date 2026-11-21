@@ -38,6 +38,73 @@ pub struct Metadata {
     pub uid: u32,
 }
 
+/// What a path names, in the detail the shell's file tests (`test -p`, `[[ -S … ]]`) read (KNSH-102).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FileType {
+    /// A regular file.
+    Regular,
+    /// A directory.
+    Directory,
+    /// A symbolic link (only when the final symlink is not followed).
+    Symlink,
+    /// A named pipe (FIFO), or a pipe.
+    Fifo,
+    /// A socket.
+    Socket,
+    /// A character device (a terminal, `/dev/null`).
+    CharacterDevice,
+    /// A block device.
+    BlockDevice,
+}
+
+/// A file time: seconds and nanoseconds since the Unix epoch, ordered as `timespec_cmp` orders them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct FileTime {
+    /// Whole seconds (negative before 1970).
+    pub seconds: i64,
+    /// Nanoseconds within the second, below 1,000,000,000.
+    pub nanoseconds: u32,
+}
+
+/// What `stat(2)` (or `lstat(2)`) tells about one path, for the shell's file tests (KNSH-102: `-e -f -d -s -O -G
+/// -N -u -g -k -nt -ot -ef` and the type tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileStatus {
+    /// What it is.
+    pub file_type: FileType,
+    /// Permission bits with set-user-id, set-group-id and sticky (`0o7777` mask).
+    pub mode: u32,
+    /// Owner's user id.
+    pub uid: u32,
+    /// Group id.
+    pub gid: u32,
+    /// Size in bytes.
+    pub len: u64,
+    /// Device holding it: with [`FileStatus::inode`], what `-ef` compares.
+    pub device: u64,
+    /// Inode number.
+    pub inode: u64,
+    /// Last access.
+    pub accessed: FileTime,
+    /// Last modification.
+    pub modified: FileTime,
+    /// Whether the owner is this process's effective user (`test -O`).
+    pub owned_by_effective_user: bool,
+    /// Whether the group is this process's effective group (`test -G`).
+    pub owned_by_effective_group: bool,
+}
+
+/// The permission `access(2)` checks (`test -r`, `-w`, `-x`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Access {
+    /// `R_OK`.
+    Read,
+    /// `W_OK`.
+    Write,
+    /// `X_OK`.
+    Execute,
+}
+
 /// Filesystem operations. Object safe: hold it as `Arc<dyn Fs>`.
 ///
 /// All paths must be absolute; a relative path is refused with [`PlatformError::InvalidPath`] rather than resolved
@@ -195,6 +262,23 @@ pub trait Fs: Send + Sync {
     /// entries; [`PlatformError::Os`] with [`Operation::ReadDirectory`](crate::Operation::ReadDirectory)
     /// (`ENOENT`, `ENOTDIR`).
     fn list_dir(&self, path: &Path, limit: usize) -> Result<Vec<OsString>, PlatformError>;
+
+    /// `stat(2)` of `path` (`follow`: symlinks followed, as bash's `sh_stat`), or `lstat(2)` (the link itself, for
+    /// `test -h`).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::InvalidPath`]; [`PlatformError::Os`] with [`Operation::Metadata`](crate::Operation::Metadata)
+    /// (`ENOENT`, `ENOTDIR`, `EACCES`, `ELOOP`).
+    fn status(&self, path: &Path, follow: bool) -> Result<FileStatus, PlatformError>;
+
+    /// Whether this process may access `path` as `access`, judged with its effective user and group ids
+    /// (`faccessat` with `AT_EACCESS`, bash's `sh_eaccess`), symlinks followed. A missing file is `Ok(false)`.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::InvalidPath`] for a relative path or one holding a NUL byte.
+    fn accessible(&self, path: &Path, access: Access) -> Result<bool, PlatformError>;
 }
 
 /// Refuses relative paths, which every [`Fs`] method rejects.

@@ -141,7 +141,7 @@ pub enum Unsupported {
     Time,
     /// A function definition (KNSH-103).
     FunctionDefinition,
-    /// A bash builtin the interpreter does not run yet (`read`, `trap`, `getopts`, `shopt`, …: KNSH-102 to
+    /// A bash builtin the interpreter does not run yet (`trap`, `getopts`, `shopt`, …: KNSH-103 and
     /// KNSH-104), or a form of one it runs that a later story implements (`set` with options, KNSH-104).
     Builtin,
     /// A name reference, `declare -n` (KNSH-103, with scopes).
@@ -162,8 +162,26 @@ pub enum Unsupported {
     /// (an unterminated quote, a construct the parser does not read), or before which bash would have run commands
     /// the parser cannot separate (KNSH-101).
     Unparsed,
-    /// A construct the parser keeps opaque: `[[ … ]]`, `select`, an arithmetic `for` whose header is not three
-    /// expressions.
+    /// One of the shell's standard descriptors read, stat'ed or tested as a terminal (`read` from standard input,
+    /// `test -t 1`, `[ -p /dev/stdin ]`) by an interpreter the host gave no standard descriptors
+    /// ([`Interpreter::with_standard_descriptors`](crate::Interpreter::with_standard_descriptors)), KNSH-102.
+    StandardDescriptor,
+    /// A `[[ … ]]` whose words the interpreter cannot read as bash's parser does (a syntax error bash would report
+    /// before running anything, a regular expression with an unbalanced parenthesis), or a redirection after it,
+    /// which the parser keeps opaque (KNSH-102).
+    Conditional,
+    /// A `read` option that needs what later stories add: `-a` (arrays, KNSH-103) and `-e` (line editing, KNSH-107)
+    /// (KNSH-102).
+    ReadOption,
+    /// `printf %(…)T` in an interpreter given no local time
+    /// ([`Interpreter::with_local_time`](crate::Interpreter::with_local_time)), or with a `TZ` the host's conversion
+    /// does not use; and number formatting in a locale whose grouping or decimal point the interpreter does not
+    /// reproduce (KNSH-102).
+    PrintfLocale,
+    /// `[[ … =~ … ]]` on text the system's regular expression engine would match in bytes while bash matches in
+    /// characters, or the reverse: a capture that does not end on a character boundary (KNSH-102).
+    RegexText,
+    /// A construct the parser keeps opaque: `select`, an arithmetic `for` whose header is not three expressions.
     Construct(UnsupportedConstruct),
 }
 
@@ -187,13 +205,18 @@ impl fmt::Display for Unsupported {
             Self::InShellProcessId => f.write_str("$! of a background job the shell runs itself"),
             Self::Time => f.write_str("the time keyword without clocks"),
             Self::FunctionDefinition => f.write_str("function definition (KNSH-103)"),
-            Self::Builtin => f.write_str("this builtin (KNSH-102 to KNSH-104)"),
+            Self::Builtin => f.write_str("this builtin (KNSH-103, KNSH-104)"),
             Self::Nameref => f.write_str("a name reference (KNSH-103)"),
             Self::Alias => f.write_str("this alias's text in place of its command"),
             Self::SourceDescriptor => f.write_str("source of one of the shell's descriptors"),
             Self::NonUtf8Script => f.write_str("a sourced file that is not UTF-8"),
             Self::UnknownUmask => f.write_str("the umask, which the host did not give"),
             Self::Unparsed => f.write_str("eval or source text the parser cannot report as bash would"),
+            Self::StandardDescriptor => f.write_str("a standard descriptor the host did not give"),
+            Self::Conditional => f.write_str("this [[ … ]] form"),
+            Self::ReadOption => f.write_str("this read option (KNSH-103, KNSH-107)"),
+            Self::PrintfLocale => f.write_str("this printf conversion in the shell's locale or time zone"),
+            Self::RegexText => f.write_str("a regular expression match bash would split differently"),
             Self::Construct(construct) => write!(f, "{construct}"),
         }
     }

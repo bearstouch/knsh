@@ -23,12 +23,41 @@ pub(crate) enum Name {
     Positional(usize),
     /// `@ * # ? - $ !`.
     Special(char),
-    /// `${PIPESTATUS[…]}`: the one array the interpreter reads before arrays exist (KNSH-100; arrays are
-    /// KNSH-103).
-    Pipestatus(Subscript),
+    /// `${PIPESTATUS[…]}` or `${BASH_REMATCH[…]}`: the arrays the shell maintains itself, which the interpreter
+    /// reads before arrays exist (KNSH-100, KNSH-102; arrays are KNSH-103).
+    Array(ShellArray, Subscript),
 }
 
-/// The subscript of `${PIPESTATUS[…]}`: what the interpreter reads without evaluating an arithmetic expression.
+/// An array the shell maintains itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellArray {
+    /// `PIPESTATUS` (KNSH-100).
+    Pipestatus,
+    /// `BASH_REMATCH` (KNSH-102).
+    BashRematch,
+}
+
+impl ShellArray {
+    /// The array variable `name` is, if any.
+    pub(crate) fn named(name: &str) -> Option<Self> {
+        match name {
+            crate::state::PIPESTATUS => Some(Self::Pipestatus),
+            crate::state::BASH_REMATCH => Some(Self::BashRematch),
+            _ => None,
+        }
+    }
+
+    /// Its name.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Pipestatus => crate::state::PIPESTATUS,
+            Self::BashRematch => crate::state::BASH_REMATCH,
+        }
+    }
+}
+
+/// The subscript of `${PIPESTATUS[…]}` and `${BASH_REMATCH[…]}`: what the interpreter reads without evaluating an
+/// arithmetic expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Subscript {
     /// `[@]`, or `[*]` when `star`.
@@ -58,15 +87,16 @@ impl Subscript {
     }
 }
 
-/// The `PIPESTATUS` subscript at the start of `rest` (which starts with `[`) and its length with the brackets, when
-/// `name` is `PIPESTATUS`.
-fn pipestatus_subscript(name: &Name, rest: &str) -> Option<(Subscript, usize)> {
-    if *name != Name::Variable(crate::state::PIPESTATUS.to_owned()) {
+/// The array `name` names and the subscript at the start of `rest` (which starts with `[`), with the subscript's
+/// length with the brackets, when `name` is one of the shell's own arrays.
+fn shell_array_subscript(name: &Name, rest: &str) -> Option<(ShellArray, Subscript, usize)> {
+    let Name::Variable(variable) = name else {
         return None;
-    }
+    };
+    let array = ShellArray::named(variable)?;
     let inner = rest.strip_prefix('[')?;
     let close = inner.find(']')?;
-    Some((Subscript::parse(&inner[..close])?, close + 2))
+    Some((array, Subscript::parse(&inner[..close])?, close + 2))
 }
 
 impl Name {
@@ -88,7 +118,7 @@ impl Name {
 
     /// Whether this is `$@` or `$*`, which expand to the positional parameters, or `${PIPESTATUS[@]}`.
     pub(crate) const fn is_list(&self) -> bool {
-        matches!(self, Self::Special('@' | '*') | Self::Pipestatus(Subscript::All { .. }))
+        matches!(self, Self::Special('@' | '*') | Self::Array(_, Subscript::All { .. }))
     }
 }
 
@@ -98,10 +128,10 @@ impl std::fmt::Display for Name {
             Self::Variable(name) => f.write_str(name),
             Self::Positional(n) => write!(f, "{n}"),
             Self::Special(ch) => write!(f, "{ch}"),
-            Self::Pipestatus(Subscript::All { star }) => {
-                write!(f, "PIPESTATUS[{}]", if *star { '*' } else { '@' })
+            Self::Array(array, Subscript::All { star }) => {
+                write!(f, "{}[{}]", array.name(), if *star { '*' } else { '@' })
             }
-            Self::Pipestatus(Subscript::Index(index)) => write!(f, "PIPESTATUS[{index}]"),
+            Self::Array(array, Subscript::Index(index)) => write!(f, "{}[{index}]", array.name()),
         }
     }
 }
@@ -276,9 +306,9 @@ fn length_or_hash(body: &str, at: &dyn Fn(usize, usize) -> Span) -> Parsed {
         return match leading_name(rest) {
             Some((name, len)) if len == rest.len() => Parsed::Length(name),
             Some((name, len)) if rest.as_bytes().get(len) == Some(&b'[') => {
-                match pipestatus_subscript(&name, &rest[len..]) {
-                    Some((subscript, taken)) if len + taken == rest.len() => {
-                        Parsed::Length(Name::Pipestatus(subscript))
+                match shell_array_subscript(&name, &rest[len..]) {
+                    Some((array, subscript, taken)) if len + taken == rest.len() => {
+                        Parsed::Length(Name::Array(array, subscript))
                     }
                     Some(_) => Parsed::Bad,
                     None => Parsed::Unsupported(Unsupported::Array),
@@ -334,10 +364,10 @@ fn indirect(body: &str, at: &dyn Fn(usize, usize) -> Span) -> Parsed {
 fn with_op(name: Name, indirect: bool, body: &str, from: usize, at: &dyn Fn(usize, usize) -> Span) -> Parsed {
     if body.as_bytes().get(from) == Some(&b'[') {
         let rest = body.get(from..).unwrap_or("");
-        return match pipestatus_subscript(&name, rest) {
-            Some((subscript, taken)) if !indirect => match operator(body, from + taken, at) {
+        return match shell_array_subscript(&name, rest) {
+            Some((array, subscript, taken)) if !indirect => match operator(body, from + taken, at) {
                 Some(op) => Parsed::Param {
-                    name: Name::Pipestatus(subscript),
+                    name: Name::Array(array, subscript),
                     indirect,
                     op,
                 },

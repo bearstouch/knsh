@@ -10,7 +10,7 @@ use knsh_core::CanonicalPath;
 
 use super::lock;
 use crate::error::{Operation, PlatformError};
-use crate::fs::{FileKind, Fs, Metadata, require_absolute, split_target};
+use crate::fs::{Access, FileKind, FileStatus, FileTime, FileType, Fs, Metadata, require_absolute, split_target};
 
 /// Symlinks followed per lookup before giving up with `ELOOP`, as `MAXSYMLINKS` on macOS.
 const MAX_SYMLINKS: u32 = 32;
@@ -20,6 +20,9 @@ const TEMP_NAME: &str = ".knsh.fake.tmp";
 
 /// User id the fake runs as unless [`MemFs::with_uid`] says otherwise (the first user account on macOS).
 pub const DEFAULT_UID: u32 = 501;
+
+/// Group id of every node and of the fake's user unless [`MemFs::set_group`] says otherwise (`staff` on macOS).
+pub const DEFAULT_GID: u32 = 20;
 
 #[derive(Debug, Clone)]
 enum Node {
@@ -42,6 +45,13 @@ struct State {
     owners: BTreeMap<PathBuf, u32>,
     /// Extended attributes of each node, by name.
     xattrs: BTreeMap<PathBuf, BTreeMap<String, Vec<u8>>>,
+    /// Group of each node; a node missing here is in [`DEFAULT_GID`] (KNSH-102).
+    groups: BTreeMap<PathBuf, u32>,
+    /// Access and modification times of each node; a node missing here has both at the epoch (KNSH-102).
+    times: BTreeMap<PathBuf, (FileTime, FileTime)>,
+    /// The type a file node reports to [`Fs::status`] instead of a regular file: a FIFO, socket or device
+    /// (KNSH-102).
+    types: BTreeMap<PathBuf, FileType>,
 }
 
 /// An in-memory filesystem.
@@ -89,6 +99,9 @@ impl MemFs {
                 umask: 0,
                 owners,
                 xattrs: BTreeMap::new(),
+                groups: BTreeMap::new(),
+                times: BTreeMap::new(),
+                types: BTreeMap::new(),
             }),
         }
     }
@@ -116,6 +129,49 @@ impl MemFs {
             return Err(os(Operation::Metadata, libc::ENOENT));
         }
         state.owners.insert(path.to_path_buf(), uid);
+        Ok(())
+    }
+
+    /// Puts `path` (exactly) in group `gid`. Setup helper (KNSH-102: `test -G`).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Os`] with `ENOENT` if nothing exists at `path`.
+    pub fn set_group(&self, path: &Path, gid: u32) -> Result<(), PlatformError> {
+        let mut state = lock(&self.state);
+        if !state.nodes.contains_key(path) {
+            return Err(os(Operation::Metadata, libc::ENOENT));
+        }
+        state.groups.insert(path.to_path_buf(), gid);
+        Ok(())
+    }
+
+    /// Sets the access and modification times of `path` (exactly). Setup helper (KNSH-102: `-nt`, `-ot`, `-N`).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Os`] with `ENOENT` if nothing exists at `path`.
+    pub fn set_times(&self, path: &Path, accessed: FileTime, modified: FileTime) -> Result<(), PlatformError> {
+        let mut state = lock(&self.state);
+        if !state.nodes.contains_key(path) {
+            return Err(os(Operation::Metadata, libc::ENOENT));
+        }
+        state.times.insert(path.to_path_buf(), (accessed, modified));
+        Ok(())
+    }
+
+    /// Makes the file at `path` (exactly) report `file_type` to [`Fs::status`]: a FIFO, socket or device. Setup
+    /// helper (KNSH-102: `test -p`, `-S`, `-c`, `-b`).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Os`] with `ENOENT` unless a file exists at `path`.
+    pub fn set_file_type(&self, path: &Path, file_type: FileType) -> Result<(), PlatformError> {
+        let mut state = lock(&self.state);
+        if !matches!(state.nodes.get(path), Some(Node::File { .. })) {
+            return Err(os(Operation::Metadata, libc::ENOENT));
+        }
+        state.types.insert(path.to_path_buf(), file_type);
         Ok(())
     }
 
@@ -414,6 +470,70 @@ impl Fs for MemFs {
             }),
             None => Err(os(Operation::Metadata, libc::ENOENT)),
         }
+    }
+
+    fn status(&self, path: &Path, follow: bool) -> Result<FileStatus, PlatformError> {
+        let mut state = lock(&self.state);
+        require_absolute(path)?;
+        state.check_fault(Operation::Metadata)?;
+        let resolved = resolve(&state.nodes, path, follow, Operation::Metadata)?;
+        let (file_type, mode, len) = match state.nodes.get(&resolved) {
+            Some(Node::File { data, mode }) => (
+                state.types.get(&resolved).copied().unwrap_or(FileType::Regular),
+                *mode,
+                data.len() as u64,
+            ),
+            Some(Node::Directory { mode }) => (FileType::Directory, *mode, 0),
+            Some(Node::Symlink { target }) => (FileType::Symlink, 0o755, target.as_os_str().len() as u64),
+            None => return Err(os(Operation::Metadata, libc::ENOENT)),
+        };
+        let uid = state.owner(&resolved);
+        let gid = state.groups.get(&resolved).copied().unwrap_or(DEFAULT_GID);
+        let (accessed, modified) = state.times.get(&resolved).copied().unwrap_or_default();
+        // Without hard links a node is its path: the inode is the path's hash, stable for the process.
+        let inode = {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            resolved.hash(&mut hasher);
+            hasher.finish()
+        };
+        Ok(FileStatus {
+            file_type,
+            mode,
+            uid,
+            gid,
+            len,
+            device: 1,
+            inode,
+            accessed,
+            modified,
+            owned_by_effective_user: uid == state.uid,
+            owned_by_effective_group: gid == DEFAULT_GID,
+        })
+    }
+
+    /// The owner's bits for the fake's user, the other bits for anyone else; root may read and write anything and
+    /// execute anything with an execute bit, as the kernel decides.
+    fn accessible(&self, path: &Path, access: Access) -> Result<bool, PlatformError> {
+        require_absolute(path)?;
+        let state = lock(&self.state);
+        let Ok(resolved) = resolve(&state.nodes, path, true, Operation::Metadata) else {
+            return Ok(false);
+        };
+        let mode = match state.nodes.get(&resolved) {
+            Some(Node::File { mode, .. } | Node::Directory { mode }) => *mode,
+            Some(Node::Symlink { .. }) | None => return Ok(false),
+        };
+        let bit = match access {
+            Access::Read => 0o4,
+            Access::Write => 0o2,
+            Access::Execute => 0o1,
+        };
+        if state.uid == 0 {
+            return Ok(access != Access::Execute || mode & 0o111 != 0);
+        }
+        let shift = if state.owner(&resolved) == state.uid { 6 } else { 0 };
+        Ok((mode >> shift) & bit != 0)
     }
 
     fn canonicalise(&self, path: &Path) -> Result<CanonicalPath, PlatformError> {

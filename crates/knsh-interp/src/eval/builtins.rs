@@ -9,17 +9,14 @@
 //! - Every program, whatever started it (a command, `command`, `exec`, `eval`, `source`), starts through
 //!   [`CommandSpawner`](knsh_platform::CommandSpawner), the seam KNSH-108 decides at.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use knsh_bash::Span;
 use knsh_platform::{CommandRequest, Started};
 
-use super::{
-    BUILTIN_PROGRAM_PATH, EXTERNAL_BUILTINS, Flow, Interpreter, Run, Sink, Stop, external_builtin_differs,
-    is_bash_builtin, is_native_builtin, is_refused_builtin, unsupported,
-};
+use super::{Flow, Interpreter, Run, Sink, Stop, is_bash_builtin, is_native_builtin, is_refused_builtin, unsupported};
 use crate::error::Unsupported;
 use crate::lookup::{self, Missing, Refusal, Resolved};
 use crate::quote;
@@ -92,7 +89,7 @@ impl Interpreter {
             }
             return self.with_temporary(name, args, assignments, |shell| shell.builtin(name, args, span, run));
         }
-        if is_refused_builtin(name) || external_builtin_differs(name, args) {
+        if is_refused_builtin(name) {
             return Err(unsupported(Unsupported::Builtin, span).into());
         }
         self.external(name, args, assignments, search, span, run)
@@ -168,6 +165,9 @@ impl Interpreter {
             "type" => Ok(self.type_builtin(args, span, run)),
             "hash" => Ok(self.hash_builtin(args, span, run)),
             "exec" => self.exec_builtin(args, &[], span, run),
+            "test" | "[" => self.test_builtin(name, args, span, run),
+            "printf" => self.printf_builtin(args, span, run),
+            "read" => self.read_builtin(args, span, run),
             _ => match self.job_builtin(name, args, span, run) {
                 Some(result) => result,
                 None => Err(unsupported(Unsupported::Builtin, span).into()),
@@ -193,15 +193,6 @@ impl Interpreter {
     /// Finds program `name` as bash's `search_for_command` does: the hash table first, then `PATH` (or the
     /// standard path, or the command's own `PATH=…`), remembering what `PATH` found.
     fn resolve(&mut self, name: &str, assignments: &[(String, OsString)], search: Search) -> Resolved {
-        // A builtin run as its program is never searched on `PATH`.
-        if EXTERNAL_BUILTINS.contains(&name) {
-            return lookup::find(
-                &*self.fs,
-                name,
-                Some(OsStr::new(BUILTIN_PROGRAM_PATH)),
-                self.state.cwd(),
-            );
-        }
         let own_path = assignments
             .iter()
             .rev()

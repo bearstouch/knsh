@@ -34,10 +34,12 @@ use knsh_platform::{Collation, Fs, UserHomes};
 use crate::arith::{self, Failure};
 use crate::error::{InterpError, Unsupported};
 use crate::glob;
-use crate::param::{self, CaseKind, DefaultKind, Name, Op, Parsed, ReplaceMode, Subscript};
+use crate::param::{self, CaseKind, DefaultKind, Name, Op, Parsed, ReplaceMode, ShellArray, Subscript};
 use crate::pattern::{self, Flags, Pattern};
 use crate::scan::{self, Mode, Part};
-use crate::state::{AssignError, DEFAULT_IFS, LastBackground, PIPESTATUS, ShellState, refuses_assignment};
+use crate::state::{
+    AssignError, BASH_REMATCH, DEFAULT_IFS, LastBackground, PIPESTATUS, ShellState, refuses_assignment,
+};
 use crate::word::{self, WordChar, assignment_value_start};
 
 /// Deepest nesting of `${…}` and `$((…))` inside one another. The parser's own limits keep real scripts far below
@@ -369,7 +371,7 @@ impl<'a> Expander<'a> {
                     // `$1` is named `$1` in bash's message; `$x` is named `x`.
                     let label = match &parsed {
                         Name::Variable(variable) => variable.clone(),
-                        Name::Positional(_) | Name::Special(_) | Name::Pipestatus(_) => format!("${parsed}"),
+                        Name::Positional(_) | Name::Special(_) | Name::Array(..) => format!("${parsed}"),
                     };
                     let value = self.require(value, &parsed, &label)?;
                     self.emit(value, quoted, out);
@@ -471,6 +473,9 @@ impl<'a> Expander<'a> {
         if name == PIPESTATUS {
             return Ok(self.state.pipestatus().first().map(ToString::to_string));
         }
+        if name == BASH_REMATCH {
+            return Ok(self.state.bash_rematch().first().cloned());
+        }
         let value = self
             .overlay
             .iter()
@@ -536,8 +541,11 @@ impl<'a> Expander<'a> {
                 },
                 _ => None,
             },
-            Name::Pipestatus(subscript) => {
-                let statuses: Vec<String> = state.pipestatus().iter().map(ToString::to_string).collect();
+            Name::Array(array, subscript) => {
+                let statuses: Vec<String> = match array {
+                    ShellArray::Pipestatus => state.pipestatus().iter().map(ToString::to_string).collect(),
+                    ShellArray::BashRematch => state.bash_rematch().to_vec(),
+                };
                 match *subscript {
                     Subscript::All { star } => Some(Value::List { items: statuses, star }),
                     Subscript::Index(index) => {
@@ -774,7 +782,7 @@ impl<'a> Expander<'a> {
             DefaultKind::Alternative if !missing => self.word(word, quoted, out),
             DefaultKind::Alternative => Ok(()),
             DefaultKind::Assign if missing => {
-                if let Name::Pipestatus(_) = target {
+                if let Name::Array(..) = target {
                     return Err(InterpError::Unsupported {
                         feature: Unsupported::Array,
                         span: word,
@@ -1242,7 +1250,7 @@ fn transform(op: char, text: &str, target: &Name, letters: &str) -> String {
         'A' => match target {
             Name::Variable(name) if !letters.is_empty() => format!("declare -{letters} {name}={}", quote(text)),
             Name::Variable(name) => format!("{name}={}", quote(text)),
-            Name::Positional(_) | Name::Special(_) | Name::Pipestatus(_) => String::new(),
+            Name::Positional(_) | Name::Special(_) | Name::Array(..) => String::new(),
         },
         'a' => letters.to_owned(),
         // `Q`, and `K` and `k`, which quote a scalar the same way.

@@ -59,6 +59,15 @@ tests (`crates/knsh-interp/src/expand/tests.rs`, `src/arith/tests.rs`); forms bo
 | `declare -l`, `declare -u` (KNSH-101) | Invalid option | Lower and upper case |
 | `declare x` then `declare -p x`, `${x-unset}` (KNSH-101) | `declare -- x=""`, empty | `declare -- x`, `unset` |
 | `type -t` of a name not found among others (KNSH-101) | Status 0 | Status 1 (bash 5.2's `type.def`; pending a 5.2 run, KNSH-109) |
+| `printf %q '~x'`, `printf %q 'a=~'` (KNSH-102) | `~x`, `a=~` | `\~x`, `a=\~` (a tilde at the start or after `:` or `=` is quoted) |
+| `printf %d 12abc` (KNSH-102) | Prints `0`, status 1 | Prints `12` (the number read up to the error), status 1 |
+| `printf %d 09`, `printf %d 0x` (KNSH-102) | `invalid number` | `invalid octal number`, `invalid hex number` |
+| `printf '%(%F)T'`, `printf %Q`, `test -v`, `test -R`, `read -N`, `read -i` (KNSH-102) | No such conversion or option | Time formatting, quoting after the precision, set-variable and name-reference tests, exact character count, initial text |
+| `[ ! ! a ]` (three arguments, `!` first, KNSH-102) | `too many arguments`, status 2 | Status 0 (bash 5.2's `test.c` uses every argument) |
+| `[[ ab == @(a\|b)b ]]` without `extglob` (KNSH-102) | Syntax error | Matches: `[[` reads extended glob groups always |
+| `read` of input holding NUL bytes (KNSH-102) | The line ends at the first NUL | NUL bytes are dropped |
+| `read -t 0` with input at end of file (KNSH-102) | Status 1 | Status 0: end of file is input waiting (bash 5.2's `input_avail`; pending a 5.2 run, KNSH-109) |
+| `read`'s usage line (KNSH-102) | `read [-ers] [-u fd] [-t timeout] [-p prompt] [-a array] [-n nchars] [-d delim] [name ...]` | `read [-ers] [-a array] [-d delim] [-i text] [-n nchars] [-N nchars] [-p prompt] [-t timeout] [-u fd] [name ...]` |
 
 Known differences of the native interpreter from bash 5.2 (KNSH-098): in the C locale bash matches `?` and bracket
 expressions against bytes and the interpreter against characters, so they differ for non-ASCII text only (`?`
@@ -91,6 +100,23 @@ job, so a later `wait` for its process id is `not a child of this shell` (127); 
 with KNSH-107); `time` adds the shell's own CPU time and that of every child its process reaped meanwhile, which in
 a process running several shells includes the others'. The terminal modes a stopped job had are not saved for its
 `fg` (the shell restores its own).
+
+Known differences of the native interpreter from bash 5.2 in `test`, `[[ … ]]`, `printf` and `read` (KNSH-102):
+`read` reads a byte at a time from any descriptor (bash reads a regular file in blocks and seeks back), which only
+costs time; `printf`'s floating conversions use a `double`, as bash's `long double` is on Apple silicon (bash on an
+Intel Mac prints more digits past the seventeenth significant one); the `'` flag in a locale that groups digits, and
+floating conversions in a locale whose decimal point is not `.`, are refused; `%(…)T` is refused unless the host
+gives the interpreter its local time (`Interpreter::with_local_time`) and the shell's `TZ` is the zone the host
+converts in (the process's own `TZ`); `printf %c` prints the first byte of its argument, as bash 3.2 does (pending a
+5.2 run for a multibyte first character, KNSH-109); a `[[ … ]]` bash's parser would reject is refused before anything
+runs (bash reports a syntax error), as is a redirection after its `]]`; `[[ =~ ]]` in the C locale over UTF-8 text is
+refused when a capture would split a character; `test -o` reports the options the interpreter does not hold yet as
+off (their `set` forms are refused, KNSH-104) and refuses the line-editing and history options of an interactive
+shell; an interactive `read` does not print `PS2` before a continuation line (KNSH-107); reading or testing one of the
+spawner's standard descriptors (`read` from standard input, `test -t 1`, `[ -p /dev/stdin ]`) is refused unless the
+host gives them (`Interpreter::with_standard_descriptors`). Refused until the story that implements them: `read -a`
+(KNSH-103), `read -e` on a terminal (KNSH-107), `nocasematch` for `[[` (KNSH-104). `[[ =~ ]]` is built on macOS only
+until the Linux backend declares its `regex_t`.
 
 Known differences of the native interpreter from bash 5.2 in the core builtins (KNSH-101): `exec cmd` runs the
 program through the spawner and the shell then ends with its status, so the program has a process id of its own, not

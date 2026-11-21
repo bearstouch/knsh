@@ -56,6 +56,11 @@ impl Harness {
 
     /// As [`Harness::new`], with the interpreter changed by `configure` (job control, clocks).
     fn with(configure: impl FnOnce(Interpreter) -> Interpreter) -> Self {
+        Self::with_descriptors(|interpreter, _| configure(interpreter))
+    }
+
+    /// As [`Harness::with`], `configure` also given the fake descriptors (to make standard input, KNSH-102).
+    fn with_descriptors(configure: impl FnOnce(Interpreter, &FakeDescriptors) -> Interpreter) -> Self {
         let fs = Arc::new(MemFs::new());
         fs.add_dir_all(Path::new("/bin")).unwrap();
         fs.add_dir_all(Path::new("/work")).unwrap();
@@ -82,7 +87,7 @@ impl Harness {
             Box::new(diagnostics.clone()),
         )
         .with_output(Box::new(output.clone()));
-        let interpreter = configure(interpreter);
+        let interpreter = configure(interpreter, &descriptors);
         Self {
             interpreter,
             commands,
@@ -123,6 +128,7 @@ impl Harness {
                         Some(FakeOpened::HereString(text)) => format!("<<<{}", String::from_utf8_lossy(&text)),
                         Some(FakeOpened::Pipe { n, write: true }) => format!("|{n}>"),
                         Some(FakeOpened::Pipe { n, write: false }) => format!("<{n}|"),
+                        Some(FakeOpened::Input { .. }) => "input".to_owned(),
                         None => "unknown".to_owned(),
                     },
                 };
@@ -512,7 +518,13 @@ fn unsupported_constructs_are_refused_before_anything_runs() {
         ("true | { echo $(ls); }", Unsupported::CommandSubstitution),
         ("true & (trap '' INT)", Unsupported::Builtin),
         ("f() { true; }", Unsupported::FunctionDefinition),
-        ("true; read x", Unsupported::Builtin),
+        ("true; trap x INT", Unsupported::Builtin),
+        // KNSH-102: `read -a` needs arrays (KNSH-103); `[[ … ]]` with what bash's parser rejects, or a command
+        // substitution inside.
+        ("true; read -ra x", Unsupported::ReadOption),
+        ("true; [[ a b ]]", Unsupported::Conditional),
+        ("true; [[ $(ls) ]]", Unsupported::CommandSubstitution),
+        ("true; [[ x ]] >out", Unsupported::Conditional),
         ("if true; then shopt -s extglob; fi", Unsupported::Builtin),
         ("mapfile x", Unsupported::Builtin),
         // KNSH-101: forms of the core builtins that later stories implement.
@@ -524,57 +536,32 @@ fn unsupported_constructs_are_refused_before_anything_runs() {
     for (line, feature) in cases {
         assert_eq!(refused(h.run(line)), *feature, "{line}");
     }
-    assert!(matches!(refused(h.run("[[ -n x ]]")), Unsupported::Construct(_)));
+    assert!(matches!(
+        refused(h.run("select x in a; do true; done")),
+        Unsupported::Construct(_)
+    ));
     assert_eq!(h.ran(), Vec::<String>::new());
 }
 
-// The builtins with an equivalent program run as that program for now.
+// KNSH-102: `test`, `[` and `printf` are builtins the interpreter runs itself; no program starts.
 #[test]
-fn stateless_builtins_run_as_their_programs() {
+fn test_and_printf_run_in_the_shell() {
     let mut h = Harness::new();
-    for program in ["echo", "test", "printf"] {
-        h.on(program, &[exited(0)]);
-    }
-    assert_eq!(h.status("echo hi; test -n x; printf x; true"), 0);
-    // `echo` and `true` are builtins the interpreter runs itself (KNSH-101).
-    assert_eq!(h.ran(), ["test", "printf"]);
-}
-
-// Fail closed: a builtin whose program would act differently for these arguments is refused, never run as the
-// program (macOS `/bin/echo` has no `-e` and stops at `\c`; `printf -v` sets a variable; `test -v` reads one).
-#[test]
-fn builtin_forms_the_programs_do_not_share_are_refused() {
-    let mut h = Harness::new();
-    for line in [
-        "printf -v x %s y",
-        "printf '%q' x",
-        "printf '%-5Q' x",
-        "printf '%(%Y)T'",
-        "test -v HOME",
-        "[ -o emacs ]",
-        "true; [ a = a -a b = b ]",
-    ] {
-        assert_eq!(refused(h.run(line)), Unsupported::Builtin, "{line}");
-    }
+    assert_eq!(h.status("test -n x && [ a = a ] && printf '%s\\n' ok"), 0);
+    assert_eq!(h.output.text(), "ok\n");
     assert_eq!(h.ran(), Vec::<String>::new());
-    for program in ["echo", "printf", "test"] {
-        h.on(program, &[exited(0)]);
-    }
-    assert_eq!(h.status("echo -n x; echo - -x; printf '%s %%q\\n' a; test -e x"), 0);
-    assert_eq!(h.ran(), ["printf", "test"]);
 }
 
-// Bash never searches `PATH` for a builtin: another `echo` on `PATH`, or `PATH` unset, changes nothing.
+// Bash never searches `PATH` for a builtin: another `printf` on `PATH`, or `PATH` unset, changes nothing.
 #[test]
 fn builtins_ignore_path() {
     let mut h = Harness::new();
     h.fs.add_dir_all(Path::new("/evil")).unwrap();
     h.fs.write(Path::new("/evil/printf"), b"", 0o755).unwrap();
-    h.on("printf", &[exited(0)]);
     assert_eq!(h.status("PATH=/evil printf hi"), 0);
     assert_eq!(h.status("PATH=/nowhere; printf hi"), 0);
-    let programs: Vec<_> = h.commands.runs().into_iter().map(|run| run.program).collect();
-    assert_eq!(programs, [Path::new("/bin/printf"), Path::new("/bin/printf")]);
+    assert_eq!(h.output.text(), "hihi");
+    assert_eq!(h.commands.runs().len(), 0);
 }
 
 // A failure to start a command that is not the command's fault stops the script.
@@ -733,8 +720,8 @@ fn nounset_ends_the_script_with_status_one() {
 fn refusals_found_by_expansion_stop_the_script_there() {
     let mut h = Harness::new();
     h.on("tool", &[exited(0)]);
-    h.interpreter.state_mut().set_variable("cmd", "read");
-    assert_eq!(refused(h.run("tool; $cmd x; tool")), Unsupported::Builtin);
+    h.interpreter.state_mut().set_variable("cmd", "trap");
+    assert_eq!(refused(h.run("tool; $cmd x INT; tool")), Unsupported::Builtin);
     assert_eq!(refused(h.run("set -${cmd:+e}")), Unsupported::Builtin);
     // A builtin produced by brace or pathname expansion too (KNSH-098).
     assert_eq!(refused(h.run("{tra,x}p x")), Unsupported::Builtin);
@@ -1310,3 +1297,4 @@ fn moving_a_descriptor_onto_itself_keeps_it() {
 
 mod builtins;
 mod jobs;
+mod test_printf_read;

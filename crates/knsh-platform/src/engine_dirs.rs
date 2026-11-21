@@ -772,5 +772,11 @@ mod tests {
         fn list_dir(&self, path: &Path, limit: usize) -> Result<Vec<std::ffi::OsString>, PlatformError> {
             self.0.list_dir(path, limit)
         }
+        fn status(&self, path: &Path, follow: bool) -> Result<crate::FileStatus, PlatformError> {
+            self.0.status(path, follow)
+        }
+        fn accessible(&self, path: &Path, access: crate::Access) -> Result<bool, PlatformError> {
+            self.0.accessible(path, access)
+        }
     }
 }

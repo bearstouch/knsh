@@ -1,4 +1,4 @@
-//! KNSH-096 to KNSH-100 integration tests: scripts run under the native interpreter (real processes
+//! KNSH-096 to KNSH-102 integration tests: scripts run under the native interpreter (real processes
 //! through `SystemProcesses`, real lookups and directory listings through `RealFs`, the system's collation) and under
 //! `/bin/bash`; standard output and exit status must match (NFR-COMPAT-01, NFR-COMPAT-02).
 //!
@@ -142,7 +142,8 @@ fn run_knsh_full(
     let null = || SharedFd::new(OwnedFd::from(std::fs::File::open("/dev/null").unwrap()));
     // KNSH-100: what the shell writes to standard output itself (`jobs`) goes into the same pipe as its commands'.
     let own_output = std::fs::File::from(OwnedFd::from(writer.try_clone().unwrap()));
-    let stdio = Stdio::Passed(Box::new([null(), SharedFd::new(OwnedFd::from(writer)), null()]));
+    let standard = [null(), SharedFd::new(OwnedFd::from(writer)), null()];
+    let stdio = Stdio::Passed(Box::new(standard.clone()));
     let spawner = ProcessCommandSpawner::new(Arc::new(SystemProcesses::new()), stdio);
     let environment = std::iter::once(("PATH", PATH))
         .chain(env.iter().copied())
@@ -163,7 +164,9 @@ fn run_knsh_full(
         Arc::new(SystemDescriptors::new()),
         Box::new(std::io::sink()),
     )
-    .with_output(Box::new(own_output));
+    .with_output(Box::new(own_output))
+    // KNSH-102: `read` and `test -t` see the same descriptors the commands get.
+    .with_standard_descriptors(standard);
     let parsed = knsh_bash::parse_with(script, knsh_bash::ParseOptions::default().with_extglob(extglob)).unwrap();
     let status = interpreter.run(&parsed, script).unwrap();
     // The interpreter holds the spawner, which holds the pipe's write end: drop it so the read sees end of file.
@@ -525,6 +528,63 @@ fn builtin_script_matches_bash() {
     std::fs::remove_dir_all(&bash_dir).unwrap();
     std::fs::remove_dir_all(&knsh_dir).unwrap();
     assert!(bash.0.ends_with("[1]\nbye\n"), "bash output: {}", bash.0);
+    assert_eq!(knsh.0, bash.0);
+    assert_eq!(knsh, bash);
+}
+
+/// KNSH-102: `test`, `[`, `[[ … ]]`, `printf` and `read` in forms bash 3.2 and 5.2 agree on (the 5.2-only forms,
+/// `%q` of `~`, `printf %d 12abc`'s value, `read` of NUL bytes, `-t 0`, are unit tests against bash 5.2's source).
+const TEST_PRINTF_READ: &str = r#"touch file; mkdir dir; ln -s file link; printf 'data' > full
+for args in '' 'x' '!' '-n' '! x' '-z ""' 'a = a' 'a != a' '-n = -n' 'a -a ""' 'a -o ""' '\( a \)' '! a = a' \
+    '! -z a -a b' 'a -a b -o ""' '1 -lt 2' '" 3 " -eq 3' '1 -eq x' 'a b c' 'a = b c d e' '\( a' '-t 1 2'; do
+  eval "test $args"; printf '%s:%d ' "$args" $?
+done; echo
+for t in '-e file' '-f dir' '-d dir' '-s full' '-s file' '-h link' '-L file' '-f link' '-r file' '-w file' \
+    '-x dir' '-x file' '-O file' '-G file' '-e ""' 'file -ef link' 'full -nt missing' 'missing -ot file' '-t 1'; do
+  eval "[ $t ]"; printf '%s:%d ' "$t" $?
+done; echo
+x="a b"; star='*'; re='^(a|b)+$'
+[[ $x == "a b" ]]; echo $?; [[ $x = a* ]]; echo $?; [[ -n $x && ! -z $x ]]; echo $?; [[ $star == \* ]]; echo $?
+[[ file == $star ]]; echo $?; [[ file == "$star" ]]; echo $?; [[ a < b ]]; echo $?; [[ 1 -eq 1+0 ]]; echo $?
+[[ 010 -eq 8 ]]; echo $?; [[ ! ( a == b ) && c ]]; echo $?; [[ -f file || -d nowhere ]]; echo $?
+[[ abc =~ ^a(b)(x)?c$ ]]; echo "$? ${BASH_REMATCH[0]} ${#BASH_REMATCH[@]} [${BASH_REMATCH[1]}] [${BASH_REMATCH[2]}]"
+[[ abab =~ $re ]]; echo "$? $BASH_REMATCH"; [[ 'a b' =~ (a b) ]]; echo "$? ${BASH_REMATCH[1]}"
+[[ a.c =~ "a.c" ]]; echo $?; [[ abc =~ "a.c" ]]; echo $?; [[ x.y =~ x[.]y ]]; echo $?
+printf '%s\n' a b c; printf '%s %s|' a b c; echo; printf 'x\n' a b; printf '%d-%d,' 1 2 3; echo
+printf '%05.1f|%-8.3e|%+g|% d|%#o|%#x|%.0f|%.0f|%g|%g|%#g|%G\n' 3.14159 1234.5 2.5 7 8 0 0.5 1.5 1e-5 123456789 1 1e100
+printf '%a|%.2a|%A|%a|%a\n' 3.5 1.0 255 0.1 0
+printf '%f %e %g %F|%5f|%05f\n' inf -inf nan inf inf inf
+printf '%05s|%5.2s|%-5d|%05d|%.3d|%+.0d|\n' ab abc 3 -3 5 0
+printf '%x %u %o|%d|%d|%d|%d\n' -1 -1 -8 0x1f 010 ' 12' -0x10
+printf '%d %d\n' "'a" "'"; printf '%.3s|%-6b|%b|%b' abcdef 'a\tb' '\101\0102\x41' 'x\cy' z; echo
+printf '\101\0102|\q|\"\n'; printf '[%3c][%-3c][%c]\n'; printf '%*d|%-*d|%.*f\n' 5 3 4 2 2 3.14159
+printf '%q ' 'a b' "it's" '$x' '#a' 'a#' $'a\tb' '' 'a,b' '!' "new
+line"; echo
+printf -v out '%s=%d;' k 1 j 2; echo "$out"; printf 'ab%y' 2>/dev/null; echo " $?"; printf 'abc%' 2>/dev/null; echo " $?"
+printf '%d\n' 99999999999999999999 2>/dev/null; echo $?; printf '%s' 2>/dev/null; echo $?
+IFS=: read a b <<< 'x:y:z:'; echo "[$a][$b]"; read a b <<< '  one   two  three  '; echo "[$a][$b]"
+read a <<< '  one   two  '; echo "[$a]"; read <<< '  one \ two  '; echo "[$REPLY]"
+read -r a <<< 'x\ny'; echo "[$a]"; read a <<< 'x\ny'; echo "[$a]"; read -d , a b <<< 'p q,r'; echo "[$a][$b] $?"
+read a <<< ''; echo "$? [$a]"; printf 'abc' | { read a; echo "$? [$a]"; }; read -n 2 a <<< xyz; echo "[$a]"
+IFS=, read a b c <<< '1,,3'; echo "[$a][$b][$c]"; IFS=', ' read a b c <<< '1 , 2,3'; echo "[$a][$b][$c]"
+read a b <<< 'a b\ '; echo "[$a][$b]"; read a b <<< 'a b c\ '; echo "[$a][$b]"; IFS=, read a b <<< '1,2,,'; echo "[$a][$b]"
+IFS=' ,' read a b <<< '1 ,  , 2 ,'; echo "[$a][$b]"; IFS= read a b <<< '  x y  '; echo "[$a][$b]"
+printf 'l1\nl2\nl3' > lines; while read line; do printf '<%s>' "$line"; done < lines; echo " [$line]"
+exec 3< lines; read -u 3 first; read -u 3 second; exec 3<&-; echo "$first $second"
+read none; echo "stdin:$? [$none]"; read 1a <<< x 2>/dev/null; echo $?; read -z 2>/dev/null; echo $?
+read -t x a 2>/dev/null; echo $?; read -u 9 a 2>/dev/null; echo $?
+[ a 2>/dev/null"#;
+
+// KNSH-102: the builtins' output and statuses match bash's, and none of them starts a program.
+#[test]
+fn test_printf_read_script_matches_bash() {
+    let bash_dir = temp_dir("bash-knsh102");
+    let knsh_dir = temp_dir("knsh-knsh102");
+    let bash = run_bash(TEST_PRINTF_READ, &bash_dir);
+    let knsh = run_knsh(TEST_PRINTF_READ, &knsh_dir);
+    std::fs::remove_dir_all(&bash_dir).unwrap();
+    std::fs::remove_dir_all(&knsh_dir).unwrap();
+    assert_eq!(bash.1, 2, "bash output: {}", bash.0);
     assert_eq!(knsh.0, bash.0);
     assert_eq!(knsh, bash);
 }

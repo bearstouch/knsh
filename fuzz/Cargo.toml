@@ -116,3 +116,10 @@ path = "fuzz_targets/word_expansion.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "builtin_conditional"
+path = "fuzz_targets/builtin_conditional.rs"
+test = false
+doc = false
+bench = false
