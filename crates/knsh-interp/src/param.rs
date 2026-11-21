@@ -1,17 +1,19 @@
-//! Reading the body of `${…}`: which parameter, and which operator with which words (KNSH-097).
+//! Reading the body of `${…}`: which parameter, and which operator with which words (KNSH-097, KNSH-103).
 //!
 //! Follows bash 5.2's `parameter_brace_expand`: `${#name}` is a length unless what follows `#` is no parameter
-//! (`${#:-x}` is `$#` with a default); `${!name}` is indirect, `${!prefix*}` and `${!prefix@}` list variable names;
-//! a name is an identifier, a number or one special character; the operator is the first character after it. What
-//! bash rejects as a "bad substitution" is [`Parsed::Bad`] (an error when expanded, not a refusal), and forms a
-//! later story implements (arrays) are [`Parsed::Unsupported`].
+//! (`${#:-x}` is `$#` with a default); `${!name}` is indirect, `${!prefix*}` and `${!prefix@}` list variable names,
+//! `${!name[@]}` and `${!name[*]}` an array's keys; a name is an identifier (with a subscript, `name[…]`, read up to
+//! its matching `]` as bash's `skipsubscript` does), a number or one special character; the operator is the first
+//! character after it. What bash rejects as a "bad substitution" is [`Parsed::Bad`] (an error when expanded, not a
+//! refusal).
 //!
-//! The words an operator takes are kept as spans of the source, read by [`crate::scan`] only when the expansion runs.
+//! The words an operator takes, and a subscript, are kept as spans of the source, read by [`crate::scan`] only when
+//! the expansion runs.
 
 use knsh_bash::Span;
 
 use crate::error::Unsupported;
-use crate::scan::find_top_level;
+use crate::scan::{find_top_level, subscript_end};
 use crate::state::is_name;
 
 /// A parameter named inside `${…}` (or after `$`).
@@ -23,84 +25,48 @@ pub(crate) enum Name {
     Positional(usize),
     /// `@ * # ? - $ !`.
     Special(char),
-    /// `${PIPESTATUS[…]}` or `${BASH_REMATCH[…]}`: the arrays the shell maintains itself, which the interpreter
-    /// reads before arrays exist (KNSH-100, KNSH-102; arrays are KNSH-103).
-    Array(ShellArray, Subscript),
+    /// `name[subscript]`: an element of an array, or all of them (KNSH-103).
+    Element(String, Subscript),
 }
 
-/// An array the shell maintains itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ShellArray {
-    /// `PIPESTATUS` (KNSH-100).
-    Pipestatus,
-    /// `BASH_REMATCH` (KNSH-102).
-    BashRematch,
-}
-
-impl ShellArray {
-    /// The array variable `name` is, if any.
-    pub(crate) fn named(name: &str) -> Option<Self> {
-        match name {
-            crate::state::PIPESTATUS => Some(Self::Pipestatus),
-            crate::state::BASH_REMATCH => Some(Self::BashRematch),
-            _ => None,
-        }
-    }
-
-    /// Its name.
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Pipestatus => crate::state::PIPESTATUS,
-            Self::BashRematch => crate::state::BASH_REMATCH,
-        }
-    }
-}
-
-/// The subscript of `${PIPESTATUS[…]}` and `${BASH_REMATCH[…]}`: what the interpreter reads without evaluating an
-/// arithmetic expression.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The subscript of `name[…]` (KNSH-103).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Subscript {
-    /// `[@]`, or `[*]` when `star`.
+    /// `[@]`, or `[*]` when `star`: every element.
     All {
         /// `[*]`.
         star: bool,
     },
-    /// `[n]`, a decimal number, from the end when negative (bash 4.3 and later).
-    Index(i64),
+    /// A subscript written in the source, between the brackets: expanded, then evaluated as an arithmetic
+    /// expression for an indexed array or taken as the key of an associative one.
+    Source {
+        /// Where it is.
+        span: Span,
+        /// Its text, for messages.
+        text: String,
+    },
+    /// A subscript that came from a value (`x='a[1]'; ${!x}`): not expanded again.
+    Text(String),
 }
 
 impl Subscript {
-    /// The subscript `text` (between the brackets) spells, or `None` for one that needs arithmetic (`[$i]`,
-    /// `[1+1]`), which is refused with the other arrays.
-    fn parse(text: &str) -> Option<Self> {
-        match text {
-            "@" => Some(Self::All { star: false }),
-            "*" => Some(Self::All { star: true }),
-            _ => {
-                let digits = text.strip_prefix('-').unwrap_or(text);
-                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-                    return None;
-                }
-                text.parse().ok().map(Self::Index)
-            }
+    /// The subscript `text` spells, written at `span` (or taken from a value when `span` is `None`).
+    fn new(text: &str, span: Option<Span>) -> Self {
+        match (text, span) {
+            ("@", _) => Self::All { star: false },
+            ("*", _) => Self::All { star: true },
+            (_, Some(span)) => Self::Source {
+                span,
+                text: text.to_owned(),
+            },
+            (_, None) => Self::Text(text.to_owned()),
         }
     }
 }
 
-/// The array `name` names and the subscript at the start of `rest` (which starts with `[`), with the subscript's
-/// length with the brackets, when `name` is one of the shell's own arrays.
-fn shell_array_subscript(name: &Name, rest: &str) -> Option<(ShellArray, Subscript, usize)> {
-    let Name::Variable(variable) = name else {
-        return None;
-    };
-    let array = ShellArray::named(variable)?;
-    let inner = rest.strip_prefix('[')?;
-    let close = inner.find(']')?;
-    Some((array, Subscript::parse(&inner[..close])?, close + 2))
-}
-
 impl Name {
-    /// The parameter `text` names: an identifier, a number or one special character.
+    /// The parameter `text` names: an identifier, a number or one special character, or `name[subscript]` (the
+    /// target of an indirection, whose subscript is not expanded again).
     pub(crate) fn parse(text: &str) -> Option<Self> {
         if is_name(text) {
             return Some(Self::Variable(text.to_owned()));
@@ -109,6 +75,14 @@ impl Name {
             // A number too large to be a position names a parameter that is never set.
             return Some(Self::Positional(text.parse().unwrap_or(usize::MAX)));
         }
+        if let Some((name, rest)) = text.split_once('[')
+            && is_name(name)
+            && let Some(close) = subscript_end(rest)
+            && close + 1 == rest.len()
+            && close > 0
+        {
+            return Some(Self::Element(name.to_owned(), Subscript::new(&rest[..close], None)));
+        }
         let mut chars = text.chars();
         match (chars.next(), chars.next()) {
             (Some(ch @ ('@' | '*' | '#' | '?' | '-' | '$' | '!')), None) => Some(Self::Special(ch)),
@@ -116,9 +90,9 @@ impl Name {
         }
     }
 
-    /// Whether this is `$@` or `$*`, which expand to the positional parameters, or `${PIPESTATUS[@]}`.
+    /// Whether this is `$@` or `$*`, which expand to the positional parameters.
     pub(crate) const fn is_list(&self) -> bool {
-        matches!(self, Self::Special('@' | '*') | Self::Array(_, Subscript::All { .. }))
+        matches!(self, Self::Special('@' | '*'))
     }
 }
 
@@ -128,10 +102,10 @@ impl std::fmt::Display for Name {
             Self::Variable(name) => f.write_str(name),
             Self::Positional(n) => write!(f, "{n}"),
             Self::Special(ch) => write!(f, "{ch}"),
-            Self::Array(array, Subscript::All { star }) => {
-                write!(f, "{}[{}]", array.name(), if *star { '*' } else { '@' })
+            Self::Element(name, Subscript::All { star }) => write!(f, "{name}[{}]", if *star { '*' } else { '@' }),
+            Self::Element(name, Subscript::Source { text, .. } | Subscript::Text(text)) => {
+                write!(f, "{name}[{text}]")
             }
-            Self::Array(array, Subscript::Index(index)) => write!(f, "{}[{index}]", array.name()),
         }
     }
 }
@@ -141,6 +115,13 @@ impl std::fmt::Display for Name {
 pub(crate) enum Parsed {
     /// `${#name}`: the length of the value (the number of positional parameters for `@` and `*`).
     Length(Name),
+    /// `${!name[@]}` or `${!name[*]}` (`star`): the indices or keys of an array (KNSH-103).
+    Keys {
+        /// The array.
+        name: String,
+        /// `[*]`.
+        star: bool,
+    },
     /// `${!prefix*}` (`at` false) or `${!prefix@}` (`at` true): the names of set variables starting with `prefix`.
     Names {
         /// The prefix.
@@ -160,6 +141,7 @@ pub(crate) enum Parsed {
     /// What bash reports as a bad substitution.
     Bad,
     /// A form a later story implements.
+    #[allow(dead_code)]
     Unsupported(Unsupported),
 }
 
@@ -305,13 +287,10 @@ fn length_or_hash(body: &str, at: &dyn Fn(usize, usize) -> Span) -> Parsed {
         // Bash reads everything after `#name` as part of the name: anything more is a bad substitution.
         return match leading_name(rest) {
             Some((name, len)) if len == rest.len() => Parsed::Length(name),
-            Some((name, len)) if rest.as_bytes().get(len) == Some(&b'[') => {
-                match shell_array_subscript(&name, &rest[len..]) {
-                    Some((array, subscript, taken)) if len + taken == rest.len() => {
-                        Parsed::Length(Name::Array(array, subscript))
-                    }
-                    Some(_) => Parsed::Bad,
-                    None => Parsed::Unsupported(Unsupported::Array),
+            Some((Name::Variable(name), len)) if rest.as_bytes().get(len) == Some(&b'[') => {
+                match element(&name, rest, len, 1, at) {
+                    Some((element, taken)) if len + taken == rest.len() => Parsed::Length(element),
+                    Some(_) | None => Parsed::Bad,
                 }
             }
             Some(_) | None => Parsed::Bad,
@@ -353,7 +332,22 @@ fn indirect(body: &str, at: &dyn Fn(usize, usize) -> Span) -> Parsed {
                     at: after == "@",
                 };
             }
-            _ if after.starts_with('[') => return Parsed::Unsupported(Unsupported::Array),
+            _ if after.starts_with('[') => {
+                return match element(prefix, rest, len, 1, at) {
+                    Some((Name::Element(name, Subscript::All { star }), taken)) if len + taken == rest.len() => {
+                        Parsed::Keys { name, star }
+                    }
+                    Some((element, taken)) => match operator(body, 1 + len + taken, at) {
+                        Some(op) => Parsed::Param {
+                            name: element,
+                            indirect: true,
+                            op,
+                        },
+                        None => Parsed::Bad,
+                    },
+                    None => Parsed::Bad,
+                };
+            }
             _ => {}
         }
     }
@@ -363,23 +357,45 @@ fn indirect(body: &str, at: &dyn Fn(usize, usize) -> Span) -> Parsed {
 /// The operator after the name, which ends at `from` in `body`.
 fn with_op(name: Name, indirect: bool, body: &str, from: usize, at: &dyn Fn(usize, usize) -> Span) -> Parsed {
     if body.as_bytes().get(from) == Some(&b'[') {
-        let rest = body.get(from..).unwrap_or("");
-        return match shell_array_subscript(&name, rest) {
-            Some((array, subscript, taken)) if !indirect => match operator(body, from + taken, at) {
+        let Name::Variable(variable) = &name else {
+            return Parsed::Bad;
+        };
+        return match element(variable, body, from, 0, at) {
+            Some((element, taken)) => match operator(body, from + taken, at) {
                 Some(op) => Parsed::Param {
-                    name: Name::Array(array, subscript),
+                    name: element,
                     indirect,
                     op,
                 },
                 None => Parsed::Bad,
             },
-            Some(_) | None => Parsed::Unsupported(Unsupported::Array),
+            None => Parsed::Bad,
         };
     }
     match operator(body, from, at) {
         Some(op) => Parsed::Param { name, indirect, op },
         None => Parsed::Bad,
     }
+}
+
+/// `name[…]` with the subscript starting at `text[from]` (a `[`), where `text` starts `offset` bytes into the body:
+/// the element and the subscript's length with its brackets, or `None` when the subscript is not closed or empty
+/// (bash's bad substitution).
+fn element(
+    name: &str,
+    text: &str,
+    from: usize,
+    offset: usize,
+    at: &dyn Fn(usize, usize) -> Span,
+) -> Option<(Name, usize)> {
+    let inner = text.get(from + 1..)?;
+    let close = subscript_end(inner)?;
+    if close == 0 {
+        return None;
+    }
+    let start = offset + from + 1;
+    let subscript = Subscript::new(&inner[..close], Some(at(start, start + close)));
+    Some((Name::Element(name.to_owned(), subscript), close + 2))
 }
 
 /// The operator of `body` starting at `from`, or `None` for a bad substitution (an array subscript is refused by
@@ -657,10 +673,50 @@ mod tests {
         assert_eq!(op("x@Q"), Op::Transform('Q'));
     }
 
+    // KNSH-103: subscripts are read to their matching `]`, with the operator after them.
     #[test]
-    fn arrays_are_refused() {
-        for body in ["a[0]", "#a[@]", "!a[@]", "a[1]:-x"] {
-            assert_eq!(parsed(body), Parsed::Unsupported(Unsupported::Array), "{body}");
+    fn elements_keys_and_lengths() {
+        let element = |body: &str| match parsed(body) {
+            Parsed::Param {
+                name: Name::Element(name, subscript),
+                indirect,
+                op,
+            } => (name, subscript, indirect, op),
+            other => panic!("{body}: {other:?}"),
+        };
+        let (name, subscript, indirect, op) = element("a[i+1]");
+        assert_eq!((name.as_str(), indirect, op), ("a", false, Op::None));
+        assert!(matches!(subscript, Subscript::Source { text, .. } if text == "i+1"));
+        let (_, subscript, _, op) = element("a[@]:-x");
+        assert_eq!(subscript, Subscript::All { star: false });
+        assert!(matches!(op, Op::Default { .. }));
+        let (_, subscript, _, _) = element("a[\"]\"]");
+        assert!(matches!(subscript, Subscript::Source { text, .. } if text == "\"]\""));
+        let (_, subscript, _, _) = element("a[b[1]]#x");
+        assert!(matches!(subscript, Subscript::Source { text, .. } if text == "b[1]"));
+        assert!(matches!(
+            parsed("#a[@]"),
+            Parsed::Length(Name::Element(_, Subscript::All { .. }))
+        ));
+        assert!(matches!(parsed("#a[2]"), Parsed::Length(Name::Element(..))));
+        assert_eq!(
+            parsed("!a[*]"),
+            Parsed::Keys {
+                name: "a".into(),
+                star: true
+            }
+        );
+        assert!(matches!(parsed("!a[0]"), Parsed::Param { indirect: true, .. }));
+        for bad in ["a[]", "a[1", "#a[1]x", "1[2]", "a[1]x"] {
+            assert_eq!(parsed(bad), Parsed::Bad, "{bad}");
         }
+        assert_eq!(
+            Name::parse("a[$i]"),
+            Some(Name::Element("a".into(), Subscript::Text("$i".into())))
+        );
+        assert_eq!(
+            Name::parse("a[@]"),
+            Some(Name::Element("a".into(), Subscript::All { star: false }))
+        );
     }
 }

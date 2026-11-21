@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use knsh_bash::parse;
+use knsh_bash::{ParseOptions, parse_with};
 use knsh_interp::{InterpError, Interpreter, ShellState};
 use knsh_platform::Fs;
 use knsh_platform::testing::{FakeCollation, FakeDescriptors, FakeLocalTime, FakeUserHomes, MemFs, ScriptedCommands};
@@ -39,7 +39,11 @@ impl std::io::Write for Sink {
 
 /// Runs `line` over a small filesystem, with `input` as standard input.
 fn run(line: &str, input: &[u8]) -> Option<Outcome> {
-    let script = parse(line).ok()?;
+    // Read as the native interpreter reads lines (arrays: KNSH-103).
+    let options = ParseOptions::default()
+        .with_redirection_variables(true)
+        .with_arrays(true);
+    let script = parse_with(line, options).ok()?;
     let fs = Arc::new(MemFs::new());
     for dir in ["/bin", "/w/d"] {
         fs.add_dir_all(Path::new(dir)).expect("directory");

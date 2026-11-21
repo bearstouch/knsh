@@ -70,9 +70,12 @@ impl Host for ShellHost<'_> {
             Ok(()) => Ok(()),
             Err(AssignError::Readonly) => Err(CountError::Message(format!("{name}: readonly variable"))),
             Err(AssignError::Invalid) => Err(CountError::Message(format!("`{name}': not a valid identifier"))),
-            Err(AssignError::Arithmetic(_) | AssignError::Unsupported(_)) => {
-                Err(CountError::Refused(Refusal::Unsupported(Unsupported::Builtin)))
-            }
+            Err(
+                AssignError::Arithmetic(_)
+                | AssignError::Unsupported(_)
+                | AssignError::BadSubscript
+                | AssignError::Kind,
+            ) => Err(CountError::Refused(Refusal::Unsupported(Unsupported::Builtin))),
         }
     }
 
@@ -126,16 +129,22 @@ impl Interpreter {
             self.report_plain(format_args!("{USAGE}"));
             return Ok(Status::new(2));
         }
+        // KNSH-103: `-v name[subscript]` assigns one element.
+        let mut element = None;
         if let Some(name) = &target {
-            if name.contains('[') {
-                return Err(unsupported(Unsupported::Array, span).into());
-            }
-            if !is_name(name) {
-                self.report(span, run, format_args!("printf: `{name}': not a valid identifier"));
-                return Ok(Status::new(2));
-            }
-            if refuses_assignment(name) || self.state.is_unemulated(name) {
+            let named = self.named(name, span, run)?;
+            let array = match &named {
+                Some(super::function::Named::Variable(array) | super::function::Named::Element(array, _)) => array,
+                Some(super::function::Named::All(_)) | None => {
+                    self.report(span, run, format_args!("printf: `{name}': not a valid identifier"));
+                    return Ok(Status::new(2));
+                }
+            };
+            if refuses_assignment(array) || self.state.is_unemulated(array) {
                 return Err(unsupported(Unsupported::ShellVariable, span).into());
+            }
+            if let Some(super::function::Named::Element(array, key)) = named {
+                element = Some((array, key));
             }
         }
         let Some((format, arguments)) = rest.split_first() else {
@@ -171,7 +180,14 @@ impl Interpreter {
                 if let Some(nul) = bytes.iter().position(|&byte| byte == 0) {
                     bytes.truncate(nul);
                 }
-                if let Some(failed) = self.assign_or_report(&name, OsString::from_vec(bytes), false, span, run)? {
+                let failed = match &element {
+                    Some((array, key)) => {
+                        let result = self.state.assign_element(array, key, OsString::from_vec(bytes), false);
+                        self.assigned(array, &name, result, span, run)?
+                    }
+                    None => self.assign_or_report(&name, OsString::from_vec(bytes), false, span, run)?,
+                };
+                if let Some(failed) = failed {
                     status = failed;
                 }
             }

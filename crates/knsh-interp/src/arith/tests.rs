@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use super::*;
+use crate::state::Key;
 
 /// Variables in a map; `set -u` when `nounset`.
 #[derive(Default)]
@@ -36,6 +37,48 @@ impl Variables for Vars {
         self.values.insert(name.to_owned(), value.to_string());
         Ok(())
     }
+
+    fn is_assoc(&mut self, name: &str) -> bool {
+        name.starts_with('h')
+    }
+
+    fn get_element(&mut self, name: &str, key: &Key) -> Result<Option<String>> {
+        self.reads += 1;
+        Ok(self.values.get(&element_name(name, key)).cloned())
+    }
+
+    fn set_element(&mut self, name: &str, key: &Key, value: i64) -> Result<()> {
+        self.values.insert(element_name(name, key), value.to_string());
+        Ok(())
+    }
+}
+
+/// How the test variables hold an element: `name[key]`.
+fn element_name(name: &str, key: &Key) -> String {
+    match key {
+        Key::Index(index) => format!("{name}[{index}]"),
+        Key::Name(key) => format!("{name}[{key}]"),
+    }
+}
+
+// KNSH-103: array elements are operands and lvalues; an indexed subscript is an expression evaluated once, an
+// associative one a key.
+#[test]
+fn array_elements_read_and_assign() {
+    let mut vars = Vars::default();
+    vars.values.insert("a[2]".into(), "5".into());
+    vars.values.insert("i".into(), "1".into());
+    assert_eq!(evaluate("a[i+1] * 2", &mut vars), Ok(10));
+    assert_eq!(evaluate("a[i++]=7, i", &mut vars), Ok(2));
+    assert_eq!(vars.values.get("a[1]").map(String::as_str), Some("7"));
+    assert_eq!(evaluate("a[2]++ + a[2]", &mut vars), Ok(11));
+    assert_eq!(evaluate("h[x y] += 3", &mut vars), Ok(3));
+    assert_eq!(vars.values.get("h[x y]").map(String::as_str), Some("3"));
+    assert_eq!(evaluate("0 && a[i++]", &mut vars), Ok(0));
+    assert_eq!(vars.values.get("i").map(String::as_str), Some("2"));
+    assert!(
+        matches!(evaluate("a[1", &mut vars), Err(Failure::Error(message)) if message.contains("bad array subscript"))
+    );
 }
 
 fn eval(expression: &str) -> i64 {
@@ -275,14 +318,6 @@ fn unevaluated_operands_neither_read_nor_assign() {
     assert_eq!(evaluate("1 ? 2 : (x = 9)", &mut vars), Ok(2));
     assert_eq!(vars.values["x"], "1");
     assert_eq!(vars.reads, 0);
-}
-
-#[test]
-fn array_elements_are_refused() {
-    assert_eq!(
-        evaluate("a[1] + 1", &mut Vars::default()),
-        Err(Failure::Unsupported(Unsupported::Array))
-    );
 }
 
 /// Runs `f` on a thread with the interpreter's evaluation stack, as the interpreter does.

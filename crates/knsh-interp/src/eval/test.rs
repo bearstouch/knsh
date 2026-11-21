@@ -21,7 +21,7 @@ use knsh_platform::{Access, ChildDescriptor, FileStatus, FileType, StandardStrea
 use super::control::legal_number;
 use super::{Flow, Interpreter, Run, Stop, unsupported};
 use crate::error::Unsupported;
-use crate::state::{BASH_REMATCH, PIPESTATUS, is_name};
+use crate::state::is_name;
 use crate::status::Status;
 
 /// Why a test expression stopped before giving an answer.
@@ -147,6 +147,7 @@ impl Interpreter {
         };
         let mut parser = TestParser {
             shell: self,
+            run,
             args,
             pos: 0,
             span,
@@ -164,7 +165,7 @@ impl Interpreter {
     }
 
     /// Bash's `unary_test`: unary operator `op` (validated by [`is_unary_operator`]) applied to `arg`.
-    pub(super) fn unary_test(&mut self, op: &str, arg: &str, span: Span) -> Flow<bool> {
+    pub(super) fn unary_test(&mut self, op: &str, arg: &str, span: Span, run: &Run<'_>) -> Flow<bool> {
         let letter = op.as_bytes().get(1).copied().unwrap_or(b'n');
         let status = |shell: &mut Self, follow| shell.test_status(arg, follow, span);
         Ok(match letter {
@@ -194,11 +195,15 @@ impl Interpreter {
             },
             b'z' => arg.is_empty(),
             b'o' => self.option_is_set(arg, span)?,
-            b'v' => self.variable_is_set(arg, span)?,
-            // Name references do not exist yet (KNSH-103: `declare -n` is refused), so none is one.
+            b'v' => self.variable_is_set(arg, span, run)?,
+            // `-R`: a name reference with a value (KNSH-103).
             b'R' => {
-                self.variable_is_set(arg, span)?;
-                false
+                is_name(arg)
+                    && self
+                        .state
+                        .own_attributes(arg)
+                        .is_some_and(|attributes| attributes.nameref)
+                    && self.state.own_value(arg).is_some()
             }
             _ => !arg.is_empty(),
         })
@@ -363,29 +368,49 @@ impl Interpreter {
         })
     }
 
-    /// `-v name`: whether variable `name` is set (has a value). An array element is refused with the arrays
-    /// (KNSH-103), and so is a variable bash maintains itself.
-    fn variable_is_set(&self, name: &str, span: Span) -> Flow<bool> {
-        if name.contains('[') {
-            return Err(unsupported(Unsupported::Array, span).into());
-        }
-        if !is_name(name) {
+    /// `-v name`: whether variable `name` is set (has a value): for an array, its element 0; `name[subscript]`
+    /// one element, `name[@]` any (KNSH-103). A variable bash maintains itself is refused.
+    fn variable_is_set(&mut self, name: &str, span: Span, run: &Run<'_>) -> Flow<bool> {
+        let Some(named) = self.named(name, span, run)? else {
             return Ok(false);
-        }
-        if self.state.is_unemulated(name) {
+        };
+        let array = match &named {
+            super::function::Named::Variable(array)
+            | super::function::Named::Element(array, _)
+            | super::function::Named::All(array) => array.clone(),
+        };
+        if self.state.is_unemulated(&array) {
             return Err(unsupported(Unsupported::ShellVariable, span).into());
         }
-        Ok(match name {
-            PIPESTATUS => true,
-            BASH_REMATCH => !self.state.bash_rematch().is_empty(),
-            _ => self.state.variable(name).is_some(),
+        let refused = |feature| Stop::Error(unsupported(feature, span));
+        Ok(match named {
+            super::function::Named::Variable(name) => self
+                .state
+                .value(&name)
+                .map_err(refused)?
+                .is_some_and(|value| value.first().is_some()),
+            super::function::Named::All(name) => self
+                .state
+                .value(&name)
+                .map_err(refused)?
+                .is_some_and(|value| value.count() > 0),
+            super::function::Named::Element(name, key) => match self.state.element(&name, &key) {
+                Ok(found) => found.is_some(),
+                Err(crate::state::ElementError::BadSubscript) => {
+                    self.state.note(format!("{name}: bad array subscript"));
+                    false
+                }
+                Err(crate::state::ElementError::Unsupported(feature)) => return Err(refused(feature)),
+            },
         })
     }
 }
 
 /// Bash's `test` argument parser over `args` (without `[`'s `]`).
-struct TestParser<'a> {
+struct TestParser<'a, 'r> {
     shell: &'a mut Interpreter,
+    /// What the command is part of, for subscripts' errors (KNSH-103).
+    run: &'a Run<'r>,
     args: &'a [String],
     /// The next argument.
     pos: usize,
@@ -397,7 +422,7 @@ struct TestParser<'a> {
 
 type Answer = Result<bool, Abort>;
 
-impl TestParser<'_> {
+impl TestParser<'_, '_> {
     fn arg(&self, at: usize) -> &str {
         self.args.get(at).map_or("", String::as_str)
     }
@@ -573,16 +598,16 @@ impl TestParser<'_> {
                 }
                 let fd = self.arg(self.pos).to_owned();
                 self.pos += 1;
-                return Ok(self.shell.unary_test(&op, &fd, self.span)?);
+                return Ok(self.shell.unary_test(&op, &fd, self.span, self.run)?);
             }
-            return Ok(self.shell.unary_test(&op, "1", self.span)?);
+            return Ok(self.shell.unary_test(&op, "1", self.span, self.run)?);
         }
         if self.pos + 1 >= self.argc() {
             return Err(Abort::Syntax("argument expected".to_owned()));
         }
         let arg = self.arg(self.pos + 1).to_owned();
         self.pos += 2;
-        Ok(self.shell.unary_test(&op, &arg, self.span)?)
+        Ok(self.shell.unary_test(&op, &arg, self.span, self.run)?)
     }
 
     /// The binary operator at `pos + 1` between the arguments around it.

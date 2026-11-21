@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use knsh_bash::{
     AndOr, AndOrOperator, ArithmeticParts, CaseClause, CaseCommand, CaseTerminatorKind, Command, CommandWord,
-    CompoundKind, ForCommand, IfCommand, ListItem, LoopBody, LoopCommand, Script, SimpleCommand, Span,
+    CompoundCommand, CompoundKind, ForCommand, IfCommand, ListItem, LoopBody, LoopCommand, Script, SimpleCommand, Span,
     UnsupportedCommand,
 };
 use knsh_platform::{
@@ -64,8 +64,10 @@ mod cd;
 mod conditional;
 mod control;
 mod declare;
+mod function;
 mod job;
 mod job_builtins;
+mod mapfile;
 mod nested;
 mod printf_builtin;
 mod read;
@@ -99,15 +101,54 @@ const LATER_BUILTINS: &[&str] = &["compopt", "mapfile", "readarray"];
 /// Whether `name` is a builtin the interpreter does not run yet: running a program of that name instead would not
 /// do what bash does (`cd`, `export`, `exit` change the shell itself).
 pub(crate) fn is_refused_builtin(name: &str) -> bool {
-    (knsh_bash::is_builtin(name) && !NATIVE_BUILTINS.contains(&name)) || LATER_BUILTINS.contains(&name)
+    (knsh_bash::is_builtin(name) || LATER_BUILTINS.contains(&name)) && !NATIVE_BUILTINS.contains(&name)
 }
 
 /// Builtins the interpreter runs itself: `let` (KNSH-097), the job builtins `wait`, `jobs`, `fg`, `bg` and `disown`
-/// (KNSH-100), the core builtins (KNSH-101), and `test`, `[`, `printf` and `read` (KNSH-102).
+/// (KNSH-100), the core builtins (KNSH-101), `test`, `[`, `printf` and `read` (KNSH-102), and `local`, `mapfile`
+/// and `readarray` (KNSH-103).
 pub(crate) const NATIVE_BUILTINS: &[&str] = &[
-    ".", ":", "[", "alias", "bg", "break", "builtin", "cd", "command", "continue", "declare", "disown", "echo", "eval",
-    "exec", "exit", "export", "false", "fg", "hash", "jobs", "let", "local", "printf", "pwd", "read", "readonly",
-    "return", "set", "shift", "source", "test", "true", "type", "typeset", "umask", "unalias", "unset", "wait",
+    ".",
+    ":",
+    "[",
+    "alias",
+    "bg",
+    "break",
+    "builtin",
+    "cd",
+    "command",
+    "continue",
+    "declare",
+    "disown",
+    "echo",
+    "eval",
+    "exec",
+    "exit",
+    "export",
+    "false",
+    "fg",
+    "hash",
+    "jobs",
+    "let",
+    "local",
+    "mapfile",
+    "printf",
+    "pwd",
+    "read",
+    "readarray",
+    "readonly",
+    "return",
+    "set",
+    "shift",
+    "source",
+    "test",
+    "true",
+    "type",
+    "typeset",
+    "umask",
+    "unalias",
+    "unset",
+    "wait",
 ];
 
 /// The declaration builtins, whose arguments spelled like assignments are expanded as assignments (bash's
@@ -125,8 +166,7 @@ pub(crate) fn is_bash_builtin(name: &str) -> bool {
 }
 
 /// The feature a later story implements that builtin `name` with literal `args` needs, if any: `set` with options
-/// or without arguments (KNSH-104), arrays and name references in the declaration builtins (KNSH-103), and
-/// `read -a` (KNSH-103).
+/// or without arguments (KNSH-104).
 pub(crate) fn refused_form(name: &str, args: &[String]) -> Option<Unsupported> {
     match name {
         "set" => match args.first().map(String::as_str) {
@@ -135,33 +175,6 @@ pub(crate) fn refused_form(name: &str, args: &[String]) -> Option<Unsupported> {
             Some(first) if first.starts_with(['-', '+']) => Some(Unsupported::Builtin),
             Some(_) => None,
         },
-        "declare" | "typeset" | "readonly" | "export" | "local" => {
-            let letters: String = args
-                .iter()
-                .take_while(|arg| arg.as_str() != "--" && arg.len() > 1 && arg.starts_with(['-', '+']))
-                .flat_map(|arg| arg.chars().skip(1))
-                .collect();
-            if letters.contains(['a', 'A']) {
-                Some(Unsupported::Array)
-            } else if letters.contains('n') && name != "export" {
-                Some(Unsupported::Nameref)
-            } else {
-                None
-            }
-        }
-        // KNSH-102: `read -a` fills an array (KNSH-103).
-        "read" => args
-            .iter()
-            .take_while(|arg| arg.as_str() != "--" && arg.len() > 1 && arg.starts_with('-'))
-            .any(|arg| {
-                // Letters up to the first that takes a value (`-d a` names no array).
-                let letters = arg.trim_start_matches('-');
-                let end = letters
-                    .find(['d', 'i', 'n', 'N', 'p', 't', 'u'])
-                    .unwrap_or(letters.len());
-                letters[..end].contains('a')
-            })
-            .then_some(Unsupported::ReadOption),
         _ => None,
     }
 }
@@ -195,7 +208,7 @@ pub(crate) enum Stop {
         /// The status if this leaves a subshell instead.
         status: Status,
     },
-    /// `return` from a sourced file (functions: KNSH-103), with this status.
+    /// `return` from a function or a sourced file (KNSH-101, KNSH-103), with this status.
     Return(Status),
 }
 
@@ -247,6 +260,7 @@ fn write_shared(writer: &SharedWriter, bytes: &[u8]) {
 }
 
 /// The native interpreter: shell state plus the injected effects it runs commands through.
+#[allow(clippy::struct_excessive_bools)] // Independent flags of the shell being run, as bash keeps them.
 pub struct Interpreter {
     /// Variables, positional parameters, `$?`, options and the working directory.
     state: ShellState,
@@ -316,6 +330,12 @@ pub struct Interpreter {
     /// `exec cmd` started its program as the shell's foreground job: the shell ends with the job's status once
     /// it is waited for (KNSH-101).
     exit_after_job: bool,
+    /// The `name=(…)` lists of the declaration builtin being run, by the index of their argument (KNSH-103): bash
+    /// expands them in the builtin, once it knows the attributes asked for.
+    declaration_lists: Vec<(usize, knsh_bash::ArrayValue)>,
+    /// This is the subshell of a pipeline stage that is not run in the shell itself (KNSH-103): a function it calls
+    /// must have been given a thread of its own.
+    forked_stage: bool,
 }
 
 impl fmt::Debug for Interpreter {
@@ -375,6 +395,8 @@ impl Interpreter {
             visible_aliases: Arc::new(BTreeMap::new()),
             alias_guard: Vec::new(),
             exit_after_job: false,
+            declaration_lists: Vec::new(),
+            forked_stage: false,
         }
         .with_checked_oldpwd()
     }
@@ -522,7 +544,9 @@ impl Interpreter {
         self.nested_bytes = 0;
         self.exit_after_job = false;
         let run = Run::new(source);
-        match self.script(&script.items, &run) {
+        let result = self.script(&script.items, &run);
+        self.flush_notes(Span::new(source.len(), source.len()), &run);
+        match result {
             Ok(status) => Ok(status),
             // Bash exits: the script ends here with this status. `break`, `continue` and `return` never get here
             // (outside a loop or a sourced file they are reported and stop nothing), but would end it the same way.
@@ -736,36 +760,37 @@ impl Interpreter {
     fn command(&mut self, command: &Command, run: &Run<'_>) -> Flow<Status> {
         match command {
             Command::Simple(simple) => self.simple(simple, run),
-            Command::Compound(compound) => {
-                if let Some(span) = here_document(&compound.redirections) {
-                    return Err(unsupported(Unsupported::HereDocument, span).into());
-                }
-                // The redirections hold for the whole body and are undone after it, however it ends.
-                let Some(saved) = self.redirect(&compound.redirections, run)? else {
-                    return Ok(Status::FAILURE);
-                };
-                let result = match &compound.kind {
-                    CompoundKind::Group(group) => self.list(&group.body, run),
-                    // Reached only in a subshell already (a pipeline stage, `( … )` alone): the body runs here.
-                    CompoundKind::Subshell(subshell) => self.list(&subshell.body, run),
-                    CompoundKind::If(command) => self.if_command(command, run),
-                    CompoundKind::For(command) => self.for_command(command, run),
-                    CompoundKind::While(command) => self.loop_command(command, true, run),
-                    CompoundKind::Until(command) => self.loop_command(command, false, run),
-                    CompoundKind::Case(command) => self.case_command(command, run),
-                };
-                self.restore(saved);
-                result
-            }
-            Command::FunctionDefinition(definition) => {
-                Err(unsupported(Unsupported::FunctionDefinition, definition.span).into())
-            }
+            Command::Compound(compound) => self.compound(compound, run),
+            Command::FunctionDefinition(definition) => Ok(self.define_function(definition, run)),
             Command::Unsupported(construct) => match construct.arithmetic.as_deref() {
                 Some(parts) => self.arithmetic_command(construct, parts, run),
                 None if is_conditional(construct) => self.conditional_command(construct, run),
                 None => Err(unsupported(Unsupported::Construct(construct.construct), construct.span).into()),
             },
         }
+    }
+
+    /// A compound command with its redirections, which hold for the whole body and are undone after it, however
+    /// it ends.
+    fn compound(&mut self, compound: &CompoundCommand, run: &Run<'_>) -> Flow<Status> {
+        if let Some(span) = here_document(&compound.redirections) {
+            return Err(unsupported(Unsupported::HereDocument, span).into());
+        }
+        let Some(saved) = self.redirect(&compound.redirections, run)? else {
+            return Ok(Status::FAILURE);
+        };
+        let result = match &compound.kind {
+            CompoundKind::Group(group) => self.list(&group.body, run),
+            // Reached only in a subshell already (a pipeline stage, `( … )` alone): the body runs here.
+            CompoundKind::Subshell(subshell) => self.list(&subshell.body, run),
+            CompoundKind::If(command) => self.if_command(command, run),
+            CompoundKind::For(command) => self.for_command(command, run),
+            CompoundKind::While(command) => self.loop_command(command, true, run),
+            CompoundKind::Until(command) => self.loop_command(command, false, run),
+            CompoundKind::Case(command) => self.case_command(command, run),
+        };
+        self.restore(saved);
+        result
     }
 
     /// `if`: the first clause whose condition succeeds runs its body; otherwise `else`, or status 0.
@@ -975,9 +1000,29 @@ impl Interpreter {
         if let Some(result) = self.alias_command(simple, run) {
             return result;
         }
+        let result = self.simple_command(simple, run);
+        self.flush_notes(simple.span, run);
+        result
+    }
+
+    /// [`Interpreter::simple`] once aliases are expanded.
+    fn simple_command(&mut self, simple: &SimpleCommand, run: &Run<'_>) -> Flow<Status> {
         let words = self.command_arguments(simple, run)?;
+        let lists = std::mem::take(&mut self.declaration_lists);
         let mut assignments: Vec<(String, OsString)> = Vec::with_capacity(simple.assignments.len());
         for assignment in &simple.assignments {
+            if assignment.subscript.is_some() || assignment.array.is_some() {
+                // `a[1]=x cmd` and `a=(1) cmd`: bash's handling of an array in the temporary environment is not
+                // reproduced.
+                if !words.is_empty() {
+                    return Err(unsupported(Unsupported::Array, assignment.span).into());
+                }
+                if self.array_assignment(assignment, run)?.is_some() {
+                    self.state.set_last_status(Status::FAILURE);
+                    return Err(Stop::Discard);
+                }
+                continue;
+            }
             let parts = word::parts(&assignment.word.segments, run.source, assignment.value.start)?;
             let result = self
                 .expander(run, &assignments)
@@ -1022,7 +1067,9 @@ impl Interpreter {
         let Some(saved) = self.redirect(&simple.redirections, run)? else {
             return Ok(Status::FAILURE);
         };
+        self.declaration_lists = lists;
         let result = self.simple_body(simple, &words, &assignments, run);
+        self.declaration_lists.clear();
         let keeps = matches!(words.as_slice(), [name, args @ ..] if name == "exec" && exec_redirects_only(args));
         if keeps && result.is_ok() {
             // `exec` without a command: its redirections are the shell's from now on.
@@ -1058,6 +1105,7 @@ impl Interpreter {
                 self.expanded(result, span, run)
             }
             Err(AssignError::Unsupported(feature)) => Err(unsupported(feature, span).into()),
+            Err(AssignError::BadSubscript | AssignError::Kind) => Err(unsupported(Unsupported::Array, span).into()),
         }
     }
 
@@ -1070,11 +1118,23 @@ impl Interpreter {
             .first()
             .and_then(|first| alias::literal_text(first, run.source))
             .is_some_and(|name| DECLARATION_BUILTINS.contains(&name));
+        self.declaration_lists.clear();
         if !declaration {
             return self.arguments(&simple.words, run);
         }
         let mut out = Vec::with_capacity(simple.words.len());
         for (index, command_word) in simple.words.iter().enumerate() {
+            if let Some(array) = &command_word.array {
+                // `declare -a x=(…)`: the word is `x=` (or `x+=`); the list is expanded by the builtin.
+                let text = command_word
+                    .word
+                    .segments
+                    .iter()
+                    .filter_map(|segment| segment.body.text(run.source));
+                out.push(text.collect());
+                self.declaration_lists.push((out.len() - 1, (**array).clone()));
+                continue;
+            }
             let pieces = word::pieces(&command_word.word.segments, run.source, 0)?;
             for parts in brace::expand(&pieces, command_word.span)? {
                 let value_start = match parts.first() {
@@ -1111,6 +1171,15 @@ impl Interpreter {
         let Some((name, args)) = words.split_first() else {
             return Ok(Status::SUCCESS);
         };
+        // Bash looks for a function before a builtin or a program (outside POSIX mode).
+        if self.state.function(name).is_some() {
+            if !self.declaration_lists.is_empty() {
+                // `declare x=(1 2)` with a function named `declare`: bash hands it the word as written, which
+                // the list read apart from its word is not.
+                return Err(unsupported(Unsupported::Array, simple.span).into());
+            }
+            return self.call_function(name, args, assignments, simple.span, run);
+        }
         if name == "exec" {
             return self.exec_builtin(args, assignments, simple.span, run);
         }
@@ -1134,8 +1203,8 @@ impl Interpreter {
     }
 }
 
-/// What one run of a script reads besides the shell state: the main script, an `eval` string, a sourced file or an
-/// alias's text (KNSH-101).
+/// What one run of a script reads besides the shell state: the main script, an `eval` string, a sourced file, an
+/// alias's text or a function's body (KNSH-101, KNSH-103).
 struct Run<'a> {
     /// The text the script's spans index.
     source: &'a str,
@@ -1144,16 +1213,36 @@ struct Run<'a> {
     /// Lines before the text's first line, in the file messages number lines of (an `eval` string's lines count
     /// on from its command's line).
     line_base: usize,
+    /// The text as one a function defined in it keeps (KNSH-103), made once on the first definition.
+    shared: std::cell::OnceCell<Arc<str>>,
 }
 
 impl<'a> Run<'a> {
     /// The main script `source`.
-    const fn new(source: &'a str) -> Self {
+    fn new(source: &'a str) -> Self {
+        Self::nested(source, None, 0)
+    }
+
+    /// Text `source` named `origin` in messages, its lines counted after `line_base` others.
+    fn nested(source: &'a str, origin: Option<&'a str>, line_base: usize) -> Self {
         Self {
             source,
-            origin: None,
-            line_base: 0,
+            origin,
+            line_base,
+            shared: std::cell::OnceCell::new(),
         }
+    }
+
+    /// The text of `source`, already shared (a function's body or a subshell's copy).
+    fn shared(source: &'a Arc<str>, origin: Option<&'a str>, line_base: usize) -> Self {
+        let run = Self::nested(source, origin, line_base);
+        let _ = run.shared.set(Arc::clone(source));
+        run
+    }
+
+    /// The text, shared with what keeps it past this run.
+    fn source_arc(&self) -> Arc<str> {
+        Arc::clone(self.shared.get_or_init(|| Arc::from(self.source)))
     }
 
     /// The line `span` starts on, as messages number it.

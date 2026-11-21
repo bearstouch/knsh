@@ -107,7 +107,10 @@ impl Harness {
 
     /// Runs `line`, read as bash 5.2 reads it (`{name}>file` is a redirection, KNSH-099).
     fn run(&mut self, line: &str) -> Result<Status, InterpError> {
-        let script = parse_with(line, ParseOptions::default().with_redirection_variables(true)).unwrap();
+        let options = ParseOptions::default()
+            .with_redirection_variables(true)
+            .with_arrays(true);
+        let script = parse_with(line, options).unwrap();
         self.interpreter.run(&script, line)
     }
 
@@ -505,33 +508,29 @@ fn unsupported_constructs_are_refused_before_anything_runs() {
         ("true; echo $RANDOM", Unsupported::ShellVariable),
         ("true; echo ${#LINENO}", Unsupported::ShellVariable),
         ("true; echo ${!BASH*}", Unsupported::ShellVariable),
-        ("true; echo ${a[0]}", Unsupported::Array),
         ("true; echo ${x@P}", Unsupported::PromptExpansion),
         ("true; (( x )) > out", Unsupported::Redirection),
         ("true; cat <<EOF\nx\nEOF\n", Unsupported::HereDocument),
         ("true; { true; } <<-EOF\nx\nEOF\n", Unsupported::HereDocument),
-        // KNSH-100: without clocks `time` cannot report; PIPESTATUS is read, never assigned; an index needing
-        // arithmetic is an array access (KNSH-103).
+        // KNSH-100: without clocks `time` cannot report; PIPESTATUS is read, never assigned.
         ("time true", Unsupported::Time),
         ("true; PIPESTATUS=1", Unsupported::ShellVariable),
-        ("true; echo ${PIPESTATUS[$x]}", Unsupported::Array),
         ("true | { echo $(ls); }", Unsupported::CommandSubstitution),
         ("true & (trap '' INT)", Unsupported::Builtin),
-        ("f() { true; }", Unsupported::FunctionDefinition),
         ("true; trap x INT", Unsupported::Builtin),
-        // KNSH-102: `read -a` needs arrays (KNSH-103); `[[ … ]]` with what bash's parser rejects, or a command
-        // substitution inside.
-        ("true; read -ra x", Unsupported::ReadOption),
+        // KNSH-102: `[[ … ]]` with what bash's parser rejects, or a command substitution inside.
         ("true; [[ a b ]]", Unsupported::Conditional),
         ("true; [[ $(ls) ]]", Unsupported::CommandSubstitution),
         ("true; [[ x ]] >out", Unsupported::Conditional),
         ("if true; then shopt -s extglob; fi", Unsupported::Builtin),
-        ("mapfile x", Unsupported::Builtin),
+        // KNSH-103: `mapfile` reads standard input, which the host did not give; a function's definition is not
+        // printed; the call stack's arrays are the shell's.
+        ("mapfile x", Unsupported::StandardDescriptor),
+        ("f() { :; }; type f", Unsupported::FunctionPrint),
+        ("true; FUNCNAME=x", Unsupported::ShellVariable),
         // KNSH-101: forms of the core builtins that later stories implement.
         ("true; set -e", Unsupported::Builtin),
         ("true; set", Unsupported::Builtin),
-        ("true; declare -a x", Unsupported::Array),
-        ("true; local -n x", Unsupported::Nameref),
     ];
     for (line, feature) in cases {
         assert_eq!(refused(h.run(line)), *feature, "{line}");
@@ -1296,5 +1295,6 @@ fn moving_a_descriptor_onto_itself_keeps_it() {
 }
 
 mod builtins;
+mod functions_arrays;
 mod jobs;
 mod test_printf_read;

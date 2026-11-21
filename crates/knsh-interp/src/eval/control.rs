@@ -72,11 +72,11 @@ impl Interpreter {
         Err(Stop::Exit(status))
     }
 
-    /// `return [n]`: leaves the file being sourced with `n`, or `$?`. Outside one (and outside a function, which
-    /// arrive with KNSH-103) it is an error with status 2, bash's `EX_USAGE`.
+    /// `return [n]`: leaves the function or the file being sourced with `n`, or `$?` (KNSH-103). Outside both it is
+    /// an error with status 2, bash's `EX_USAGE`.
     pub(super) fn return_builtin(&mut self, args: &[String], span: Span, run: &Run<'_>) -> Flow<Status> {
         let status = self.exit_status("return", args, span, run)?;
-        if self.sourcing > 0 {
+        if self.sourcing > 0 || self.state.in_function() {
             return Err(Stop::Return(status));
         }
         self.report(

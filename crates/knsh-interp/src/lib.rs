@@ -20,8 +20,7 @@
 //! as [`ShellOptions::monitor`]; an interactive shell with its terminal through [`Interpreter::with_job_control`],
 //! and [`JobSignals`] for the supervisor's pause, FR-SES-10). KNSH-101 adds the core builtins: `cd` (with `CDPATH`,
 //! `-L`, `-P` and `OLDPWD`; the host is told of each change through a [`DirectoryObserver`], [`Osc7`] writing
-//! OSC 7), `pwd`, `export`, `unset`, `readonly`, `declare` and `typeset` (variable attributes but arrays), `local`
-//! (an error outside a function until KNSH-103), `shift`, `set` for the positional parameters, `exit`, `return`,
+//! OSC 7), `pwd`, `export`, `unset`, `readonly`, `declare` and `typeset` (variable attributes), `local`, `shift`, `set` for the positional parameters, `exit`, `return`,
 //! `break`, `continue`, `true`, `false`, `:`, `echo` (with [`ShellOptions::xpg_echo`]), `eval`, `source` and `.`,
 //! `command`, `builtin`, `type`, `hash` (bash's command hash table), `alias` and `unalias` (expanded with
 //! [`ShellOptions::expand_aliases`]), `umask` (passed to every command and redirection) and `exec` with a command.
@@ -30,7 +29,11 @@
 //! POSIX regular expressions with `BASH_REMATCH`), `printf` (every bash conversion, `%q`, `%(…)T` through the host's
 //! [`knsh_platform::LocalTime`] given with [`Interpreter::with_local_time`], `-v`) and `read` (`-r -d -n -N -p -s
 //! -t -u`, `IFS` splitting, timeouts at status 142), reading the spawner's standard input given with
-//! [`Interpreter::with_standard_descriptors`].
+//! [`Interpreter::with_standard_descriptors`]. KNSH-103 adds functions (both syntaxes, `return`, `FUNCNEST`, the
+//! call stack in `FUNCNAME`, `BASH_SOURCE` and `BASH_LINENO`), bash's dynamic scopes (`local`, `declare` in a
+//! function, `declare -g`), sparse indexed and associative arrays (in bash 5.2's hash order) with every array
+//! expansion, subscript and slice, arrays in arithmetic, name references (`declare -n`), `read -a` and
+//! `mapfile`/`readarray`. Scripts must be parsed with [`knsh_bash::ParseOptions::arrays`] for array assignments.
 //!
 //! # Boundaries
 //!
@@ -107,6 +110,7 @@ mod quote;
 mod scan;
 mod state;
 mod status;
+mod vars;
 mod word;
 
 pub use arith::{Failure as ArithmeticError, MAX_ARITH_DEPTH, evaluate_arithmetic};

@@ -750,8 +750,25 @@ pub struct CommandWord {
     pub span: Span,
     /// The command substitutions, backticks and process substitutions in the word (inside double quotes too), in
     /// source order, each parsed into a nested script (KNSH-031). Empty for a here-document delimiter, which bash
-    /// never expands.
+    /// never expands. For an argument with a [`CommandWord::array`] list, the substitutions of its elements follow.
     pub substitutions: Vec<Substitution>,
+    /// For an argument of a declaration builtin spelled `name=(…)` (`declare -a x=(1 2)`), read only with
+    /// [`ParseOptions::arrays`](crate::ParseOptions::arrays): the parenthesised list after the `=`. The word itself
+    /// is then `name=` (or `name+=`) and [`span`](Self::span) runs to the closing `)`.
+    pub array: Option<Box<ArrayValue>>,
+}
+
+/// The parenthesised list of a compound array assignment, `name=(a [2]=b c)` (KNSH-103), read only with
+/// [`ParseOptions::arrays`](crate::ParseOptions::arrays). Its elements are words, each `[subscript]=value` or a
+/// plain value; newlines and comments may stand between them, as in bash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrayValue {
+    /// The `(`.
+    pub open: Span,
+    /// The elements, in source order, with their substitutions parsed.
+    pub elements: Vec<CommandWord>,
+    /// The `)`.
+    pub close: Span,
 }
 
 /// A command substitution, backtick or process substitution, with its body parsed (KNSH-031; decision 6: parsed
@@ -809,9 +826,16 @@ pub struct Assignment {
     /// The whole word, with its quoting structure.
     pub word: Word,
     /// The substitutions in the value, each parsed into a nested script (KNSH-031): `X=$(curl …) cmd` runs `curl`.
+    /// For an [`array`](Self::array) list, those of its elements.
     pub substitutions: Vec<Substitution>,
-    /// The whole assignment.
+    /// The whole assignment (to the closing `)` of an [`array`](Self::array) list).
     pub span: Span,
+    /// `name[subscript]=value`: the subscript, between the brackets, as written. Read only with
+    /// [`ParseOptions::arrays`](crate::ParseOptions::arrays) (KNSH-103); without it such a line is refused.
+    pub subscript: Option<Span>,
+    /// `name=(…)` or `name+=(…)`: the list, read only with [`ParseOptions::arrays`](crate::ParseOptions::arrays)
+    /// (KNSH-103); without it such a line is refused. [`value`](Self::value) then spans the list.
+    pub array: Option<ArrayValue>,
 }
 
 /// A redirection with its target.

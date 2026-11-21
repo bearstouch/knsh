@@ -189,7 +189,7 @@ impl Interpreter {
             Some(old) => self.state.assign("OLDPWD", old, false),
             None if self.state.is_readonly("OLDPWD") => Err(crate::state::AssignError::Readonly),
             None => {
-                self.state.change_attributes("OLDPWD", |_| {});
+                self.state.change_attributes("OLDPWD", true, |_| {});
                 self.state.clear_value("OLDPWD");
                 Ok(())
             }
