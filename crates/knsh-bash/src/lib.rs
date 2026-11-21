@@ -21,7 +21,8 @@
 //! 6 whose extent is certain (`select`, `[[ … ]]`, `(( … ))`) are kept whole as [`Command::Unsupported`] nodes; other
 //! valid bash it does not read (`coproc`, `time` where bash versions read it differently, array assignments) is
 //! refused with [`ParseError::Unsupported`] rather than read partly. Array assignments are read only with
-//! [`ParseOptions::arrays`] (KNSH-103), which the native interpreter sets and the classifier does not. The `time` keyword at the start of a pipeline
+//! [`ParseOptions::arrays`] (KNSH-103), which the native interpreter sets and the classifier does not; `coproc` is
+//! read only with [`ParseOptions::coproc`] (KNSH-105), as an opaque node whose [`CoprocParts`] the interpreter runs. The `time` keyword at the start of a pipeline
 //! is read ([`TimeKeyword`], KNSH-036).
 //!
 //! Substitutions and here-documents (KNSH-031): every `$( … )`, backtick (un-escaped as bash does first), `<( … )`
@@ -120,9 +121,9 @@ mod wrappers;
 
 pub use ast::{
     AndOr, AndOrOperator, AndOrPart, ArithmeticParts, ArrayValue, Assignment, CaseClause, CaseCommand, CaseTerminator,
-    CaseTerminatorKind, Command, CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems,
-    FunctionCall, FunctionDefinition, Group, HereDocument, IfClause, IfCommand, ListItem, LoopBody, LoopCommand,
-    PipeOperator, Pipeline, PipelinePart, Redirect, RedirectionVariable, Script, Separator, SeparatorKind,
+    CaseTerminatorKind, Command, CommandWord, CompoundCommand, CompoundKind, CoprocParts, ElseClause, ForCommand,
+    ForItems, FunctionCall, FunctionDefinition, Group, HereDocument, IfClause, IfCommand, ListItem, LoopBody,
+    LoopCommand, PipeOperator, Pipeline, PipelinePart, Redirect, RedirectionVariable, Script, Separator, SeparatorKind,
     SimpleCommand, Subshell, Substitution, SubstitutionKind, TimeKeyword, UnsupportedCommand,
 };
 pub use builtins::is_builtin;
@@ -138,7 +139,7 @@ pub use irreversible::{BUILTIN_IRREVERSIBLE, curl_reason, rsync_reason};
 pub use lex::lex;
 pub use limits::{MAX_FUNCTION_DEFINITIONS, MAX_INPUT_LEN, MAX_NESTING_DEPTH, MAX_TOKENS};
 pub use outcome::{Dynamic, DynamicPart, DynamicReason, Exact, ParseOutcome, parse_line};
-pub use parse::{ParseOptions, parse, parse_with};
+pub use parse::{ParseOptions, backtick_text, parse, parse_with};
 pub use reserialise::reserialise;
 pub use subcommand_table::SUBCOMMAND_TABLE;
 pub use subcommands::{

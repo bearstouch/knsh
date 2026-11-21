@@ -42,7 +42,7 @@ use crate::error::{InterpError, Unsupported};
 use crate::glob;
 use crate::param::{self, CaseKind, DefaultKind, Name, Op, Parsed, ReplaceMode, Subscript};
 use crate::pattern::{self, Flags, Pattern};
-use crate::scan::{self, Mode, Part};
+use crate::scan::{self, Mode, Part, Subst, SubstKind};
 use crate::state::{AssignError, DEFAULT_IFS, ElementError, Key, Kind, LastBackground, ShellState, refuses_assignment};
 use crate::vars;
 use crate::word::{self, WordChar, assignment_value_start};
@@ -164,6 +164,19 @@ impl Value {
     }
 }
 
+/// What runs the command and process substitutions an expansion meets (KNSH-105): the evaluator, which runs each
+/// in a copy of the shell. An expander without one refuses them.
+pub(crate) trait Substitutions {
+    /// Runs `subst` (written in `source`) against `state`, the shell as the expansion has left it so far: the
+    /// output of a command substitution with its trailing newlines removed (`$?` set to its status), or the
+    /// `/dev/fd/N` name of a process substitution.
+    ///
+    /// # Errors
+    ///
+    /// [`ExpandError`], as any expansion fails.
+    fn substitute(&mut self, state: &mut ShellState, subst: &Subst, source: &str) -> Result<String>;
+}
+
 /// Expands words against the shell state.
 pub(crate) struct Expander<'a> {
     state: &'a mut ShellState,
@@ -178,6 +191,8 @@ pub(crate) struct Expander<'a> {
     overlay: &'a [(String, OsString)],
     /// `${…}` and `$((…))` currently being expanded.
     depth: usize,
+    /// What runs command and process substitutions, if they may run here (KNSH-105).
+    substitutions: Option<Box<dyn Substitutions + 'a>>,
 }
 
 impl<'a> Expander<'a> {
@@ -199,7 +214,22 @@ impl<'a> Expander<'a> {
             source,
             overlay,
             depth: 0,
+            substitutions: None,
         }
+    }
+
+    /// The same expander running command and process substitutions through `substitutions` (KNSH-105).
+    pub(crate) fn with_substitutions(mut self, substitutions: Box<dyn Substitutions + 'a>) -> Self {
+        self.substitutions = Some(substitutions);
+        self
+    }
+
+    /// The text of a here-document body made of `body` (one double-quoted part, [`word::here_document_parts`]):
+    /// expanded as inside double quotes, never split or matched against file names (KNSH-105).
+    pub(crate) fn here_document(&mut self, body: &Part, span: Span) -> Result<String> {
+        let mut fields = Fields::new();
+        self.expand(std::slice::from_ref(body), false, false, &mut fields)?;
+        Ok(self.join(fields, span)?.into_iter().map(|c| c.ch).collect())
     }
 
     // ---- Words, by context ----
@@ -415,6 +445,22 @@ impl<'a> Expander<'a> {
                     let result = self.arithmetic(*body, *span);
                     self.depth -= 1;
                     out.push_str(&result?.to_string(), quoted, true);
+                }
+                // KNSH-105: the output of `$(…)` (or `/dev/fd/N` for `<(…)`), expanded text like a parameter's.
+                Part::Subst(subst) => {
+                    let Some(substitutions) = self.substitutions.as_mut() else {
+                        let feature = match subst.kind {
+                            SubstKind::Command | SubstKind::Backtick { .. } => Unsupported::CommandSubstitution,
+                            SubstKind::Input | SubstKind::Output => Unsupported::ProcessSubstitution,
+                        };
+                        return Err(InterpError::Unsupported {
+                            feature,
+                            span: subst.span,
+                        }
+                        .into());
+                    };
+                    let text = substitutions.substitute(self.state, subst, self.source)?;
+                    out.push_str(&text, quoted, true);
                 }
             }
         }

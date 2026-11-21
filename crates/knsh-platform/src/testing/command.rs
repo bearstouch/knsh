@@ -49,6 +49,8 @@ struct State {
     signals: Vec<(ProcessGroupId, Signal)>,
     /// The next process id.
     next_pid: i32,
+    /// Requests are recorded without their descriptors ([`ScriptedCommands::releasing_descriptors`]).
+    release_descriptors: bool,
 }
 
 /// A [`CommandSpawner`] that runs nothing: each program answers with the outcomes the test scripted for it, in
@@ -71,6 +73,15 @@ impl ScriptedCommands {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The same spawner recording each request without its descriptors, so nothing it was handed stays open: a pipe
+    /// a program was given as its output then reaches end of file for its reader once the shell's copies are gone, as
+    /// it would once a real program ends (KNSH-105). [`ScriptedCommands::runs`] then lists no descriptors.
+    #[must_use]
+    pub fn releasing_descriptors(self) -> Self {
+        lock(&self.state).release_descriptors = true;
+        self
     }
 
     fn plan(&self, program: PathBuf, planned: Planned) {
@@ -154,7 +165,11 @@ impl ScriptedCommands {
 impl CommandSpawner for ScriptedCommands {
     fn start(&self, request: &CommandRequest, options: &ChildOptions) -> Result<Started, PlatformError> {
         let mut state = lock(&self.state);
-        state.runs.push((request.clone(), options.clone()));
+        let mut recorded = request.clone();
+        if state.release_descriptors {
+            recorded.descriptors.clear();
+        }
+        state.runs.push((recorded, options.clone()));
         let queue = state
             .plans
             .get_mut(&request.program)

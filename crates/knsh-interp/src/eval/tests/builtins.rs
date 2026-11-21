@@ -439,7 +439,10 @@ fn eval_and_source_run_commands_through_the_spawner() {
     // The positional parameters are put back after `source` with arguments.
     assert_eq!(h.output.text(), "4 b\n4 from-file 2\n");
     // What the check refuses is refused when `eval` runs it.
-    assert_eq!(refused(h.run("eval 'echo $(ls)'")), Unsupported::CommandSubstitution);
+    assert_eq!(
+        refused(h.run("eval 'echo $(echo $RANDOM)'")),
+        Unsupported::ShellVariable
+    );
 }
 
 // Untrusted input: text that runs itself again holds its text and tree per level, so the bytes of `eval`, `source`

@@ -52,6 +52,144 @@ pub(crate) struct JobContext {
     asynchronous: bool,
 }
 
+impl JobContext {
+    /// The context of the commands a command or process substitution runs (KNSH-105): never under job control, in
+    /// the shell's own process group as bash places them; `asynchronous` for a process substitution started without
+    /// job control, whose programs ignore `SIGINT` and `SIGQUIT` as a background job's do.
+    pub(super) fn substitution(asynchronous: bool) -> Self {
+        Self {
+            group: GroupCell::default(),
+            controlled: false,
+            terminal: None,
+            asynchronous,
+        }
+    }
+
+    /// Started with `&` without job control, or inside such a job.
+    pub(super) const fn is_asynchronous(&self) -> bool {
+        self.asynchronous
+    }
+}
+
+/// What a subshell copies from its shell besides the state and descriptors, borrowed: so a copy can be made while
+/// the state is lent to an expansion (KNSH-105: a command substitution runs in a copy of the shell as its
+/// expansion has left it). Built with [`seed!`].
+pub(super) struct Seed<'a> {
+    pub(super) fs: &'a Arc<dyn knsh_platform::Fs>,
+    pub(super) spawner: &'a Arc<dyn knsh_platform::CommandSpawner>,
+    pub(super) homes: &'a Arc<dyn knsh_platform::UserHomes>,
+    pub(super) collation: &'a Arc<dyn knsh_platform::Collation>,
+    pub(super) descriptors: &'a Arc<dyn knsh_platform::Descriptors>,
+    pub(super) times: &'a Option<Arc<dyn knsh_platform::ShellTimes>>,
+    pub(super) standard: &'a Option<Arc<[SharedFd; 3]>>,
+    pub(super) local_time: &'a Option<(Arc<dyn knsh_platform::LocalTime>, i64)>,
+    pub(super) diagnostics: &'a super::SharedWriter,
+    pub(super) output: &'a super::SharedWriter,
+    pub(super) max_depth: usize,
+    pub(super) depth: usize,
+    pub(super) registry: &'a Arc<crate::jobs::Registry>,
+    pub(super) placement: &'a Option<JobContext>,
+    pub(super) loops: usize,
+    pub(super) sourcing: usize,
+    pub(super) nested_bytes: usize,
+    pub(super) visible_aliases: &'a Arc<std::collections::BTreeMap<String, String>>,
+    pub(super) alias_guard: &'a [String],
+    pub(super) errexit_ignored: usize,
+    pub(super) traps_running: &'a [crate::trap::TrapId],
+    pub(super) trace_level: usize,
+}
+
+/// The [`Seed`] of interpreter `$shell` (an expression of type `&Interpreter` or `&mut Interpreter`, usually
+/// `self`), borrowing only the fields it names, so `$shell.state` and `$shell.fds` can be borrowed mutably beside it.
+macro_rules! seed {
+    ($shell:expr) => {
+        $crate::eval::job::Seed {
+            fs: &$shell.fs,
+            spawner: &$shell.spawner,
+            homes: &$shell.homes,
+            collation: &$shell.collation,
+            descriptors: &$shell.descriptors,
+            times: &$shell.times,
+            standard: &$shell.standard,
+            local_time: &$shell.local_time,
+            diagnostics: &$shell.diagnostics,
+            output: &$shell.output,
+            max_depth: $shell.max_depth,
+            depth: $shell.depth,
+            registry: &$shell.jobs.registry,
+            placement: &$shell.placement,
+            loops: $shell.loops,
+            sourcing: $shell.sourcing,
+            nested_bytes: $shell.nested_bytes,
+            visible_aliases: &$shell.visible_aliases,
+            alias_guard: &$shell.alias_guard,
+            errexit_ignored: $shell.errexit_ignored,
+            traps_running: &$shell.traps_running,
+            trace_level: $shell.trace_level,
+        }
+    };
+}
+pub(super) use seed;
+
+impl Seed<'_> {
+    /// A subshell: a copy of `state` and of `fds`, in job `context`, sharing the shell's effects and writers. It has
+    /// no jobs of its own yet and never does job control.
+    pub(super) fn subshell(
+        &self,
+        state: &crate::state::ShellState,
+        fds: super::FdTable,
+        context: JobContext,
+    ) -> Interpreter {
+        let mut state = state.clone();
+        state.set_interactive(false);
+        // KNSH-104: bash's forked subshell resets its traps (ignored signals stay ignored).
+        let (functrace, errtrace) = (state.options().functrace, state.options().errtrace);
+        state.traps_mut().reset_for_subshell(functrace, errtrace);
+        Interpreter {
+            state,
+            fs: Arc::clone(self.fs),
+            spawner: Arc::clone(self.spawner),
+            homes: Arc::clone(self.homes),
+            collation: Arc::clone(self.collation),
+            descriptors: Arc::clone(self.descriptors),
+            times: self.times.clone(),
+            standard: self.standard.clone(),
+            local_time: self.local_time.clone(),
+            terminal: None,
+            diagnostics: Arc::clone(self.diagnostics),
+            output: Arc::clone(self.output),
+            fds,
+            max_depth: self.max_depth,
+            depth: self.depth,
+            jobs: Jobs::new(Arc::clone(self.registry)),
+            placement: Some(context),
+            sink: Sink::Off,
+            pipe_stderr: false,
+            is_subshell: true,
+            parent: None,
+            loops: self.loops,
+            sourcing: self.sourcing,
+            nested_bytes: self.nested_bytes,
+            observer: None,
+            visible_aliases: Arc::clone(self.visible_aliases),
+            alias_guard: self.alias_guard.to_vec(),
+            exit_after_job: false,
+            declaration_lists: Vec::new(),
+            forked_stage: false,
+            errexit_ignored: self.errexit_ignored,
+            // A subshell started from a trap is still inside it, as bash's forked subshell keeps the trap's
+            // `SIG_INPROGRESS` mark: `DEBUG` and `ERR` do not run again in it (or the trap would recurse).
+            traps_running: self.traps_running.to_vec(),
+            trace_level: self.trace_level,
+            signals: None,
+            terminating: None,
+            skip_exit_trap: false,
+            substituted_fds: Vec::new(),
+            substitution_status: None,
+        }
+    }
+}
+
 /// The default output of the `time` keyword (bash's `TIMEFORMAT` when unset).
 const DEFAULT_TIME_FORMAT: &str = "\nreal\t%3lR\nuser\t%3lU\nsys\t%3lS";
 
@@ -113,51 +251,7 @@ impl Interpreter {
     /// A subshell of this shell: a copy of its state and of `fds`, in job `context`, sharing its effects and
     /// writers. It has no jobs of its own yet and never does job control.
     fn subshell(&self, fds: super::FdTable, context: JobContext) -> Self {
-        let mut state = self.state.clone();
-        state.set_interactive(false);
-        // KNSH-104: bash's forked subshell resets its traps (ignored signals stay ignored).
-        let (functrace, errtrace) = (state.options().functrace, state.options().errtrace);
-        state.traps_mut().reset_for_subshell(functrace, errtrace);
-        Self {
-            state,
-            fs: Arc::clone(&self.fs),
-            spawner: Arc::clone(&self.spawner),
-            homes: Arc::clone(&self.homes),
-            collation: Arc::clone(&self.collation),
-            descriptors: Arc::clone(&self.descriptors),
-            times: self.times.clone(),
-            standard: self.standard.clone(),
-            local_time: self.local_time.clone(),
-            terminal: None,
-            diagnostics: Arc::clone(&self.diagnostics),
-            output: Arc::clone(&self.output),
-            fds,
-            max_depth: self.max_depth,
-            depth: self.depth,
-            jobs: Jobs::new(Arc::clone(&self.jobs.registry)),
-            placement: Some(context),
-            sink: Sink::Off,
-            pipe_stderr: false,
-            is_subshell: true,
-            parent: None,
-            loops: self.loops,
-            sourcing: self.sourcing,
-            nested_bytes: self.nested_bytes,
-            observer: None,
-            visible_aliases: Arc::clone(&self.visible_aliases),
-            alias_guard: self.alias_guard.clone(),
-            exit_after_job: false,
-            declaration_lists: Vec::new(),
-            forked_stage: false,
-            errexit_ignored: self.errexit_ignored,
-            // A subshell started from a trap is still inside it, as bash's forked subshell keeps the trap's
-            // `SIG_INPROGRESS` mark: `DEBUG` and `ERR` do not run again in it (or the trap would recurse).
-            traps_running: self.traps_running.clone(),
-            trace_level: self.trace_level,
-            signals: None,
-            terminating: None,
-            skip_exit_trap: false,
-        }
+        seed!(self).subshell(&self.state, fds, context)
     }
 
     /// A subshell (this shell) ends with `result`: its status, after its `EXIT` trap if it set one (KNSH-104).
@@ -278,7 +372,9 @@ impl Interpreter {
             let alone = match &pipeline.first {
                 Command::Compound(compound) => !matches!(compound.kind, CompoundKind::Subshell(_)),
                 Command::FunctionDefinition(_) => true,
-                Command::Simple(_) | Command::Unsupported(_) => false,
+                // KNSH-105: `coproc` starts a background job of its own and sets the shell's variables.
+                Command::Unsupported(unsupported) => unsupported.coproc.is_some(),
+                Command::Simple(_) => false,
             };
             // Run in the shell itself, outside any job of its own: its commands are jobs each.
             if alone {
@@ -335,7 +431,7 @@ impl Interpreter {
 
     /// Starts `pipeline` as a new job and returns its key: in the background when `background`, else to be waited
     /// for with [`Interpreter::wait_foreground`].
-    fn launch(&mut self, pipeline: &Pipeline, background: bool, run: &Run<'_>) -> Flow<Key> {
+    pub(super) fn launch(&mut self, pipeline: &Pipeline, background: bool, run: &Run<'_>) -> Flow<Key> {
         let commands: Vec<&Command> = pipeline.commands().collect();
         let count = commands.len();
         let context = self.new_context(background);
@@ -645,6 +741,15 @@ impl Interpreter {
             }
             key
         };
+        self.started_in_background(key);
+        self.state.set_last_status(Status::SUCCESS);
+        self.act_on_signals(and_or.span, run)?;
+        Ok(Status::SUCCESS)
+    }
+
+    /// Job `key` was started in the background (`&`, `coproc`): `$!` names its last command, and an interactive
+    /// shell announces it as bash does (`[n] pid`). Returns what `$!` names.
+    pub(super) fn started_in_background(&mut self, key: Key) -> LastBackground {
         let last = self.jobs.get(key).and_then(|job| job.members.last()).cloned();
         let last = match last {
             Some(Member { pid: Some(pid), .. }) => LastBackground::Process(pid),
@@ -660,9 +765,7 @@ impl Interpreter {
             };
             self.write_shell(2, format!("[{number}]{pid}\n").as_bytes());
         }
-        self.state.set_last_status(Status::SUCCESS);
-        self.act_on_signals(and_or.span, run)?;
-        Ok(Status::SUCCESS)
+        last
     }
 
     /// Continues job `key` (`fg`, `bg`): `SIGCONT` to its group if it is stopped; its stopped members run again.

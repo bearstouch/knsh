@@ -665,6 +665,22 @@ pub struct UnsupportedCommand {
     /// them (KNSH-097). The node stays opaque to the classifier: this only saves the native interpreter from reading
     /// the construct a second time.
     pub arithmetic: Option<Box<ArithmeticParts>>,
+    /// For `coproc`, read only with [`ParseOptions::coproc`](crate::ParseOptions::coproc) (KNSH-105): its name and
+    /// command, as the parser read them. Opaque to the classifier, like [`arithmetic`](Self::arithmetic).
+    pub coproc: Option<Box<CoprocParts>>,
+}
+
+/// The parts of `coproc [NAME] command` (KNSH-105), kept inside a [`Command::Unsupported`] node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoprocParts {
+    /// The `coproc` reserved word.
+    pub keyword: Span,
+    /// The name written before a compound command, unquoted (`coproc worker { … }`); `None` for bash's default
+    /// name, `COPROC`. Bash checks that it is a valid identifier when the command runs.
+    pub name: Option<Span>,
+    /// The command run as the coprocess: a simple command, or a compound command with its redirections (an
+    /// unsupported one stays an unsupported node). Never a function definition.
+    pub command: Command,
 }
 
 /// The parts of an arithmetic command or arithmetic `for` loop (KNSH-097), kept inside a

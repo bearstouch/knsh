@@ -200,8 +200,8 @@ Known differences of the native interpreter from bash 5.2 in traps, signals, `se
   `nocaseglob`, `lastpipe`, `expand_aliases`, `inherit_errexit` and `xpg_echo`); those are listed and tested at bash
   5.2's defaults for `bash -c`. In an interactive shell, reading or listing the line-editing and history options is
   refused (KNSH-107). `BASH_XTRACEFD` and `BASH_COMMAND` are refused as variables bash maintains.
-- `inherit_errexit` is held and reported; it acts on command substitution, which arrives with KNSH-105. Subshells
-  always inherit `set -e`, and the exemption of the context they run in, as in bash.
+- `inherit_errexit` is held and reported; it acts on command substitution (KNSH-105: `set -e` is off inside one
+  unless it is set). Subshells always inherit `set -e`, and the exemption of the context they run in, as in bash.
 - Where bash 3.2 and 5.2 differ, bash 5.2's source is followed (pending a run against bash 5.2 itself, KNSH-109):
   `[[ … ]]` and `(( … ))` are subject to `set -e` and `ERR` (bash 4.1 and later); the parent runs `ERR` after a
   failing `( … )` too; a `DEBUG`, `ERR` or `RETURN` trap a function sets while the caller's is set aside is kept
@@ -218,6 +218,33 @@ Known differences of the native interpreter from bash 5.2 in traps, signals, `se
   before it), as bash echoes each line it reads; the parser has read the whole script already, so a syntax error is
   still reported before anything runs. A trap's or `eval`'s text is echoed when it runs, as bash reads it then.
 - Messages from a trap's commands number lines from the line of the command the trap fired after.
+
+Known differences of the native interpreter from bash 5.2 in command and process substitution, `coproc` and
+here-documents (KNSH-105):
+
+- A substitution runs in a copy of the shell on a thread of its own, never a forked process
+  ([decision 19](../09-reference/decisions.md)); its body is parsed again from its text when it runs, as bash 5.2
+  does, and a body that does not parse alone is refused. `BASHPID` and `BASH_SUBSHELL` stay refused.
+- Refused: a substitution inside `[[ … ]]`, `(( … ))`, `$(( … ))` or `${ … }` (the interpreter reads that text again
+  itself, and the parser refuses the last two for the classifier), and in `PS4`; a here-document inside `$( … )`
+  (refused by the parser, which bash versions read differently); output that is not UTF-8.
+- Command substitution output is bounded at 64 MiB ([defaults and limits](../09-reference/defaults-and-limits.md));
+  NUL bytes are dropped silently, as bash 3.2 drops them (bash 4.4 and later also warn `ignored null byte in
+  input`). A `$(< file)` read error names the file as written. Past the bound a program writing the output sees a
+  broken pipe and ends; a builtin loop writing it (`$(while :; do echo y; done)`) does not, as the shell's builtins
+  never get `SIGPIPE`, so the run then waits for it (bash runs out of memory instead).
+- A command substitution does not see the temporary assignments of the command it is a word of
+  (`a=1 b=$(echo $a) cmd`: `b` is empty here, `1` in bash).
+- Process substitutions are not waited for, as in bash; `$!` is not set to one (bash 4.4 and later set it) and
+  `wait` does not wait for them. An error that stops one is reported as `name: process substitution: …`. The
+  shell's end is numbered from 63 down, as bash's are.
+- `coproc` follows bash 5.2's `execute_coproc` (pending a run against bash 5.2, KNSH-109; bash 3.2 has none). It runs
+  only as a pipeline of its own: in a pipeline, after `!` or `time`, or with `&`, it is refused, as is a name that is
+  not an identifier. Its ends are placed at the highest free numbers below 64 (63 and 62; bash's numbers are not
+  confirmed) and held close-on-exec, losing that mark if a redirection replaces the number. When the coprocess ends
+  its array and descriptors stay until the script closes or reuses them (bash closes them and unsets the array as it
+  reaps the coprocess), and a second coprocess gives no warning. A coprocess of a compound command has no process of
+  its own: reading `NAME_PID` (or `$!`) is refused.
 | Messages under `bash -c` | `bash: message` (no line number on one-line scripts) | `bash: line n: message` |
 | Arithmetic error token after trailing blanks (`$(( 1 + ))`) | `error token is " "` | The last token read: `error token is "+ "` |
 | `base#` with no digits (`$((2#))`) | 0 | Error `invalid integer constant` |

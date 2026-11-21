@@ -57,10 +57,10 @@ use std::mem;
 
 use crate::ast::{
     AndOr, AndOrOperator, AndOrPart, ArithmeticParts, ArrayValue, Assignment, CaseClause, CaseCommand, CaseTerminator,
-    CaseTerminatorKind, Command, CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems,
-    FunctionDefinition, Group, HereDocument, IfClause, IfCommand, ListItem, LoopBody, LoopCommand, PipeOperator,
-    Pipeline, PipelinePart, Redirect, RedirectionVariable, Script, Separator, SeparatorKind, SimpleCommand, Subshell,
-    Substitution, SubstitutionKind, TimeKeyword, UnsupportedCommand,
+    CaseTerminatorKind, Command, CommandWord, CompoundCommand, CompoundKind, CoprocParts, ElseClause, ForCommand,
+    ForItems, FunctionDefinition, Group, HereDocument, IfClause, IfCommand, ListItem, LoopBody, LoopCommand,
+    PipeOperator, Pipeline, PipelinePart, Redirect, RedirectionVariable, Script, Separator, SeparatorKind,
+    SimpleCommand, Subshell, Substitution, SubstitutionKind, TimeKeyword, UnsupportedCommand,
 };
 use crate::error::{CompoundStart, LexError, ParseError, Unexpected, UnsupportedConstruct};
 use crate::functions::mark_function_calls;
@@ -118,6 +118,7 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
 /// any of it, so a `shopt` on the line itself never changes how that line is read).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
+#[allow(clippy::struct_excessive_bools)] // Independent options of how bash reads a line, as bash keeps them.
 pub struct ParseOptions {
     /// `shopt -s extglob`: `?(…)`, `*(…)`, `+(…)`, `@(…)` and `!(…)` are read as part of a word, with nothing inside
     /// the parentheses ending it, instead of being a syntax error (KNSH-098). Off by default, as in bash.
@@ -136,6 +137,12 @@ pub struct ParseOptions {
     /// classifier never reads a value it does not walk. The native interpreter parses with it on. Substitutions in
     /// the list's elements are listed with the assignment's or word's own, so every walker still sees them.
     pub arrays: bool,
+    /// Read `coproc` as bash 4 and later do (KNSH-105): `coproc command` (a simple command, named `COPROC`) and
+    /// `coproc [NAME] compound-command`, kept as a [`Command::Unsupported`] node whose
+    /// [`coproc`](UnsupportedCommand::coproc) holds the parts, so the classifier still treats it as opaque. Off by
+    /// default: a line using `coproc` is then refused as a whole (decision 6; bash 3.2 has no `coproc`). The native
+    /// interpreter parses with it on.
+    pub coproc: bool,
 }
 
 impl ParseOptions {
@@ -157,6 +164,13 @@ impl ParseOptions {
     #[must_use]
     pub const fn with_redirection_variables(mut self, on: bool) -> Self {
         self.redirection_variables = on;
+        self
+    }
+
+    /// These options with `coproc` set to `on`.
+    #[must_use]
+    pub const fn with_coproc(mut self, on: bool) -> Self {
+        self.coproc = on;
         self
     }
 }
@@ -183,6 +197,7 @@ pub fn parse_with(input: &str, options: ParseOptions) -> Result<Script, ParseErr
         extglob: options.extglob,
         redirection_variables: options.redirection_variables,
         arrays: options.arrays,
+        coproc: options.coproc,
         ..LexContext::default()
     };
     let mut script = parse_source(input, Span::new(0, input.len()), context, 0, &tokens_left)?;
@@ -552,6 +567,9 @@ impl Parser<'_> {
                 if *reserved == ReservedWord::Function {
                     return self.function_definition(depth);
                 }
+                if *reserved == ReservedWord::Coproc && self.context.coproc {
+                    return self.coproc(depth);
+                }
                 return Err(misplaced_reserved_word(*reserved, span));
             }
             TokenKind::Word(_) => {
@@ -799,6 +817,7 @@ impl Parser<'_> {
             extglob: self.context.extglob,
             redirection_variables: self.context.redirection_variables,
             arrays: self.context.arrays,
+            coproc: self.context.coproc,
         };
         let script = parse_source(self.input, segment.body, context, self.depth + 1, self.tokens_left)?;
         Ok(Substitution {
@@ -822,6 +841,7 @@ impl Parser<'_> {
             extglob: self.context.extglob,
             redirection_variables: self.context.redirection_variables,
             arrays: self.context.arrays,
+            coproc: self.context.coproc,
         };
         let body = segment.body.text(self.input).unwrap_or_default();
         let (text, script) = match unescape_backtick(body, in_double_quotes, None) {
@@ -907,6 +927,7 @@ impl Parser<'_> {
                 construct,
                 span,
                 arithmetic,
+                coproc: None,
             }),
         })
     }
@@ -1329,8 +1350,63 @@ impl Parser<'_> {
                 construct: body.construct,
                 span,
                 arithmetic: None,
+                coproc: None,
             }),
         })
+    }
+
+    // ---- Coprocesses ----
+
+    /// `coproc [NAME] compound-command` or `coproc simple-command`, read with [`ParseOptions::coproc`] (KNSH-105), as
+    /// bash 4 and later read it: a word followed by the start of a compound command names the coprocess; otherwise
+    /// what follows `coproc` is the command itself (a simple command's first word is its name, never the
+    /// coprocess's), named `COPROC`. The node stays opaque to the classifier; its parts are for the interpreter.
+    fn coproc(&mut self, depth: usize) -> Result<Command, ParseError> {
+        let keyword = self.advance_span();
+        let Some(next) = self.peek() else {
+            return Err(ParseError::MissingCommand { span: keyword });
+        };
+        let named = matches!(&next.kind, TokenKind::Word(Word { reserved: None, .. }))
+            && self
+                .tokens
+                .get(self.position + 1)
+                .is_some_and(|after| compound_start(&after.kind).is_some());
+        let name = if named {
+            let span = self.advance_span();
+            Some(span)
+        } else {
+            None
+        };
+        // Bash's grammar has no `coproc coproc …`: refused before reading on, which also keeps a run of `coproc`
+        // words from recursing without bound (the depth does not grow here).
+        if let Some(token) = self.peek()
+            && matches!(
+                token.kind,
+                TokenKind::Word(Word {
+                    reserved: Some(ReservedWord::Coproc),
+                    ..
+                })
+            )
+        {
+            return Err(misplaced_reserved_word(ReservedWord::Coproc, token.span));
+        }
+        let command = match self.peek().and_then(|token| compound_start(&token.kind)) {
+            Some(start) => self.compound_command(start, depth)?.into_command(),
+            None => self.command(Some(keyword), depth)?,
+        };
+        if matches!(command, Command::FunctionDefinition(_)) {
+            return Err(ParseError::UnexpectedToken {
+                token: Unexpected::Operator(Operator::LeftParen),
+                span: command.span(),
+            });
+        }
+        let span = Span::new(keyword.start, command.span().end);
+        Ok(Command::Unsupported(UnsupportedCommand {
+            construct: UnsupportedConstruct::Compound(CompoundStart::ReservedWord(ReservedWord::Coproc)),
+            span,
+            arithmetic: None,
+            coproc: Some(Box::new(CoprocParts { keyword, name, command })),
+        }))
     }
 
     // ---- Words and assignments ----
@@ -1746,6 +1822,15 @@ fn error_on_line(error: ParseError, body_span: Span, body: &str, in_double_quote
             .map_or(body_span.end, |origin| body_span.start + origin)
     };
     error.map_span(|span| Span::new(origin(span.start), origin(span.end)))
+}
+
+/// The text bash reads as commands for the backtick substitution whose body (between the backticks, as written) is
+/// `body`: un-escaped as [`Substitution::text`] is (KNSH-105: the native interpreter parses it again when it runs
+/// it, as bash does). `in_double_quotes` is set when the backticks are inside `"…"` or `$"…"`, not in a
+/// here-document body.
+#[must_use]
+pub fn backtick_text(body: &str, in_double_quotes: bool) -> Cow<'_, str> {
+    unescape_backtick(body, in_double_quotes, None)
 }
 
 /// Un-escapes a backtick body as bash does before reading it as commands: a backslash is removed before `$`, `` ` ``
@@ -3041,6 +3126,53 @@ mod tests {
         assert_eq!(
             unexpected_token("for (a) do b; done"),
             (Unexpected::Operator(Operator::LeftParen), "(")
+        );
+    }
+
+    // KNSH-105: with `ParseOptions::coproc`, `coproc` is an opaque node holding its name and command, as bash 4 and
+    // later read it; without it the line stays refused (decision 6).
+    #[test]
+    fn coproc_is_read_with_the_option() {
+        let options = ParseOptions::default().with_coproc(true);
+        let parts = |input: &str| {
+            let script = parse_with(input, options).unwrap();
+            let Command::Unsupported(node) = &script.items[0].and_or.first.first else {
+                panic!("not an unsupported node: {input}");
+            };
+            assert_eq!(
+                node.construct,
+                UnsupportedConstruct::Compound(CompoundStart::ReservedWord(ReservedWord::Coproc))
+            );
+            assert_eq!(text(input, node.span), input.trim_end_matches(['\n', ';']));
+            let parts = node.coproc.clone().unwrap();
+            (parts.name.map(|name| text(input, name).to_owned()), parts.command)
+        };
+        let (name, command) = parts("coproc cat -n");
+        assert_eq!(name, None);
+        let Command::Simple(simple) = command else { panic!() };
+        assert_eq!(word_texts("coproc cat -n", &simple.words), ["cat", "-n"]);
+        // A word followed by anything but a compound command is the command's name, never the coprocess's.
+        let (name, command) = parts("coproc worker arg");
+        assert_eq!(name, None);
+        assert!(matches!(command, Command::Simple(_)));
+        let (name, command) = parts("coproc worker { cat; } 2>/dev/null");
+        assert_eq!(name.as_deref(), Some("worker"));
+        let Command::Compound(compound) = command else { panic!() };
+        assert!(matches!(compound.kind, CompoundKind::Group(_)));
+        assert_eq!(compound.redirections.len(), 1);
+        let (name, command) = parts("coproc ( cat )");
+        assert_eq!(name, None);
+        assert!(matches!(command, Command::Compound(_)));
+        // Nothing to run, and a function definition, are errors.
+        assert!(parse_with("coproc", options).is_err());
+        assert!(parse_with("coproc f() { :; }", options).is_err());
+        // Bash has no `coproc coproc …`; a long run of them is refused without recursing on each.
+        assert!(parse_with("coproc coproc cat", options).is_err());
+        assert!(parse_with(&format!("{}cat", "coproc ".repeat(20_000)), options).is_err());
+        // Without the option the line is refused as before.
+        assert_eq!(
+            unsupported("coproc worker { cat; }"),
+            UnsupportedConstruct::Compound(CompoundStart::ReservedWord(ReservedWord::Coproc))
         );
     }
 

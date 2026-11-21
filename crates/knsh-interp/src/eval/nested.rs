@@ -66,7 +66,8 @@ impl Interpreter {
     pub(super) fn parse_options(&self) -> ParseOptions {
         let mut options = ParseOptions::default()
             .with_redirection_variables(true)
-            .with_arrays(true);
+            .with_arrays(true)
+            .with_coproc(true);
         options.extglob = self.state.options().extglob;
         options
     }

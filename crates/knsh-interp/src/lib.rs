@@ -40,7 +40,12 @@
 //! `PS4`, `-v`, `-n`, `-E` and `-T`. The host hands the shell the signals sent to it through [`ShellSignals`]
 //! ([`Interpreter::shell_signals`]) and the signals it was started ignoring through
 //! [`ShellState::with_ignored_signals`]; [`Interpreter::terminating_signal`] and [`Interpreter::finish`] end it as
-//! bash ends.
+//! bash ends. KNSH-105 adds command substitution (`$(…)` and backquotes: the output without its trailing newlines,
+//! split and matched against file names unless quoted, `$?` its status, `$(< file)`), process substitution (`<(…)`
+//! and `>(…)` as `/dev/fd/N`, closed after their command), here-documents (`<<`, `<<-`, quoted delimiters) and
+//! `coproc` (named and `COPROC` arrays, `NAME_PID`); each substitution and coprocess runs in a copy of the shell on a
+//! thread of its own, so its commands start through the same spawner. Scripts using `coproc` must be parsed with
+//! [`knsh_bash::ParseOptions::coproc`].
 //!
 //! # Boundaries
 //!
@@ -59,9 +64,10 @@
 //!   must start through the spawner): pipeline stages and background lists that the shell runs itself run on threads
 //!   of their own (decision 19). Children are known by handle, waited for by one thread each, and a job's process
 //!   group is signalled only while one of its members is held unreaped.
-//! - What later stories implement (command substitution, here-documents, process substitution, POSIX mode) is
-//!   refused with [`InterpError::Unsupported`] by a check of the whole script before anything runs, or,
-//!   when only an expansion's value reveals it (or `eval` and `source` text), when it is reached. `[[ … ]]`, which
+//! - What later stories implement (POSIX mode, and a substitution inside the text the interpreter reads again
+//!   itself: `[[ … ]]`, `(( … ))`, `$(( … ))`) is refused with [`InterpError::Unsupported`] by a check of the whole
+//!   script before anything runs (substitution bodies included), or, when only an expansion's value reveals it (or
+//!   `eval` and `source` text), when it is reached. `[[ … ]]`, which
 //!   the parser keeps whole, is read again from its text with the same lexer, as `(( … ))` bodies are; one bash's
 //!   parser would reject is refused by that check.
 //! - Regular expressions are the system's `regcomp` and `regexec` ([`knsh_platform::regex_match`], decision 21):
@@ -93,8 +99,10 @@
 //! - `specs/00-stories/KNSH-102-builtins-test-printf-read.md`, `specs/09-reference/decisions.md` (decision 21: system
 //!   regular expressions)
 //! - `specs/00-stories/KNSH-104-traps-signals-set-and-shopt-options.md`
+//! - `specs/00-stories/KNSH-105-process-substitution-coproc-and-here-documents.md`, `specs/09-reference/decisions.md`
+//!   (decision 6: `coproc` stays dynamic for the classifier)
 //! - `specs/09-reference/defaults-and-limits.md` (the evaluation, arithmetic and expansion depth limits, the brace
-//!   and pathname expansion bounds, and the `printf` and `read` bounds)
+//!   and pathname expansion bounds, the `printf` and `read` bounds, and the command substitution output bound)
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
