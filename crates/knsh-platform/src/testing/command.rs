@@ -274,6 +274,7 @@ mod tests {
             env: Vec::new(),
             cwd: "/".into(),
             descriptors: CommandRequest::standard_descriptors(),
+            umask: None,
         }
     }
 

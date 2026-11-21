@@ -195,6 +195,7 @@ impl ProcessExecutor<'_> {
             ])),
             inherit: Vec::new(),
             placements: Vec::new(),
+            umask: None,
         };
         let group = self.processes.spawn(&request).ok()?;
         // The child has its own copies now. Dropping ours lets the hook see end of file on stdin once the writer is

@@ -46,6 +46,17 @@ pub trait Descriptors: Send + Sync {
     /// (`/dev/fd`).
     fn open(&self, path: &Path, mode: OpenMode) -> Result<SharedFd, PlatformError>;
 
+    /// [`Descriptors::open`] for a shell whose own umask is `umask` (KNSH-101: the `umask` builtin): a file created
+    /// gets mode `0666` less `umask`. The system also removes the bits of this process's umask, so a shell umask less
+    /// restrictive than the process's is not honoured fully; a more restrictive one (`umask 077`) always is. There is
+    /// no provided implementation: one that ignored `umask` would create a file the script meant to keep private
+    /// (`umask 077; echo secret >file`) with the process's looser mode.
+    ///
+    /// # Errors
+    ///
+    /// As [`Descriptors::open`].
+    fn open_masked(&self, path: &Path, mode: OpenMode, umask: u32) -> Result<SharedFd, PlatformError>;
+
     /// A read-only descriptor positioned at the start of exactly `text`, for a here-string (`<<<`): a pipe already
     /// holding it when it fits, otherwise an unlinked temporary file. Close-on-exec.
     ///

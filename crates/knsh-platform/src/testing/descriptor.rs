@@ -100,6 +100,11 @@ impl FakeDescriptors {
 
 impl Descriptors for FakeDescriptors {
     fn open(&self, path: &Path, mode: OpenMode) -> Result<SharedFd, PlatformError> {
+        self.open_masked(path, mode, 0)
+    }
+
+    /// Creates a missing file with mode `0666` less `umask` (and the [`MemFs`]'s own umask, as the kernel would).
+    fn open_masked(&self, path: &Path, mode: OpenMode, umask: u32) -> Result<SharedFd, PlatformError> {
         if !path.is_absolute() {
             return Err(PlatformError::InvalidPath);
         }
@@ -116,7 +121,7 @@ impl Descriptors for FakeDescriptors {
         let kind = self.kind(path)?;
         let create = |data: &[u8]| {
             self.fs
-                .write(path, data, 0o666)
+                .write(path, data, 0o666 & !umask & 0o777)
                 .map_err(|error| os(error.errno().unwrap_or(libc::EIO)))
         };
         match (mode, kind) {

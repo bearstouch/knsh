@@ -85,13 +85,14 @@ const fn open_error(errno: i32) -> PlatformError {
     }
 }
 
-/// `open(path, flags | O_NOFOLLOW_ANY, 0666)`, retried on `EINTR`.
-fn open_nofollow(path: &Path, flags: libc::c_int) -> Result<OwnedFd, i32> {
+/// `open(path, flags | O_NOFOLLOW_ANY, perms)`, retried on `EINTR`. A file created gets `perms` less the process's
+/// umask.
+fn open_nofollow(path: &Path, flags: libc::c_int, perms: u32) -> Result<OwnedFd, i32> {
     let text = CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
     loop {
         // SAFETY: `text` is a valid NUL-terminated string that outlives the call; the mode is a plain integer
         // (variadic, promoted to `c_uint` as `open` expects).
-        let fd = unsafe { libc::open(text.as_ptr(), flags | libc::O_NOFOLLOW_ANY, 0o666 as libc::c_uint) };
+        let fd = unsafe { libc::open(text.as_ptr(), flags | libc::O_NOFOLLOW_ANY, perms as libc::c_uint) };
         if fd >= 0 {
             // SAFETY: `open` just returned this descriptor; nothing else owns it.
             return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
@@ -119,18 +120,19 @@ fn resolve(path: &Path) -> Result<PathBuf, i32> {
     }
 }
 
-/// Opens `path` with `flags`, never reaching this process's descriptor table (see the module docs).
-fn open_checked(path: &Path, flags: libc::c_int) -> Result<OwnedFd, i32> {
+/// Opens `path` with `flags` (a file created gets `perms`), never reaching this process's descriptor table (see the
+/// module docs).
+fn open_checked(path: &Path, flags: libc::c_int, perms: u32) -> Result<OwnedFd, i32> {
     if reaches_descriptor_table(path) {
         return Err(libc::EPERM);
     }
-    match open_nofollow(path, flags) {
+    match open_nofollow(path, flags, perms) {
         Err(libc::ELOOP) => {
             let resolved = resolve(path)?;
             if reaches_descriptor_table(&resolved) {
                 return Err(libc::EPERM);
             }
-            open_nofollow(&resolved, flags)
+            open_nofollow(&resolved, flags, perms)
         }
         other => other,
     }
@@ -149,13 +151,13 @@ fn is_regular(fd: &OwnedFd) -> Result<bool, i32> {
 
 /// Bash's `noclobber_open`: refuse an existing regular file, create a missing one exclusively, open anything else
 /// (`/dev/null`) for writing without truncating it.
-fn open_noclobber(path: &Path) -> Result<OwnedFd, i32> {
+fn open_noclobber(path: &Path, perms: u32) -> Result<OwnedFd, i32> {
     let write = flags(OpenMode::NoClobber);
-    match open_checked(path, write | libc::O_CREAT | libc::O_EXCL) {
+    match open_checked(path, write | libc::O_CREAT | libc::O_EXCL, perms) {
         Err(libc::EEXIST) => {}
         other => return other,
     }
-    let fd = open_checked(path, write)?;
+    let fd = open_checked(path, write, perms)?;
     // Regular now (replaced since the exclusive open failed, or it always was): refused, as bash refuses it.
     if is_regular(&fd)? {
         return Err(libc::EEXIST);
@@ -163,18 +165,29 @@ fn open_noclobber(path: &Path) -> Result<OwnedFd, i32> {
     Ok(fd)
 }
 
-impl Descriptors for SystemDescriptors {
-    fn open(&self, path: &Path, mode: OpenMode) -> Result<SharedFd, PlatformError> {
+impl SystemDescriptors {
+    /// [`Descriptors::open`] with `perms` for a file it creates.
+    fn open_with(path: &Path, mode: OpenMode, perms: u32) -> Result<SharedFd, PlatformError> {
         if !path.is_absolute() || path.as_os_str().as_bytes().contains(&0) {
             return Err(PlatformError::InvalidPath);
         }
         let opened = match mode {
-            OpenMode::NoClobber => open_noclobber(path),
+            OpenMode::NoClobber => open_noclobber(path, perms),
             OpenMode::Read | OpenMode::Truncate | OpenMode::Append | OpenMode::ReadWrite => {
-                open_checked(path, flags(mode))
+                open_checked(path, flags(mode), perms)
             }
         };
         opened.map(SharedFd::new).map_err(open_error)
+    }
+}
+
+impl Descriptors for SystemDescriptors {
+    fn open(&self, path: &Path, mode: OpenMode) -> Result<SharedFd, PlatformError> {
+        Self::open_with(path, mode, 0o666)
+    }
+
+    fn open_masked(&self, path: &Path, mode: OpenMode, umask: u32) -> Result<SharedFd, PlatformError> {
+        Self::open_with(path, mode, 0o666 & !umask & 0o777)
     }
 
     fn here_string(&self, text: &[u8]) -> Result<SharedFd, PlatformError> {
@@ -285,6 +298,32 @@ mod tests {
             descriptors.open(Path::new("relative"), OpenMode::Read).err(),
             Some(PlatformError::InvalidPath)
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // KNSH-101: a file a redirection creates gets the shell's umask (`umask 077` before `>secret`); an existing file
+    // keeps its mode.
+    #[test]
+    fn masked_opens_create_files_with_the_shell_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let descriptors = SystemDescriptors::new();
+        let dir = temp_dir("umask");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        for (name, open) in [
+            ("t", OpenMode::Truncate),
+            ("a", OpenMode::Append),
+            ("rw", OpenMode::ReadWrite),
+            ("n", OpenMode::NoClobber),
+        ] {
+            let path = dir.join(name);
+            descriptors.open_masked(&path, open, 0o077).unwrap();
+            assert_eq!(mode(&path), 0o600, "{name}");
+        }
+        let existing = dir.join("t");
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+        descriptors.open_masked(&existing, OpenMode::Truncate, 0o077).unwrap();
+        assert_eq!(mode(&existing), 0o644);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

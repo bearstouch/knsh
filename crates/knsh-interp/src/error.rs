@@ -117,11 +117,12 @@ pub enum Unsupported {
     /// An array: `${a[0]}`, `${a[@]}`, `${!a[@]}`, `a[1]` in arithmetic (KNSH-103).
     Array,
     /// A variable bash maintains itself (`RANDOM`, `LINENO`, `BASH_VERSION`, `$_` …), which the interpreter does not
-    /// emulate yet, so reading it would give a value bash never gives (KNSH-101).
+    /// emulate, so reading or changing it would give a value bash never gives; also a builtin's listing that would
+    /// include such variables (`declare -p` without names, `readonly -p`).
     ShellVariable,
     /// `${x@P}`, which expands the value as a prompt string (KNSH-107).
     PromptExpansion,
-    /// `~N`, `~+N`, `~-N` and `~-`: the directory stack and `OLDPWD` (KNSH-101).
+    /// `~N`, `~+N` and `~-N`: entries of the directory stack (`pushd`, `popd` and `dirs`, not scheduled yet).
     DirectoryStack,
     /// A variable whose value is not UTF-8, used in an expansion. Passing it on unchanged needs byte-level words.
     NonUtf8Value,
@@ -140,8 +141,27 @@ pub enum Unsupported {
     Time,
     /// A function definition (KNSH-103).
     FunctionDefinition,
-    /// A bash builtin other than `let` and the few whose external program behaves the same (KNSH-101, KNSH-102).
+    /// A bash builtin the interpreter does not run yet (`read`, `trap`, `getopts`, `shopt`, …: KNSH-102 to
+    /// KNSH-104), or a form of one it runs that a later story implements (`set` with options, KNSH-104).
     Builtin,
+    /// A name reference, `declare -n` (KNSH-103, with scopes).
+    Nameref,
+    /// An alias whose text cannot be run in place of the command it starts: text that does not parse alone, a
+    /// pipeline stage whose alias is not a single simple command, or a chain of aliases past the interpreter's
+    /// bound (KNSH-101).
+    Alias,
+    /// `source` of one of the shell's own descriptors (`. /dev/stdin`, `. /dev/fd/3`), which the interpreter does
+    /// not read as files.
+    SourceDescriptor,
+    /// A sourced file that is not UTF-8.
+    NonUtf8Script,
+    /// `umask` printing the mask, or changing it with a symbolic mode, when the host never said what the process's
+    /// umask is ([`ShellState::with_umask`](crate::ShellState::with_umask)): the interpreter never reads it itself.
+    UnknownUmask,
+    /// `eval` or `source` text with a syntax error bash would report differently from what the parser can tell
+    /// (an unterminated quote, a construct the parser does not read), or before which bash would have run commands
+    /// the parser cannot separate (KNSH-101).
+    Unparsed,
     /// A construct the parser keeps opaque: `[[ … ]]`, `select`, an arithmetic `for` whose header is not three
     /// expressions.
     Construct(UnsupportedConstruct),
@@ -157,9 +177,9 @@ impl fmt::Display for Unsupported {
                 f.write_str("joining $* or $@ with a non-space IFS where bash does not split (KNSH-109)")
             }
             Self::Array => f.write_str("arrays (KNSH-103)"),
-            Self::ShellVariable => f.write_str("a variable bash maintains itself (KNSH-101)"),
+            Self::ShellVariable => f.write_str("a variable bash maintains itself"),
             Self::PromptExpansion => f.write_str("prompt expansion (KNSH-107)"),
-            Self::DirectoryStack => f.write_str("the directory stack and OLDPWD (KNSH-101)"),
+            Self::DirectoryStack => f.write_str("the directory stack"),
             Self::NonUtf8Value => f.write_str("a variable value that is not UTF-8"),
             Self::NonUtf8FileName => f.write_str("a file name that is not UTF-8"),
             Self::Redirection => f.write_str("a redirection of an arithmetic command"),
@@ -167,7 +187,13 @@ impl fmt::Display for Unsupported {
             Self::InShellProcessId => f.write_str("$! of a background job the shell runs itself"),
             Self::Time => f.write_str("the time keyword without clocks"),
             Self::FunctionDefinition => f.write_str("function definition (KNSH-103)"),
-            Self::Builtin => f.write_str("this builtin (KNSH-101, KNSH-102)"),
+            Self::Builtin => f.write_str("this builtin (KNSH-102 to KNSH-104)"),
+            Self::Nameref => f.write_str("a name reference (KNSH-103)"),
+            Self::Alias => f.write_str("this alias's text in place of its command"),
+            Self::SourceDescriptor => f.write_str("source of one of the shell's descriptors"),
+            Self::NonUtf8Script => f.write_str("a sourced file that is not UTF-8"),
+            Self::UnknownUmask => f.write_str("the umask, which the host did not give"),
+            Self::Unparsed => f.write_str("eval or source text the parser cannot report as bash would"),
             Self::Construct(construct) => write!(f, "{construct}"),
         }
     }

@@ -43,7 +43,7 @@ impl Interpreter {
 
     /// Splits `args` into the leading options (single letters among `allowed`) and the operands. `Err` with the
     /// status after reporting an unknown option as bash does.
-    fn options<'a>(
+    pub(super) fn options<'a>(
         &mut self,
         name: &str,
         usage: &str,
@@ -64,7 +64,8 @@ impl Interpreter {
             };
             if let Some(bad) = options.chars().find(|ch| !allowed.contains(*ch)) {
                 self.report(span, run, format_args!("{name}: -{bad}: invalid option"));
-                self.report(span, run, format_args!("{name}: usage: {name} {usage}"));
+                // Bash's `builtin_usage`: the usage line has no name or line number before it.
+                self.report_plain(format_args!("{name}: usage: {name} {usage}"));
                 return Err(Status::new(2));
             }
             letters.push_str(options);

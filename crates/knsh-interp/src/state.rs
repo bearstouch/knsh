@@ -1,28 +1,114 @@
-//! Shell state: variables, positional parameters, `$?`, options and the working directory (KNSH-096, KNSH-097).
+//! Shell state: variables, positional parameters, `$?`, options and the working directory (KNSH-096, KNSH-097), and
+//! what the core builtins keep (KNSH-101): variable attributes, the command hash table, aliases and the umask.
 //!
 //! Values are kept as [`OsString`]: an inherited environment value need not be UTF-8, and the shell passes it on to
 //! commands unchanged.
+//!
+//! A variable may be declared without a value (`declare x`, `export x`): it then has attributes but reads as unset,
+//! as in bash. Every assignment the shell makes goes through [`ShellState::assign`], which refuses a read-only
+//! variable and applies the integer and case attributes, as bash's `bind_variable` does; changing `PATH` empties
+//! the hash table, as bash's `sv_path` does.
 //!
 //! At start-up bash sets a few variables itself, and this state does the same: `IFS` is space, tab and newline
 //! (never taken from the environment), `PWD` names the working directory and `SHLVL` is one more than inherited,
 //! both exported. Variables bash keeps up to date itself (`RANDOM`, `LINENO`, `BASH_VERSION`, `$_` …) are not
 //! emulated: reading one is refused ([`is_unemulated`]) rather than answered with a value bash would never give.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-use crate::error::InterpError;
+use crate::arith::Failure;
+use crate::error::{InterpError, Unsupported};
 use crate::status::Status;
+
+/// The attributes `declare` sets on a variable (KNSH-101), bash's `att_*` flags but the array ones (KNSH-103).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct Attributes {
+    /// `-x`: commands receive it in their environment (when it has a value).
+    pub(crate) exported: bool,
+    /// `-r`: it can be neither assigned nor unset.
+    pub(crate) readonly: bool,
+    /// `-i`: each value assigned is evaluated as an arithmetic expression.
+    pub(crate) integer: bool,
+    /// `-l`: each value assigned is converted to lower case.
+    pub(crate) lowercase: bool,
+    /// `-u`: each value assigned is converted to upper case.
+    pub(crate) uppercase: bool,
+    /// `-t`: the trace attribute, which only functions use; kept so `declare -p` shows it.
+    pub(crate) trace: bool,
+}
+
+impl Attributes {
+    /// The letters `declare -p` and `${x@a}` show, in bash's order (`show_var_attributes`: `i`, `r`, `t`, `x`, `l`,
+    /// `u` among the ones kept here).
+    pub(crate) fn letters(self) -> String {
+        [
+            (self.integer, 'i'),
+            (self.readonly, 'r'),
+            (self.trace, 't'),
+            (self.exported, 'x'),
+            (self.lowercase, 'l'),
+            (self.uppercase, 'u'),
+        ]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, letter)| *letter)
+        .collect()
+    }
+}
 
 /// One shell variable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Variable {
-    /// Its value.
-    value: OsString,
-    /// Whether commands receive it in their environment.
-    exported: bool,
+    /// Its value, or `None` for a variable declared without one, which reads as unset.
+    value: Option<OsString>,
+    /// Its attributes.
+    attributes: Attributes,
 }
+
+impl Variable {
+    /// An exported variable holding `value`, as one imported from the environment.
+    fn exported(value: OsString) -> Self {
+        Self {
+            value: Some(value),
+            attributes: Attributes {
+                exported: true,
+                ..Attributes::default()
+            },
+        }
+    }
+}
+
+/// Why an assignment or `unset` was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AssignError {
+    /// The name is not a valid identifier.
+    Invalid,
+    /// The variable is read-only: bash's `name: readonly variable`.
+    Readonly,
+    /// The variable has the integer attribute and the value is not a valid expression (bash's arithmetic error,
+    /// which discards the line).
+    Arithmetic(Failure),
+    /// The value cannot be handled yet (a case conversion of a value that is not UTF-8).
+    Unsupported(Unsupported),
+}
+
+/// A command remembered in the hash table: where `PATH` found it and how often it was run since (`hash`'s `hits`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Hashed {
+    /// The program found.
+    pub(crate) path: PathBuf,
+    /// Times it was found through the table.
+    pub(crate) hits: u32,
+    /// When it was added, to list the table in bash's order (newest first within a bucket).
+    seq: u64,
+}
+
+/// A variable as it was, or `None` if it did not exist, to put back after a temporary assignment.
+#[derive(Debug, Clone)]
+pub(crate) struct SavedVariable(Option<Variable>);
 
 /// Shell options set by `set` and `shopt`.
 ///
@@ -66,6 +152,14 @@ pub struct ShellOptions {
     /// terminal to the foreground job and reports stopped jobs. Off, every command stays in the shell's own process
     /// group, as bash runs a script (KNSH-100).
     pub monitor: bool,
+    /// `shopt -s expand_aliases`: aliases defined before a line is read are expanded in it. Off in a script, on in
+    /// an interactive shell ([`Interpreter::with_job_control`](crate::Interpreter::with_job_control)), as in bash
+    /// (KNSH-101).
+    pub expand_aliases: bool,
+    /// `shopt -s xpg_echo`: `echo` interprets backslash escapes without `-e` (KNSH-101).
+    pub xpg_echo: bool,
+    /// `set -o physical` (`set -P`): `cd` and `pwd` resolve symbolic links, as if given `-P` (KNSH-101).
+    pub physical: bool,
 }
 
 /// `IFS` as bash sets it at start-up: space, tab, newline.
@@ -101,7 +195,6 @@ const UNEMULATED: &[&str] = &[
     "GROUPS",
     "HISTCMD",
     "LINENO",
-    "OLDPWD",
     "OPTERR",
     "OPTIND",
     "PPID",
@@ -187,6 +280,18 @@ pub struct ShellState {
     last_background: Option<LastBackground>,
     /// Whether this is an interactive shell (`i` in `$-`).
     interactive: bool,
+    /// Names of [`UNEMULATED_WHEN_UNSET`] variables the script assigned, declared or unset itself: from then on
+    /// their state is the script's, not the default bash would have given them.
+    touched: BTreeSet<String>,
+    /// The command hash table: names found on `PATH`, by name (KNSH-101).
+    hashed: BTreeMap<String, Hashed>,
+    /// Entries added to the hash table so far, to order them.
+    hash_seq: u64,
+    /// Aliases, by name (KNSH-101).
+    aliases: BTreeMap<String, String>,
+    /// The file mode creation mask commands and redirections use (`umask`, KNSH-101), or `None` while it is the
+    /// process's own, which the shell does not know.
+    umask: Option<u32>,
 }
 
 impl ShellState {
@@ -214,6 +319,11 @@ impl ShellState {
             pipestatus: vec![Status::SUCCESS],
             last_background: None,
             interactive: false,
+            touched: BTreeSet::new(),
+            hashed: BTreeMap::new(),
+            hash_seq: 0,
+            aliases: BTreeMap::new(),
+            umask: None,
         };
         state.start_up(None);
         Ok(state)
@@ -232,8 +342,7 @@ impl ShellState {
                     if valid == "SHLVL" {
                         inherited_level = Some(value.clone());
                     }
-                    self.variables
-                        .insert(valid.to_owned(), Variable { value, exported: true });
+                    self.variables.insert(valid.to_owned(), Variable::exported(value));
                 }
                 None => self.passthrough.push((name, value)),
             }
@@ -242,9 +351,17 @@ impl ShellState {
         self
     }
 
-    /// Sets the variables bash sets at start-up, given the inherited `SHLVL` if any.
+    /// Sets the variables bash sets at start-up, given the inherited `SHLVL` if any. `OLDPWD` is exported without a
+    /// value unless inherited (bash's `set_pwd`; the interpreter drops an inherited one that is not a directory).
     fn start_up(&mut self, inherited_level: Option<&OsStr>) {
         self.set_variable("IFS", DEFAULT_IFS);
+        self.variables.entry("OLDPWD".to_owned()).or_insert(Variable {
+            value: None,
+            attributes: Attributes {
+                exported: true,
+                ..Attributes::default()
+            },
+        });
         let cwd = self.cwd.clone().into_os_string();
         if self.variable("PWD") != Some(cwd.as_os_str()) {
             self.set_exported("PWD", cwd);
@@ -261,13 +378,28 @@ impl ShellState {
 
     /// Sets `name` to `value` and exports it.
     fn set_exported(&mut self, name: &str, value: impl Into<OsString>) {
-        self.variables.insert(
-            name.to_owned(),
-            Variable {
-                value: value.into(),
-                exported: true,
-            },
-        );
+        self.variables.insert(name.to_owned(), Variable::exported(value.into()));
+    }
+
+    /// Sets the shell's umask (the file mode creation mask commands and redirections start with) to `umask`: the
+    /// embedder passes the umask the shell's process inherited, as bash starts with it. Without it commands and
+    /// redirections keep the process's own umask until the `umask` builtin sets one, and `umask` cannot print it
+    /// (that use is refused), since the interpreter never reads or changes the process's umask.
+    #[must_use]
+    pub fn with_umask(mut self, umask: u32) -> Self {
+        self.umask = Some(umask & 0o777);
+        self
+    }
+
+    /// The umask (`umask`, KNSH-101), or `None` while it is the process's own.
+    #[must_use]
+    pub fn umask(&self) -> Option<u32> {
+        self.umask
+    }
+
+    /// Sets the umask.
+    pub(crate) fn set_umask(&mut self, umask: u32) {
+        self.umask = Some(umask & 0o777);
     }
 
     /// Sets `$$` to `pid` instead of this process's id: the interpreter stands for a shell whose process id may be
@@ -303,36 +435,262 @@ impl ShellState {
         &self.positional
     }
 
-    /// The value of variable `name`, or `None` if it is unset.
+    /// The value of variable `name`, or `None` if it is unset (or declared without a value).
     #[must_use]
     pub fn variable(&self, name: &str) -> Option<&OsStr> {
-        self.variables.get(name).map(|variable| variable.value.as_os_str())
+        self.variables.get(name).and_then(|variable| variable.value.as_deref())
     }
 
-    /// Whether variable `name` is set and exported.
+    /// Whether variable `name` exists (set, or declared without a value) and is exported.
     #[must_use]
     pub fn is_exported(&self, name: &str) -> bool {
-        self.variables.get(name).is_some_and(|variable| variable.exported)
+        self.attributes(name).is_some_and(|attributes| attributes.exported)
     }
 
-    /// Sets variable `name` to `value`, keeping whether it is exported (a new variable is not). Returns `false` and
-    /// changes nothing if `name` is not a valid identifier.
+    /// Whether variable `name` is read-only (`readonly`, `declare -r`, KNSH-101).
+    #[must_use]
+    pub fn is_readonly(&self, name: &str) -> bool {
+        self.attributes(name).is_some_and(|attributes| attributes.readonly)
+    }
+
+    /// The attributes of variable `name`, if it exists (set or declared without a value).
+    pub(crate) fn attributes(&self, name: &str) -> Option<Attributes> {
+        self.variables.get(name).map(|variable| variable.attributes)
+    }
+
+    /// Every variable that exists, in byte order of names: name, value (`None` when declared without one) and
+    /// attributes, for `declare -p` and `export -p`.
+    pub(crate) fn all_variables(&self) -> impl Iterator<Item = (&str, Option<&OsStr>, Attributes)> {
+        self.variables
+            .iter()
+            .map(|(name, variable)| (name.as_str(), variable.value.as_deref(), variable.attributes))
+    }
+
+    /// Sets variable `name` to `value` as the embedder does between runs, keeping its attributes (a new variable has
+    /// none) but applying none of them: neither read-only nor integer stops or changes it. Returns `false` and changes
+    /// nothing if `name` is not a valid identifier. The shell's own assignments apply both, as bash does.
     pub fn set_variable(&mut self, name: &str, value: impl Into<OsString>) -> bool {
         if !is_name(name) {
             return false;
         }
-        let value = value.into();
-        self.variables
-            .entry(name.to_owned())
-            .and_modify(|variable| variable.value.clone_from(&value))
-            .or_insert(Variable { value, exported: false });
+        self.store(name, value.into());
         true
     }
 
-    /// Removes variable `name` (the `unset` builtin arrives with KNSH-101).
-    #[cfg(test)]
-    pub(crate) fn unset_variable(&mut self, name: &str) {
+    /// Stores `value` in `name` (a valid identifier) as it is, keeping its attributes.
+    fn store(&mut self, name: &str, value: OsString) {
+        self.noticed(name);
+        match self.variables.get_mut(name) {
+            Some(variable) => variable.value = Some(value),
+            None => {
+                self.variables.insert(
+                    name.to_owned(),
+                    Variable {
+                        value: Some(value),
+                        attributes: Attributes::default(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Records that the script changed `name` itself: a default bash would have set no longer applies, and changing
+    /// `PATH` empties the hash table (bash's `sv_path`).
+    fn noticed(&mut self, name: &str) {
+        if UNEMULATED_WHEN_UNSET.contains(&name) && !self.touched.contains(name) {
+            self.touched.insert(name.to_owned());
+        }
+        if name == "PATH" {
+            self.hashed.clear();
+        }
+    }
+
+    /// Assigns `value` to variable `name` as bash's `bind_variable` does (`append`: `name+=value`): refused if `name`
+    /// is not an identifier or the variable is read-only; with the integer attribute the value (and, appending, the
+    /// old value) is evaluated as an arithmetic expression; with `-l` or `-u` it is converted to that case.
+    ///
+    /// # Errors
+    ///
+    /// [`AssignError`]; nothing changes then (an integer expression may have assigned other variables already, as in
+    /// bash).
+    pub(crate) fn assign(&mut self, name: &str, value: OsString, append: bool) -> Result<(), AssignError> {
+        if !is_name(name) {
+            return Err(AssignError::Invalid);
+        }
+        let attributes = self.attributes(name).unwrap_or_default();
+        if attributes.readonly {
+            return Err(AssignError::Readonly);
+        }
+        let old = || self.variable(name).map(ToOwned::to_owned).unwrap_or_default();
+        let value = if attributes.integer {
+            let utf8 = |text: OsString| {
+                text.into_string()
+                    .map_err(|_| AssignError::Unsupported(Unsupported::NonUtf8Value))
+            };
+            let base = if append {
+                let old = utf8(old())?;
+                crate::arith::evaluate_arithmetic(&old, self).map_err(AssignError::Arithmetic)?
+            } else {
+                0
+            };
+            let added = crate::arith::evaluate_arithmetic(&utf8(value)?, self).map_err(AssignError::Arithmetic)?;
+            OsString::from(base.wrapping_add(added).to_string())
+        } else {
+            let mut whole = if append { old() } else { OsString::new() };
+            whole.push(value);
+            if attributes.lowercase || attributes.uppercase {
+                let text = whole
+                    .into_string()
+                    .map_err(|_| AssignError::Unsupported(Unsupported::NonUtf8Value))?;
+                OsString::from(convert_case(&text, attributes.uppercase))
+            } else {
+                whole
+            }
+        };
+        self.store(name, value);
+        Ok(())
+    }
+
+    /// Removes variable `name` (`unset`).
+    ///
+    /// # Errors
+    ///
+    /// [`AssignError::Invalid`] for a name that is not an identifier, [`AssignError::Readonly`] for a read-only
+    /// variable, which is kept.
+    pub(crate) fn unset(&mut self, name: &str) -> Result<(), AssignError> {
+        if !is_name(name) {
+            return Err(AssignError::Invalid);
+        }
+        if self.is_readonly(name) {
+            return Err(AssignError::Readonly);
+        }
+        self.noticed(name);
         self.variables.remove(name);
+        Ok(())
+    }
+
+    /// Changes the attributes of variable `name` (a valid identifier), creating it without a value if it does not
+    /// exist, through `change`. Its value is not converted: bash applies `-i`, `-l` and `-u` only to values assigned
+    /// later.
+    pub(crate) fn change_attributes(&mut self, name: &str, change: impl FnOnce(&mut Attributes)) {
+        self.noticed(name);
+        let variable = self.variables.entry(name.to_owned()).or_insert(Variable {
+            value: None,
+            attributes: Attributes::default(),
+        });
+        change(&mut variable.attributes);
+    }
+
+    /// Removes `name`'s value but keeps the variable and its attributes, as bash's `invisible` variables: an
+    /// inherited `OLDPWD` that is not a directory.
+    pub(crate) fn clear_value(&mut self, name: &str) {
+        if let Some(variable) = self.variables.get_mut(name) {
+            variable.value = None;
+        }
+    }
+
+    /// Changes the working directory to `cwd` (absolute): `cd`. `PWD` and `OLDPWD` are the caller's to set.
+    pub(crate) fn set_cwd(&mut self, cwd: PathBuf) {
+        debug_assert!(cwd.is_absolute(), "the working directory is always absolute");
+        if cwd.is_absolute() {
+            self.cwd = cwd;
+        }
+    }
+
+    /// The command hash table entry of `name`, counting one more use of it.
+    pub(crate) fn hash_use(&mut self, name: &str) -> Option<PathBuf> {
+        self.hashed.get_mut(name).map(|entry| {
+            entry.hits = entry.hits.saturating_add(1);
+            entry.path.clone()
+        })
+    }
+
+    /// Remembers that `name` runs `path`, with `hits` uses so far (bash's `phash_insert`: an entry already there
+    /// keeps its place in the table).
+    pub(crate) fn hash_insert(&mut self, name: &str, path: PathBuf, hits: u32) {
+        let seq = if let Some(entry) = self.hashed.get(name) {
+            entry.seq
+        } else {
+            self.hash_seq += 1;
+            self.hash_seq
+        };
+        self.hashed.insert(name.to_owned(), Hashed { path, hits, seq });
+    }
+
+    /// Forgets `name`; whether it was remembered.
+    pub(crate) fn hash_remove(&mut self, name: &str) -> bool {
+        self.hashed.remove(name).is_some()
+    }
+
+    /// Forgets every command (`hash -r`).
+    pub(crate) fn hash_clear(&mut self) {
+        self.hashed.clear();
+    }
+
+    /// The hash table in the order bash's `hash` lists it: by bucket of bash's 256-bucket table (FNV-1 of the
+    /// name), newest first within a bucket.
+    pub(crate) fn hash_entries(&self) -> Vec<(&str, &Hashed)> {
+        let mut entries: Vec<(&str, &Hashed)> =
+            self.hashed.iter().map(|(name, entry)| (name.as_str(), entry)).collect();
+        entries.sort_by_key(|(name, entry)| (bash_hash_bucket(name), std::cmp::Reverse(entry.seq)));
+        entries
+    }
+
+    /// The value of alias `name`.
+    pub(crate) fn alias(&self, name: &str) -> Option<&str> {
+        self.aliases.get(name).map(String::as_str)
+    }
+
+    /// Defines alias `name` as `value`.
+    pub(crate) fn set_alias(&mut self, name: &str, value: String) {
+        self.aliases.insert(name.to_owned(), value);
+    }
+
+    /// Removes alias `name`; whether it existed.
+    pub(crate) fn remove_alias(&mut self, name: &str) -> bool {
+        self.aliases.remove(name).is_some()
+    }
+
+    /// Removes every alias (`unalias -a`).
+    pub(crate) fn clear_aliases(&mut self) {
+        self.aliases.clear();
+    }
+
+    /// Every alias, by name in byte order, as `alias` lists them.
+    pub(crate) fn aliases(&self) -> &BTreeMap<String, String> {
+        &self.aliases
+    }
+
+    /// What variable `name` is now, to put back with [`ShellState::restore_variable`].
+    pub(crate) fn save_variable(&self, name: &str) -> SavedVariable {
+        SavedVariable(self.variables.get(name).cloned())
+    }
+
+    /// Puts variable `name` back as `saved` holds it.
+    pub(crate) fn restore_variable(&mut self, name: &str, saved: SavedVariable) {
+        self.noticed(name);
+        match saved.0 {
+            Some(variable) => {
+                self.variables.insert(name.to_owned(), variable);
+            }
+            None => {
+                self.variables.remove(name);
+            }
+        }
+    }
+
+    /// Sets `name` to `value`, exported, for one builtin's run (bash's temporary environment). Its other attributes
+    /// are kept.
+    pub(crate) fn set_temporary(&mut self, name: &str, value: OsString) {
+        self.store(name, value);
+        if let Some(variable) = self.variables.get_mut(name) {
+            variable.attributes.exported = true;
+        }
+    }
+
+    /// Sets the positional parameters (`set --`, `shift`, `source` with arguments).
+    pub(crate) fn set_positional(&mut self, parameters: Vec<String>) {
+        self.positional = parameters;
     }
 
     /// `$?`: the status of the last pipeline run.
@@ -391,15 +749,22 @@ impl ShellState {
         &mut self.options
     }
 
-    /// The names of the set variables, sorted as bash sorts them for `${!prefix*}` (byte order).
+    /// The names of the set variables, sorted as bash sorts them for `${!prefix*}` (byte order). A variable declared
+    /// without a value is not set, and not listed.
     pub(crate) fn variable_names(&self) -> impl Iterator<Item = &str> {
-        self.variables.keys().map(String::as_str)
+        self.variables
+            .iter()
+            .filter(|(_, variable)| variable.value.is_some())
+            .map(|(name, _)| name.as_str())
     }
 
     /// Whether reading variable `name` must be refused because bash would answer with a value it maintains itself
     /// ([`Unsupported::ShellVariable`](crate::Unsupported::ShellVariable)).
     pub(crate) fn is_unemulated(&self, name: &str) -> bool {
-        is_always_unemulated(name) || (UNEMULATED_WHEN_UNSET.contains(&name) && !self.variables.contains_key(name))
+        is_always_unemulated(name)
+            || (UNEMULATED_WHEN_UNSET.contains(&name)
+                && !self.variables.contains_key(name)
+                && !self.touched.contains(name))
     }
 
     /// Whether `${!prefix*}` could list a variable whose reading [`ShellState::is_unemulated`] refuses: bash would
@@ -423,8 +788,8 @@ impl ShellState {
         let mut named: BTreeMap<&str, &OsStr> = self
             .variables
             .iter()
-            .filter(|(_, variable)| variable.exported)
-            .map(|(name, variable)| (name.as_str(), variable.value.as_os_str()))
+            .filter(|(_, variable)| variable.attributes.exported)
+            .filter_map(|(name, variable)| Some((name.as_str(), variable.value.as_deref()?)))
             .collect();
         for (name, value) in assignments {
             named.insert(name, value);
@@ -435,6 +800,35 @@ impl ShellState {
             .chain(named.into_iter().map(|(name, value)| (name.into(), value.to_owned())))
             .collect()
     }
+}
+
+/// The bucket of `name` in bash's command hash table: FNV-1 (`hash_string`) masked to its 256 buckets
+/// (`FILENAME_HASH_BUCKETS`).
+fn bash_hash_bucket(name: &str) -> u32 {
+    let mut hash: u32 = 2_166_136_261;
+    for byte in name.bytes() {
+        hash = hash.wrapping_mul(16_777_619);
+        hash ^= u32::from(byte);
+    }
+    hash & 255
+}
+
+/// `text` in upper case (`upper`) or lower case, one character at a time as bash's `sh_modcase` does with
+/// `towupper` and `towlower`: a character whose conversion is more than one character (`ß`) is kept.
+pub(crate) fn convert_case(text: &str, upper: bool) -> String {
+    text.chars()
+        .map(|ch| {
+            let mut converted: Vec<char> = if upper {
+                ch.to_uppercase().collect()
+            } else {
+                ch.to_lowercase().collect()
+            };
+            match converted.len() {
+                1 => converted.pop().unwrap_or(ch),
+                _ => ch,
+            }
+        })
+        .collect()
 }
 
 /// Whether `name` is a valid shell identifier: `[A-Za-z_][A-Za-z0-9_]*`.
@@ -525,7 +919,7 @@ mod tests {
     #[test]
     fn variables_bash_maintains_are_not_emulated() {
         let state = state().with_environment([("TERM".into(), "xterm".into())]);
-        for name in ["RANDOM", "LINENO", "BASH_VERSION", "_", "PPID", "OLDPWD"] {
+        for name in ["RANDOM", "LINENO", "BASH_VERSION", "_", "PPID"] {
             assert!(state.is_unemulated(name), "{name}");
         }
         assert!(state.is_unemulated("HOSTNAME"));

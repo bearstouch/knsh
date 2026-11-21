@@ -428,6 +428,18 @@ fn build_command(
     if let Some(cwd) = &request.cwd {
         command.current_dir(cwd);
     }
+    if let Some(mask) = request.umask {
+        // A plain integer, masked to the permission bits `umask` takes.
+        let mask = libc::mode_t::try_from(mask & 0o777).unwrap_or(0o022);
+        // SAFETY: the closure runs in the forked child before `exec` and only calls `umask`, which is
+        // async-signal-safe, takes a plain integer and cannot fail.
+        unsafe {
+            command.pre_exec(move || {
+                libc::umask(mask);
+                Ok(())
+            });
+        }
+    }
     let [stdin, stdout, stderr] = standard_descriptors(&request.stdio)?;
     command.stdin(stdin).stdout(stdout).stderr(stderr);
     if let Some(options) = job {
@@ -814,6 +826,28 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         panic!("the member of the group survived");
+    }
+
+    // KNSH-101: the child starts with the umask the request names (a shell's `umask`), not the caller's.
+    #[test]
+    fn spawn_sets_the_requested_umask() {
+        use std::io::Read;
+
+        for (mask, shown) in [(Some(0o077), "0077"), (Some(0o002), "0002")] {
+            let (mut read, write) = std::io::pipe().unwrap();
+            let out = SharedFd::new(write.into());
+            let null = SharedFd::new(std::fs::File::open("/dev/null").unwrap().into());
+            let mut request = SpawnRequest::new("/bin/sh").arg("-c").arg("umask");
+            request.stdio = Stdio::Passed(Box::new([null.clone(), out, null]));
+            request.umask = mask;
+            let processes = SystemProcesses::new();
+            let group = processes.spawn(&request).unwrap();
+            drop(request);
+            let mut text = String::new();
+            read.read_to_string(&mut text).unwrap();
+            assert_eq!(processes.wait(group), Ok(ExitStatus::Exited(0)));
+            assert_eq!(text.trim(), shown);
+        }
     }
 
     // KNSH-051: passed stdio becomes the child's 0, 1 and 2; an inherited descriptor keeps its number, and nothing

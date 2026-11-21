@@ -37,6 +37,9 @@ pub enum Failure {
     Unbound(String),
     /// Something the interpreter does not evaluate yet (an array element, a variable bash computes).
     Unsupported(Unsupported),
+    /// The expression assigns this read-only variable (KNSH-101). Bash reports `name: readonly variable` and abandons
+    /// the expression, as for an arithmetic error.
+    Readonly(String),
 }
 
 type Result<T> = std::result::Result<T, Failure>;
@@ -55,7 +58,7 @@ pub(crate) trait Variables {
     ///
     /// # Errors
     ///
-    /// As bash refuses the assignment (none yet: read-only variables arrive with KNSH-101).
+    /// [`Failure::Readonly`] for a read-only variable; [`Failure::Unsupported`] for one bash maintains itself.
     fn set(&mut self, name: &str, value: i64) -> Result<()>;
 }
 
@@ -93,8 +96,20 @@ impl Variables for StateVariables<'_> {
         if crate::state::refuses_assignment(name) {
             return Err(Failure::Unsupported(Unsupported::ShellVariable));
         }
-        self.state.set_variable(name, value.to_string());
-        Ok(())
+        assigned(name, self.state.assign(name, value.to_string().into(), false))
+    }
+}
+
+/// An arithmetic assignment's outcome as a [`Failure`].
+pub(crate) fn assigned(name: &str, result: std::result::Result<(), crate::state::AssignError>) -> Result<()> {
+    use crate::state::AssignError;
+    match result {
+        Ok(()) => Ok(()),
+        Err(AssignError::Readonly) => Err(Failure::Readonly(name.to_owned())),
+        Err(AssignError::Arithmetic(failure)) => Err(failure),
+        Err(AssignError::Unsupported(feature)) => Err(Failure::Unsupported(feature)),
+        // The evaluator only assigns names it read as identifiers.
+        Err(AssignError::Invalid) => Err(Failure::Error(format!("{name}: invalid variable name"))),
     }
 }
 

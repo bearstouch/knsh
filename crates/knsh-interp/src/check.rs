@@ -1,4 +1,4 @@
-//! The check of a whole script before it runs (KNSH-096 to KNSH-100): every construct a later story
+//! The check of a whole script before it runs (KNSH-096 to KNSH-101): every construct a later story
 //! implements is refused here, with its span, so a script the interpreter cannot evaluate runs none of its commands.
 //!
 //! Expansions are read but not performed: each `${…}` body is parsed, and the words and expressions inside it are
@@ -17,7 +17,7 @@ use knsh_bash::{
 
 use crate::brace;
 use crate::error::{InterpError, Unsupported};
-use crate::eval::{exec_redirects_only, external_builtin_differs, is_refused_builtin, trailing_redirection};
+use crate::eval::{external_builtin_differs, is_refused_builtin, refused_form, trailing_redirection};
 use crate::expand::MAX_EXPANSION_DEPTH;
 use crate::param::{self, Name, Op, Parsed};
 use crate::pattern;
@@ -128,14 +128,17 @@ impl Checker<'_> {
         for command_word in &simple.words {
             literals.push(self.literal_argument(command_word)?);
         }
-        // A builtin named literally is refused now; one produced by an expansion when it runs.
+        // A builtin named literally is refused now; one produced by an expansion when it runs. So is a form of a
+        // builtin the interpreter runs that a later story implements (`set -e`, `declare -a`), when its words are
+        // literal; the builtin refuses it again when it runs.
         if let (Some(Some(name)), Some(first)) = (literals.first(), simple.words.first()) {
             let args: Option<Vec<String>> = literals.iter().skip(1).cloned().collect();
             let differs = args.as_ref().is_some_and(|args| external_builtin_differs(name, args));
-            // `exec cmd` replaces the shell: refused; `exec` with redirections only is run (KNSH-099).
-            let replaces_shell = name == "exec" && args.is_some_and(|args| !exec_redirects_only(&args));
-            if is_refused_builtin(name) || differs || replaces_shell {
+            if is_refused_builtin(name) || differs {
                 return Err(refuse(Unsupported::Builtin, first.span));
+            }
+            if let Some(feature) = args.as_deref().and_then(|args| refused_form(name, args)) {
+                return Err(refuse(feature, first.span));
             }
         }
         self.redirections(&simple.redirections)

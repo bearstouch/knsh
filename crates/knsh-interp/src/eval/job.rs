@@ -60,9 +60,13 @@ const POSIX_TIME_FORMAT: &str = "real %2R\nuser %2U\nsys %2S";
 
 /// The status of a command run in a subshell: an `exit` (or a fatal expansion error) ends only the subshell, with its
 /// status; a discarded line ends it with 1.
+/// `break`, `continue` and `return` end the subshell too, with their status, as bash's forked subshell ends (KNSH-101).
 fn subshell_status(result: &Flow<Status>) -> Result<Status, InterpError> {
     match result {
-        Ok(status) | Err(Stop::Exit(status)) => Ok(*status),
+        Ok(status)
+        | Err(Stop::Exit(status) | Stop::Return(status) | Stop::Break { status, .. } | Stop::Continue { status, .. }) => {
+            Ok(*status)
+        }
         Err(Stop::Discard) => Ok(Status::FAILURE),
         Err(Stop::Error(error)) => Err(*error),
     }
@@ -131,6 +135,13 @@ impl Interpreter {
             pipe_stderr: false,
             is_subshell: true,
             parent: None,
+            loops: self.loops,
+            sourcing: self.sourcing,
+            nested_bytes: self.nested_bytes,
+            observer: None,
+            visible_aliases: Arc::clone(&self.visible_aliases),
+            alias_guard: self.alias_guard.clone(),
+            exit_after_job: false,
         }
     }
 
@@ -234,7 +245,12 @@ impl Interpreter {
             }
         }
         let key = self.launch(pipeline, false, run)?;
-        self.wait_foreground(key, run)
+        let status = self.wait_foreground(key, run)?;
+        // `exec cmd` in the shell itself: the shell was replaced by the program, and ends with it.
+        if std::mem::take(&mut self.exit_after_job) {
+            return Err(Stop::Exit(status));
+        }
+        Ok(status)
     }
 
     /// `time pipeline`: the pipeline, then the real, user and system time it took on the shell's descriptor 2, in
@@ -424,11 +440,17 @@ impl Interpreter {
         subshell.parent = Some(self.jobs.parent(key, index));
         let sender = self.jobs.sender();
         let source: Arc<str> = Arc::from(run.source);
+        let origin: Option<Arc<str>> = run.origin.map(Arc::from);
+        let line_base = run.line_base;
         std::thread::Builder::new()
             .name("knsh-subshell".to_owned())
             .stack_size(EVAL_STACK_SIZE)
             .spawn(move || {
-                let run = Run { source: &source };
+                let run = Run {
+                    source: &source,
+                    origin: origin.as_deref(),
+                    line_base,
+                };
                 // A panic must still be reported, or the shell would wait for this member forever.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     subshell_status(&task(&mut subshell, &run))

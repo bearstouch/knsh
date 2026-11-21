@@ -46,6 +46,9 @@ pub struct CommandRequest {
     ///
     /// [`standard_descriptors`]: CommandRequest::standard_descriptors
     pub descriptors: Vec<(i32, ChildDescriptor)>,
+    /// The file mode creation mask the command starts with: the shell's own (`umask`, KNSH-101), set in the child
+    /// before it executes. `None` leaves the caller's.
+    pub umask: Option<u32>,
 }
 
 impl CommandRequest {
@@ -203,6 +206,7 @@ impl CommandSpawner for ProcessCommandSpawner {
             stdio: self.stdio.clone(),
             inherit: Vec::new(),
             placements: placements(&request.descriptors),
+            umask: request.umask,
         };
         match self.processes.spawn_child(&spawn, options) {
             Ok(child) => Ok(Started::Running(child)),
@@ -278,6 +282,7 @@ mod tests {
             env: vec![("PATH".into(), "/bin".into())],
             cwd: PathBuf::from("/work"),
             descriptors: CommandRequest::standard_descriptors(),
+            umask: None,
         }
     }
 

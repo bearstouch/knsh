@@ -125,7 +125,7 @@ fn run_knsh(script: &str, dir: &Path) -> (String, u8) {
 
 /// Runs `script` under the native interpreter in `dir` with positional parameters `args`: (stdout, status).
 fn run_knsh_with(script: &str, dir: &Path, args: &[&str]) -> (String, u8) {
-    run_knsh_full(script, dir, args, |_| {}, &[])
+    run_knsh_full(script, dir, args, |_| {}, &[], 0o022)
 }
 
 /// Runs `script` under the native interpreter in `dir` with positional parameters `args`, the options `options`
@@ -136,6 +136,7 @@ fn run_knsh_full(
     args: &[&str],
     options: impl FnOnce(&mut ShellOptions),
     env: &[(&str, &str)],
+    umask: u32,
 ) -> (String, u8) {
     let (mut reader, writer) = std::io::pipe().unwrap();
     let null = || SharedFd::new(OwnedFd::from(std::fs::File::open("/dev/null").unwrap()));
@@ -149,7 +150,8 @@ fn run_knsh_full(
     let mut state = ShellState::new("knsh", dir)
         .unwrap()
         .with_environment(environment)
-        .with_positional(args.iter().map(|arg| (*arg).to_owned()).collect());
+        .with_positional(args.iter().map(|arg| (*arg).to_owned()).collect())
+        .with_umask(umask);
     options(state.options_mut());
     let extglob = state.options().extglob;
     let mut interpreter = Interpreter::new(
@@ -194,7 +196,7 @@ fn signalled_command_is_128_plus_signal() {
     // `kill 0` signals the caller's own process group. Without job control a command stays in the shell's group, as
     // in bash (KNSH-100), where it would kill the test runner too; under `set -m` it leads a group of its own, so
     // only the command dies. Compared against the documented value.
-    let knsh = run_knsh_full(script, &dir, &[], |options| options.monitor = true, &[]);
+    let knsh = run_knsh_full(script, &dir, &[], |options| options.monitor = true, &[], 0o022);
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(knsh, (String::new(), 137));
 }
@@ -279,7 +281,7 @@ fn words_script_matches_bash() {
     let knsh_dir = temp_dir("knsh-words");
     let home = [("HOME", "/Users/nobody-knsh")];
     let bash = run_bash_full(WORDS, &bash_dir, &[], &[], &home);
-    let knsh = run_knsh_full(WORDS, &knsh_dir, &[], |_| {}, &home);
+    let knsh = run_knsh_full(WORDS, &knsh_dir, &[], |_| {}, &home, 0o022);
     std::fs::remove_dir_all(&bash_dir).unwrap();
     std::fs::remove_dir_all(&knsh_dir).unwrap();
     assert!(bash.0.contains("escaped-pattern"), "bash output: {}", bash.0);
@@ -326,6 +328,7 @@ fn glob_options_match_bash() {
                 other => panic!("{other}"),
             },
             &[],
+            0o022,
         );
         std::fs::remove_dir_all(&bash_dir).unwrap();
         std::fs::remove_dir_all(&knsh_dir).unwrap();
@@ -342,7 +345,7 @@ fn glob_order_matches_bash_in_c_and_utf8_locales() {
         let bash_dir = temp_dir("bash-order");
         let knsh_dir = temp_dir("knsh-order");
         let bash = run_bash_full(script, &bash_dir, &[], &[], &env);
-        let knsh = run_knsh_full(script, &knsh_dir, &[], |_| {}, &env);
+        let knsh = run_knsh_full(script, &knsh_dir, &[], |_| {}, &env, 0o022);
         std::fs::remove_dir_all(&bash_dir).unwrap();
         std::fs::remove_dir_all(&knsh_dir).unwrap();
         assert_eq!(knsh, bash, "LANG={locale}");
@@ -400,7 +403,7 @@ fn noclobber_matches_bash() {
     let bash_dir = temp_dir("bash-noclobber");
     let knsh_dir = temp_dir("knsh-noclobber");
     let bash = run_bash_full(script, &bash_dir, &[], &["-C"], &[]);
-    let knsh = run_knsh_full(script, &knsh_dir, &[], |options| options.noclobber = true, &[]);
+    let knsh = run_knsh_full(script, &knsh_dir, &[], |options| options.noclobber = true, &[], 0o022);
     std::fs::remove_dir_all(&bash_dir).unwrap();
     std::fs::remove_dir_all(&knsh_dir).unwrap();
     assert_eq!(bash.0, "refused\na\nc\nnull-ok\n");
@@ -465,9 +468,63 @@ fn pipefail_matches_bash() {
     let bash_dir = temp_dir("bash-pipefail");
     let knsh_dir = temp_dir("knsh-pipefail");
     let bash = run_bash_full(script, &bash_dir, &[], &["-o", "pipefail"], &[]);
-    let knsh = run_knsh_full(script, &knsh_dir, &[], |options| options.pipefail = true, &[]);
+    let knsh = run_knsh_full(script, &knsh_dir, &[], |options| options.pipefail = true, &[], 0o022);
     std::fs::remove_dir_all(&bash_dir).unwrap();
     std::fs::remove_dir_all(&knsh_dir).unwrap();
     assert_eq!(bash.0, "1\n1\n3\n0\n0\n");
+    assert_eq!(knsh, bash);
+}
+
+/// The core builtins (KNSH-101) in forms bash 3.2 (`/bin/bash` here) and 5.2 agree on. Directories are printed
+/// relative to the run's own temporary directory, `$base`. Left out because 3.2 differs from 5.2, which the
+/// interpreter follows: `type -t` of a name not found (5.2: status 1), `return` outside a sourced file (5.2: 2),
+/// `exit abc` (5.2: 2), `echo -e '\e'`, and usage errors (5.2: 2).
+const BUILTINS: &str = r#"base=$PWD
+export -p | sed "s|$base|BASE|"
+echo -e 'a\tb\x41\0101'; echo -n x; echo; echo -ne 'y\cz'; echo; echo 'a\nb' -E -n; echo -e -n; echo -- -n
+x=1; export y="a\"b\$c"; declare -p x y; declare -rx z=2; declare -p z
+declare -i n=3+4; n+=2; echo $n; declare -p n
+set -- a 'b c' d; shift; echo $# "$1"; shift 5; echo $?
+set x y; echo "$*"; set --; echo $#
+for i in 1 2 3; do for j in a b; do continue 2; done; echo no; done; echo $i
+while :; do while :; do break 2; done; echo no; done; echo broke
+for i in 1 2; do (break); echo $i; done
+for ((k = 0; k < 3; k++)); do continue; done; echo $k
+readonly r=1; r=2 /bin/echo temp; unset r; echo $?
+unset nosuch; echo $?; unset 1a; echo $?
+type cd if ls; type -t cd if ls; echo $?; type nosuch; echo $?
+command -v cd ls if nosuch; echo $?; command -V cd ls if
+hash; ls >/dev/null; hash; hash -t ls; hash -r; hash
+mkdir -p d/sub; cd d; echo "${PWD#$base}" "${OLDPWD#$base}"; cd sub; cd ..; echo "${PWD#$base}"
+cd "$base"; ln -s d link; cd link; echo "${PWD#$base}"; pwd -P | sed "s|^$base||"; cd -P .; echo "${PWD#$base}"
+cd "$base"; CDPATH=/nowhere:$base/d; cd sub > "$base/cdout"; echo "${PWD#$base}"; sed "s|^$base||" "$base/cdout"
+unset CDPATH; cd - >/dev/null; echo "${PWD#$base}"; cd /nonexistent; echo $?
+umask 077; umask; umask -S; umask -p; touch f; ls -l f | cut -c1-10; umask u=rwx,g=rx,o=; umask; umask 022
+eval 'echo "$#"'; eval "w=5"; echo $w; eval ''; echo $?
+printf 'echo sourced $#\nreturn 3\necho never\n' > inc.sh; . ./inc.sh a b; echo $? $#
+alias ll='ls -l'; alias q="it's"; alias; alias ll; unalias ll; alias; type -t q; echo $?
+x=hi eval 'echo $x'; echo "[$x]"
+exec /bin/echo bye
+echo never
+"#;
+
+/// The umask this process runs with, as `/bin/sh` reports it: what both shells inherit.
+fn inherited_umask() -> u32 {
+    let output = Command::new("/bin/sh").arg("-c").arg("umask").output().unwrap();
+    u32::from_str_radix(String::from_utf8(output.stdout).unwrap().trim(), 8).unwrap()
+}
+
+// NFR-COMPAT-02, KNSH-101: the core builtins' output and statuses match bash.
+#[test]
+fn builtin_script_matches_bash() {
+    let bash_dir = temp_dir("bash-builtins");
+    let knsh_dir = temp_dir("knsh-builtins");
+    let bash = run_bash(BUILTINS, &bash_dir);
+    let umask = inherited_umask();
+    let knsh = run_knsh_full(BUILTINS, &knsh_dir, &[], |_| {}, &[], umask);
+    std::fs::remove_dir_all(&bash_dir).unwrap();
+    std::fs::remove_dir_all(&knsh_dir).unwrap();
+    assert!(bash.0.ends_with("[1]\nbye\n"), "bash output: {}", bash.0);
+    assert_eq!(knsh.0, bash.0);
     assert_eq!(knsh, bash);
 }

@@ -10,7 +10,8 @@
 //!
 //! "Executable" means any execute bit, as [`knsh_platform`]'s binary lookup reads it. Bash asks the kernel for the
 //! current user; for a file executable only by others the two differ, and `exec` then fails, which still gives 126.
-//! Bash's command hash table is not kept: every command is looked up afresh, which bash also does after `hash -r`.
+//! Bash's command hash table is kept by the interpreter (KNSH-101): a name found here is remembered and run from
+//! the table afterwards, until `PATH` changes or `hash -r`.
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -89,6 +90,31 @@ pub(crate) fn find(fs: &dyn Fs, name: &str, path: Option<&OsStr>, cwd: &Path) ->
         Some(_) => Resolved::NotExecutable(Refusal::PermissionDenied),
         None => Resolved::NotFound(Missing::NotOnPath),
     }
+}
+
+/// Every executable regular file `name` names in the entries of `path` (the value of `PATH`), in order: what
+/// `type -a` lists (bash's `user_command_matches`). Empty when `name` holds a `/` or `PATH` is unset.
+pub(crate) fn all_on_path(fs: &dyn Fs, name: &str, path: Option<&OsStr>, cwd: &Path) -> Vec<PathBuf> {
+    let Some(path) = path.filter(|_| !name.is_empty() && !name.contains('/')) else {
+        return Vec::new();
+    };
+    path.as_bytes()
+        .split(|&byte| byte == b':')
+        .map(|entry| {
+            let dir = if entry.is_empty() {
+                cwd.to_path_buf()
+            } else {
+                cwd.join(OsStr::from_bytes(entry))
+            };
+            dir.join(name)
+        })
+        .filter(|candidate| probe(fs, candidate) == Probe::Executable)
+        .collect()
+}
+
+/// Whether `path` is an executable regular file, symlinks followed (bash's `executable_file`).
+pub(crate) fn is_executable(fs: &dyn Fs, path: &Path) -> bool {
+    probe(fs, path) == Probe::Executable
 }
 
 /// Resolves a path named directly.

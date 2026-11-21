@@ -117,7 +117,7 @@ fn quoted_star_joins_with_first_ifs_char() {
     assert_eq!(expand_with(&args, &[("IFS", ":-")], r#""$*""#), ["a:b:c"]);
     assert_eq!(expand_with(&args, &[("IFS", "")], r#""$*""#), ["abc"]);
     let mut unset_ifs = state(&args, &[]);
-    unset_ifs.unset_variable("IFS");
+    unset_ifs.unset("IFS").unwrap();
     assert_eq!(expand_in(&mut unset_ifs, r#""$*""#).unwrap(), ["a b c"]);
 }
 
@@ -473,13 +473,17 @@ fn tilde_expands_home_and_user() {
     );
     // HOME unset: the user database; HOME empty: empty.
     let mut state = state(&[], &[]);
-    state.unset_variable("HOME");
+    state.unset("HOME").unwrap();
     assert_eq!(expand_in(&mut state, "~").unwrap(), ["/Users/me"]);
     state.set_variable("HOME", "");
     assert_eq!(expand_in(&mut state, "~").unwrap(), [""]);
-    for words in ["~-", "~1", "~+2"] {
+    for words in ["~1", "~+2", "~-3"] {
         assert_eq!(refusal(&[], words), Unsupported::DirectoryStack, "{words}");
     }
+    // KNSH-101: `~-` is `$OLDPWD`, left as written while it is unset.
+    assert_eq!(expand_in(&mut state, "~-/x").unwrap(), ["~-/x"]);
+    state.set_variable("OLDPWD", "/old");
+    assert_eq!(expand_in(&mut state, "~-/x").unwrap(), ["/old/x"]);
 }
 
 // Fail closed: bash would pass a home directory that is not UTF-8 as its bytes, not `~name` as written.
