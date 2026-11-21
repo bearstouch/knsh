@@ -64,7 +64,9 @@ impl Interpreter {
     /// The parse options a line is read with, from the shell's options (as bash reads each line with the options
     /// set before it).
     pub(super) fn parse_options(&self) -> ParseOptions {
-        let mut options = ParseOptions::default().with_redirection_variables(true);
+        let mut options = ParseOptions::default()
+            .with_redirection_variables(true)
+            .with_arrays(true);
         options.extglob = self.state.options().extglob;
         options
     }
@@ -93,11 +95,7 @@ impl Interpreter {
             return Ok(Status::SUCCESS);
         }
         let text = args.join(" ");
-        let nested = Run {
-            source: &text,
-            origin: run.origin,
-            line_base: run.line(span).saturating_sub(1),
-        };
+        let nested = Run::nested(&text, run.origin, run.line(span).saturating_sub(1));
         self.run_text(&nested, Kind::Eval, span)
     }
 
@@ -162,14 +160,17 @@ impl Interpreter {
             self.state.set_positional(parameters.to_vec());
             saved
         });
-        let nested = Run {
-            source: &text,
-            origin: Some(&found),
-            line_base: 0,
-        };
+        let nested = Run::nested(&text, Some(&found), 0);
+        // KNSH-103: `source` is a frame of the call stack (`FUNCNAME` shows `source`, `BASH_SOURCE` the file).
+        self.state.push_frame(crate::state::Frame {
+            function: None,
+            file: Some(found.clone()),
+            line: run.line(span),
+        });
         self.sourcing += 1;
         let result = self.run_text(&nested, Kind::Source, span);
         self.sourcing -= 1;
+        self.state.pop_frame();
         if let Some(saved) = saved {
             self.state.set_positional(saved);
         }
@@ -258,11 +259,7 @@ impl Interpreter {
             let Ok(script) = knsh_bash::parse_with(before, self.parse_options()) else {
                 return Err(refused());
             };
-            let prefix = Run {
-                source: before,
-                origin: nested.origin,
-                line_base: nested.line_base,
-            };
+            let prefix = Run::nested(before, nested.origin, nested.line_base);
             self.run_parsed(&script, &prefix)?;
         }
         let name = nested

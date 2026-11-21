@@ -465,6 +465,11 @@ fn same_simple(
                 && shift.span(old.span) == new.span
                 && shift.span(old.value) == new.value
                 && same_substitutions(&old.substitutions, &new.substitutions, shift)
+                // Lines are re-read without `ParseOptions::arrays`, so neither side ever holds an array part.
+                && old.subscript.is_none()
+                && new.subscript.is_none()
+                && old.array.is_none()
+                && new.array.is_none()
         });
     let same_calls = match (&old.function_call, &new.function_call) {
         (None, None) => true,
@@ -486,7 +491,7 @@ fn same_simple(
     )?;
     let mut replaced = 0;
     for (old_word, new_word) in old.words.iter().zip(&new.words) {
-        check(shift.span(old_word.span) == new_word.span)?;
+        check(shift.span(old_word.span) == new_word.span && old_word.array.is_none() && new_word.array.is_none())?;
         if let Some(edit) = shift.edit_at(old_word.span) {
             // The replaced name must read as exactly its path: one word, no expansion, nothing else.
             check(

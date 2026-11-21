@@ -21,6 +21,12 @@
 //!    (`nullglob`), or abandons the command with bash's `no match` error (`failglob`).
 //! 4. Quote removal: what is left are the characters themselves.
 //!
+//! Arrays (KNSH-103): `${a[i]}` reads one element (the subscript expanded, then evaluated as an arithmetic expression
+//! for an indexed array or taken as the key of an associative one), `${a[@]}` and `${a[*]}` every element as `$@`
+//! and `$*` do, `${!a[@]}` the keys, `${#a[@]}` the count, `${a[@]:offset:count}` a slice by index; the other
+//! operators apply to each element. A negative index counts back from the end; one before the first element is
+//! bash's `bad array subscript`, reported, and reads as unset.
+//!
 //! Bash's own expansion errors come back as [`ExpandError::Discard`] (bash abandons the command and the rest of its
 //! line: a bad substitution, an arithmetic error, an invalid indirection, `${1:=x}`) or [`ExpandError::Fatal`]
 //! (bash exits: an unset parameter under `set -u`, `${x?}`), with bash's message.
@@ -34,12 +40,11 @@ use knsh_platform::{Collation, Fs, UserHomes};
 use crate::arith::{self, Failure};
 use crate::error::{InterpError, Unsupported};
 use crate::glob;
-use crate::param::{self, CaseKind, DefaultKind, Name, Op, Parsed, ReplaceMode, ShellArray, Subscript};
+use crate::param::{self, CaseKind, DefaultKind, Name, Op, Parsed, ReplaceMode, Subscript};
 use crate::pattern::{self, Flags, Pattern};
 use crate::scan::{self, Mode, Part};
-use crate::state::{
-    AssignError, BASH_REMATCH, DEFAULT_IFS, LastBackground, PIPESTATUS, ShellState, refuses_assignment,
-};
+use crate::state::{AssignError, DEFAULT_IFS, ElementError, Key, Kind, LastBackground, ShellState, refuses_assignment};
+use crate::vars;
 use crate::word::{self, WordChar, assignment_value_start};
 
 /// Deepest nesting of `${…}` and `$((…))` inside one another. The parser's own limits keep real scripts far below
@@ -371,7 +376,7 @@ impl<'a> Expander<'a> {
                     // `$1` is named `$1` in bash's message; `$x` is named `x`.
                     let label = match &parsed {
                         Name::Variable(variable) => variable.clone(),
-                        Name::Positional(_) | Name::Special(_) | Name::Array(..) => format!("${parsed}"),
+                        Name::Positional(_) | Name::Special(_) | Name::Element(..) => format!("${parsed}"),
                     };
                     let value = self.require(value, &parsed, &label)?;
                     self.emit(value, quoted, out);
@@ -464,38 +469,33 @@ impl<'a> Expander<'a> {
         }
     }
 
-    /// The value of variable `name`: the command's own assignment first, then the shell's.
+    /// The value of variable `name`: the command's own assignment first, then the shell's (element 0 of an array).
     fn variable(&self, name: &str) -> std::result::Result<Option<String>, Unsupported> {
         if self.state.is_unemulated(name) {
             return Err(Unsupported::ShellVariable);
         }
-        // `$PIPESTATUS` is its first element, as for any bash array (KNSH-100).
-        if name == PIPESTATUS {
-            return Ok(self.state.pipestatus().first().map(ToString::to_string));
+        if let Some((_, value)) = self.overlay.iter().rev().find(|(assigned, _)| assigned == name) {
+            return value
+                .to_str()
+                .map(|value| Some(value.to_owned()))
+                .ok_or(Unsupported::NonUtf8Value);
         }
-        if name == BASH_REMATCH {
-            return Ok(self.state.bash_rematch().first().cloned());
-        }
-        let value = self
-            .overlay
-            .iter()
-            .rev()
-            .find(|(assigned, _)| assigned == name)
-            .map(|(_, value)| value.as_os_str())
-            .or_else(|| self.state.variable(name));
+        let Some(value) = self.state.value(name)? else {
+            return Ok(None);
+        };
         value
+            .first()
             .map(|value| value.to_str().map(str::to_owned).ok_or(Unsupported::NonUtf8Value))
             .transpose()
     }
 
-    /// Whether variable `name` is exported (or is one of the command's own assignments, which are).
     /// The attribute letters of variable `name` for `${name@a}`: a command's own assignment is exported.
     fn attribute_letters(&self, name: &str) -> String {
         let mut attributes = self.state.attributes(name).unwrap_or_default();
         if self.overlay.iter().any(|(assigned, _)| assigned == name) {
             attributes.exported = true;
         }
-        attributes.letters()
+        attributes.letters(self.state.kind(name))
     }
 
     /// `${name=word}`'s assignment of `value`: bash's errors discard the line.
@@ -506,17 +506,20 @@ impl<'a> Expander<'a> {
             Err(AssignError::Arithmetic(failure)) => Err(failed(failure, span)),
             Err(AssignError::Unsupported(feature)) => Err(InterpError::Unsupported { feature, span }.into()),
             Err(AssignError::Invalid) => Err(ExpandError::Discard(format!("{name}: bad substitution"))),
+            Err(AssignError::BadSubscript | AssignError::Kind) => Err(InterpError::Unsupported {
+                feature: Unsupported::Array,
+                span,
+            }
+            .into()),
         }
     }
 
     /// The value of parameter `name`, or `None` if it is unset.
-    fn lookup(&self, name: &Name, span: Span) -> Result<Option<Value>> {
+    fn lookup(&mut self, name: &Name, span: Span) -> Result<Option<Value>> {
+        let refused = |feature| ExpandError::from(InterpError::Unsupported { feature, span });
         let state = &*self.state;
         Ok(match name {
-            Name::Variable(variable) => self
-                .variable(variable)
-                .map_err(|feature| InterpError::Unsupported { feature, span })?
-                .map(Value::Str),
+            Name::Variable(variable) => self.variable(variable).map_err(refused)?.map(Value::Str),
             Name::Positional(0) => Some(Value::Str(state.name().to_owned())),
             Name::Positional(n) => state.positional().get(n - 1).cloned().map(Value::Str),
             Name::Special(special) => match special {
@@ -532,35 +535,115 @@ impl<'a> Expander<'a> {
                     None => None,
                     Some(LastBackground::Process(pid)) => Some(Value::Str(pid.to_string())),
                     Some(LastBackground::InShell) => {
-                        return Err(InterpError::Unsupported {
-                            feature: Unsupported::InShellProcessId,
-                            span,
-                        }
-                        .into());
+                        return Err(refused(Unsupported::InShellProcessId));
                     }
                 },
                 _ => None,
             },
-            Name::Array(array, subscript) => {
-                let statuses: Vec<String> = match array {
-                    ShellArray::Pipestatus => state.pipestatus().iter().map(ToString::to_string).collect(),
-                    ShellArray::BashRematch => state.bash_rematch().to_vec(),
-                };
-                match *subscript {
-                    Subscript::All { star } => Some(Value::List { items: statuses, star }),
-                    Subscript::Index(index) => {
-                        let at = if index < 0 {
-                            usize::try_from(index.unsigned_abs())
-                                .ok()
-                                .and_then(|back| statuses.len().checked_sub(back))
-                        } else {
-                            usize::try_from(index).ok()
-                        };
-                        at.and_then(|at| statuses.get(at).cloned()).map(Value::Str)
-                    }
-                }
+            Name::Element(array, Subscript::All { star }) => self.elements(array, span)?.map(|elements| Value::List {
+                items: elements.into_iter().map(|(_, value)| value).collect(),
+                star: *star,
+            }),
+            Name::Element(array, subscript) => {
+                let key = self.key(array, subscript, span)?;
+                self.element(array, &key, span)?.map(Value::Str)
             }
         })
+    }
+
+    /// Every element of array `array` (a string is element 0; the command's own assignment first), or `None` when
+    /// it is unset.
+    fn elements(&self, array: &str, span: Span) -> Result<Option<Vec<(Key, String)>>> {
+        let refused = |feature| ExpandError::from(InterpError::Unsupported { feature, span });
+        if self.state.is_unemulated(array) {
+            return Err(refused(Unsupported::ShellVariable));
+        }
+        if let Some((_, value)) = self.overlay.iter().rev().find(|(assigned, _)| assigned == array) {
+            let value = value.to_str().ok_or_else(|| refused(Unsupported::NonUtf8Value))?;
+            return Ok(Some(vec![(Key::Index(0), value.to_owned())]));
+        }
+        let Some(value) = self.state.value(array).map_err(refused)? else {
+            return Ok(None);
+        };
+        value
+            .elements()
+            .into_iter()
+            .map(|(key, value)| {
+                let value = value.into_string().map_err(|_| refused(Unsupported::NonUtf8Value))?;
+                Ok((key, value))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+
+    /// Element `key` of `array`, or `None` when unset; a bad subscript is reported (bash goes on) and reads as unset.
+    fn element(&self, array: &str, key: &Key, span: Span) -> Result<Option<String>> {
+        let refused = |feature| ExpandError::from(InterpError::Unsupported { feature, span });
+        if self.state.is_unemulated(array) {
+            return Err(refused(Unsupported::ShellVariable));
+        }
+        if let Some((_, value)) = self.overlay.iter().rev().find(|(assigned, _)| assigned == array) {
+            let value = vars::Value::Scalar(value.clone());
+            let Ok(found) = value.element(key) else {
+                self.state.note(format!("{array}: bad array subscript"));
+                return Ok(None);
+            };
+            return found
+                .map(|value| {
+                    value
+                        .to_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| refused(Unsupported::NonUtf8Value))
+                })
+                .transpose();
+        }
+        match self.state.element(array, key) {
+            Ok(found) => found
+                .map(|value| value.into_string().map_err(|_| refused(Unsupported::NonUtf8Value)))
+                .transpose(),
+            Err(ElementError::BadSubscript) => {
+                self.state.note(format!("{array}: bad array subscript"));
+                Ok(None)
+            }
+            Err(ElementError::Unsupported(feature)) => Err(refused(feature)),
+        }
+    }
+
+    /// The element `subscript` names in `array`: for an associative array the subscript expanded as a string, for
+    /// any other the subscript expanded and evaluated as an arithmetic expression. A subscript taken from a value
+    /// (an indirection's) is not expanded again, and one holding an expansion is refused.
+    fn key(&mut self, array: &str, subscript: &Subscript, span: Span) -> Result<Key> {
+        let assoc = self.state.kind(array) == Kind::Assoc;
+        self.subscript(assoc, subscript, span)
+    }
+
+    /// The element `subscript` names in an associative array (`assoc`) or an indexed one, as [`Expander::key`].
+    pub(crate) fn subscript(&mut self, assoc: bool, subscript: &Subscript, span: Span) -> Result<Key> {
+        match subscript {
+            Subscript::All { .. } => Ok(Key::Index(0)),
+            Subscript::Source { span: inner, .. } if assoc => {
+                let parts = scan::scan(self.source, *inner, Mode::Unquoted)?;
+                let mut fields = Fields::new();
+                self.expand(&parts, false, false, &mut fields)?;
+                let key: String = self.join(fields, *inner)?.into_iter().map(|c| c.ch).collect();
+                Ok(Key::Name(key))
+            }
+            Subscript::Source { span: inner, .. } => {
+                let text = self.arithmetic_text(*inner)?;
+                let index = self.evaluate(&text).map_err(|failure| failed(failure, span))?;
+                Ok(Key::Index(index))
+            }
+            Subscript::Text(text) if text.contains(['$', '`']) => Err(InterpError::Unsupported {
+                feature: Unsupported::Array,
+                span,
+            }
+            .into()),
+            Subscript::Text(text) if assoc => Ok(Key::Name(text.clone())),
+            Subscript::Text(text) => {
+                let index = self.evaluate(text).map_err(|failure| failed(failure, span))?;
+                Ok(Key::Index(index))
+            }
+        }
     }
 
     /// `$-`: the option letters of a shell started as `bash -c` (`h` hashing, `B` brace expansion, `c`), with `f`
@@ -620,6 +703,19 @@ impl<'a> Expander<'a> {
                 out.push_str(&length.to_string(), quoted, true);
                 Ok(())
             }
+            Parsed::Keys { name, star } => {
+                let items = self
+                    .elements(&name, span)?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(key, _)| match key {
+                        Key::Index(index) => index.to_string(),
+                        Key::Name(key) => key,
+                    })
+                    .collect();
+                self.emit(Some(Value::List { items, star }), quoted, out);
+                Ok(())
+            }
             Parsed::Names { prefix, at } => {
                 if self.state.lists_unemulated(&prefix) {
                     return Err(InterpError::Unsupported {
@@ -631,6 +727,7 @@ impl<'a> Expander<'a> {
                 let items = self
                     .state
                     .variable_names()
+                    .into_iter()
                     .filter(|name| name.starts_with(prefix.as_str()))
                     .map(str::to_owned)
                     .collect();
@@ -638,6 +735,22 @@ impl<'a> Expander<'a> {
                 Ok(())
             }
             Parsed::Param { name, indirect, op } => {
+                // `${!ref}` of a name reference is the name it refers to, not a second indirection (bash 4.3).
+                if indirect
+                    && let Name::Variable(variable) = &name
+                    && self
+                        .state
+                        .own_attributes(variable)
+                        .is_some_and(|attributes| attributes.nameref)
+                {
+                    let value = self
+                        .state
+                        .own_value(variable)
+                        .and_then(vars::Value::first)
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .map(Value::Str);
+                    return self.operate(&op, variable, &name, value, quoted, span, out);
+                }
                 let (label, target) = if indirect {
                     self.indirect(&name, span)?
                 } else {
@@ -649,22 +762,13 @@ impl<'a> Expander<'a> {
         }
     }
 
-    /// `${!name}`: the parameter the value of `name` names.
-    fn indirect(&self, name: &Name, span: Span) -> Result<(String, Name)> {
+    /// `${!name}`: the parameter the value of `name` names (an array element too: `x='a[1]'; ${!x}`).
+    fn indirect(&mut self, name: &Name, span: Span) -> Result<(String, Name)> {
         let text = match self.lookup(name, span)? {
             None => return Err(ExpandError::Discard(format!("{name}: invalid indirect expansion"))),
             Some(Value::Str(text)) => text,
             Some(Value::List { items, .. }) => items.join(" "),
         };
-        if let Some((array, _)) = text.split_once('[')
-            && Name::parse(array).is_some()
-        {
-            return Err(InterpError::Unsupported {
-                feature: Unsupported::Array,
-                span,
-            }
-            .into());
-        }
         match Name::parse(&text) {
             Some(target) => Ok((text, target)),
             None => Err(ExpandError::Discard(format!("{text}: invalid variable name"))),
@@ -690,9 +794,12 @@ impl<'a> Expander<'a> {
             }
             Op::Substring { offset, length } => {
                 let value = self.require(value, target, label)?;
-                match value {
-                    None => None,
-                    Some(value) => Some(self.substring(value, target, *offset, *length, span)?),
+                match (value, target) {
+                    (None, _) => None,
+                    (Some(Value::List { star, .. }), Name::Element(array, Subscript::All { .. })) => {
+                        Some(self.array_slice(array, star, *offset, *length, span)?)
+                    }
+                    (Some(value), _) => Some(self.substring(value, target, *offset, *length, span)?),
                 }
             }
             Op::Remove {
@@ -736,9 +843,17 @@ impl<'a> Expander<'a> {
                     }
                     .into());
                 }
+                if matches!(op, 'A' | 'K' | 'k') && matches!(target, Name::Element(..)) {
+                    // `declare` lines and key-value lists of arrays (KNSH-103) are not built yet.
+                    return Err(InterpError::Unsupported {
+                        feature: Unsupported::Array,
+                        span,
+                    }
+                    .into());
+                }
                 let value = self.require(value, target, label)?;
                 let letters = match target {
-                    Name::Variable(name) => self.attribute_letters(name),
+                    Name::Variable(name) | Name::Element(name, _) => self.attribute_letters(name),
                     _ => String::new(),
                 };
                 value
@@ -782,12 +897,39 @@ impl<'a> Expander<'a> {
             DefaultKind::Alternative if !missing => self.word(word, quoted, out),
             DefaultKind::Alternative => Ok(()),
             DefaultKind::Assign if missing => {
-                if let Name::Array(..) = target {
-                    return Err(InterpError::Unsupported {
-                        feature: Unsupported::Array,
-                        span: word,
+                if let Name::Element(array, subscript) = target {
+                    if matches!(subscript, Subscript::All { .. }) {
+                        return Err(InterpError::Unsupported {
+                            feature: Unsupported::Array,
+                            span: word,
+                        }
+                        .into());
                     }
-                    .into());
+                    let key = self.key(array, subscript, word)?;
+                    let assigned = self.word_string(word, quoted)?;
+                    match self.state.assign_element(array, &key, OsString::from(assigned), false) {
+                        Ok(()) => {}
+                        Err(AssignError::Readonly) => {
+                            return Err(ExpandError::Discard(format!("{array}: readonly variable")));
+                        }
+                        Err(AssignError::BadSubscript) => {
+                            return Err(ExpandError::Discard(format!("{label}: bad array subscript")));
+                        }
+                        Err(AssignError::Arithmetic(failure)) => return Err(failed(failure, word)),
+                        Err(AssignError::Unsupported(feature)) => {
+                            return Err(InterpError::Unsupported { feature, span: word }.into());
+                        }
+                        Err(AssignError::Invalid | AssignError::Kind) => {
+                            return Err(InterpError::Unsupported {
+                                feature: Unsupported::Array,
+                                span: word,
+                            }
+                            .into());
+                        }
+                    }
+                    let held = self.element(array, &key, word)?.unwrap_or_default();
+                    out.push_str(&held, quoted, true);
+                    return Ok(());
                 }
                 let Name::Variable(variable) = target else {
                     return Err(ExpandError::Discard(format!("${label}: cannot assign in this way")));
@@ -915,6 +1057,65 @@ impl<'a> Expander<'a> {
                 })
             }
         }
+    }
+
+    /// `${array[@]:offset:count}`, as bash's `array_subrange`: the elements from the first whose index is at least
+    /// `offset` (counted back from one past the greatest index when negative), at most `count` of them. An
+    /// associative array's offset counts elements.
+    fn array_slice(
+        &mut self,
+        array: &str,
+        star: bool,
+        offset: Span,
+        length: Option<Span>,
+        span: Span,
+    ) -> Result<Value> {
+        let start = self.substring_number(offset, span)?;
+        let count = match length {
+            Some(length_span) => {
+                let count = self.substring_number(length_span, span)?;
+                if count < 0 {
+                    let text = word::text(length_span, self.source)?;
+                    return Err(ExpandError::Discard(format!("{text}: substring expression < 0")));
+                }
+                Some(count)
+            }
+            None => None,
+        };
+        let elements = self.elements(array, span)?.unwrap_or_default();
+        let assoc = self.state.kind(array) == Kind::Assoc;
+        let empty = Value::List {
+            items: Vec::new(),
+            star,
+        };
+        let end = if assoc {
+            to_i64(elements.len())
+        } else {
+            elements
+                .iter()
+                .filter_map(|(key, _)| match key {
+                    Key::Index(index) => Some(index.saturating_add(1)),
+                    Key::Name(_) => None,
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        let start = if start < 0 { start.saturating_add(end) } else { start };
+        if start < 0 || start > end {
+            return Ok(empty);
+        }
+        let take = count.map_or(usize::MAX, |count| usize::try_from(count).unwrap_or(usize::MAX));
+        let items = elements
+            .into_iter()
+            .enumerate()
+            .filter(|(at, (key, _))| match key {
+                Key::Index(index) if !assoc => *index >= start,
+                Key::Index(_) | Key::Name(_) => to_i64(*at) >= start,
+            })
+            .map(|(_, (_, value))| value)
+            .take(take)
+            .collect();
+        Ok(Value::List { items, star })
     }
 
     /// An offset or length of `${name:offset:length}`: an arithmetic expression.
@@ -1060,6 +1261,26 @@ impl arith::Variables for ArithVariables<'_, '_> {
             self.expander
                 .state
                 .assign(name, OsString::from(value.to_string()), false),
+        )
+    }
+
+    fn is_assoc(&mut self, name: &str) -> bool {
+        self.expander.state.kind(name) == Kind::Assoc
+    }
+
+    fn get_element(&mut self, name: &str, key: &Key) -> std::result::Result<Option<String>, Failure> {
+        arith::element_value(self.expander.state, name, key)
+    }
+
+    fn set_element(&mut self, name: &str, key: &Key, value: i64) -> std::result::Result<(), Failure> {
+        if refuses_assignment(name) {
+            return Err(Failure::Unsupported(Unsupported::ShellVariable));
+        }
+        arith::assigned(
+            name,
+            self.expander
+                .state
+                .assign_element(name, key, OsString::from(value.to_string()), false),
         )
     }
 }
@@ -1250,7 +1471,7 @@ fn transform(op: char, text: &str, target: &Name, letters: &str) -> String {
         'A' => match target {
             Name::Variable(name) if !letters.is_empty() => format!("declare -{letters} {name}={}", quote(text)),
             Name::Variable(name) => format!("{name}={}", quote(text)),
-            Name::Positional(_) | Name::Special(_) | Name::Array(..) => String::new(),
+            Name::Positional(_) | Name::Special(_) | Name::Element(..) => String::new(),
         },
         'a' => letters.to_owned(),
         // `Q`, and `K` and `k`, which quote a scalar the same way.

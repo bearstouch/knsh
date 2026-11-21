@@ -1,32 +1,55 @@
-//! Shell state: variables, positional parameters, `$?`, options and the working directory (KNSH-096, KNSH-097), and
-//! what the core builtins keep (KNSH-101): variable attributes, the command hash table, aliases and the umask.
+//! Shell state: variables, positional parameters, `$?`, options and the working directory (KNSH-096, KNSH-097), what
+//! the core builtins keep (KNSH-101): variable attributes, the command hash table, aliases and the umask, and
+//! functions, scopes and arrays (KNSH-103).
 //!
 //! Values are kept as [`OsString`]: an inherited environment value need not be UTF-8, and the shell passes it on to
-//! commands unchanged.
+//! commands unchanged. A variable holds a string, an indexed array or an associative array ([`Value`]).
 //!
 //! A variable may be declared without a value (`declare x`, `export x`): it then has attributes but reads as unset,
-//! as in bash. Every assignment the shell makes goes through [`ShellState::assign`], which refuses a read-only
-//! variable and applies the integer and case attributes, as bash's `bind_variable` does; changing `PATH` empties
-//! the hash table, as bash's `sv_path` does.
+//! as in bash. Every assignment the shell makes goes through [`ShellState::assign`] (or its element and list forms),
+//! which refuses a read-only variable and applies the integer and case attributes, as bash's `bind_variable` does;
+//! changing `PATH` empties the hash table, as bash's `sv_path` does.
+//!
+//! Scopes are bash's dynamic scopes (KNSH-103): each function call pushes one, holding the variables `local` (or
+//! `declare` inside a function) makes there and the assignments written before the call; a name is looked up from
+//! the innermost scope outwards to the global variables, and an assignment to a name no scope holds creates a global
+//! variable. `unset` of a variable local to the running function leaves it local and unset until the function
+//! returns; `unset` of one local to a calling function removes it, so the variable it shadowed shows again.
+//!
+//! A name reference (`declare -n`) holds the name of another variable: reading, assigning and unsetting it act on
+//! that variable, followed through at most bash's `NAMEREF_MAX` (8) references. A reference that leads back to
+//! itself is bash's `circular name reference` warning; a reference without a value is assigned the name it is given.
 //!
 //! At start-up bash sets a few variables itself, and this state does the same: `IFS` is space, tab and newline
 //! (never taken from the environment), `PWD` names the working directory and `SHLVL` is one more than inherited,
-//! both exported. Variables bash keeps up to date itself (`RANDOM`, `LINENO`, `BASH_VERSION`, `$_` …) are not
-//! emulated: reading one is refused ([`is_unemulated`]) rather than answered with a value bash would never give.
+//! both exported. The arrays bash keeps for the call stack (`FUNCNAME`, `BASH_SOURCE`, `BASH_LINENO`) are kept from
+//! [`ShellState::push_frame`]; other variables bash keeps up to date itself (`RANDOM`, `LINENO`, `BASH_VERSION`,
+//! `$_` …) are not emulated: reading one is refused ([`is_unemulated`]) rather than answered with a value bash would
+//! never give.
 
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use knsh_bash::CompoundCommand;
 
 use crate::arith::Failure;
 use crate::error::{InterpError, Unsupported};
 use crate::status::Status;
+pub(crate) use crate::vars::{Assoc, Key, Kind, Value};
 
-/// The attributes `declare` sets on a variable (KNSH-101), bash's `att_*` flags but the array ones (KNSH-103).
+/// Bash's `NAMEREF_MAX`: the most name references followed in one lookup.
+const NAMEREF_MAX: usize = 8;
+
+/// The attributes `declare` sets on a variable (KNSH-101, KNSH-103). Whether it is an indexed or associative array
+/// is its value's kind ([`Kind`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Attributes {
-    /// `-x`: commands receive it in their environment (when it has a value).
+    /// `-x`: commands receive it in their environment (when it has a string value).
     pub(crate) exported: bool,
     /// `-r`: it can be neither assigned nor unset.
     pub(crate) readonly: bool,
@@ -38,14 +61,19 @@ pub(crate) struct Attributes {
     pub(crate) uppercase: bool,
     /// `-t`: the trace attribute, which only functions use; kept so `declare -p` shows it.
     pub(crate) trace: bool,
+    /// `-n`: a name reference; its string value names the variable it stands for (KNSH-103).
+    pub(crate) nameref: bool,
 }
 
 impl Attributes {
-    /// The letters `declare -p` and `${x@a}` show, in bash's order (`show_var_attributes`: `i`, `r`, `t`, `x`, `l`,
-    /// `u` among the ones kept here).
-    pub(crate) fn letters(self) -> String {
+    /// The letters `declare -p` and `${x@a}` show for a variable of `kind`, in bash's order (`var_attribute_string`:
+    /// `a`, `A`, `i`, `n`, `r`, `t`, `x`, `l`, `u` among the ones kept here).
+    pub(crate) fn letters(self, kind: Kind) -> String {
         [
+            (kind == Kind::Indexed, 'a'),
+            (kind == Kind::Assoc, 'A'),
             (self.integer, 'i'),
+            (self.nameref, 'n'),
             (self.readonly, 'r'),
             (self.trace, 't'),
             (self.exported, 'x'),
@@ -61,23 +89,49 @@ impl Attributes {
 
 /// One shell variable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Variable {
+pub(crate) struct Variable {
     /// Its value, or `None` for a variable declared without one, which reads as unset.
-    value: Option<OsString>,
+    pub(crate) value: Option<Value>,
     /// Its attributes.
-    attributes: Attributes,
+    pub(crate) attributes: Attributes,
 }
 
 impl Variable {
     /// An exported variable holding `value`, as one imported from the environment.
     fn exported(value: OsString) -> Self {
         Self {
-            value: Some(value),
+            value: Some(Value::Scalar(value)),
             attributes: Attributes {
                 exported: true,
                 ..Attributes::default()
             },
         }
+    }
+
+    /// A variable without a value or attributes.
+    const fn empty() -> Self {
+        Self {
+            value: None,
+            attributes: Attributes {
+                exported: false,
+                readonly: false,
+                integer: false,
+                lowercase: false,
+                uppercase: false,
+                trace: false,
+                nameref: false,
+            },
+        }
+    }
+
+    /// The kind of its value.
+    pub(crate) fn kind(&self) -> Kind {
+        self.value.as_ref().map_or(Kind::Scalar, Value::kind)
+    }
+
+    /// The value `$name` reads.
+    fn first(&self) -> Option<&OsString> {
+        self.value.as_ref().and_then(Value::first)
     }
 }
 
@@ -91,8 +145,14 @@ pub(crate) enum AssignError {
     /// The variable has the integer attribute and the value is not a valid expression (bash's arithmetic error,
     /// which discards the line).
     Arithmetic(Failure),
-    /// The value cannot be handled yet (a case conversion of a value that is not UTF-8).
+    /// The value cannot be handled yet (a case conversion of a value that is not UTF-8, a name reference this
+    /// interpreter does not follow).
     Unsupported(Unsupported),
+    /// A negative index before an array's first element: bash's `name[sub]: bad array subscript` (KNSH-103).
+    BadSubscript,
+    /// An associative array assigned as an indexed one or the reverse (bash's `cannot convert associative to
+    /// indexed array` and the like): refused rather than reported.
+    Kind,
 }
 
 /// A command remembered in the hash table: where `PATH` found it and how often it was run since (`hash`'s `hits`).
@@ -106,9 +166,56 @@ pub(crate) struct Hashed {
     seq: u64,
 }
 
-/// A variable as it was, or `None` if it did not exist, to put back after a temporary assignment.
+/// Where a variable is held: a function's scope (by depth) or the global variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// The scope at this depth (0 for the outermost function).
+    Scope(usize),
+    /// The global variables.
+    Global,
+}
+
+/// A variable as it was, or `None` if it did not exist, with where it was, to put back after a temporary
+/// assignment.
 #[derive(Debug, Clone)]
-pub(crate) struct SavedVariable(Option<Variable>);
+pub(crate) struct SavedVariable(Place, Option<Variable>);
+
+/// A shell function (KNSH-103): its body and the text its spans index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FunctionBody {
+    /// The body, with the redirections applied on every call.
+    pub(crate) body: CompoundCommand,
+    /// The text of the script, `eval` string or sourced file that defined it, which the body's spans index.
+    pub(crate) source: Arc<str>,
+    /// The sourced file it was defined in, as `source` named it: the name of its messages and its `BASH_SOURCE`
+    /// element. `None` for the main script, whose name is `$0`.
+    pub(crate) origin: Option<Arc<str>>,
+    /// Lines before the text's first line, in the file messages number lines of.
+    pub(crate) line_base: usize,
+}
+
+/// A function with its attributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Function {
+    /// What it runs.
+    pub(crate) body: Arc<FunctionBody>,
+    /// `readonly -f`: it can be neither redefined nor unset.
+    pub(crate) readonly: bool,
+    /// `declare -ft`.
+    pub(crate) trace: bool,
+}
+
+/// One entry of the call stack `FUNCNAME`, `BASH_SOURCE` and `BASH_LINENO` describe (KNSH-103).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Frame {
+    /// The function called, or `None` for a file being sourced (`source` in `FUNCNAME`).
+    pub(crate) function: Option<String>,
+    /// The file the function was defined in, or the file sourced: its `BASH_SOURCE` element. `None` for a function
+    /// of the main script, which bash 5.2 lists as `main` and bash 3.2 not at all: reading that element is refused.
+    pub(crate) file: Option<String>,
+    /// The line it was called on, in the caller's file: its `BASH_LINENO` element.
+    pub(crate) line: usize,
+}
 
 /// Shell options set by `set` and `shopt`.
 ///
@@ -179,8 +286,6 @@ const UNEMULATED: &[&str] = &[
     "BASH_CMDS",
     "BASH_COMMAND",
     "BASH_EXECUTION_STRING",
-    "BASH_LINENO",
-    "BASH_SOURCE",
     "BASH_SUBSHELL",
     "BASH_VERSINFO",
     "BASH_VERSION",
@@ -190,7 +295,6 @@ const UNEMULATED: &[&str] = &[
     "EPOCHREALTIME",
     "EPOCHSECONDS",
     "EUID",
-    "FUNCNAME",
     "GROUPS",
     "HISTCMD",
     "LINENO",
@@ -227,19 +331,27 @@ pub(crate) fn is_always_unemulated(name: &str) -> bool {
     UNEMULATED.contains(&name)
 }
 
-/// The array of the last pipeline's statuses, which the shell keeps itself (KNSH-100). It is read like any variable
-/// (`$PIPESTATUS`, `${PIPESTATUS[@]}`); assigning it is refused, as bash would overwrite it after the next pipeline
-/// and the interpreter has no arrays to hold another value (KNSH-103).
+/// The array of the last pipeline's statuses, which the shell keeps itself (KNSH-100). It is read like any array
+/// (`$PIPESTATUS`, `${PIPESTATUS[@]}`); assigning it is refused, as bash would overwrite it after the next pipeline.
 pub(crate) const PIPESTATUS: &str = "PIPESTATUS";
 
 /// The array `[[ string =~ regex ]]` sets to the match and its subexpressions (KNSH-102). It is read like
-/// `PIPESTATUS` (`$BASH_REMATCH`, `${BASH_REMATCH[1]}`, `${#BASH_REMATCH[@]}`); assigning it is refused for the same
-/// reason.
+/// `PIPESTATUS`; assigning it is refused for the same reason.
 pub(crate) const BASH_REMATCH: &str = "BASH_REMATCH";
 
-/// Whether assigning `name` must be refused: a variable bash maintains itself, `PIPESTATUS` or `BASH_REMATCH`.
+/// The arrays of the call stack (KNSH-103), kept by the shell and read like `PIPESTATUS`: the functions called,
+/// innermost first (`source` for a file being sourced), unset outside every function; the files they were defined
+/// in (or sourced); and the lines they were called on.
+pub(crate) const CALL_STACK_ARRAYS: [&str; 3] = ["FUNCNAME", "BASH_SOURCE", "BASH_LINENO"];
+
+/// Whether `name` is one of the arrays the shell keeps itself: `PIPESTATUS`, `BASH_REMATCH` and the call stack's.
+pub(crate) fn is_shell_array(name: &str) -> bool {
+    name == PIPESTATUS || name == BASH_REMATCH || CALL_STACK_ARRAYS.contains(&name)
+}
+
+/// Whether assigning `name` must be refused: a variable bash maintains itself or one of the shell's own arrays.
 pub(crate) fn refuses_assignment(name: &str) -> bool {
-    is_always_unemulated(name) || name == PIPESTATUS || name == BASH_REMATCH
+    is_always_unemulated(name) || is_shell_array(name)
 }
 
 /// What `$!` names: the last background job's last command (KNSH-100).
@@ -255,8 +367,26 @@ pub(crate) enum LastBackground {
 
 /// Whether `${!prefix*}` could list one of the variables bash always maintains itself, whatever the state.
 pub(crate) fn lists_always_unemulated(prefix: &str) -> bool {
-    // `BASH_REMATCH` is held as an array the listing does not see (KNSH-102).
-    UNEMULATED.iter().any(|name| name.starts_with(prefix)) || BASH_REMATCH.starts_with(prefix)
+    // The shell's own arrays are not among the variables the listing walks (KNSH-102, KNSH-103).
+    UNEMULATED.iter().any(|name| name.starts_with(prefix))
+        || [PIPESTATUS, BASH_REMATCH]
+            .iter()
+            .chain(CALL_STACK_ARRAYS.iter())
+            .any(|name| name.starts_with(prefix))
+}
+
+/// What a name stands for once name references are followed (KNSH-103).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Resolved {
+    /// This variable (which may not exist yet).
+    Name(String),
+    /// A name reference without a value, by name: assigning it sets the name it refers to.
+    Dangling(String),
+    /// References that lead back to themselves: bash's `circular name reference`.
+    Circular,
+    /// A reference this interpreter does not follow (to an array element, more than `NAMEREF_MAX` deep, or
+    /// circular inside a function, where bash looks for a global variable instead).
+    Refused,
 }
 
 /// Everything a script reads and changes besides the filesystem and processes.
@@ -266,8 +396,17 @@ pub struct ShellState {
     name: String,
     /// `$1`, `$2`, …
     positional: Vec<String>,
-    /// Variables by name. Every name is a valid identifier.
-    variables: BTreeMap<String, Variable>,
+    /// Global variables by name. Every name is a valid identifier.
+    globals: BTreeMap<String, Variable>,
+    /// The scope of each function running, outermost first (KNSH-103).
+    scopes: Vec<BTreeMap<String, Variable>>,
+    /// Functions by name (KNSH-103).
+    functions: BTreeMap<String, Function>,
+    /// The call stack, outermost first: every function call and every file being sourced (KNSH-103).
+    frames: Vec<Frame>,
+    /// Messages found while reading variables (a circular name reference, a bad array subscript), which bash
+    /// reports and goes on: the evaluator writes them out.
+    notes: RefCell<Vec<String>>,
     /// Inherited environment entries whose name is not a valid identifier or not UTF-8. Bash keeps them out of its
     /// variables but passes them to every command unchanged; so does this.
     passthrough: Vec<(OsString, OsString)>,
@@ -318,7 +457,11 @@ impl ShellState {
         let mut state = Self {
             name: name.into(),
             positional: Vec::new(),
-            variables: BTreeMap::new(),
+            globals: BTreeMap::new(),
+            scopes: Vec::new(),
+            functions: BTreeMap::new(),
+            frames: Vec::new(),
+            notes: RefCell::new(Vec::new()),
             passthrough: Vec::new(),
             last_status: Status::SUCCESS,
             options: ShellOptions::default(),
@@ -351,7 +494,7 @@ impl ShellState {
                     if valid == "SHLVL" {
                         inherited_level = Some(value.clone());
                     }
-                    self.variables.insert(valid.to_owned(), Variable::exported(value));
+                    self.globals.insert(valid.to_owned(), Variable::exported(value));
                 }
                 None => self.passthrough.push((name, value)),
             }
@@ -364,7 +507,7 @@ impl ShellState {
     /// value unless inherited (bash's `set_pwd`; the interpreter drops an inherited one that is not a directory).
     fn start_up(&mut self, inherited_level: Option<&OsStr>) {
         self.set_variable("IFS", DEFAULT_IFS);
-        self.variables.entry("OLDPWD".to_owned()).or_insert(Variable {
+        self.globals.entry("OLDPWD".to_owned()).or_insert(Variable {
             value: None,
             attributes: Attributes {
                 exported: true,
@@ -385,9 +528,9 @@ impl ShellState {
         self.set_exported("SHLVL", level.to_string());
     }
 
-    /// Sets `name` to `value` and exports it.
+    /// Sets global `name` to `value` and exports it.
     fn set_exported(&mut self, name: &str, value: impl Into<OsString>) {
-        self.variables.insert(name.to_owned(), Variable::exported(value.into()));
+        self.globals.insert(name.to_owned(), Variable::exported(value.into()));
     }
 
     /// Sets the shell's umask (the file mode creation mask commands and redirections start with) to `umask`: the
@@ -444,10 +587,126 @@ impl ShellState {
         &self.positional
     }
 
-    /// The value of variable `name`, or `None` if it is unset (or declared without a value).
+    // ---- Finding variables ----
+
+    /// Where the variable `name` is held, without following name references: the innermost scope holding it, or the
+    /// global variables.
+    fn place(&self, name: &str) -> Option<Place> {
+        if let Some(depth) = self.scopes.iter().rposition(|scope| scope.contains_key(name)) {
+            return Some(Place::Scope(depth));
+        }
+        self.globals.contains_key(name).then_some(Place::Global)
+    }
+
+    /// The variable `name` as seen from here, without following name references.
+    fn find(&self, name: &str) -> Option<&Variable> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+            .or_else(|| self.globals.get(name))
+    }
+
+    /// The variable held at `place` under `name`, to change.
+    fn at_mut(&mut self, place: Place, name: &str) -> Option<&mut Variable> {
+        match place {
+            Place::Scope(depth) => self.scopes.get_mut(depth)?.get_mut(name),
+            Place::Global => self.globals.get_mut(name),
+        }
+    }
+
+    /// The table of `place`.
+    fn table_mut(&mut self, place: Place) -> &mut BTreeMap<String, Variable> {
+        match place {
+            Place::Scope(depth) if depth < self.scopes.len() => &mut self.scopes[depth],
+            Place::Scope(_) | Place::Global => &mut self.globals,
+        }
+    }
+
+    /// What `name` stands for after following name references, as bash's `find_variable_nameref` does: a reference
+    /// leading back to the variable it started from, or to itself, is circular.
+    pub(crate) fn resolve(&self, name: &str) -> Resolved {
+        let mut current = name.to_owned();
+        for _ in 0..=NAMEREF_MAX {
+            let Some(variable) = self.find(&current) else {
+                return Resolved::Name(current);
+            };
+            if !variable.attributes.nameref {
+                return Resolved::Name(current);
+            }
+            let target = match variable.first().and_then(|value| value.to_str()) {
+                Some(target) if !target.is_empty() => target.to_owned(),
+                _ => return Resolved::Dangling(current),
+            };
+            if !is_name(&target) {
+                return Resolved::Refused;
+            }
+            if target == name || target == current {
+                // Bash then looks for a global variable of that name inside a function: not followed here.
+                return if self.scopes.is_empty() {
+                    Resolved::Circular
+                } else {
+                    Resolved::Refused
+                };
+            }
+            current = target;
+        }
+        Resolved::Refused
+    }
+
+    /// The variable reading `name` reads (following references), noting bash's warning for a circular reference.
+    ///
+    /// # Errors
+    ///
+    /// [`Unsupported::Nameref`] for a reference this interpreter does not follow.
+    fn read(&self, name: &str) -> Result<Option<(String, &Variable)>, Unsupported> {
+        match self.resolve(name) {
+            Resolved::Name(target) => Ok(self.find(&target).map(|variable| (target, variable))),
+            Resolved::Dangling(_) => Ok(None),
+            Resolved::Circular => {
+                self.note(format!("warning: {name}: circular name reference"));
+                Ok(None)
+            }
+            Resolved::Refused => Err(Unsupported::Nameref),
+        }
+    }
+
+    /// The name an assignment to `name` assigns (following references): `Ok(None)` when `name` is a reference
+    /// without a value, which is itself given the value as the name it refers to.
+    fn write_target(&self, name: &str) -> Result<Option<String>, AssignError> {
+        match self.resolve(name) {
+            Resolved::Name(target) => Ok(Some(target)),
+            Resolved::Dangling(reference) if reference == name => Ok(None),
+            // A reference to a reference without a value: bash sets the last one.
+            Resolved::Dangling(_) | Resolved::Circular | Resolved::Refused => {
+                Err(AssignError::Unsupported(Unsupported::Nameref))
+            }
+        }
+    }
+
+    /// Records a message bash reports while expanding, without stopping (`warning: x: circular name reference`).
+    pub(crate) fn note(&self, message: String) {
+        self.notes.borrow_mut().push(message);
+    }
+
+    /// The messages recorded since the last call.
+    pub(crate) fn take_notes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.notes.borrow_mut())
+    }
+
+    // ---- Reading ----
+
+    /// The value of variable `name`, or `None` if it is unset (or declared without a value): its string, or element
+    /// 0 of an array. Name references are followed; one this interpreter does not follow reads as unset here (the
+    /// expansions that read variables refuse it, KNSH-103).
     #[must_use]
     pub fn variable(&self, name: &str) -> Option<&OsStr> {
-        self.variables.get(name).and_then(|variable| variable.value.as_deref())
+        match self.read(name) {
+            Ok(found) => found
+                .and_then(|(_, variable)| variable.first())
+                .map(OsString::as_os_str),
+            Err(_) => None,
+        }
     }
 
     /// Whether variable `name` exists (set, or declared without a value) and is exported.
@@ -462,18 +721,146 @@ impl ShellState {
         self.attributes(name).is_some_and(|attributes| attributes.readonly)
     }
 
-    /// The attributes of variable `name`, if it exists (set or declared without a value).
+    /// The attributes of variable `name` (following references), if it exists.
     pub(crate) fn attributes(&self, name: &str) -> Option<Attributes> {
-        self.variables.get(name).map(|variable| variable.attributes)
+        self.read(name).ok().flatten().map(|(_, variable)| variable.attributes)
     }
 
-    /// Every variable that exists, in byte order of names: name, value (`None` when declared without one) and
-    /// attributes, for `declare -p` and `export -p`.
-    pub(crate) fn all_variables(&self) -> impl Iterator<Item = (&str, Option<&OsStr>, Attributes)> {
-        self.variables
-            .iter()
-            .map(|(name, variable)| (name.as_str(), variable.value.as_deref(), variable.attributes))
+    /// The attributes of variable `name` itself, without following references, if it exists.
+    pub(crate) fn own_attributes(&self, name: &str) -> Option<Attributes> {
+        self.find(name).map(|variable| variable.attributes)
     }
+
+    /// The value of `name` itself, without following references (a reference's target name).
+    pub(crate) fn own_value(&self, name: &str) -> Option<&Value> {
+        self.find(name).and_then(|variable| variable.value.as_ref())
+    }
+
+    /// What kind of value `name` holds (following references): [`Kind::Unset`] when no such variable exists.
+    pub(crate) fn kind(&self, name: &str) -> Kind {
+        if is_shell_array(name) {
+            return Kind::Indexed;
+        }
+        match self.read(name) {
+            Ok(Some((_, variable))) => variable.kind(),
+            Ok(None) | Err(_) => Kind::Unset,
+        }
+    }
+
+    /// The whole value of `name` (following references), `None` when unset or declared without a value. The shell's
+    /// own arrays are built from what it keeps.
+    ///
+    /// # Errors
+    ///
+    /// [`Unsupported::Nameref`] for a reference not followed; [`Unsupported::ShellVariable`] for a `BASH_SOURCE`
+    /// holding an element this interpreter cannot give as bash would.
+    pub(crate) fn value(&self, name: &str) -> Result<Option<Cow<'_, Value>>, Unsupported> {
+        if let Some(array) = self.shell_array(name)? {
+            return Ok(array.map(Cow::Owned));
+        }
+        Ok(self
+            .read(name)?
+            .and_then(|(_, variable)| variable.value.as_ref())
+            .map(Cow::Borrowed))
+    }
+
+    /// Element `key` of `name` (following references). `Err(Ok(()))`-like failures: [`ElementError`].
+    ///
+    /// # Errors
+    ///
+    /// [`ElementError::BadSubscript`] for a negative index before the first element (bash's message, then unset);
+    /// [`ElementError::Unsupported`] for what [`ShellState::value`] refuses.
+    pub(crate) fn element(&self, name: &str, key: &Key) -> Result<Option<OsString>, ElementError> {
+        if name == "BASH_SOURCE" {
+            return self.bash_source_element(key);
+        }
+        let Some(value) = self.value(name).map_err(ElementError::Unsupported)? else {
+            return Ok(None);
+        };
+        value
+            .element(key)
+            .map(|found: Option<&OsString>| found.cloned())
+            .map_err(|()| ElementError::BadSubscript)
+    }
+
+    /// One element of `BASH_SOURCE`: refused only when that element is one bash 5.2 and 3.2 give differently.
+    fn bash_source_element(&self, key: &Key) -> Result<Option<OsString>, ElementError> {
+        let files: Vec<Option<&String>> = self.frames.iter().rev().map(|frame| frame.file.as_ref()).collect();
+        let index = match key {
+            Key::Index(index) => *index,
+            Key::Name(name) => name.parse().unwrap_or(0),
+        };
+        let index = if index < 0 {
+            i64::try_from(files.len()).unwrap_or(i64::MAX).saturating_add(index)
+        } else {
+            index
+        };
+        if index < 0 {
+            return Err(ElementError::BadSubscript);
+        }
+        match usize::try_from(index).ok().and_then(|at| files.get(at)) {
+            None => Ok(None),
+            Some(Some(file)) => Ok(Some(OsString::from(file.as_str()))),
+            Some(None) => Err(ElementError::Unsupported(Unsupported::ShellVariable)),
+        }
+    }
+
+    /// The shell's own array `name`, if it is one: `Some(None)` while it is unset (`FUNCNAME` outside functions).
+    #[allow(clippy::option_option)] // Not one of the shell's arrays, or one that is unset.
+    fn shell_array(&self, name: &str) -> Result<Option<Option<Value>>, Unsupported> {
+        let items: Vec<String> = match name {
+            PIPESTATUS => self.pipestatus.iter().map(ToString::to_string).collect(),
+            BASH_REMATCH => self.bash_rematch.clone(),
+            "FUNCNAME" => {
+                if !self.frames.iter().any(|frame| frame.function.is_some()) {
+                    return Ok(Some(None));
+                }
+                self.frames
+                    .iter()
+                    .rev()
+                    .map(|frame| frame.function.clone().unwrap_or_else(|| "source".to_owned()))
+                    .collect()
+            }
+            "BASH_SOURCE" => self
+                .frames
+                .iter()
+                .rev()
+                .map(|frame| frame.file.clone().ok_or(Unsupported::ShellVariable))
+                .collect::<Result<_, _>>()?,
+            "BASH_LINENO" => self.frames.iter().rev().map(|frame| frame.line.to_string()).collect(),
+            _ => return Ok(None),
+        };
+        let elements = items
+            .into_iter()
+            .enumerate()
+            .map(|(at, item)| (i64::try_from(at).unwrap_or(i64::MAX), OsString::from(item)))
+            .collect();
+        Ok(Some(Some(Value::Indexed(elements))))
+    }
+
+    /// Every variable visible from here (the innermost of each name), in byte order of names, for `declare -p` and
+    /// `export -p`.
+    pub(crate) fn all_variables(&self) -> Vec<(&str, &Variable)> {
+        let mut visible: BTreeMap<&str, &Variable> = self.globals.iter().map(|(name, v)| (name.as_str(), v)).collect();
+        for scope in &self.scopes {
+            for (name, variable) in scope {
+                visible.insert(name, variable);
+            }
+        }
+        visible.into_iter().collect()
+    }
+
+    /// The names of the set variables visible from here, sorted as bash sorts them for `${!prefix*}` (byte order).
+    /// A variable declared without a value is not set, and not listed.
+    pub(crate) fn variable_names(&self) -> Vec<&str> {
+        self.all_variables()
+            .into_iter()
+            .filter(|(_, variable)| variable.value.is_some())
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    // ---- Assigning ----
 
     /// Sets variable `name` to `value` as the embedder does between runs, keeping its attributes (a new variable has
     /// none) but applying none of them: neither read-only nor integer stops or changes it. Returns `false` and changes
@@ -482,25 +869,19 @@ impl ShellState {
         if !is_name(name) {
             return false;
         }
-        self.store(name, value.into());
+        self.store(name, Value::Scalar(value.into()));
         true
     }
 
-    /// Stores `value` in `name` (a valid identifier) as it is, keeping its attributes.
-    fn store(&mut self, name: &str, value: OsString) {
+    /// Stores `value` in the visible variable `name` (a valid identifier) as it is, keeping its attributes; a new
+    /// variable is global, as bash creates it.
+    fn store(&mut self, name: &str, value: Value) {
         self.noticed(name);
-        match self.variables.get_mut(name) {
-            Some(variable) => variable.value = Some(value),
-            None => {
-                self.variables.insert(
-                    name.to_owned(),
-                    Variable {
-                        value: Some(value),
-                        attributes: Attributes::default(),
-                    },
-                );
-            }
-        }
+        let place = self.place(name).unwrap_or(Place::Global);
+        self.table_mut(place)
+            .entry(name.to_owned())
+            .or_insert_with(Variable::empty)
+            .value = Some(value);
     }
 
     /// Records that the script changed `name` itself: a default bash would have set no longer applies, and changing
@@ -514,9 +895,45 @@ impl ShellState {
         }
     }
 
+    /// `value` as a variable with `attributes` stores it, given its `old` value when appending: the integer
+    /// attribute evaluates it (and the old value) as arithmetic, `-l` and `-u` convert its case.
+    fn converted(
+        &mut self,
+        attributes: Attributes,
+        old: Option<OsString>,
+        value: OsString,
+        append: bool,
+    ) -> Result<OsString, AssignError> {
+        let old = old.unwrap_or_default();
+        if attributes.integer {
+            let utf8 = |text: OsString| {
+                text.into_string()
+                    .map_err(|_| AssignError::Unsupported(Unsupported::NonUtf8Value))
+            };
+            let base = if append {
+                let old = utf8(old)?;
+                crate::arith::evaluate_arithmetic(&old, self).map_err(AssignError::Arithmetic)?
+            } else {
+                0
+            };
+            let added = crate::arith::evaluate_arithmetic(&utf8(value)?, self).map_err(AssignError::Arithmetic)?;
+            return Ok(OsString::from(base.wrapping_add(added).to_string()));
+        }
+        let mut whole = if append { old } else { OsString::new() };
+        whole.push(value);
+        if attributes.lowercase || attributes.uppercase {
+            let text = whole
+                .into_string()
+                .map_err(|_| AssignError::Unsupported(Unsupported::NonUtf8Value))?;
+            return Ok(OsString::from(convert_case(&text, attributes.uppercase)));
+        }
+        Ok(whole)
+    }
+
     /// Assigns `value` to variable `name` as bash's `bind_variable` does (`append`: `name+=value`): refused if `name`
     /// is not an identifier or the variable is read-only; with the integer attribute the value (and, appending, the
-    /// old value) is evaluated as an arithmetic expression; with `-l` or `-u` it is converted to that case.
+    /// old value) is evaluated as an arithmetic expression; with `-l` or `-u` it is converted to that case. An array
+    /// has its element 0 assigned (`a=x`), as in bash; a name reference assigns the variable it refers to.
     ///
     /// # Errors
     ///
@@ -526,41 +943,299 @@ impl ShellState {
         if !is_name(name) {
             return Err(AssignError::Invalid);
         }
-        let attributes = self.attributes(name).unwrap_or_default();
+        let Some(target) = self.write_target(name)? else {
+            return self.set_reference(name, value);
+        };
+        match self.kind(&target) {
+            Kind::Indexed => return self.assign_element(&target, &Key::Index(0), value, append),
+            Kind::Assoc => return self.assign_element(&target, &Key::Name("0".to_owned()), value, append),
+            Kind::Unset | Kind::Scalar => {}
+        }
+        let attributes = self.attributes(&target).unwrap_or_default();
         if attributes.readonly {
             return Err(AssignError::Readonly);
         }
-        let old = || self.variable(name).map(ToOwned::to_owned).unwrap_or_default();
-        let value = if attributes.integer {
-            let utf8 = |text: OsString| {
-                text.into_string()
-                    .map_err(|_| AssignError::Unsupported(Unsupported::NonUtf8Value))
-            };
-            let base = if append {
-                let old = utf8(old())?;
-                crate::arith::evaluate_arithmetic(&old, self).map_err(AssignError::Arithmetic)?
-            } else {
-                0
-            };
-            let added = crate::arith::evaluate_arithmetic(&utf8(value)?, self).map_err(AssignError::Arithmetic)?;
-            OsString::from(base.wrapping_add(added).to_string())
-        } else {
-            let mut whole = if append { old() } else { OsString::new() };
-            whole.push(value);
-            if attributes.lowercase || attributes.uppercase {
-                let text = whole
-                    .into_string()
-                    .map_err(|_| AssignError::Unsupported(Unsupported::NonUtf8Value))?;
-                OsString::from(convert_case(&text, attributes.uppercase))
-            } else {
-                whole
-            }
-        };
-        self.store(name, value);
+        let old = self.variable(&target).map(ToOwned::to_owned);
+        let value = self.converted(attributes, old, value, append)?;
+        self.store(&target, Value::Scalar(value));
         Ok(())
     }
 
-    /// Removes variable `name` (`unset`).
+    /// Sets `name` itself to the string `value`, without following references or applying attributes but read-only
+    /// (`declare -n ref=target` stores the target's name).
+    ///
+    /// # Errors
+    ///
+    /// [`AssignError::Readonly`] for a read-only variable.
+    pub(crate) fn assign_own(&mut self, name: &str, value: OsString) -> Result<(), AssignError> {
+        if self.own_attributes(name).is_some_and(|attributes| attributes.readonly) {
+            return Err(AssignError::Readonly);
+        }
+        self.store(name, Value::Scalar(value));
+        Ok(())
+    }
+
+    /// Hides every function scope, so what follows acts on the global variables (`declare -g`); give them back to
+    /// [`ShellState::show_scopes`].
+    pub(crate) fn hide_scopes(&mut self) -> Vec<BTreeMap<String, Variable>> {
+        std::mem::take(&mut self.scopes)
+    }
+
+    /// Gives back the scopes [`ShellState::hide_scopes`] hid.
+    pub(crate) fn show_scopes(&mut self, scopes: Vec<BTreeMap<String, Variable>>) {
+        self.scopes = scopes;
+    }
+
+    /// Gives the name reference `name`, which has no value, `value` as the name it refers to.
+    fn set_reference(&mut self, name: &str, value: OsString) -> Result<(), AssignError> {
+        if self.own_attributes(name).is_some_and(|attributes| attributes.readonly) {
+            return Err(AssignError::Readonly);
+        }
+        if !value.to_str().is_some_and(is_name) {
+            return Err(AssignError::Unsupported(Unsupported::Nameref));
+        }
+        let place = self.place(name).unwrap_or(Place::Global);
+        if let Some(variable) = self.at_mut(place, name) {
+            variable.value = Some(Value::Scalar(value));
+        }
+        Ok(())
+    }
+
+    /// Assigns element `key` of array `name` (`name[key]=value`, `+=` when `append`), as bash's
+    /// `assign_array_element` does: a string or a new variable becomes an indexed array (the string its element 0);
+    /// a negative index counts back from the end. The integer and case attributes apply to the element.
+    ///
+    /// # Errors
+    ///
+    /// [`AssignError`]; nothing changes then.
+    pub(crate) fn assign_element(
+        &mut self,
+        name: &str,
+        key: &Key,
+        value: OsString,
+        append: bool,
+    ) -> Result<(), AssignError> {
+        if !is_name(name) {
+            return Err(AssignError::Invalid);
+        }
+        let target = self
+            .write_target(name)?
+            .ok_or(AssignError::Unsupported(Unsupported::Nameref))?;
+        if refuses_assignment(&target) {
+            return Err(AssignError::Unsupported(Unsupported::ShellVariable));
+        }
+        let attributes = self.attributes(&target).unwrap_or_default();
+        if attributes.readonly {
+            return Err(AssignError::Readonly);
+        }
+        if attributes.nameref {
+            return Err(AssignError::Unsupported(Unsupported::Nameref));
+        }
+        let kind = self.kind(&target);
+        let key = match (kind, key) {
+            (Kind::Assoc, Key::Name(_)) => key.clone(),
+            (Kind::Assoc, Key::Index(index)) => Key::Name(index.to_string()),
+            (Kind::Unset | Kind::Scalar | Kind::Indexed, Key::Index(index)) if *index >= 0 => key.clone(),
+            (Kind::Unset | Kind::Scalar | Kind::Indexed, Key::Index(index)) => {
+                // Counted back from one past the greatest index, read in place: copying the array for every
+                // element assigned would make `mapfile` and `a[i]=x` loops quadratic.
+                let end = self.indexed_end(&target);
+                let resolved = end.saturating_add(*index);
+                if resolved < 0 {
+                    return Err(AssignError::BadSubscript);
+                }
+                Key::Index(resolved)
+            }
+            (Kind::Unset | Kind::Scalar | Kind::Indexed, Key::Name(_)) => return Err(AssignError::Kind),
+        };
+        let old = self
+            .value(&target)
+            .ok()
+            .flatten()
+            .and_then(|whole| whole.element(&key).ok().flatten().cloned());
+        let value = self.converted(attributes, old, value, append)?;
+        self.noticed(&target);
+        let place = self.place(&target).unwrap_or(Place::Global);
+        let variable = self
+            .table_mut(place)
+            .entry(target.clone())
+            .or_insert_with(Variable::empty);
+        match (&mut variable.value, key) {
+            (Some(Value::Assoc(entries)), Key::Name(key)) => entries.insert(&key, value),
+            (Some(Value::Indexed(elements)), Key::Index(index)) => {
+                elements.insert(index, value);
+            }
+            (held, Key::Index(index)) => {
+                let mut elements = held.take().map(Value::into_indexed).unwrap_or_default();
+                elements.insert(index, value);
+                *held = Some(Value::Indexed(elements));
+            }
+            (_, Key::Name(_)) => return Err(AssignError::Kind),
+        }
+        Ok(())
+    }
+
+    /// One past the greatest index of `name` read as an indexed array (a string is its element 0), 0 when unset.
+    fn indexed_end(&self, name: &str) -> i64 {
+        match self.value(name).ok().flatten().as_deref() {
+            Some(Value::Scalar(_)) => 1,
+            Some(Value::Indexed(elements)) => elements.keys().next_back().map_or(0, |last| last.saturating_add(1)),
+            Some(Value::Assoc(entries)) => i64::try_from(entries.len()).unwrap_or(i64::MAX),
+            None => 0,
+        }
+    }
+
+    /// Assigns the list `items` to `name` (`name=(…)`, or `name+=(…)` when `append`), as bash's
+    /// `assign_compound_array_list` does: each item is `(key, value, append)`, a missing key meaning the index after
+    /// the last one assigned (or after the greatest index when appending); `assoc` makes a new variable
+    /// associative. Without `append` the old elements go first.
+    ///
+    /// # Errors
+    ///
+    /// [`AssignError`]; nothing changes then, but integer elements' expressions may have run.
+    pub(crate) fn assign_list(
+        &mut self,
+        name: &str,
+        items: Vec<(Option<Key>, OsString, bool)>,
+        append: bool,
+        assoc: bool,
+    ) -> Result<(), AssignError> {
+        if !is_name(name) {
+            return Err(AssignError::Invalid);
+        }
+        let target = self
+            .write_target(name)?
+            .ok_or(AssignError::Unsupported(Unsupported::Nameref))?;
+        if refuses_assignment(&target) {
+            return Err(AssignError::Unsupported(Unsupported::ShellVariable));
+        }
+        let attributes = self.attributes(&target).unwrap_or_default();
+        if attributes.readonly {
+            return Err(AssignError::Readonly);
+        }
+        if attributes.nameref {
+            return Err(AssignError::Unsupported(Unsupported::Nameref));
+        }
+        let held = self.value(&target).ok().flatten();
+        let has_value = held.is_some();
+        let emptied = match held.as_deref() {
+            Some(Value::Assoc(entries)) => Some(entries.emptied()),
+            Some(Value::Scalar(_) | Value::Indexed(_)) | None => None,
+        };
+        let kind = match self.kind(&target) {
+            Kind::Unset if assoc => Kind::Assoc,
+            // A variable declared without a value keeps the kind `declare` gave it, or is indexed.
+            Kind::Scalar if !has_value && assoc => Kind::Assoc,
+            other => other,
+        };
+        // Appending takes the old value out rather than copying it, so `a+=(x)` in a loop is not quadratic. That is
+        // done only when nothing below can fail (keys checked first, no attribute that evaluates or converts), so
+        // an error still leaves the variable as it was.
+        let current = if !append {
+            None
+        } else if !(attributes.integer || attributes.lowercase || attributes.uppercase)
+            && self.list_keys_valid(&target, kind, &items)
+        {
+            let place = self.place(&target).unwrap_or(Place::Global);
+            self.at_mut(place, &target).and_then(|variable| variable.value.take())
+        } else {
+            self.value(&target).ok().flatten().map(Cow::into_owned)
+        };
+        let value = if kind == Kind::Assoc {
+            let mut entries = match current {
+                Some(Value::Assoc(entries)) => entries,
+                Some(Value::Scalar(_) | Value::Indexed(_)) | None => emptied.filter(|_| !append).unwrap_or_default(),
+            };
+            for (key, value, item_append) in items {
+                let Some(Key::Name(key)) = key else {
+                    return Err(AssignError::Kind);
+                };
+                let old = entries.get(&key).cloned();
+                let value = self.converted(attributes, old, value, item_append)?;
+                entries.insert(&key, value);
+            }
+            Value::Assoc(entries)
+        } else {
+            let mut elements = current.map(Value::into_indexed).unwrap_or_default();
+            let mut next = elements.keys().next_back().map_or(0, |last| last.saturating_add(1));
+            for (key, value, item_append) in items {
+                let index = match key {
+                    None => next,
+                    Some(Key::Index(index)) => {
+                        crate::vars::resolve_index(&elements, index).map_err(|()| AssignError::BadSubscript)?
+                    }
+                    Some(Key::Name(_)) => return Err(AssignError::Kind),
+                };
+                let old = elements.get(&index).cloned();
+                let value = self.converted(attributes, old, value, item_append)?;
+                elements.insert(index, value);
+                next = index.saturating_add(1);
+            }
+            Value::Indexed(elements)
+        };
+        self.store(&target, value);
+        Ok(())
+    }
+
+    /// Whether every key of `items`, assigned in turn to `target` (appending) as an array of `kind`, is one
+    /// [`ShellState::assign_list`] accepts: a key for an associative array, an index (or none) for an indexed one,
+    /// and no negative index before the first element at its turn.
+    fn list_keys_valid(&self, target: &str, kind: Kind, items: &[(Option<Key>, OsString, bool)]) -> bool {
+        if kind == Kind::Assoc {
+            return items.iter().all(|(key, _, _)| matches!(key, Some(Key::Name(_))));
+        }
+        let mut end = self.indexed_end(target);
+        let mut next = end;
+        for (key, _, _) in items {
+            let index = match key {
+                None => next,
+                Some(Key::Index(index)) if *index >= 0 => *index,
+                Some(Key::Index(index)) => match end.checked_add(*index) {
+                    Some(resolved) if resolved >= 0 => resolved,
+                    _ => return false,
+                },
+                Some(Key::Name(_)) => return false,
+            };
+            next = index.saturating_add(1);
+            end = end.max(next);
+        }
+        true
+    }
+
+    /// Makes `name` an empty array of the kind `assoc` says, if it is not one already (`declare -a x`, `declare -A
+    /// h`): a string becomes element 0 of an indexed array.
+    ///
+    /// # Errors
+    ///
+    /// [`AssignError::Kind`] to turn an associative array into an indexed one or the reverse.
+    pub(crate) fn make_array(&mut self, name: &str, assoc: bool) -> Result<(), AssignError> {
+        let target = match self.write_target(name)? {
+            Some(target) => target,
+            None => name.to_owned(),
+        };
+        let current = self.find(&target).and_then(|variable| variable.value.clone());
+        let value = match (current, assoc) {
+            (Some(Value::Assoc(entries)), true) => Value::Assoc(entries),
+            (Some(Value::Indexed(elements)), false) => Value::Indexed(elements),
+            (Some(Value::Assoc(_)), false) | (Some(Value::Indexed(_)), true) => return Err(AssignError::Kind),
+            // A string becomes element 0 (key `0`), as bash's `convert_var_to_array` and `convert_var_to_assoc`.
+            (Some(Value::Scalar(text)), true) => {
+                let mut entries = Assoc::default();
+                entries.insert("0", text);
+                Value::Assoc(entries)
+            }
+            (Some(Value::Scalar(text)), false) => Value::Indexed(BTreeMap::from([(0, text)])),
+            (None, true) => Value::Assoc(Assoc::default()),
+            (None, false) => Value::Indexed(BTreeMap::new()),
+        };
+        self.store(&target, value);
+        Ok(())
+    }
+
+    // ---- Unsetting ----
+
+    /// Removes variable `name` (`unset`), following references, as bash's `makunbound` does: a variable local to the
+    /// running function stays local, unset, until it returns; any other is removed from where it is held.
     ///
     /// # Errors
     ///
@@ -570,33 +1245,231 @@ impl ShellState {
         if !is_name(name) {
             return Err(AssignError::Invalid);
         }
-        if self.is_readonly(name) {
+        let target = match self.resolve(name) {
+            Resolved::Name(target) => target,
+            // Bash unsets the reference itself when it has no value.
+            Resolved::Dangling(reference) => reference,
+            Resolved::Circular | Resolved::Refused => return Err(AssignError::Unsupported(Unsupported::Nameref)),
+        };
+        self.unset_own(&target)
+    }
+
+    /// Removes variable `name` itself, without following references (`unset -n`).
+    ///
+    /// # Errors
+    ///
+    /// As [`ShellState::unset`].
+    pub(crate) fn unset_own(&mut self, name: &str) -> Result<(), AssignError> {
+        if !is_name(name) {
+            return Err(AssignError::Invalid);
+        }
+        if self.own_attributes(name).is_some_and(|attributes| attributes.readonly) {
             return Err(AssignError::Readonly);
         }
         self.noticed(name);
-        self.variables.remove(name);
+        match self.place(name) {
+            None => {}
+            Some(Place::Scope(depth)) if depth + 1 == self.scopes.len() => {
+                // Bash resets its attributes and makes it invisible: it stays local, without a value.
+                self.scopes[depth].insert(name.to_owned(), Variable::empty());
+            }
+            Some(place) => {
+                self.table_mut(place).remove(name);
+            }
+        }
         Ok(())
     }
 
-    /// Changes the attributes of variable `name` (a valid identifier), creating it without a value if it does not
-    /// exist, through `change`. Its value is not converted: bash applies `-i`, `-l` and `-u` only to values assigned
-    /// later.
-    pub(crate) fn change_attributes(&mut self, name: &str, change: impl FnOnce(&mut Attributes)) {
-        self.noticed(name);
-        let variable = self.variables.entry(name.to_owned()).or_insert(Variable {
-            value: None,
-            attributes: Attributes::default(),
-        });
+    /// Removes element `key` of array `name` (`unset 'a[i]'`); a string's element 0 is the string itself.
+    ///
+    /// # Errors
+    ///
+    /// [`AssignError::Readonly`] for a read-only array, [`AssignError::BadSubscript`] for a negative index before
+    /// the first element.
+    pub(crate) fn unset_element(&mut self, name: &str, key: &Key) -> Result<(), AssignError> {
+        let target = match self.resolve(name) {
+            Resolved::Name(target) => target,
+            Resolved::Dangling(_) => return Ok(()),
+            Resolved::Circular | Resolved::Refused => return Err(AssignError::Unsupported(Unsupported::Nameref)),
+        };
+        if self.attributes(&target).is_some_and(|attributes| attributes.readonly) {
+            return Err(AssignError::Readonly);
+        }
+        let Some(place) = self.place(&target) else {
+            return Ok(());
+        };
+        let Some(variable) = self.at_mut(place, &target) else {
+            return Ok(());
+        };
+        match (&mut variable.value, key) {
+            (Some(Value::Indexed(elements)), Key::Index(index)) => {
+                let index = crate::vars::resolve_index(elements, *index).map_err(|()| AssignError::BadSubscript)?;
+                elements.remove(&index);
+            }
+            (Some(Value::Assoc(entries)), Key::Name(key)) => {
+                entries.remove(key);
+            }
+            (Some(Value::Assoc(entries)), Key::Index(index)) => {
+                entries.remove(&index.to_string());
+            }
+            // Bash unsets a string when element 0 is unset.
+            (Some(Value::Scalar(_)), Key::Index(0 | -1)) => return self.unset(&target),
+            (Some(Value::Scalar(_)), Key::Index(index)) if *index < -1 => return Err(AssignError::BadSubscript),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // ---- Attributes ----
+
+    /// Changes the attributes of variable `name` (a valid identifier; references followed unless `own`), creating
+    /// it without a value if it does not exist, through `change`. Its value is not converted: bash applies `-i`,
+    /// `-l` and `-u` only to values assigned later.
+    pub(crate) fn change_attributes(&mut self, name: &str, own: bool, change: impl FnOnce(&mut Attributes)) {
+        let target = if own {
+            name.to_owned()
+        } else {
+            match self.resolve(name) {
+                Resolved::Name(target) => target,
+                Resolved::Dangling(_) | Resolved::Circular | Resolved::Refused => name.to_owned(),
+            }
+        };
+        self.noticed(&target);
+        let place = self.place(&target).unwrap_or(Place::Global);
+        let variable = self.table_mut(place).entry(target).or_insert_with(Variable::empty);
         change(&mut variable.attributes);
     }
 
     /// Removes `name`'s value but keeps the variable and its attributes, as bash's `invisible` variables: an
     /// inherited `OLDPWD` that is not a directory.
     pub(crate) fn clear_value(&mut self, name: &str) {
-        if let Some(variable) = self.variables.get_mut(name) {
+        if let Some(place) = self.place(name)
+            && let Some(variable) = self.at_mut(place, name)
+        {
             variable.value = None;
         }
     }
+
+    // ---- Scopes and functions (KNSH-103) ----
+
+    /// Enters a function: a new scope holding `temporaries` (the assignments written before the call), exported,
+    /// as bash makes the temporary environment the function's own scope.
+    pub(crate) fn push_scope(&mut self, temporaries: &[(String, OsString)]) {
+        let mut scope = BTreeMap::new();
+        for (name, value) in temporaries {
+            scope.insert(name.clone(), Variable::exported(value.clone()));
+        }
+        self.scopes.push(scope);
+    }
+
+    /// Leaves the innermost function's scope, dropping its local variables.
+    pub(crate) fn pop_scope(&mut self) {
+        // Leaving a scope that held `PATH` changes the visible `PATH`: bash's `sv_path` runs then too.
+        if self.scopes.pop().is_some_and(|scope| scope.contains_key("PATH")) {
+            self.hashed.clear();
+        }
+    }
+
+    /// Whether a function is running (bash's `variable_context` is not 0).
+    pub(crate) fn in_function(&self) -> bool {
+        !self.scopes.is_empty()
+    }
+
+    /// Makes `name` local to the running function (`local name`, `declare name` inside a function), as bash's
+    /// `make_local_variable` does: one already local there is kept; a new one has no value and only the export
+    /// attribute of the variable it shadows.
+    ///
+    /// # Errors
+    ///
+    /// [`AssignError::Readonly`] when the variable it would shadow is read-only.
+    pub(crate) fn make_local(&mut self, name: &str) -> Result<(), AssignError> {
+        let Some(scope) = self.scopes.len().checked_sub(1) else {
+            return Ok(());
+        };
+        if self.scopes[scope].contains_key(name) {
+            return Ok(());
+        }
+        let shadowed = self.find(name).map(|variable| variable.attributes);
+        if shadowed.is_some_and(|attributes| attributes.readonly) {
+            return Err(AssignError::Readonly);
+        }
+        self.noticed(name);
+        let mut variable = Variable::empty();
+        variable.attributes.exported = shadowed.is_some_and(|attributes| attributes.exported);
+        self.scopes[scope].insert(name.to_owned(), variable);
+        Ok(())
+    }
+
+    /// Function `name`, if defined.
+    pub(crate) fn function(&self, name: &str) -> Option<&Function> {
+        self.functions.get(name)
+    }
+
+    /// Every function, by name in byte order.
+    pub(crate) fn functions(&self) -> &BTreeMap<String, Function> {
+        &self.functions
+    }
+
+    /// Defines function `name` to run `body`, keeping the attributes of one it replaces.
+    ///
+    /// # Errors
+    ///
+    /// [`AssignError::Readonly`] for a read-only function, which is kept.
+    pub(crate) fn define_function(&mut self, name: &str, body: Arc<FunctionBody>) -> Result<(), AssignError> {
+        match self.functions.get_mut(name) {
+            Some(function) if function.readonly => Err(AssignError::Readonly),
+            Some(function) => {
+                function.body = body;
+                Ok(())
+            }
+            None => {
+                self.functions.insert(
+                    name.to_owned(),
+                    Function {
+                        body,
+                        readonly: false,
+                        trace: false,
+                    },
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Removes function `name`; whether it existed.
+    ///
+    /// # Errors
+    ///
+    /// [`AssignError::Readonly`] for a read-only function, which is kept.
+    pub(crate) fn remove_function(&mut self, name: &str) -> Result<bool, AssignError> {
+        match self.functions.get(name) {
+            Some(function) if function.readonly => Err(AssignError::Readonly),
+            Some(_) => Ok(self.functions.remove(name).is_some()),
+            None => Ok(false),
+        }
+    }
+
+    /// Function `name`, to change its attributes.
+    pub(crate) fn function_mut(&mut self, name: &str) -> Option<&mut Function> {
+        self.functions.get_mut(name)
+    }
+
+    /// Enters `frame` of the call stack.
+    pub(crate) fn push_frame(&mut self, frame: Frame) {
+        self.frames.push(frame);
+    }
+
+    /// Leaves the innermost frame of the call stack.
+    pub(crate) fn pop_frame(&mut self) {
+        self.frames.pop();
+    }
+
+    /// Functions running (bash's `funcnest`).
+    pub(crate) fn function_depth(&self) -> usize {
+        self.frames.iter().filter(|frame| frame.function.is_some()).count()
+    }
+
+    // ---- Everything else ----
 
     /// Changes the working directory to `cwd` (absolute): `cd`. `PWD` and `OLDPWD` are the caller's to set.
     pub(crate) fn set_cwd(&mut self, cwd: PathBuf) {
@@ -670,36 +1543,59 @@ impl ShellState {
         &self.aliases
     }
 
-    /// What variable `name` is now, to put back with [`ShellState::restore_variable`].
+    /// What the visible variable `name` is now, with where it is held, to put back with
+    /// [`ShellState::restore_variable`].
     pub(crate) fn save_variable(&self, name: &str) -> SavedVariable {
-        SavedVariable(self.variables.get(name).cloned())
+        let place = self.place(name).unwrap_or(Place::Global);
+        let held = match place {
+            Place::Scope(depth) => self.scopes.get(depth).and_then(|scope| scope.get(name)),
+            Place::Global => self.globals.get(name),
+        };
+        SavedVariable(place, held.cloned())
     }
 
-    /// Puts variable `name` back as `saved` holds it.
+    /// Puts variable `name` back as `saved` holds it, where it was held.
     pub(crate) fn restore_variable(&mut self, name: &str, saved: SavedVariable) {
         self.noticed(name);
-        match saved.0 {
+        let SavedVariable(place, held) = saved;
+        let table = self.table_mut(place);
+        match held {
             Some(variable) => {
-                self.variables.insert(name.to_owned(), variable);
+                table.insert(name.to_owned(), variable);
             }
             None => {
-                self.variables.remove(name);
+                table.remove(name);
             }
         }
     }
 
-    /// Sets `name` to `value`, exported, for one builtin's run (bash's temporary environment). Its other attributes
-    /// are kept.
+    /// Sets the visible variable `name` to `value`, exported, for one builtin's run (bash's temporary environment).
+    /// Its other attributes are kept; an array has its element 0 set.
     pub(crate) fn set_temporary(&mut self, name: &str, value: OsString) {
-        self.store(name, value);
-        if let Some(variable) = self.variables.get_mut(name) {
-            variable.attributes.exported = true;
+        let place = self.place(name).unwrap_or(Place::Global);
+        self.noticed(name);
+        let variable = self
+            .table_mut(place)
+            .entry(name.to_owned())
+            .or_insert_with(Variable::empty);
+        match &mut variable.value {
+            Some(Value::Indexed(elements)) => {
+                elements.insert(0, value);
+            }
+            Some(Value::Assoc(entries)) => entries.insert("0", value),
+            held => *held = Some(Value::Scalar(value)),
         }
+        variable.attributes.exported = true;
     }
 
-    /// Sets the positional parameters (`set --`, `shift`, `source` with arguments).
+    /// Sets the positional parameters (`set --`, `shift`, `source` with arguments, a function call).
     pub(crate) fn set_positional(&mut self, parameters: Vec<String>) {
         self.positional = parameters;
+    }
+
+    /// The positional parameters, to replace for a function call and put back after it.
+    pub(crate) fn positional_mut(&mut self) -> &mut Vec<String> {
+        &mut self.positional
     }
 
     /// `$?`: the status of the last pipeline run.
@@ -770,22 +1666,11 @@ impl ShellState {
         &mut self.options
     }
 
-    /// The names of the set variables, sorted as bash sorts them for `${!prefix*}` (byte order). A variable declared
-    /// without a value is not set, and not listed.
-    pub(crate) fn variable_names(&self) -> impl Iterator<Item = &str> {
-        self.variables
-            .iter()
-            .filter(|(_, variable)| variable.value.is_some())
-            .map(|(name, _)| name.as_str())
-    }
-
     /// Whether reading variable `name` must be refused because bash would answer with a value it maintains itself
     /// ([`Unsupported::ShellVariable`](crate::Unsupported::ShellVariable)).
     pub(crate) fn is_unemulated(&self, name: &str) -> bool {
         is_always_unemulated(name)
-            || (UNEMULATED_WHEN_UNSET.contains(&name)
-                && !self.variables.contains_key(name)
-                && !self.touched.contains(name))
+            || (UNEMULATED_WHEN_UNSET.contains(&name) && self.find(name).is_none() && !self.touched.contains(name))
     }
 
     /// Whether `${!prefix*}` could list a variable whose reading [`ShellState::is_unemulated`] refuses: bash would
@@ -804,13 +1689,17 @@ impl ShellState {
     }
 
     /// The environment of a command run with `assignments` before its name (`A=1 cmd`): the passed-through entries,
-    /// every exported variable, and the assignments, which win over a variable of the same name.
+    /// every exported variable visible from here that holds a string (bash exports no array), and the assignments,
+    /// which win over a variable of the same name.
     pub(crate) fn environment(&self, assignments: &[(String, OsString)]) -> Vec<(OsString, OsString)> {
         let mut named: BTreeMap<&str, &OsStr> = self
-            .variables
-            .iter()
+            .all_variables()
+            .into_iter()
             .filter(|(_, variable)| variable.attributes.exported)
-            .filter_map(|(name, variable)| Some((name.as_str(), variable.value.as_deref()?)))
+            .filter_map(|(name, variable)| match &variable.value {
+                Some(Value::Scalar(value)) => Some((name, value.as_os_str())),
+                Some(Value::Indexed(_) | Value::Assoc(_)) | None => None,
+            })
             .collect();
         for (name, value) in assignments {
             named.insert(name, value);
@@ -821,6 +1710,15 @@ impl ShellState {
             .chain(named.into_iter().map(|(name, value)| (name.into(), value.to_owned())))
             .collect()
     }
+}
+
+/// Why reading an array element failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ElementError {
+    /// A negative index before the first element: bash reports `name: bad array subscript` and reads it as unset.
+    BadSubscript,
+    /// Refused ([`ShellState::value`]).
+    Unsupported(Unsupported),
 }
 
 /// The bucket of `name` in bash's command hash table: FNV-1 (`hash_string`) masked to its 256 buckets

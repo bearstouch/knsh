@@ -1,0 +1,1 @@
+x; declare -A h=([k]=v ["a b"]=c); declare -n r=h; tool "${r[a b]}" "${!h[@]}" "${h[@]^^}"; unset "h[k]"; mapfile -t m < f; tool ${#m[@]}

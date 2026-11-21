@@ -68,6 +68,13 @@ tests (`crates/knsh-interp/src/expand/tests.rs`, `src/arith/tests.rs`); forms bo
 | `read` of input holding NUL bytes (KNSH-102) | The line ends at the first NUL | NUL bytes are dropped |
 | `read -t 0` with input at end of file (KNSH-102) | Status 1 | Status 0: end of file is input waiting (bash 5.2's `input_avail`; pending a 5.2 run, KNSH-109) |
 | `read`'s usage line (KNSH-102) | `read [-ers] [-u fd] [-t timeout] [-p prompt] [-a array] [-n nchars] [-d delim] [name ...]` | `read [-ers] [-a array] [-d delim] [-i text] [-n nchars] [-N nchars] [-p prompt] [-t timeout] [-u fd] [name ...]` |
+| `declare -A`, `declare -n`, `local -n`, `mapfile`, `readarray`, `declare -g` (KNSH-103) | No such option or builtin | Associative arrays, name references, lines into an array, global from a function |
+| `${a[-1]}`, `a[-1]=x` (KNSH-103) | `bad array subscript` | Counts back from one past the greatest index |
+| `${a[@]: -2}` (negative offset of an array slice, KNSH-103) | Expands to nothing | Elements from the index two before one past the greatest |
+| `declare -p` of an array (KNSH-103) | `declare -a a='([0]="x")'` | `declare -a a=([0]="x")`; an associative array `declare -A h=([k]="v" )` |
+| `break` or `continue` in a function called from a loop (KNSH-103) | Acts on the caller's loop | `only meaningful in a loop` (bash 4.4 and later reset the loop state in a function) |
+| `BASH_SOURCE` element of a function defined in a `bash -c` script (KNSH-103) | Left out | `main`; reading it is refused (see below) |
+| `BASH_LINENO` and `$LINENO` under `bash -c` (KNSH-103) | One less than the line (the first line is 0) | The line, as bash's messages number it |
 
 Known differences of the native interpreter from bash 5.2 (KNSH-098): in the C locale bash matches `?` and bracket
 expressions against bytes and the interpreter against characters, so they differ for non-ASCII text only (`?`
@@ -114,8 +121,8 @@ refused when a capture would split a character; `test -o` reports the options th
 off (their `set` forms are refused, KNSH-104) and refuses the line-editing and history options of an interactive
 shell; an interactive `read` does not print `PS2` before a continuation line (KNSH-107); reading or testing one of the
 spawner's standard descriptors (`read` from standard input, `test -t 1`, `[ -p /dev/stdin ]`) is refused unless the
-host gives them (`Interpreter::with_standard_descriptors`). Refused until the story that implements them: `read -a`
-(KNSH-103), `read -e` on a terminal (KNSH-107), `nocasematch` for `[[` (KNSH-104). `[[ =~ ]]` is built on macOS only
+host gives them (`Interpreter::with_standard_descriptors`). Refused until the story that implements them: `read -e`
+on a terminal (KNSH-107), `nocasematch` for `[[` (KNSH-104). `[[ =~ ]]` is built on macOS only
 until the Linux backend declares its `regex_t`.
 
 Known differences of the native interpreter from bash 5.2 in the core builtins (KNSH-101): `exec cmd` runs the
@@ -133,10 +140,41 @@ differently (an unterminated quote, a construct the parser does not read) is ref
 a read-only variable gives only bash's second message (`name: cannot assign fd to variable`); `exit` in an
 interactive shell with stopped jobs exits at once (bash first warns `There are stopped jobs.`); `command -p`
 searches macOS's standard path (`/usr/bin:/bin:/usr/sbin:/sbin`). Refused until the story that implements them:
-`set` with options or without arguments (KNSH-104), `declare -a`, `-A`, `-n` and `name[…]` (KNSH-103), `local` and
-`declare -f` with functions (KNSH-103), `. /dev/stdin` and other descriptors as files, a sourced file that is not
-UTF-8, and the listings that would include variables bash maintains itself (`declare -p` and `declare` without
-names, `readonly -p`, `declare -i` without names).
+`set` with options or without arguments (KNSH-104), `. /dev/stdin` and other descriptors as files, a sourced file that
+is not UTF-8, and the listings that would include variables bash maintains itself (`declare -p` and `declare` without
+names, `readonly -p`, `declare -i` without names, `local` without names).
+
+Known differences of the native interpreter from bash 5.2 in functions, scopes and arrays (KNSH-103):
+
+- Array assignments (`a=(…)`, `a[i]=v`, `declare -a x=(…)`) are read only when the line is parsed with
+  `knsh_bash::ParseOptions::arrays`, which the native interpreter's caller sets (and `eval`, `source` and aliases
+  use). The classifier parses without it, so such a line stays refused there and is classified as dynamic, as
+  decision 6 requires; the substitutions in a list's elements are listed with the assignment's own either way.
+
+- Associative arrays list their elements in bash 5.2's own order, reproduced from its hash table (`assoc.c` over
+  `hashlib.c`: 1,024 buckets chosen by bash's FNV-1 string hash, newest key first within a bucket, growing four times
+  past two entries per bucket). Bash documents no order; scripts that print `${!h[@]}` see it, so it is reproduced
+  rather than replaced. Pending: a run against bash 5.2 itself (KNSH-109).
+- Printing a function's definition (`declare -f name`, `declare -f` once a function exists, `type name`,
+  `command -V name`) is refused: bash re-formats the body with its own pretty-printer. `declare -F`, `type -t`,
+  `command -v`, `declare -fr`/`-ft` and `readonly -f` work; `export -f` is refused (bash's environment encoding).
+- `BASH_SOURCE`: a function defined in the main script has the element bash 5.2 calls `main` and bash 3.2 leaves
+  out, so reading that element (or the whole array while it holds one) is refused; elements of sourced files and
+  functions defined in them are given. `FUNCNAME` has no `main` frame (the main script runs as `bash -c` would).
+- A pipeline stage that is not the last and calls a function runs it on a thread of its own beside the other stages;
+  that is decided from the command name as written, so a function called through a name an expansion produced
+  (`$cmd | wc`) there is refused.
+- Without `FUNCNEST`, endless recursion ends with the interpreter's nesting limit (`InterpError::DepthExceeded`,
+  [defaults and limits](../09-reference/defaults-and-limits.md)) where bash would crash when its stack runs out.
+- Name references are followed as bash does for reading, assigning and unsetting, `${!ref}` giving the name; refused:
+  a reference to an array element (`declare -n r=a[1]`), a chain longer than bash's 8, a circular chain inside a
+  function (bash then looks for a global variable) and an assignment through a circular chain. A circular chain at
+  the top level reads as unset after bash's `warning: x: circular name reference`.
+- Refused array forms, where bash's messages or results are not reproduced: `${a[@]@A}`, `@K` and `@k` of an array;
+  `${a[@]:=x}`; an element or list assignment before a command (`a[1]=x cmd`); an associative list mixing
+  `[key]=value` and plain words; turning an associative array into an indexed one or the reverse by assignment; a
+  subscript holding an expansion where bash expands it a second time (`unset 'a[$i]'`, `test -v 'a[$i]'`,
+  `printf -v 'a[$i]'`, `x='a[$i]'; ${!x}`); `mapfile -C`. Arrays are never exported, as in bash.
 | Messages under `bash -c` | `bash: message` (no line number on one-line scripts) | `bash: line n: message` |
 | Arithmetic error token after trailing blanks (`$(( 1 + ))`) | `error token is " "` | The last token read: `error token is "+ "` |
 | `base#` with no digits (`$((2#))`) | 0 | Error `invalid integer constant` |

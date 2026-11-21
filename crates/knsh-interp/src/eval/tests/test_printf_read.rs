@@ -201,7 +201,9 @@ fn variable_option_and_descriptor_tests() {
         0
     );
     assert_eq!(refused(h.run("[ -v RANDOM ]")), Unsupported::ShellVariable);
-    assert_eq!(refused(h.run("[ -v a[1] ]")), Unsupported::Array);
+    // KNSH-103: an element is set or not.
+    assert_eq!(h.status("[ -v a[1] ]"), 1);
+    assert_eq!(h.status("a[1]=x; [ -v a[1] ] && [ ! -v a[0] ] && [ -v a[@] ]"), 0);
     // Without standard descriptors from the host, asking about one is refused rather than guessed.
     let mut bare = Harness::new();
     assert_eq!(refused(bare.run("[ -t 1 ]")), Unsupported::StandardDescriptor);
@@ -318,7 +320,9 @@ fn printf_builtin_assigns_quotes_and_reports() {
          printf: usage: printf [-v var] format [arguments]\nknsh: line 1: printf: `1x': not a valid identifier\n"
     );
     assert_eq!(h.status("readonly r=1; printf -v r x"), 1);
-    assert_eq!(refused(h.run("printf -v 'a[1]' x")), Unsupported::Array);
+    // KNSH-103: `-v` assigns an element.
+    assert_eq!(h.status("printf -v 'a[1]' %s-%s x y"), 0);
+    assert_eq!(h.status("[ \"${a[1]}\" = x-y ]"), 0);
     // A grouped number in a locale that groups, or `%T` without a clock, is refused.
     assert_eq!(
         refused(h.run("LC_ALL=en_US.UTF-8; printf \"%'d\" 1000")),
@@ -466,10 +470,14 @@ fn read_options_and_errors() {
         assert_eq!(h.status(line), *status, "{line}");
         assert_eq!(&h.diagnostics.text()[before..], *message, "{line}");
     }
-    // `-e` off a terminal is ignored, as bash turns it off; `-a` is refused (arrays, KNSH-103).
+    // `-e` off a terminal is ignored, as bash turns it off; `-a` fills an array and a name may be an element
+    // (KNSH-103).
     assert_eq!(h.status("read -e a <<< x"), 0);
-    assert_eq!(refused(h.run("opts=-a; read $opts a <<< x")), Unsupported::ReadOption);
-    assert_eq!(refused(h.run("read a[1] <<< x")), Unsupported::Array);
+    assert_eq!(
+        h.status("opts=-a; read $opts a <<< 'x  y'; [ \"${#a[@]}:${a[1]}\" = 2:y ]"),
+        0
+    );
+    assert_eq!(h.status("read 'b[2]' c <<< 'p q'; [ \"${b[2]}$c\" = pq ]"), 0);
     // Standard input the host did not give is refused rather than guessed.
     assert_eq!(refused(h.run("read a")), Unsupported::StandardDescriptor);
 }

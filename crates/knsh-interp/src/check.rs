@@ -1,5 +1,6 @@
-//! The check of a whole script before it runs (KNSH-096 to KNSH-101): every construct a later story
+//! The check of a whole script before it runs (KNSH-096 to KNSH-103): every construct a later story
 //! implements is refused here, with its span, so a script the interpreter cannot evaluate runs none of its commands.
+//! A function's body is checked where the function is defined, as its commands are written there (KNSH-103).
 //!
 //! Expansions are read but not performed: each `${…}` body is parsed, and the words and expressions inside it are
 //! scanned, so an array, a command substitution or a variable bash maintains itself is refused wherever it is
@@ -20,7 +21,7 @@ use crate::cond;
 use crate::error::{InterpError, Unsupported};
 use crate::eval::{is_conditional, is_refused_builtin, refused_form, trailing_redirection};
 use crate::expand::MAX_EXPANSION_DEPTH;
-use crate::param::{self, Name, Op, Parsed};
+use crate::param::{self, Name, Op, Parsed, Subscript};
 use crate::pattern;
 use crate::scan::{self, Mode, Part};
 use crate::state::{is_always_unemulated, lists_always_unemulated, refuses_assignment};
@@ -85,7 +86,10 @@ impl Checker<'_> {
         match command {
             Command::Simple(simple) => self.simple(simple),
             Command::Compound(compound) => self.compound(compound, depth),
-            Command::FunctionDefinition(definition) => Err(refuse(Unsupported::FunctionDefinition, definition.span)),
+            Command::FunctionDefinition(definition) => {
+                self.word(&definition.name, Context::Plain)?;
+                self.compound(&definition.body, depth)
+            }
             Command::Unsupported(unsupported) => self.opaque(unsupported, depth),
         }
     }
@@ -140,8 +144,20 @@ impl Checker<'_> {
             if refuses_assignment(&assignment.name) {
                 return Err(refuse(Unsupported::ShellVariable, assignment.span));
             }
-            let parts = word::parts(&assignment.word.segments, self.source, assignment.value.start)?;
-            self.parts(&parts, false, 0)?;
+            if let Some(subscript) = assignment.subscript {
+                self.subscript(subscript, assignment.span)?;
+            }
+            if let Some(array) = &assignment.array {
+                self.array(array)?;
+            } else {
+                let parts = word::parts(&assignment.word.segments, self.source, assignment.value.start)?;
+                self.parts(&parts, false, 0)?;
+            }
+        }
+        for command_word in &simple.words {
+            if let Some(array) = &command_word.array {
+                self.array(array)?;
+            }
         }
         let mut literals = Vec::with_capacity(simple.words.len());
         for command_word in &simple.words {
@@ -160,6 +176,31 @@ impl Checker<'_> {
             }
         }
         self.redirections(&simple.redirections)
+    }
+
+    /// The subscript at `subscript` of an element assignment (of a command at `span`): its expansions, read both as
+    /// an arithmetic expression's and as an associative array's key would be.
+    fn subscript(&self, subscript: Span, span: Span) -> Result<(), InterpError> {
+        for mode in [Mode::Double, Mode::Unquoted] {
+            let parts = scan::scan(self.source, subscript, mode).map_err(|error| at(error, span))?;
+            self.parts(&parts, mode == Mode::Double, 1)?;
+        }
+        Ok(())
+    }
+
+    /// The elements of a compound assignment's list (KNSH-103): each word, and each `[subscript]=` subscript.
+    fn array(&self, array: &knsh_bash::ArrayValue) -> Result<(), InterpError> {
+        for element in &array.elements {
+            self.word(element, Context::Argument)?;
+            if let Some(text) = element.span.text(self.source)
+                && let Some(inner) = text.strip_prefix('[')
+                && let Some(close) = scan::subscript_end(inner)
+            {
+                let start = element.span.start + 1;
+                self.subscript(Span::new(start, start + close), element.span)?;
+            }
+        }
+        Ok(())
     }
 
     /// A command's redirections (KNSH-099): here-documents are refused (KNSH-105), a `{name}` variable bash
@@ -282,16 +323,25 @@ impl Checker<'_> {
     /// substitution is bash's error when it runs, not a refusal.
     fn brace(&self, body: Span, span: Span, quoted: bool, depth: usize) -> Result<(), InterpError> {
         let text = word::text(body, self.source)?;
-        let name_refused = |name: &Name| matches!(name, Name::Variable(variable) if is_always_unemulated(variable));
+        let name_refused = |name: &Name| matches!(name, Name::Variable(variable) | Name::Element(variable, _) if is_always_unemulated(variable));
+        if let Parsed::Length(Name::Element(_, Subscript::Source { span: inner, .. }))
+        | Parsed::Param {
+            name: Name::Element(_, Subscript::Source { span: inner, .. }),
+            ..
+        } = param::parse(text, body)
+        {
+            self.subscript(inner, span)?;
+        }
         match param::parse(text, body) {
             Parsed::Unsupported(feature) => Err(refuse(feature, span)),
             Parsed::Length(name) | Parsed::Param { name, .. } if name_refused(&name) => {
                 Err(refuse(Unsupported::ShellVariable, span))
             }
+            Parsed::Keys { name, .. } if is_always_unemulated(&name) => Err(refuse(Unsupported::ShellVariable, span)),
             Parsed::Names { prefix, .. } if lists_always_unemulated(&prefix) => {
                 Err(refuse(Unsupported::ShellVariable, span))
             }
-            Parsed::Bad | Parsed::Length(_) | Parsed::Names { .. } => Ok(()),
+            Parsed::Bad | Parsed::Length(_) | Parsed::Names { .. } | Parsed::Keys { .. } => Ok(()),
             Parsed::Param {
                 op: Op::Transform('P'), ..
             } => Err(refuse(Unsupported::PromptExpansion, span)),

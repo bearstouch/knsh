@@ -144,13 +144,9 @@ impl Interpreter {
             "umask" => self.umask_builtin(args, span, run),
             "cd" => Ok(self.cd_builtin(args, span, run)),
             "pwd" => Ok(self.pwd_builtin(args, span, run)),
-            "export" | "readonly" | "declare" | "typeset" => self.declare_builtin(name, args, span, run),
+            "export" | "readonly" | "declare" | "typeset" | "local" => self.declare_builtin(name, args, span, run),
             "unset" => self.unset_builtin(args, span, run),
-            "local" => {
-                // Functions arrive with KNSH-103; until then `local` is always outside one.
-                self.report(span, run, format_args!("local: can only be used in a function"));
-                Ok(Status::FAILURE)
-            }
+            "mapfile" | "readarray" => self.mapfile_builtin(name, args, span, run),
             "shift" => self.shift_builtin(args, span, run),
             "set" => self.set_builtin(args, span),
             "exit" => self.exit_builtin(args, span, run),
@@ -162,7 +158,7 @@ impl Interpreter {
             "unalias" => Ok(self.unalias_builtin(args, span, run)),
             "builtin" => self.builtin_builtin(args, span, run),
             "command" => self.command_builtin(args, span, run),
-            "type" => Ok(self.type_builtin(args, span, run)),
+            "type" => self.type_builtin(args, span, run),
             "hash" => Ok(self.hash_builtin(args, span, run)),
             "exec" => self.exec_builtin(args, &[], span, run),
             "test" | "[" => self.test_builtin(name, args, span, run),
@@ -425,7 +421,8 @@ impl Interpreter {
         Ok(Status::FAILURE)
     }
 
-    /// `command [-pVv] name [args …]`: runs `name` as a builtin or program (never a function), or describes it.
+    /// `command [-pVv] name [args …]`: runs `name` as a builtin or program (never a function), or describes it (a
+    /// function too).
     fn command_builtin(&mut self, args: &[String], span: Span, run: &Run<'_>) -> Flow<Status> {
         let (options, rest) = match self.options("command", "[-pVv] command [arg ...]", "pVv", args, span, run) {
             Ok(parsed) => parsed,
@@ -439,6 +436,9 @@ impl Interpreter {
             _ => None,
         });
         if let Some(describe) = describe {
+            if describe == Describe::Sentence && self.describes_a_function(rest, false) {
+                return Err(unsupported(Unsupported::FunctionPrint, span).into());
+            }
             let mut any = false;
             for name in rest {
                 let found = self.describe(name, describe, false, standard, span, run);
@@ -457,10 +457,10 @@ impl Interpreter {
     }
 
     /// `type [-afptP] name …`.
-    fn type_builtin(&mut self, args: &[String], span: Span, run: &Run<'_>) -> Status {
+    fn type_builtin(&mut self, args: &[String], span: Span, run: &Run<'_>) -> Flow<Status> {
         let (options, names) = match self.options("type", "[-afptP] name [name ...]", "afptP", args, span, run) {
             Ok(parsed) => parsed,
-            Err(status) => return status,
+            Err(status) => return Ok(status),
         };
         let all = options.contains('a');
         let mut describe = Describe::Sentence;
@@ -476,6 +476,9 @@ impl Interpreter {
                 _ => {}
             }
         }
+        if describe == Describe::Sentence && !force_path && self.describes_a_function(names, all) {
+            return Err(unsupported(Unsupported::FunctionPrint, span).into());
+        }
         let mut failed = false;
         for name in names {
             let found = if force_path {
@@ -488,7 +491,7 @@ impl Interpreter {
             }
             failed |= !found;
         }
-        if failed { Status::FAILURE } else { Status::SUCCESS }
+        Ok(if failed { Status::FAILURE } else { Status::SUCCESS })
     }
 
     /// Prints what `name` is as `describe` says (bash's `describe_command`), all of its meanings with `all`;
@@ -532,7 +535,20 @@ impl Interpreter {
                 return true;
             }
         }
-        // Functions arrive with KNSH-103: none can be defined yet.
+        if self.state.function(name).is_some() {
+            // A sentence is followed by the definition, which callers refuse before describing (bash's
+            // pretty-printer is not reproduced); `type -p` prints nothing for a function and stops there.
+            let line = match describe {
+                Describe::Kind => Some("function".to_owned()),
+                Describe::Reusable => Some(name.to_owned()),
+                Describe::Sentence | Describe::PathOnly => None,
+            };
+            self.describe_line(line, span, run);
+            found = true;
+            if !all {
+                return true;
+            }
+        }
         if is_bash_builtin(name) {
             let line = match describe {
                 Describe::Kind => Some("builtin".to_owned()),
@@ -604,6 +620,15 @@ impl Interpreter {
             self.describe_line(Some(line), span, run);
         }
         !found.is_empty()
+    }
+
+    /// Whether describing `names` as a sentence (`type`, `command -V`) would print a function's definition, which
+    /// bash re-formats with its pretty-printer (refused, KNSH-103): a function that no alias shown first hides.
+    fn describes_a_function(&self, names: &[String], all: bool) -> bool {
+        names.iter().any(|name| {
+            let aliased = self.state.options().expand_aliases && self.state.alias(name).is_some();
+            self.state.function(name).is_some() && (all || !aliased)
+        })
     }
 
     /// Prints one line of `type` or `command -v` output, if any.

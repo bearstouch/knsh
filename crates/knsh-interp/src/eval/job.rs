@@ -144,6 +144,8 @@ impl Interpreter {
             visible_aliases: Arc::clone(&self.visible_aliases),
             alias_guard: self.alias_guard.clone(),
             exit_after_job: false,
+            declaration_lists: Vec::new(),
+            forked_stage: false,
         }
     }
 
@@ -419,7 +421,16 @@ impl Interpreter {
         }
         let mut subshell = self.subshell(fds, context.clone());
         subshell.pipe_stderr = pipe_all && applies_redirections;
-        if let Command::Simple(simple) = command {
+        // KNSH-103: a function runs beside the other stages, on a thread of its own, as a compound command does.
+        let calls_function = matches!(command, Command::Simple(simple) if simple
+            .words
+            .first()
+            .and_then(|first| super::alias::literal_text(first, run.source))
+            .is_some_and(|name| self.state.function(name).is_some()));
+        if let Command::Simple(simple) = command
+            && !calls_function
+        {
+            subshell.forked_stage = true;
             subshell.sink = Sink::Open;
             let result = subshell.simple(simple, run);
             let child = std::mem::take(&mut subshell.sink).started();
@@ -441,18 +452,14 @@ impl Interpreter {
         let index = self.jobs.push(key, Member::inside());
         subshell.parent = Some(self.jobs.parent(key, index));
         let sender = self.jobs.sender();
-        let source: Arc<str> = Arc::from(run.source);
+        let source: Arc<str> = run.source_arc();
         let origin: Option<Arc<str>> = run.origin.map(Arc::from);
         let line_base = run.line_base;
         std::thread::Builder::new()
             .name("knsh-subshell".to_owned())
             .stack_size(EVAL_STACK_SIZE)
             .spawn(move || {
-                let run = Run {
-                    source: &source,
-                    origin: origin.as_deref(),
-                    line_base,
-                };
+                let run = Run::shared(&source, origin.as_deref(), line_base);
                 // A panic must still be reported, or the shell would wait for this member forever.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     subshell_status(&task(&mut subshell, &run))

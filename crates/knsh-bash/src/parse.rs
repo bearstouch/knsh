@@ -56,7 +56,7 @@ use std::collections::BTreeMap;
 use std::mem;
 
 use crate::ast::{
-    AndOr, AndOrOperator, AndOrPart, ArithmeticParts, Assignment, CaseClause, CaseCommand, CaseTerminator,
+    AndOr, AndOrOperator, AndOrPart, ArithmeticParts, ArrayValue, Assignment, CaseClause, CaseCommand, CaseTerminator,
     CaseTerminatorKind, Command, CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems,
     FunctionDefinition, Group, HereDocument, IfClause, IfCommand, ListItem, LoopBody, LoopCommand, PipeOperator,
     Pipeline, PipelinePart, Redirect, RedirectionVariable, Script, Separator, SeparatorKind, SimpleCommand, Subshell,
@@ -129,9 +129,23 @@ pub struct ParseOptions {
     /// such a line is refused rather than read the way only one of the two would run it. The native interpreter,
     /// which follows bash 5.2, parses with it on.
     pub redirection_variables: bool,
+    /// Read array assignments as bash 4 and later do (KNSH-103): `name=(…)` and `name+=(…)` before a command name,
+    /// `name[subscript]=value` and `name[subscript]+=value`, and `name=(…)` as an argument of a declaration builtin
+    /// (`declare`, `typeset`, `local`, `export`, `readonly`) named literally first. Off by default: such lines are
+    /// refused ([`UnsupportedConstruct::ArrayAssignment`], [`UnsupportedConstruct::SubscriptAssignment`]), so the
+    /// classifier never reads a value it does not walk. The native interpreter parses with it on. Substitutions in
+    /// the list's elements are listed with the assignment's or word's own, so every walker still sees them.
+    pub arrays: bool,
 }
 
 impl ParseOptions {
+    /// These options with `arrays` set to `on`.
+    #[must_use]
+    pub const fn with_arrays(mut self, on: bool) -> Self {
+        self.arrays = on;
+        self
+    }
+
     /// These options with `extglob` set to `on`.
     #[must_use]
     pub const fn with_extglob(mut self, on: bool) -> Self {
@@ -168,6 +182,7 @@ pub fn parse_with(input: &str, options: ParseOptions) -> Result<Script, ParseErr
     let context = LexContext {
         extglob: options.extglob,
         redirection_variables: options.redirection_variables,
+        arrays: options.arrays,
         ..LexContext::default()
     };
     let mut script = parse_source(input, Span::new(0, input.len()), context, 0, &tokens_left)?;
@@ -586,8 +601,9 @@ impl Parser<'_> {
                     if words.is_empty()
                         && let Some(mut assignment) = self.assignment_shape(&word, span)?
                     {
-                        self.reject_array_value(&assignment)?;
                         assignment.substitutions = self.substitutions(&assignment.word.segments, 0)?;
+                        self.array_value_of(&mut assignment)?;
+                        end = assignment.span.end;
                         assignments.push(assignment);
                     } else {
                         words.push(self.command_word(word, span)?);
@@ -611,6 +627,18 @@ impl Parser<'_> {
                     redirections.push(redirect);
                 }
                 TokenKind::Operator(Operator::LeftParen) => {
+                    if self.declaration_list_ahead(&words, token.span)
+                        && let Some(last) = words.last_mut()
+                    {
+                        let array = self.array_list(token.span)?;
+                        for element in &array.elements {
+                            last.substitutions.extend(element.substitutions.iter().cloned());
+                        }
+                        last.span = Span::new(last.span.start, array.close.end);
+                        end = last.span.end;
+                        last.array = Some(Box::new(array));
+                        continue;
+                    }
                     return Err(self.left_paren_in_command(&words, token.span));
                 }
                 // `continues_simple_command` lets none of these through.
@@ -702,6 +730,7 @@ impl Parser<'_> {
             word,
             span,
             substitutions,
+            array: None,
         })
     }
 
@@ -769,6 +798,7 @@ impl Parser<'_> {
             process_substitutions: self.context.process_substitutions + usize::from(process),
             extglob: self.context.extglob,
             redirection_variables: self.context.redirection_variables,
+            arrays: self.context.arrays,
         };
         let script = parse_source(self.input, segment.body, context, self.depth + 1, self.tokens_left)?;
         Ok(Substitution {
@@ -791,6 +821,7 @@ impl Parser<'_> {
             process_substitutions: 0,
             extglob: self.context.extglob,
             redirection_variables: self.context.redirection_variables,
+            arrays: self.context.arrays,
         };
         let body = segment.body.text(self.input).unwrap_or_default();
         let (text, script) = match unescape_backtick(body, in_double_quotes, None) {
@@ -1329,6 +1360,8 @@ impl Parser<'_> {
                             // Parsed by the caller once the word is known to be an assignment.
                             substitutions: Vec::new(),
                             span,
+                            subscript: None,
+                            array: None,
                         }));
                     }
                     b'+' if !name.is_empty() && !plus => plus = true,
@@ -1337,9 +1370,24 @@ impl Parser<'_> {
                         // starts, bash reads the subscript up to its matching `]` across blanks and operators
                         // (`a[ 1 ]=x rm f` assigns and runs `rm`; `a[;]=1 b` runs `b`), so a subscript that the
                         // word does not close is refused rather than split into other words.
+                        let close = self.subscript_close(word, index, at + 1);
+                        if self.context.arrays
+                            && let Some(close) = close
+                            && let Some((append, value_start)) = self.after_subscript(word, close)
+                        {
+                            return Ok(Some(Assignment {
+                                name,
+                                append,
+                                value: Span::new(value_start, span.end),
+                                word: word.clone(),
+                                substitutions: Vec::new(),
+                                span,
+                                subscript: Some(Span::new(at + 1, close)),
+                                array: None,
+                            }));
+                        }
                         let rest = span.text(self.input).unwrap_or_default();
-                        let closed = self.subscript_closes(word, index, at + 1);
-                        return if rest.contains('=') || !closed {
+                        return if rest.contains('=') || close.is_none() {
                             Err(ParseError::Unsupported {
                                 construct: UnsupportedConstruct::SubscriptAssignment,
                                 span,
@@ -1410,10 +1458,10 @@ impl Parser<'_> {
             .is_some_and(|text| text.len() > 2 && text.starts_with('{') && text.ends_with('}'))
     }
 
-    /// Whether the subscript opened by the `[` just before byte `from` (inside segment `index` of `word`) is closed by
-    /// a matching `]` within the word. Like bash, nested brackets are counted and quoted, escaped or substituted text
-    /// is skipped; only unquoted literal brackets count.
-    fn subscript_closes(&self, word: &Word, index: usize, from: usize) -> bool {
+    /// Where the subscript opened by the `[` just before byte `from` (inside segment `index` of `word`) is closed by
+    /// a matching `]` within the word: the offset of that `]`. Like bash, nested brackets are counted and quoted,
+    /// escaped or substituted text is skipped; only unquoted literal brackets count.
+    fn subscript_close(&self, word: &Word, index: usize, from: usize) -> Option<usize> {
         let mut depth: usize = 1;
         for segment in word.segments.iter().skip(index) {
             if !segment.kind.is_unquoted_text() {
@@ -1421,35 +1469,148 @@ impl Parser<'_> {
             }
             let start = segment.body.start.max(from);
             let text = self.input.get(start..segment.body.end.max(start)).unwrap_or_default();
-            for byte in text.bytes() {
+            for (offset, byte) in text.bytes().enumerate() {
                 match byte {
                     b'[' => depth = depth.saturating_add(1),
                     b']' => {
                         depth -= 1;
                         if depth == 0 {
-                            return true;
+                            return Some(start + offset);
                         }
                     }
                     _ => {}
                 }
             }
         }
-        false
+        None
     }
 
-    /// Refuses `name=(…)`: bash reads the parenthesised list as an array value, which this parser does not read yet.
-    /// The `(` must touch the assignment; `name= (…)` is a different error, found by `left_paren_in_command`.
-    fn reject_array_value(&self, assignment: &Assignment) -> Result<(), ParseError> {
-        if let Some(token) = self.peek()
-            && is_operator(&token.kind, Operator::LeftParen)
-            && token.span.start == assignment.span.end
-        {
+    /// After the `]` at `close` of a subscript in `word`: `=` or `+=` as unquoted literal text makes the word an
+    /// element assignment, `Some((append, value start))`; anything else leaves it an ordinary word.
+    fn after_subscript(&self, word: &Word, close: usize) -> Option<(bool, usize)> {
+        let segment = word
+            .segments
+            .iter()
+            .find(|segment| segment.body.start <= close && close < segment.body.end)?;
+        let rest = self.input.get(close + 1..segment.body.end)?;
+        if rest.starts_with('=') {
+            Some((false, close + 2))
+        } else if rest.starts_with("+=") {
+            Some((true, close + 3))
+        } else {
+            None
+        }
+    }
+
+    /// Reads the list of `name=(…)` into `assignment` with [`ParseOptions::arrays`]; refuses it without the option.
+    /// The `(` must touch the assignment; `name= (…)` is a different error, found by `left_paren_in_command`. A list
+    /// after a subscript (`a[1]=(x)`) is refused: bash reports it only when the assignment runs.
+    fn array_value_of(&mut self, assignment: &mut Assignment) -> Result<(), ParseError> {
+        let Some(token) = self.peek() else {
+            return Ok(());
+        };
+        if !(is_operator(&token.kind, Operator::LeftParen) && token.span.start == assignment.span.end) {
+            return Ok(());
+        }
+        if !self.context.arrays || assignment.subscript.is_some() {
             return Err(ParseError::Unsupported {
                 construct: UnsupportedConstruct::ArrayAssignment,
                 span: assignment.span,
             });
         }
+        let open = self.advance_span();
+        let array = self.array_list(open)?;
+        for element in &array.elements {
+            assignment.substitutions.extend(element.substitutions.iter().cloned());
+        }
+        assignment.value = Span::new(open.start, array.close.end);
+        assignment.span = Span::new(assignment.span.start, array.close.end);
+        assignment.array = Some(array);
         Ok(())
+    }
+
+    /// Whether the `(` at `open` starts the list of a declaration builtin's `name=(…)` argument, read with
+    /// [`ParseOptions::arrays`]: the command is named literally `declare`, `typeset`, `local`, `export` or `readonly`
+    /// and the `(` touches an argument spelled `name=` or `name+=` (bash's `PST_ASSIGNOK`).
+    fn declaration_list_ahead(&self, words: &[CommandWord], open: Span) -> bool {
+        if !self.context.arrays || words.len() < 2 {
+            return false;
+        }
+        let literal = |word: &CommandWord| {
+            word.word
+                .segments
+                .iter()
+                .all(|segment| segment.kind == SegmentKind::Literal)
+        };
+        let declaration = words.first().is_some_and(|first| {
+            literal(first)
+                && first
+                    .span
+                    .text(self.input)
+                    .is_some_and(|name| matches!(name, "declare" | "typeset" | "local" | "export" | "readonly"))
+        });
+        let Some(last) = words.last() else {
+            return false;
+        };
+        let shaped = last.span.end == open.start
+            && last.array.is_none()
+            && literal(last)
+            && last.span.text(self.input).is_some_and(|text| {
+                let name = text
+                    .strip_suffix('=')
+                    .map(|name| name.strip_suffix('+').unwrap_or(name));
+                name.is_some_and(is_name)
+            });
+        declaration && shaped
+    }
+
+    /// Reads the elements of a compound array assignment after its `(` (at `open`, already taken) up to the `)`:
+    /// words, with newlines and comments between them. An element whose `[` subscript the word does not close
+    /// (`([a b]=1)`, which bash reads as one element) is refused rather than split.
+    fn array_list(&mut self, open: Span) -> Result<ArrayValue, ParseError> {
+        let mut elements = Vec::new();
+        loop {
+            while self
+                .next_if(|kind| matches!(kind, TokenKind::Newline | TokenKind::Comment))
+                .is_some()
+            {}
+            let Some(token) = self.peek() else {
+                return Err(ParseError::Unclosed { span: open });
+            };
+            let span = token.span;
+            match &token.kind {
+                TokenKind::Operator(Operator::RightParen) => {
+                    let close = self.advance_span();
+                    return Ok(ArrayValue { open, elements, close });
+                }
+                TokenKind::Word(_) => {
+                    let Some(Token {
+                        kind: TokenKind::Word(word),
+                        span,
+                    }) = self.advance()
+                    else {
+                        return Err(ParseError::Unclosed { span: open });
+                    };
+                    let opens_subscript = word.segments.first().is_some_and(|first| {
+                        first.kind.is_unquoted_text()
+                            && first.body.text(self.input).is_some_and(|text| text.starts_with('['))
+                    });
+                    if opens_subscript && self.subscript_close(&word, 0, span.start + 1).is_none() {
+                        return Err(ParseError::Unsupported {
+                            construct: UnsupportedConstruct::ArrayAssignment,
+                            span,
+                        });
+                    }
+                    elements.push(self.command_word(word, span)?);
+                }
+                other => {
+                    return Err(ParseError::UnexpectedToken {
+                        token: unexpected(other),
+                        span,
+                    });
+                }
+            }
+        }
     }
 
     /// The error for a `(` inside a simple command (a lone `name ()` was already read as a function definition by
@@ -2233,6 +2394,79 @@ mod tests {
         );
         // Without `=`, `x[1]` is an ordinary (glob) word.
         assert_eq!(names("x[1] arg"), [Some("x[1]")]);
+    }
+
+    /// `input` parsed with [`ParseOptions::arrays`] (KNSH-103).
+    fn with_arrays(input: &str) -> Result<Script, ParseError> {
+        parse_with(input, ParseOptions::default().with_arrays(true))
+    }
+
+    // KNSH-103: with `arrays`, compound and element assignments are read, and the substitutions in a list's elements
+    // are listed with the assignment's or word's own, so every walker still sees what runs.
+    #[test]
+    fn arrays_option_reads_compound_and_element_assignments() {
+        let input = "a=(1 [3]=x \"y z\"\n # note\n $(rm f)) b+=(q) c[$i+1]=v d[k]+=w cmd";
+        let script = with_arrays(input).unwrap();
+        let top = |script: &Script| match &script.items[0].and_or.first.first {
+            Command::Simple(simple) => simple.clone(),
+            other => panic!("{other:?}"),
+        };
+        let command = top(&script);
+        assert_eq!(command.assignments.len(), 4);
+        let a = &command.assignments[0];
+        let list = a.array.as_ref().unwrap();
+        let elements: Vec<&str> = list.elements.iter().map(|word| text(input, word.span)).collect();
+        assert_eq!(elements, ["1", "[3]=x", "\"y z\"", "$(rm f)"]);
+        assert_eq!(text(input, a.value), "(1 [3]=x \"y z\"\n # note\n $(rm f))");
+        assert_eq!(a.substitutions.len(), 1);
+        assert!(command.assignments[1].append && command.assignments[1].array.is_some());
+        let c = &command.assignments[2];
+        assert_eq!((c.name.as_str(), text(input, c.subscript.unwrap())), ("c", "$i+1"));
+        assert_eq!(text(input, c.value), "v");
+        let d = &command.assignments[3];
+        assert!(d.append);
+        assert_eq!(text(input, d.subscript.unwrap()), "k");
+        let rm: Vec<&str> = script
+            .simple_commands()
+            .filter_map(|command| command.name().map(|name| text(input, name.span)))
+            .collect();
+        assert_eq!(rm, ["cmd", "rm"]);
+        // A declaration builtin's argument takes a list too.
+        let input = "declare -a x=(1 $(id)) y";
+        let command = top(&with_arrays(input).unwrap());
+        assert_eq!(command.words.len(), 4);
+        assert_eq!(text(input, command.words[2].span), "x=(1 $(id))");
+        assert_eq!(command.words[2].array.as_ref().unwrap().elements.len(), 2);
+        assert_eq!(command.words[2].substitutions.len(), 1);
+        // Elsewhere a list is still an error, and a list after a subscript or an unclosed element subscript refused.
+        assert!(matches!(
+            with_arrays("echo x=(1)"),
+            Err(ParseError::Unsupported {
+                construct: UnsupportedConstruct::ArrayAssignment,
+                ..
+            })
+        ));
+        for refused in ["a[1]=(x)", "a=([a b]=1)"] {
+            assert!(
+                matches!(with_arrays(refused), Err(ParseError::Unsupported { .. })),
+                "{refused}"
+            );
+        }
+        assert!(matches!(
+            with_arrays("a=(1; 2)"),
+            Err(ParseError::UnexpectedToken { .. })
+        ));
+        assert!(matches!(with_arrays("a=(1 2"), Err(ParseError::Unclosed { .. })));
+        // A subscript the word does not close is still refused, and `x[1]` alone is a word.
+        assert!(matches!(
+            with_arrays("a[ 1 ]=x rm f"),
+            Err(ParseError::Unsupported {
+                construct: UnsupportedConstruct::SubscriptAssignment,
+                ..
+            })
+        ));
+        let command = only_command_of(&with_arrays("x[1] arg").unwrap());
+        assert_eq!(command.assignments.len(), 0);
     }
 
     #[test]

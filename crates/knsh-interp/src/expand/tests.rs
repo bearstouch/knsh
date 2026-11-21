@@ -367,7 +367,8 @@ fn indirection_reads_named_variable() {
         error(&vars, "${!bad}"),
         ExpandError::Discard("a-b: invalid variable name".to_owned())
     );
-    assert_eq!(refusal(&[("arr", "a[1]")], "${!arr}"), Unsupported::Array);
+    // KNSH-103: the value may name an element.
+    assert_eq!(expand(&[("arr", "a[1]")], "${!arr}"), Vec::<String>::new());
 }
 
 #[test]
@@ -574,7 +575,8 @@ fn arithmetic_expansion_inside_words() {
         error_in(&mut state, "$((1/0))"),
         ExpandError::Discard("1/0: division by 0 (error token is \"0\")".to_owned())
     );
-    assert_eq!(refusal(&[], "$((a[1]))"), Unsupported::Array);
+    // KNSH-103: an unset element is 0.
+    assert_eq!(expand(&[], "$((a[1]))"), ["0"]);
 }
 
 #[test]

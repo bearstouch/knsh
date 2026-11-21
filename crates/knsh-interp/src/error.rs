@@ -114,7 +114,10 @@ pub enum Unsupported {
     /// A brace expansion whose pieces, brought together, would form `${…}`, `$(…)` or `$[…]` (`{$,}{a}`), which bash
     /// would then expand. Not emulated: such a word is refused rather than read differently.
     BraceBuiltExpansion,
-    /// An array: `${a[0]}`, `${a[@]}`, `${!a[@]}`, `a[1]` in arithmetic (KNSH-103).
+    /// An array form the interpreter does not evaluate as bash does (KNSH-103): `${a[@]@A}` and `${a[@]@K}`, an
+    /// assignment to every element (`${a[@]:=x}`), an element assignment before a command (`a[1]=x cmd`), an
+    /// associative array assigned as an indexed one or the reverse, an associative list mixing `[key]=value` and
+    /// plain words, a bad subscript where bash's message is not reproduced.
     Array,
     /// A variable bash maintains itself (`RANDOM`, `LINENO`, `BASH_VERSION`, `$_` …), which the interpreter does not
     /// emulate, so reading or changing it would give a value bash never gives; also a builtin's listing that would
@@ -139,12 +142,19 @@ pub enum Unsupported {
     InShellProcessId,
     /// The `time` keyword in an interpreter given no clocks ([`Interpreter::with_times`](crate::Interpreter::with_times)).
     Time,
-    /// A function definition (KNSH-103).
-    FunctionDefinition,
+    /// Printing a function's definition (`declare -f name`, `type name`, `command -V name`), which bash re-formats
+    /// with its own pretty-printer, not reproduced (KNSH-103); also `export -f`, which passes functions in the
+    /// environment in bash's own encoding.
+    FunctionPrint,
+    /// A pipeline stage that is not the last calling a function through a name an expansion produced
+    /// (`$cmd | wc`): the function must run beside the other stages, which is decided before the stage starts, from
+    /// the name as written (KNSH-103).
+    PipelineFunction,
     /// A bash builtin the interpreter does not run yet (`trap`, `getopts`, `shopt`, …: KNSH-103 and
     /// KNSH-104), or a form of one it runs that a later story implements (`set` with options, KNSH-104).
     Builtin,
-    /// A name reference, `declare -n` (KNSH-103, with scopes).
+    /// A name reference the interpreter does not follow as bash does (KNSH-103): to an array element, more than
+    /// eight references deep, circular inside a function, or assigned through a circular chain.
     Nameref,
     /// An alias whose text cannot be run in place of the command it starts: text that does not parse alone, a
     /// pipeline stage whose alias is not a single simple command, or a chain of aliases past the interpreter's
@@ -170,8 +180,7 @@ pub enum Unsupported {
     /// before running anything, a regular expression with an unbalanced parenthesis), or a redirection after it,
     /// which the parser keeps opaque (KNSH-102).
     Conditional,
-    /// A `read` option that needs what later stories add: `-a` (arrays, KNSH-103) and `-e` (line editing, KNSH-107)
-    /// (KNSH-102).
+    /// A `read` option that needs what a later story adds: `-e` on a terminal (line editing, KNSH-107) (KNSH-102).
     ReadOption,
     /// `printf %(…)T` in an interpreter given no local time
     /// ([`Interpreter::with_local_time`](crate::Interpreter::with_local_time)), or with a `TZ` the host's conversion
@@ -194,7 +203,7 @@ impl fmt::Display for Unsupported {
             Self::UnsplitJoin => {
                 f.write_str("joining $* or $@ with a non-space IFS where bash does not split (KNSH-109)")
             }
-            Self::Array => f.write_str("arrays (KNSH-103)"),
+            Self::Array => f.write_str("this array form (KNSH-103)"),
             Self::ShellVariable => f.write_str("a variable bash maintains itself"),
             Self::PromptExpansion => f.write_str("prompt expansion (KNSH-107)"),
             Self::DirectoryStack => f.write_str("the directory stack"),
@@ -204,9 +213,10 @@ impl fmt::Display for Unsupported {
             Self::HereDocument => f.write_str("here-document (KNSH-105)"),
             Self::InShellProcessId => f.write_str("$! of a background job the shell runs itself"),
             Self::Time => f.write_str("the time keyword without clocks"),
-            Self::FunctionDefinition => f.write_str("function definition (KNSH-103)"),
+            Self::FunctionPrint => f.write_str("printing a function definition (KNSH-103)"),
+            Self::PipelineFunction => f.write_str("a function named by an expansion in a pipeline stage (KNSH-103)"),
             Self::Builtin => f.write_str("this builtin (KNSH-103, KNSH-104)"),
-            Self::Nameref => f.write_str("a name reference (KNSH-103)"),
+            Self::Nameref => f.write_str("this name reference (KNSH-103)"),
             Self::Alias => f.write_str("this alias's text in place of its command"),
             Self::SourceDescriptor => f.write_str("source of one of the shell's descriptors"),
             Self::NonUtf8Script => f.write_str("a sourced file that is not UTF-8"),
@@ -214,7 +224,7 @@ impl fmt::Display for Unsupported {
             Self::Unparsed => f.write_str("eval or source text the parser cannot report as bash would"),
             Self::StandardDescriptor => f.write_str("a standard descriptor the host did not give"),
             Self::Conditional => f.write_str("this [[ … ]] form"),
-            Self::ReadOption => f.write_str("this read option (KNSH-103, KNSH-107)"),
+            Self::ReadOption => f.write_str("this read option (KNSH-107)"),
             Self::PrintfLocale => f.write_str("this printf conversion in the shell's locale or time zone"),
             Self::RegexText => f.write_str("a regular expression match bash would split differently"),
             Self::Construct(construct) => write!(f, "{construct}"),

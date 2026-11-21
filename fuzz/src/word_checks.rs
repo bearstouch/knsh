@@ -43,7 +43,12 @@ fn files() -> MemFs {
 /// Runs `tool <text>` with the glob options the bits of `flags` set.
 fn run(line: &str, flags: u8) -> Option<Outcome> {
     let extglob = flags & 1 != 0;
-    let script = parse_with(line, ParseOptions::default().with_extglob(extglob)).ok()?;
+    // Read as the native interpreter reads lines: arrays and `{name}` redirections too (KNSH-099, KNSH-103).
+    let options = ParseOptions::default()
+        .with_extglob(extglob)
+        .with_redirection_variables(true)
+        .with_arrays(true);
+    let script = parse_with(line, options).ok()?;
     let commands = Arc::new(ScriptedCommands::new());
     commands.on("/bin/tool", CommandOutcome::Finished(ExitStatus::Exited(0)));
     let mut state = ShellState::new("knsh", "/w")

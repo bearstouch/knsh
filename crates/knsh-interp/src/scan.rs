@@ -101,6 +101,28 @@ pub(crate) fn find_top_level(text: &str, target: u8, parens: bool) -> Option<usi
     None
 }
 
+/// Where the subscript in `text` (the text after a `[`) ends: the offset of its matching `]`, nested brackets
+/// counted and quotes and expansions skipped, as bash's `skipsubscript` reads it (KNSH-103).
+pub(crate) fn subscript_end(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0_usize;
+    let mut i = 0;
+    while let Some(&byte) = bytes.get(i) {
+        if let Some(after) = skip(bytes, i) {
+            i = after;
+            continue;
+        }
+        match byte {
+            b'[' => depth += 1,
+            b']' if depth == 0 => return Some(i),
+            b']' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// The three expressions of `for (( init; test; update ))`, whose header spans `span` in `source`: split at the
 /// top-level `;`, or `None` unless there are exactly three.
 pub(crate) fn arithmetic_for_header(source: &str, span: Span) -> Option<[Span; 3]> {

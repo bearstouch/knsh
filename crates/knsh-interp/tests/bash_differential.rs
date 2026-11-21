@@ -1,4 +1,4 @@
-//! KNSH-096 to KNSH-102 integration tests: scripts run under the native interpreter (real processes
+//! KNSH-096 to KNSH-103 integration tests: scripts run under the native interpreter (real processes
 //! through `SystemProcesses`, real lookups and directory listings through `RealFs`, the system's collation) and under
 //! `/bin/bash`; standard output and exit status must match (NFR-COMPAT-01, NFR-COMPAT-02).
 //!
@@ -167,7 +167,10 @@ fn run_knsh_full(
     .with_output(Box::new(own_output))
     // KNSH-102: `read` and `test -t` see the same descriptors the commands get.
     .with_standard_descriptors(standard);
-    let parsed = knsh_bash::parse_with(script, knsh_bash::ParseOptions::default().with_extglob(extglob)).unwrap();
+    let options = knsh_bash::ParseOptions::default()
+        .with_extglob(extglob)
+        .with_arrays(true);
+    let parsed = knsh_bash::parse_with(script, options).unwrap();
     let status = interpreter.run(&parsed, script).unwrap();
     // The interpreter holds the spawner, which holds the pipe's write end: drop it so the read sees end of file.
     drop(interpreter);
@@ -585,6 +588,59 @@ fn test_printf_read_script_matches_bash() {
     std::fs::remove_dir_all(&bash_dir).unwrap();
     std::fs::remove_dir_all(&knsh_dir).unwrap();
     assert_eq!(bash.1, 2, "bash output: {}", bash.0);
+    assert_eq!(knsh.0, bash.0);
+    assert_eq!(knsh, bash);
+}
+
+/// KNSH-103: functions, dynamic scopes and indexed arrays in forms bash 3.2 and 5.2 agree on (associative arrays,
+/// negative subscripts, name references, `mapfile`, `BASH_LINENO` under `-c` and `break` inside a function differ
+/// or are bash 4 and later: unit tests against bash 5.2's source).
+const FUNCTIONS_ARRAYS: &str = r#"x=global
+show() { echo "show:$x:$#:$*"; }
+f() { local x=local1; show a b; g; show; }
+g() { local x=local2; show; unset x; show; x=again; show; }
+f; echo "top:$x"
+fact() { if (( $1 <= 1 )); then echo 1; return; fi; local n=$1; local sub; sub=$(( n - 1 )); echo "$n*"; fact $sub; }
+fact 4
+ret() { return $1; }; ret 3; echo "ret:$?"; ret 0 && echo ok
+counter=0; bump() { counter=$((counter + 1)); }; bump; bump; echo "counter:$counter"
+v=orig; tmp() { echo "tmp:$v"; v=inside; }; v=temp tmp; echo "v:$v"
+names() { echo "${FUNCNAME[0]}:${#FUNCNAME[@]}"; }; names; echo "top-funcname:${#FUNCNAME[@]}"
+a=(zero "one two" three); a[7]=seven; a[4]=four
+echo "${!a[@]}|${#a[@]}|${a[1]}|${#a[1]}|$a|${#a}"
+printf '<%s>' "${a[@]}"; echo; printf '<%s>' ${a[@]}; echo; printf '<%s>' "${a[*]}"; echo
+echo "${a[@]:1:2}|${a[@]:4}|${a[*]:7}"
+unset 'a[1]'; echo "${!a[*]}"; a+=(eight nine); echo "${!a[@]}"
+for i in "${!a[@]}"; do printf '%s=%s,' "$i" "${a[$i]}"; done; echo
+i=2; echo "${a[i]} ${a[$i]} ${a[i*2]} $(( a[4] == 0 )) ${a[i+5]}"
+n=(3 4); (( n[0] += 10, n[1]++ )); echo "${n[*]}"; echo $(( n[0] * n[1] ))
+c=(apple banana cherry); echo "${c[@]#?}" "${c[@]%a*}" "${c[@]/an/AN}" "${#c[@]}"
+e=(); echo "[${e[@]}] ${#e[@]} ${e[@]:-empty} ${e[0]-unset}"
+s=scalar; s[1]=one; echo "${s[@]} ${#s[@]}"
+b=(1 2 3); b=([5]=five six); echo "${!b[@]} ${b[*]}"
+loc() { local -a arr=(p q); arr[3]=r; echo "${!arr[@]}"; declare inner=1; }; loc; echo "arr:${#arr[@]} inner:${inner-unset}"
+IFS=, read -a parts <<< 'x,y,,z'; echo "${#parts[@]}:${parts[2]}:${parts[3]}"
+read -a words <<< '  one  two   three '; echo "${#words[@]}:${words[*]}"
+pipe() { echo p1; echo p2; }; pipe | while read line; do echo "got:$line"; done
+nested() { inner_fn() { echo defined-inside; }; }; nested; inner_fn
+unset -f inner_fn; type -t inner_fn; echo "type:$?"
+over() { echo "over:$1"; }; over x; unset over; over y 2>/dev/null; echo "unset-fn:$?"
+declare -a da; da[2]=z; echo "${!da[@]}"
+r() { local d=$1; [ "$d" -le 0 ] && return 0; r $((d - 1)); echo "depth:$d"; }; r 3
+args() { echo "$#:$@"; }; set -- p q; args "$@" r; echo "$#:$1"
+k=( "$@" ); echo "${#k[@]}:${k[1]}"
+unset a; echo "${#a[@]}:${a[0]-gone}""#;
+
+// KNSH-103: functions, scopes and arrays give bash's output and status.
+#[test]
+fn functions_and_arrays_script_matches_bash() {
+    let bash_dir = temp_dir("bash-knsh103");
+    let knsh_dir = temp_dir("knsh-knsh103");
+    let bash = run_bash(FUNCTIONS_ARRAYS, &bash_dir);
+    let knsh = run_knsh(FUNCTIONS_ARRAYS, &knsh_dir);
+    std::fs::remove_dir_all(&bash_dir).unwrap();
+    std::fs::remove_dir_all(&knsh_dir).unwrap();
+    assert!(bash.0.contains("depth:3"), "bash output: {}", bash.0);
     assert_eq!(knsh.0, bash.0);
     assert_eq!(knsh, bash);
 }

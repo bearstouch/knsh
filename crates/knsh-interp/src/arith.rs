@@ -16,10 +16,14 @@
 //! - A variable named in an expression is read as an expression itself when its value is not a number (`a=b; b=3;
 //!   $((a))` is 3); unset or empty is 0. That recursion is bounded by bash's own limit, [`MAX_ARITH_DEPTH`], which
 //!   also bounds nesting of parentheses and operators here so a hostile expression cannot exhaust the stack.
+//! - An array element (`a[i]`, KNSH-103) is an operand and an lvalue: the subscript, read up to its matching `]`, is
+//!   evaluated as an expression for an indexed array (once, when the element is read) and taken as written for an
+//!   associative one.
 //! - Errors carry bash's message shape: `expression: message (error token is "rest")`, the expression with its
 //!   leading blanks removed and the rest from the start of the last token read.
 
 use crate::error::Unsupported;
+use crate::state::Key;
 
 /// Deepest nesting of variable values evaluated as expressions, parentheses, unary operators and right-associative
 /// chains together. Bash's `MAX_EXPR_RECURSION_LEVEL` for variables; bash leaves parentheses unbounded, and this
@@ -60,6 +64,23 @@ pub(crate) trait Variables {
     ///
     /// [`Failure::Readonly`] for a read-only variable; [`Failure::Unsupported`] for one bash maintains itself.
     fn set(&mut self, name: &str, value: i64) -> Result<()>;
+
+    /// Whether `name` is an associative array, whose subscripts are keys rather than expressions (KNSH-103).
+    fn is_assoc(&mut self, name: &str) -> bool;
+
+    /// Element `key` of array `name`, or `None` if it is unset.
+    ///
+    /// # Errors
+    ///
+    /// As [`Variables::get`].
+    fn get_element(&mut self, name: &str, key: &Key) -> Result<Option<String>>;
+
+    /// Sets element `key` of array `name` to `value` written in decimal.
+    ///
+    /// # Errors
+    ///
+    /// As [`Variables::set`].
+    fn set_element(&mut self, name: &str, key: &Key, value: i64) -> Result<()>;
 }
 
 /// Evaluates `expression` against the variables of `state`, as `$(( expression ))` does once the expression has
@@ -98,6 +119,41 @@ impl Variables for StateVariables<'_> {
         }
         assigned(name, self.state.assign(name, value.to_string().into(), false))
     }
+
+    fn is_assoc(&mut self, name: &str) -> bool {
+        self.state.kind(name) == crate::state::Kind::Assoc
+    }
+
+    fn get_element(&mut self, name: &str, key: &Key) -> Result<Option<String>> {
+        element_value(self.state, name, key)
+    }
+
+    fn set_element(&mut self, name: &str, key: &Key, value: i64) -> Result<()> {
+        assigned(
+            name,
+            self.state.assign_element(name, key, value.to_string().into(), false),
+        )
+    }
+}
+
+/// Element `key` of `name` in `state` for an expression: a bad subscript is bash's message and 0, as bash goes on.
+pub(crate) fn element_value(state: &crate::ShellState, name: &str, key: &Key) -> Result<Option<String>> {
+    if state.is_unemulated(name) {
+        return Err(Failure::Unsupported(Unsupported::ShellVariable));
+    }
+    match state.element(name, key) {
+        Ok(Some(value)) => value
+            .into_string()
+            .map(Some)
+            .map_err(|_| Failure::Unsupported(Unsupported::NonUtf8Value)),
+        Ok(None) if state.options().nounset => Err(Failure::Unbound(name.to_owned())),
+        Ok(None) => Ok(None),
+        Err(crate::state::ElementError::BadSubscript) => {
+            state.note(format!("{name}: bad array subscript"));
+            Ok(None)
+        }
+        Err(crate::state::ElementError::Unsupported(feature)) => Err(Failure::Unsupported(feature)),
+    }
 }
 
 /// An arithmetic assignment's outcome as a [`Failure`].
@@ -108,6 +164,8 @@ pub(crate) fn assigned(name: &str, result: std::result::Result<(), crate::state:
         Err(AssignError::Readonly) => Err(Failure::Readonly(name.to_owned())),
         Err(AssignError::Arithmetic(failure)) => Err(failure),
         Err(AssignError::Unsupported(feature)) => Err(Failure::Unsupported(feature)),
+        // A bad subscript or an array of the other kind: bash's messages there are not reproduced.
+        Err(AssignError::BadSubscript | AssignError::Kind) => Err(Failure::Unsupported(Unsupported::Array)),
         // The evaluator only assigns names it read as identifiers.
         Err(AssignError::Invalid) => Err(Failure::Error(format!("{name}: invalid variable name"))),
     }
@@ -277,6 +335,15 @@ const fn is_name_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// A variable an expression names: `name`, or element `key` of array `name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Lvalue {
+    name: String,
+    /// The element, `None` for a plain variable. While not evaluating (`noeval`) a subscript is not evaluated, and
+    /// is element 0 here; nothing is read or assigned then.
+    key: Option<Key>,
+}
+
 /// One expression being read: bash's token state for it.
 struct Expr<'t, 'v> {
     /// The expression.
@@ -287,8 +354,8 @@ struct Expr<'t, 'v> {
     lasttp: usize,
     curtok: Tok,
     lasttok: Tok,
-    /// The name of the last variable token read.
-    tokstr: Option<String>,
+    /// The last variable token read: its name, and the element it names (`a[i]`, KNSH-103).
+    tokstr: Option<Lvalue>,
     /// The value of the last number or variable token read.
     tokval: i64,
     /// The operator of the last `op=` read.
@@ -341,11 +408,15 @@ impl Expr<'_, '_> {
 
     /// The value of variable `name` in an expression: its value read as an expression, 0 if unset or empty, and
     /// nothing read at all while not evaluating.
-    fn streval(&mut self, name: &str) -> Result<i64> {
+    fn streval(&mut self, lvalue: &Lvalue) -> Result<i64> {
         if self.noeval > 0 {
             return Ok(0);
         }
-        let Some(value) = self.variables.get(name)? else {
+        let value = match &lvalue.key {
+            None => self.variables.get(&lvalue.name)?,
+            Some(key) => self.variables.get_element(&lvalue.name, key)?,
+        };
+        let Some(value) = value else {
             return Ok(0);
         };
         // Checked here, so the message names this expression, as bash's does; the nested one counts its level in
@@ -356,15 +427,18 @@ impl Expr<'_, '_> {
         subexpr(&value, self.variables, self.depth)
     }
 
-    fn assign(&mut self, name: &str, value: i64) -> Result<()> {
+    fn assign(&mut self, lvalue: &Lvalue, value: i64) -> Result<()> {
         if self.noeval == 0 {
-            self.variables.set(name, value)?;
+            match &lvalue.key {
+                None => self.variables.set(&lvalue.name, value)?,
+                Some(key) => self.variables.set_element(&lvalue.name, key, value)?,
+            }
         }
         Ok(())
     }
 
-    /// The name of the last variable token, which an assignment needs.
-    fn lvalue(&self) -> Result<String> {
+    /// The last variable token, which an assignment needs.
+    fn lvalue(&self) -> Result<Lvalue> {
         self.tokstr
             .clone()
             .ok_or_else(|| self.error("attempted assignment to non-variable"))
@@ -778,29 +852,50 @@ impl Expr<'_, '_> {
         Ok(())
     }
 
-    /// Reads the variable name starting at `start` as a [`Tok::Str`] token.
+    /// Reads the variable name starting at `start`, with its subscript if one follows (`a[i]`), as a [`Tok::Str`]
+    /// token.
     fn read_name(&mut self, start: usize) -> Result<()> {
         let bytes = self.text.as_bytes();
         let mut cp = start + 1;
         while bytes.get(cp).copied().is_some_and(is_name_char) {
             cp += 1;
         }
-        if bytes.get(cp) == Some(&b'[') {
-            return Err(Failure::Unsupported(Unsupported::Array));
-        }
         let name = self.text.get(start..cp).unwrap_or_default().to_owned();
+        let mut subscript = None;
+        if bytes.get(cp) == Some(&b'[') {
+            let inner = self.text.get(cp + 1..).unwrap_or_default();
+            let Some(close) = crate::scan::subscript_end(inner).filter(|close| *close > 0) else {
+                self.lasttp = cp;
+                return Err(self.error("bad array subscript"));
+            };
+            subscript = Some(inner[..close].to_owned());
+            cp += close + 2;
+        }
         let mut peek = cp;
         while bytes.get(peek).copied().is_some_and(is_space) {
             peek += 1;
         }
         let assigned = bytes.get(peek) == Some(&b'=') && bytes.get(peek + 1) != Some(&b'=');
         self.tp = cp;
+        let key = match subscript {
+            None => None,
+            Some(_) if self.noeval > 0 => Some(Key::Index(0)),
+            Some(text) if self.variables.is_assoc(&name) => Some(Key::Name(text)),
+            Some(text) => {
+                // Bash evaluates an indexed subscript as an expression of its own, once.
+                if *self.depth >= MAX_ARITH_DEPTH {
+                    return Err(self.error("expression recursion level exceeded"));
+                }
+                Some(Key::Index(subexpr(&text, self.variables, self.depth)?))
+            }
+        };
+        let lvalue = Lvalue { name, key };
         self.tokval = if matches!(self.lasttok, Tok::PreInc | Tok::PreDec) || !assigned {
-            self.streval(&name)?
+            self.streval(&lvalue)?
         } else {
             0
         };
-        self.tokstr = Some(name);
+        self.tokstr = Some(lvalue);
         self.lasttok = self.curtok;
         self.curtok = Tok::Str;
         Ok(())

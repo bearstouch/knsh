@@ -104,7 +104,7 @@ impl Interpreter {
             },
             Expr::Unary { op, operand } => {
                 let value = self.operand_string(*operand, run)?;
-                Truth::Is(self.unary_test(op, &value, operand.span)?)
+                Truth::Is(self.unary_test(op, &value, operand.span, run)?)
             }
             Expr::Binary { op, left, right } => self.binary_condition(op, *left, *right, span, run)?,
         })

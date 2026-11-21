@@ -17,7 +17,8 @@
 //!   error, and `-s` turns off echo, only when the input is a terminal; `-n`, `-N` and `-d` then read the terminal
 //!   a character at a time. The terminal's settings are put back afterwards, however the read ended.
 //!
-//! `-a` (arrays, KNSH-103) and `-e` on a terminal (line editing, KNSH-107) are refused ([`Unsupported::ReadOption`]).
+//! `-a name` splits every field into the indexed array `name`, emptied first (KNSH-103). `-e` on a terminal (line
+//! editing, KNSH-107) is refused ([`Unsupported::ReadOption`]).
 //! A line is bounded ([`MAX_READ_LINE`]) instead of growing without limit on endless input.
 
 use std::ffi::OsString;
@@ -51,7 +52,8 @@ struct Options {
     raw: bool,
     silent: bool,
     edit: bool,
-    array: bool,
+    /// `-a name`: the array the fields go to (KNSH-103).
+    array: Option<String>,
     delimiter: Option<u8>,
     /// `-N`: the delimiter is data.
     ignore_delimiter: bool,
@@ -183,10 +185,12 @@ impl Interpreter {
             Ok(parsed) => parsed,
             Err(status) => return Ok(status),
         };
-        if options.array {
-            return Err(unsupported(Unsupported::ReadOption, span).into());
+        if let Some(array) = &options.array
+            && let Some(status) = self.check_read_name(array, span, run)?
+        {
+            return Ok(status);
         }
-        if let Some(first) = names.first()
+        if let Some(first) = names.first().filter(|_| options.array.is_none())
             && let Some(status) = self.check_read_name(first, span, run)?
         {
             return Ok(status);
@@ -234,7 +238,11 @@ impl Interpreter {
                 return Ok(Status::FAILURE);
             }
         };
-        if let Some(status) = self.assign_read(names, &line, span, run)? {
+        let assigned = match &options.array {
+            Some(array) => self.assign_read_array(array, &line, span, run)?,
+            None => self.assign_read(names, &line, span, run)?,
+        };
+        if let Some(status) = assigned {
             return Ok(status);
         }
         Ok(match end {
@@ -309,7 +317,7 @@ impl Interpreter {
         run: &Run<'_>,
     ) -> Option<Status> {
         match letter {
-            'a' => options.array = true,
+            'a' => options.array = Some(value.to_owned()),
             'd' => options.delimiter = Some(value.as_bytes().first().copied().unwrap_or(0)),
             // Initial text for line editing: ignored without it, as in bash.
             'i' => {}
@@ -354,20 +362,34 @@ impl Interpreter {
         None
     }
 
-    /// Checks a name `read` assigns: an identifier (`Some(1)`, reported, when not), not an array element or a
+    /// Checks a name `read` assigns: an identifier or an array element (`Some(1)`, reported, when neither), not a
     /// variable bash maintains (refused).
     fn check_read_name(&mut self, name: &str, span: Span, run: &Run<'_>) -> Flow<Option<Status>> {
-        if name.contains('[') {
-            return Err(unsupported(Unsupported::Array, span).into());
-        }
-        if !is_name(name) {
+        let base = name.split_once('[').map_or(name, |(base, _)| base);
+        let valid = is_name(name) || (is_name(base) && name.ends_with(']') && name.len() > base.len() + 2);
+        if !valid {
             self.report(span, run, format_args!("read: `{name}': not a valid identifier"));
             return Ok(Some(Status::FAILURE));
         }
-        if refuses_assignment(name) || self.state.is_unemulated(name) {
+        if refuses_assignment(base) || self.state.is_unemulated(base) {
             return Err(unsupported(Unsupported::ShellVariable, span).into());
         }
         Ok(None)
+    }
+
+    /// Assigns `value` to `name` for `read`, which may name an array element (KNSH-103).
+    fn assign_read_name(&mut self, name: &str, value: OsString, span: Span, run: &Run<'_>) -> Flow<Option<Status>> {
+        match self.named(name, span, run)? {
+            Some(super::function::Named::Element(array, key)) => {
+                let result = self.state.assign_element(&array, &key, value, false);
+                self.assigned(&array, name, result, span, run)
+            }
+            Some(super::function::Named::Variable(_)) => self.assign_or_report(name, value, false, span, run),
+            Some(super::function::Named::All(_)) | None => {
+                self.report(span, run, format_args!("read: `{name}': not a valid identifier"));
+                Ok(Some(Status::FAILURE))
+            }
+        }
     }
 
     /// Reads one line from `source`: the bytes and how reading ended, or the `errno` of a failed read.
@@ -450,6 +472,22 @@ impl Interpreter {
         }
     }
 
+    /// `read -a array`: every field of what was read, split as bash's `list_string` splits it, as the elements of
+    /// `array` from 0; the status when the assignment failed (reported).
+    fn assign_read_array(&mut self, array: &str, line: &[Read], span: Span, run: &Run<'_>) -> Flow<Option<Status>> {
+        let ifs: Vec<u8> = match self.state.variable("IFS") {
+            Some(value) => value.as_encoded_bytes().to_vec(),
+            None => DEFAULT_IFS.as_bytes().to_vec(),
+        };
+        let mut rest = line;
+        let mut items = Vec::new();
+        while let Some(field) = next_field(&mut rest, &ifs) {
+            items.push((None, OsString::from_vec(field), false));
+        }
+        let result = self.state.assign_list(array, items, false, false);
+        self.assigned(array, array, result, span, run)
+    }
+
     /// Assigns what was read to `names` (or `REPLY`); the status when an assignment failed (reported).
     fn assign_read(&mut self, names: &[String], line: &[Read], span: Span, run: &Run<'_>) -> Flow<Option<Status>> {
         if names.is_empty() {
@@ -465,7 +503,7 @@ impl Interpreter {
             if let Some(status) = self.check_read_name(name, span, run)? {
                 return Ok(Some(status));
             }
-            if let Some(status) = self.assign_or_report(name, OsString::from_vec(value), false, span, run)? {
+            if let Some(status) = self.assign_read_name(name, OsString::from_vec(value), span, run)? {
                 return Ok(Some(status));
             }
         }

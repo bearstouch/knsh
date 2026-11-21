@@ -26,19 +26,29 @@ pub fn missing_in_bash32(command: &str) -> Vec<&'static str> {
         }
     };
 
-    for pair in words.windows(2) {
-        let (cmd, flags) = (pair[0], pair[1]);
-        if matches!(cmd, "declare" | "local" | "typeset") && flags.starts_with('-') && !flags.starts_with("--") {
+    for (at, cmd) in words.iter().enumerate() {
+        // Every option word of a declaration builtin counts (`declare -g -A h`), up to `--` or its first operand
+        // (KNSH-103); `readonly` takes `-A` too.
+        if !matches!(*cmd, "declare" | "local" | "typeset" | "readonly") {
+            continue;
+        }
+        let options = words[at + 1..]
+            .iter()
+            .take_while(|flags| flags.len() > 1 && flags.starts_with(['-', '+']) && **flags != "--");
+        for flags in options {
             if flags.contains('A') {
                 add("associative arrays");
             }
-            if flags.contains('n') {
+            if flags.contains('n') && *cmd != "readonly" {
                 add("namerefs");
             }
-            if flags.contains('l') || flags.contains('u') || flags.contains('c') {
+            if *cmd != "readonly" && (flags.contains('l') || flags.contains('u') || flags.contains('c')) {
                 add("case-modifying attributes");
             }
         }
+    }
+    for pair in words.windows(2) {
+        let (cmd, flags) = (pair[0], pair[1]);
         if cmd == "wait" && flags.starts_with('-') && flags.contains('n') {
             add("wait -n");
         }
@@ -168,6 +178,9 @@ mod tests {
         for (line, construct) in [
             ("declare -A m=([a]=1)", "associative arrays"),
             ("local -n ref=$1", "namerefs"),
+            ("declare -g -A cache", "associative arrays"),
+            ("readonly -A table=([k]=v)", "associative arrays"),
+            ("typeset +x -n r=x", "namerefs"),
             ("mapfile -t lines < f", "mapfile/readarray"),
             ("x=1; readarray a < f", "mapfile/readarray"),
             ("echo \"${name,,}\"", "case-modification expansion"),

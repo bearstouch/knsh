@@ -119,11 +119,7 @@ impl Interpreter {
         };
         let budget = self.max_depth.saturating_sub(self.depth);
         self.check_nested(&script.items, text, budget)?;
-        let nested = Run {
-            source: text,
-            origin: run.origin,
-            line_base: run.line(span).saturating_sub(1),
-        };
+        let nested = Run::nested(text, run.origin, run.line(span).saturating_sub(1));
         let guarded = self.alias_guard.len();
         self.alias_guard.extend(expanded);
         let result = if self.sink == Sink::Off {

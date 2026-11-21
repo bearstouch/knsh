@@ -20,7 +20,8 @@
 //! line is marked ([`SimpleCommand::function_call`]), so it is not resolved as a program. Constructs outside decision
 //! 6 whose extent is certain (`select`, `[[ … ]]`, `(( … ))`) are kept whole as [`Command::Unsupported`] nodes; other
 //! valid bash it does not read (`coproc`, `time` where bash versions read it differently, array assignments) is
-//! refused with [`ParseError::Unsupported`] rather than read partly. The `time` keyword at the start of a pipeline
+//! refused with [`ParseError::Unsupported`] rather than read partly. Array assignments are read only with
+//! [`ParseOptions::arrays`] (KNSH-103), which the native interpreter sets and the classifier does not. The `time` keyword at the start of a pipeline
 //! is read ([`TimeKeyword`], KNSH-036).
 //!
 //! Substitutions and here-documents (KNSH-031): every `$( … )`, backtick (un-escaped as bash does first), `<( … )`
@@ -118,7 +119,7 @@ mod token;
 mod wrappers;
 
 pub use ast::{
-    AndOr, AndOrOperator, AndOrPart, ArithmeticParts, Assignment, CaseClause, CaseCommand, CaseTerminator,
+    AndOr, AndOrOperator, AndOrPart, ArithmeticParts, ArrayValue, Assignment, CaseClause, CaseCommand, CaseTerminator,
     CaseTerminatorKind, Command, CommandWord, CompoundCommand, CompoundKind, ElseClause, ForCommand, ForItems,
     FunctionCall, FunctionDefinition, Group, HereDocument, IfClause, IfCommand, ListItem, LoopBody, LoopCommand,
     PipeOperator, Pipeline, PipelinePart, Redirect, RedirectionVariable, Script, Separator, SeparatorKind,
