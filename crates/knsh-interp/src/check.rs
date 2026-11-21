@@ -223,7 +223,7 @@ impl Checker<'_> {
     /// Text that does not parse with the default options is left for the builtin, which reads it with the options
     /// set by then.
     fn trap_action(&self, args: &[String], span: Span) -> Result<(), InterpError> {
-        let Form::Change(Operation::Set(text), specs) = traps::form(args) else {
+        let Form::Change(Operation::Set(text), specs) = traps::form(args, false) else {
             return Ok(());
         };
         if specs.iter().any(|spec| traps::is_child_signal(spec)) {

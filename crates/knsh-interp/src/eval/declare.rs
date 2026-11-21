@@ -130,9 +130,13 @@ impl Interpreter {
             if operand.name.contains('[') {
                 return Err(unsupported(Unsupported::Array, span).into());
             }
+            // Bash's `assign_error` (`EX_BADASSIGN`): `export` or `readonly` failing to make an assignment it was
+            // given, which POSIX mode makes fatal for these special builtins (KNSH-106).
+            let assigns = !declares && operand.value.is_some();
             if !is_name(operand.name) {
                 self.report(span, run, format_args!("{name}: `{arg}': not a valid identifier"));
                 status = Status::FAILURE;
+                self.bad_assignment |= assigns;
                 continue;
             }
             if self.bash_maintains(operand.name, operand.value.is_some()) {
@@ -147,6 +151,7 @@ impl Interpreter {
             }
             if !result? {
                 status = Status::FAILURE;
+                self.bad_assignment |= assigns;
             }
         }
         Ok(status)
@@ -179,6 +184,7 @@ impl Interpreter {
                     let sign = if on { '-' } else { '+' };
                     self.report(span, run, format_args!("{name}: {sign}{letter}: invalid option"));
                     self.report_plain(format_args!("{name}: usage: {name} {}", usage(name)));
+                    self.usage_error = true;
                     return Err(Status::new(2));
                 }
                 if on {
@@ -290,11 +296,14 @@ impl Interpreter {
             .filter(|(_, variable)| variable.attributes.exported)
             .map(|(name, variable)| (name.to_owned(), variable.clone()))
             .collect();
+        // KNSH-106: in POSIX mode `export` and `readonly` list as themselves (bash's `show_var_attributes` with
+        // `pattr`).
+        let builtin = (self.state.options().posix() && matches!(name, "export" | "readonly")).then_some(name);
         for (variable, held) in listed {
             if self.state.is_unemulated(&variable) || refuses_assignment(&variable) {
                 return Err(unsupported(Unsupported::ShellVariable, span).into());
             }
-            text.push_str(&declaration(&variable, &held));
+            text.push_str(&listing_line(builtin, &variable, &held));
         }
         Ok(self.print(name, text.as_bytes(), span, run))
     }
@@ -727,6 +736,30 @@ fn assoc_key(key: &str) -> String {
         quote::declare_value(key)
     } else {
         key.to_owned()
+    }
+}
+
+/// [`declaration`], or in POSIX mode for `export` and `readonly` (`builtin`) the line bash 5.2 prints then: the
+/// builtin's name, only the array attributes, then the name and value (`export PATH="/bin"`) (KNSH-106).
+fn listing_line(builtin: Option<&str>, name: &str, variable: &Variable) -> String {
+    let Some(builtin) = builtin else {
+        return declaration(name, variable);
+    };
+    let line = declaration(name, variable);
+    let rest = line
+        .strip_prefix("declare ")
+        .and_then(|rest| rest.split_once(' '))
+        .map_or("", |(_, rest)| rest);
+    let arrays: String = variable
+        .attributes
+        .letters(variable.kind())
+        .chars()
+        .filter(|letter| matches!(letter, 'a' | 'A'))
+        .collect();
+    if arrays.is_empty() {
+        format!("{builtin} {rest}")
+    } else {
+        format!("{builtin} -{arrays} {rest}")
     }
 }
 

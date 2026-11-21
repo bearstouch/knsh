@@ -97,6 +97,7 @@ pub(super) struct Seed<'a> {
     pub(super) errexit_ignored: usize,
     pub(super) traps_running: &'a [crate::trap::TrapId],
     pub(super) trace_level: usize,
+    pub(super) command_depth: usize,
 }
 
 /// The [`Seed`] of interpreter `$shell` (an expression of type `&Interpreter` or `&mut Interpreter`, usually
@@ -126,6 +127,7 @@ macro_rules! seed {
             errexit_ignored: $shell.errexit_ignored,
             traps_running: &$shell.traps_running,
             trace_level: $shell.trace_level,
+            command_depth: $shell.command_depth,
         }
     };
 }
@@ -186,6 +188,9 @@ impl Seed<'_> {
             skip_exit_trap: false,
             substituted_fds: Vec::new(),
             substitution_status: None,
+            usage_error: false,
+            bad_assignment: false,
+            command_depth: self.command_depth,
         }
     }
 }
@@ -706,7 +711,7 @@ impl Interpreter {
         };
         job.notified = true;
         let signal = job.stop_signal().unwrap_or(signals::SIGTSTP);
-        let line = format!("\n{}\n", job.line(mark, false));
+        let line = format!("\n{}\n", job.line(mark, false, self.state.options().posix()));
         let statuses = job.statuses();
         self.write_shell(2, line.as_bytes());
         let status = Status::from_signal(signal);

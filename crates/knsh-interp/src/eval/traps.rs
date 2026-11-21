@@ -45,8 +45,8 @@ pub(crate) enum Operation<'a> {
 pub(crate) enum Form<'a> {
     /// `-l`: the signal names.
     Signals,
-    /// `trap` alone or `-p`: the traps on these signals (all of them when empty).
-    Print(&'a [String]),
+    /// `trap` alone or `-p` (`true`): the traps on these signals (all of them when empty).
+    Print(&'a [String], bool),
     /// Changes the traps on these signals.
     Change(Operation<'a>, &'a [String]),
     /// An action without signals: the usage line, status 2.
@@ -56,8 +56,9 @@ pub(crate) enum Form<'a> {
 }
 
 /// Reads `trap`'s arguments as bash 5.2 does: options `-l` and `-p` (and `--`); then a first argument that is a
-/// signal number, or a signal alone, resets; otherwise the first argument is the action (`''` ignores, `-` resets).
-pub(crate) fn form(args: &[String]) -> Form<'_> {
+/// signal number, or (outside POSIX mode, KNSH-106) a signal alone, resets; otherwise the first argument is the
+/// action (`''` ignores, `-` resets).
+pub(crate) fn form(args: &[String], posix: bool) -> Form<'_> {
     let mut list = false;
     let mut print = false;
     let mut rest = args;
@@ -82,16 +83,16 @@ pub(crate) fn form(args: &[String]) -> Form<'_> {
         return Form::Signals;
     }
     let Some((first, after)) = rest.split_first() else {
-        return Form::Print(rest);
+        return Form::Print(rest, print);
     };
     if print {
-        return Form::Print(rest);
+        return Form::Print(rest, true);
     }
     let all_digits = first.bytes().all(|byte| byte.is_ascii_digit());
     if all_digits && trap::decode(first).is_some() {
         return Form::Change(Operation::Revert, rest);
     }
-    if first != "-" && after.is_empty() && trap::decode(first).is_some() {
+    if !posix && first != "-" && after.is_empty() && trap::decode(first).is_some() {
         return Form::Change(Operation::Revert, rest);
     }
     if after.is_empty() {
@@ -121,27 +122,30 @@ pub(crate) fn at_command(error: InterpError, span: Span) -> InterpError {
 impl Interpreter {
     /// `trap [-lp] [[action] signal …]`.
     pub(super) fn trap_builtin(&mut self, args: &[String], span: Span, run: &Run<'_>) -> Flow<Status> {
-        match form(args) {
+        match form(args, self.state.options().posix()) {
             Form::InvalidOption(letter) => {
                 self.report(span, run, format_args!("trap: -{letter}: invalid option"));
                 self.report_plain(format_args!("{TRAP_USAGE}"));
+                self.usage_error = true;
                 Ok(Status::new(2))
             }
             Form::Usage => {
                 self.report_plain(format_args!("{TRAP_USAGE}"));
+                self.usage_error = true;
                 Ok(Status::new(2))
             }
             Form::Signals => {
                 let text = signal_list();
                 Ok(self.print("trap", text.as_bytes(), span, run))
             }
-            Form::Print(specs) => self.print_traps(specs, span, run),
+            Form::Print(specs, print) => self.print_traps(specs, print && specs.is_empty(), span, run),
             Form::Change(operation, specs) => self.change_traps(operation, specs, span, run),
         }
     }
 
     /// `trap -p [signal …]`: `trap -- 'command' NAME` for each trap set, in bash's order.
-    fn print_traps(&mut self, specs: &[String], span: Span, run: &Run<'_>) -> Flow<Status> {
+    /// `print_all`: `trap -p` without signals.
+    fn print_traps(&mut self, specs: &[String], print_all: bool, span: Span, run: &Run<'_>) -> Flow<Status> {
         let mut status = Status::SUCCESS;
         let mut wanted = Vec::with_capacity(specs.len());
         for spec in specs {
@@ -153,7 +157,10 @@ impl Interpreter {
             }
         }
         let filter = (!specs.is_empty()).then_some(wanted.as_slice());
-        if self.state.traps().listing_refused(filter) {
+        let posix = self.state.options().posix();
+        // KNSH-106: `trap -p` alone in POSIX mode also lists every signal at its default and those ignored at entry
+        // (bash's `display_traps` with `show_all`), which is not reproduced.
+        if self.state.traps().listing_refused(filter) || (posix && print_all) {
             return Err(unsupported(Unsupported::Trap, span).into());
         }
         let mut text = String::new();
@@ -162,7 +169,14 @@ impl Interpreter {
                 Action::Command(command) => quote::single(command),
                 Action::Ignore => "''".to_owned(),
             };
-            let _ = writeln!(text, "trap -- {command} {}", id.name());
+            // POSIX mode names signals without `SIG` (KNSH-106).
+            let name = id.name();
+            let name = if posix {
+                name.strip_prefix("SIG").unwrap_or(&name)
+            } else {
+                &name
+            };
+            let _ = writeln!(text, "trap -- {command} {name}");
         };
         match filter {
             None => {
@@ -419,24 +433,28 @@ mod tests {
     #[test]
     fn forms_follow_bash() {
         let args = strings(&["echo hi", "EXIT", "INT"]);
-        assert_eq!(form(&args), Form::Change(Operation::Set("echo hi"), &args[1..]));
+        assert_eq!(form(&args, false), Form::Change(Operation::Set("echo hi"), &args[1..]));
         let args = strings(&["2"]);
-        assert_eq!(form(&args), Form::Change(Operation::Revert, &args[..]));
+        assert_eq!(form(&args, false), Form::Change(Operation::Revert, &args[..]));
         let args = strings(&["2", "TERM"]);
-        assert_eq!(form(&args), Form::Change(Operation::Revert, &args[..]));
+        assert_eq!(form(&args, false), Form::Change(Operation::Revert, &args[..]));
         let args = strings(&["INT"]);
-        assert_eq!(form(&args), Form::Change(Operation::Revert, &args[..]));
+        assert_eq!(form(&args, false), Form::Change(Operation::Revert, &args[..]));
         let args = strings(&["", "INT"]);
-        assert_eq!(form(&args), Form::Change(Operation::Ignore, &args[1..]));
+        assert_eq!(form(&args, false), Form::Change(Operation::Ignore, &args[1..]));
         let args = strings(&["-", "INT"]);
-        assert_eq!(form(&args), Form::Change(Operation::Revert, &args[1..]));
-        assert_eq!(form(&strings(&["--", "-"])), Form::Usage);
-        assert_eq!(form(&strings(&["echo"])), Form::Usage);
-        assert_eq!(form(&[]), Form::Print(&[]));
-        assert_eq!(form(&strings(&["-l", "INT"])), Form::Signals);
-        assert_eq!(form(&strings(&["-x"])), Form::InvalidOption('x'));
+        assert_eq!(form(&args, false), Form::Change(Operation::Revert, &args[1..]));
+        assert_eq!(form(&strings(&["--", "-"]), false), Form::Usage);
+        assert_eq!(form(&strings(&["echo"]), false), Form::Usage);
+        assert_eq!(form(&[], false), Form::Print(&[], false));
+        assert_eq!(form(&strings(&["-l", "INT"]), false), Form::Signals);
+        assert_eq!(form(&strings(&["-x"]), false), Form::InvalidOption('x'));
         let args = strings(&["-p", "INT"]);
-        assert_eq!(form(&args), Form::Print(&args[1..]));
+        assert_eq!(form(&args, false), Form::Print(&args[1..], true));
+        // KNSH-106: POSIX mode takes a signal alone as an action without signals; a number still resets.
+        assert_eq!(form(&strings(&["INT"]), true), Form::Usage);
+        let args = strings(&["2", "INT"]);
+        assert_eq!(form(&args, true), Form::Change(Operation::Revert, &args[..]));
     }
 
     // KNSH-104: `trap -l` lays the names out five to a line, as bash 5.2 does.

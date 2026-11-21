@@ -505,9 +505,10 @@ impl Interpreter {
     }
 
     /// The single word a redirection target expands into, as bash expands it (brace, tilde, parameter and
-    /// arithmetic expansion, splitting, pathname expansion): anything but one word is bash's `ambiguous redirect`.
+    /// arithmetic expansion, splitting, pathname expansion; POSIX mode neither splits nor, in a non-interactive
+    /// shell, matches file names, KNSH-106): anything but one word is bash's `ambiguous redirect`.
     fn target_word(&mut self, target: &CommandWord, run: &Run<'_>) -> Flow<Result<String, Refusal>> {
-        let mut words = self.arguments(std::slice::from_ref(target), run)?;
+        let mut words = self.redirection_arguments(target, run)?;
         Ok(match (words.pop(), words.is_empty()) {
             (Some(word), true) => Ok(word),
             (Some(_) | None, _) => Err(format!("{}: ambiguous redirect", written(target, run))),

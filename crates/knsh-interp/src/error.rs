@@ -159,7 +159,7 @@ pub enum Unsupported {
     /// A bash builtin the interpreter does not run yet (`getopts`, `kill`, `ulimit`, …), or a form of one it runs
     /// that it does not reproduce.
     Builtin,
-    /// Changing a `set -o` or `shopt` option the interpreter does not implement (`set -a`, `set -o posix`,
+    /// Changing a `set -o` or `shopt` option the interpreter does not implement (`set -a`, `set -o nolog`,
     /// `shopt -s nocasematch`), or reading a line-editing or history option of an interactive shell (KNSH-107)
     /// (KNSH-104).
     ShellOption,
@@ -205,6 +205,10 @@ pub enum Unsupported {
     /// `[[ … =~ … ]]` on text the system's regular expression engine would match in bytes while bash matches in
     /// characters, or the reverse: a capture that does not end on a character boundary (KNSH-102).
     RegexText,
+    /// What bash's POSIX mode reads differently from the parser, which has none (KNSH-106): a `}` or `"` between
+    /// single quotes in the word of a double-quoted `${name-word}` (`"${x+'}'}"`), where POSIX mode ends the
+    /// expansion or the string.
+    PosixMode,
     /// A construct the parser keeps opaque: `select`, an arithmetic `for` whose header is not three expressions.
     Construct(UnsupportedConstruct),
 }
@@ -245,6 +249,7 @@ impl fmt::Display for Unsupported {
             Self::ReadOption => f.write_str("this read option (KNSH-107)"),
             Self::PrintfLocale => f.write_str("this printf conversion in the shell's locale or time zone"),
             Self::RegexText => f.write_str("a regular expression match bash would split differently"),
+            Self::PosixMode => f.write_str("a quote that bash's POSIX mode reads differently (KNSH-106)"),
             Self::Construct(construct) => write!(f, "{construct}"),
         }
     }

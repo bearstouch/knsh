@@ -232,8 +232,9 @@ impl Job {
             .or_else(|| self.members.iter().rev().find_map(|member| member.pid))
     }
 
-    /// The state column of `jobs` and notifications, as bash prints it.
-    pub(crate) fn state_text(&self) -> String {
+    /// The state column of `jobs` and notifications, as bash prints it; in POSIX mode (`posix`) a job that exited
+    /// with a failure is `Done(n)` rather than `Exit n` (bash's `printable_job_status`, KNSH-106).
+    pub(crate) fn state_text(&self, posix: bool) -> String {
         if self.is_done() {
             let status = self.status();
             let last = self.members.last().map(|member| member.state);
@@ -243,6 +244,7 @@ impl Job {
                     signal_description(i32::from(last.code() - 128))
                 }
                 _ if status.is_success() => "Done".to_owned(),
+                _ if posix => format!("Done({})", status.code()),
                 _ => format!("Exit {}", status.code()),
             };
         }
@@ -256,10 +258,10 @@ impl Job {
     }
 
     /// The job's line in `jobs` and notifications: `[n]+  State                   text`, with `&` after a running
-    /// job's text, as bash prints it.
-    pub(crate) fn line(&self, mark: char, with_pid: bool) -> String {
+    /// job's text, as bash prints it (`posix`: as [`Job::state_text`] says).
+    pub(crate) fn line(&self, mark: char, with_pid: bool, posix: bool) -> String {
         let number = self.number.unwrap_or(0);
-        let state = self.state_text();
+        let state = self.state_text(posix);
         let running = state == "Running";
         let suffix = if running { " &" } else { "" };
         if with_pid {
@@ -819,16 +821,37 @@ mod tests {
             pid: Some(42),
             state: MemberState::Running,
         }];
-        assert_eq!(running.line('+', false), "[1]+  Running                 sleep 30 &");
+        assert_eq!(
+            running.line('+', false, false),
+            "[1]+  Running                 sleep 30 &"
+        );
         running.members[0].state = MemberState::Stopped(signals::SIGTSTP);
-        assert_eq!(running.line('+', false), "[1]+  Stopped                 sleep 30");
+        assert_eq!(
+            running.line('+', false, false),
+            "[1]+  Stopped                 sleep 30"
+        );
         running.members[0].state = MemberState::Stopped(signals::SIGTTIN);
-        assert_eq!(running.line('-', false), "[1]-  Stopped(SIGTTIN)        sleep 30");
+        assert_eq!(
+            running.line('-', false, false),
+            "[1]-  Stopped(SIGTTIN)        sleep 30"
+        );
         running.members[0].state = MemberState::Done(Status::SUCCESS);
-        assert_eq!(running.line(' ', false), "[1]   Done                    sleep 30");
+        assert_eq!(
+            running.line(' ', false, false),
+            "[1]   Done                    sleep 30"
+        );
         running.members[0].state = MemberState::Done(Status::new(3));
-        assert_eq!(running.line('+', false), "[1]+  Exit 3                  sleep 30");
+        assert_eq!(
+            running.line('+', false, false),
+            "[1]+  Exit 3                  sleep 30"
+        );
         running.members[0].state = MemberState::Done(Status::from_signal(signals::SIGTERM));
-        assert_eq!(running.line('+', false), "[1]+  Terminated: 15          sleep 30");
+        assert_eq!(
+            running.line('+', false, false),
+            "[1]+  Terminated: 15          sleep 30"
+        );
+        // KNSH-106: POSIX mode.
+        running.members[0].state = MemberState::Done(Status::new(3));
+        assert_eq!(running.line('+', false, true), "[1]+  Done(3)                 sleep 30");
     }
 }

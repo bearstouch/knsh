@@ -77,6 +77,19 @@ fn shopt_flags(args: &[String]) -> Result<(ShoptFlags, &[String]), char> {
 }
 
 impl Interpreter {
+    /// Sets `set -o` option `name` to `on`; turning POSIX mode on or off also sets or removes `POSIXLY_CORRECT`, as
+    /// bash's `set_posix_mode` does (KNSH-106).
+    fn change_set_o(&mut self, name: &str, on: bool) -> Result<(), OptionError> {
+        let interactive = self.state.is_interactive();
+        let before = self.state.options().posix();
+        options::change_set_o(self.state.options_mut(), interactive, name, on)?;
+        let after = self.state.options().posix();
+        if before != after {
+            self.state.bind_posix_variable(after);
+        }
+        Ok(())
+    }
+
     /// A refusal or bash's `invalid option name`, from reading or changing option `name` for `builtin`.
     fn option_error(
         &mut self,
@@ -108,6 +121,7 @@ impl Interpreter {
             let sign = if on { '-' } else { '+' };
             self.report(span, run, format_args!("set: {sign}{letter}: invalid option"));
             self.report_plain(format_args!("{SET_USAGE}"));
+            self.usage_error = true;
             return Ok(Status::new(2));
         }
         let interactive = self.state.is_interactive();
@@ -138,6 +152,7 @@ impl Interpreter {
                             let sign = if on { '-' } else { '+' };
                             self.report(span, run, format_args!("set: {sign}{letter}: invalid option"));
                             self.report_plain(format_args!("{SET_USAGE}"));
+                            self.usage_error = true;
                             return Ok(Status::new(2));
                         }
                         Err(OptionError::Refused(feature)) => return Err(unsupported(feature, span).into()),
@@ -146,8 +161,10 @@ impl Interpreter {
                 match rest.split_first() {
                     Some((name, after)) if !name.is_empty() && !name.starts_with(['-', '+']) => {
                         rest = after;
-                        if let Err(error) = options::change_set_o(self.state.options_mut(), interactive, name, on) {
+                        if let Err(error) = self.change_set_o(name, on) {
                             self.option_error(error, "set", "invalid option name", name, span, run)?;
+                            // Bash 5.2's `set_minus_o_option` returns `EX_USAGE` (KNSH-106: fatal in POSIX mode).
+                            self.usage_error = true;
                             return Ok(Status::FAILURE);
                         }
                     }
@@ -202,11 +219,10 @@ impl Interpreter {
         if (flags.set || flags.unset) && !names.is_empty() {
             let mut status = Status::SUCCESS;
             for name in names {
-                let options = self.state.options_mut();
                 let result = if flags.set_o {
-                    options::change_set_o(options, interactive, name, flags.set)
+                    self.change_set_o(name, flags.set)
                 } else {
-                    options::change_shopt(options, name, flags.set)
+                    options::change_shopt(self.state.options_mut(), name, flags.set)
                 };
                 if let Err(error) = result {
                     self.option_error(error, "shopt", message, name, span, run)?;
