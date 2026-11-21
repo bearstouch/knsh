@@ -340,6 +340,29 @@ impl<'a> Expander<'a> {
         Ok(self.join(fields, span)?.into_iter().map(|c| c.ch).collect())
     }
 
+    /// The text of a prompt string spanning `span` (`PS4`, already decoded) after expansion, as bash's
+    /// `expand_prompt_string` expands it: as if inside double quotes, its own double quotes kept (KNSH-104).
+    pub(crate) fn prompt_string(&mut self, span: Span) -> Result<String> {
+        fn keep_quotes(parts: Vec<Part>) -> Vec<Part> {
+            let mut out = Vec::with_capacity(parts.len());
+            for part in parts {
+                match part {
+                    Part::Double(inner) => {
+                        out.push(Part::Quoted("\"".to_owned()));
+                        out.extend(keep_quotes(inner));
+                        out.push(Part::Quoted("\"".to_owned()));
+                    }
+                    other => out.push(other),
+                }
+            }
+            out
+        }
+        let parts = keep_quotes(scan::scan(self.source, span, Mode::Double)?);
+        let mut fields = Fields::new();
+        self.expand(&parts, true, false, &mut fields)?;
+        Ok(self.join(fields, span)?.into_iter().map(|c| c.ch).collect())
+    }
+
     /// Evaluates the already expanded arithmetic `expression` against the shell's variables.
     ///
     /// # Errors
@@ -646,33 +669,10 @@ impl<'a> Expander<'a> {
         }
     }
 
-    /// `$-`: the option letters of a shell started as `bash -c` (`h` hashing, `B` brace expansion, `c`), with `f`
-    /// under `set -f`, `i` in an interactive shell, `m` under `set -m`, `u` under `set -u` and `C` under `set -C`, in
-    /// bash's order.
+    /// `$-`: the letters of the options that are on, in bash's order, with `i` in an interactive shell and `c` in a
+    /// shell started as `bash -c` (KNSH-104).
     fn flags(&self) -> String {
-        let options = self.state.options();
-        let mut flags = String::new();
-        if options.noglob {
-            flags.push('f');
-        }
-        flags.push('h');
-        if self.state.is_interactive() {
-            flags.push('i');
-        }
-        if options.monitor {
-            flags.push('m');
-        }
-        if options.nounset {
-            flags.push('u');
-        }
-        flags.push('B');
-        if options.noclobber {
-            flags.push('C');
-        }
-        if !self.state.is_interactive() {
-            flags.push('c');
-        }
-        flags
+        crate::options::dash_flags(self.state.options(), self.state.is_interactive())
     }
 
     /// `value`, or the `set -u` error for parameter `name` (called `label` in the message) if it is unset.

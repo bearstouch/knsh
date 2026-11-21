@@ -1,5 +1,6 @@
 //! Bash's quoting of values in the output of builtins (KNSH-101): `declare -p` and `export -p` (`sh_double_quote`,
-//! or `ansic_quote` for a value with a control character), `alias` (`sh_single_quote`).
+//! or `ansic_quote` for a value with a control character), `alias` (`sh_single_quote`); and of words in `set -x`
+//! traces (KNSH-104).
 
 /// Bash's `sh_single_quote`: `'…'`, each `'` written as `'\''`.
 pub(crate) fn single(text: &str) -> String {
@@ -33,6 +34,45 @@ pub(crate) fn reusable(text: &str) -> String {
     }
 }
 
+/// Bash's `sh_contains_shell_metas`: whether `text` holds a character the shell reads specially (blanks, quotes,
+/// operators, pattern and expansion characters, `~` where tilde expansion would see it, `#` first).
+fn contains_shell_metas(text: &str) -> bool {
+    let mut previous: Option<char> = None;
+    for ch in text.chars() {
+        match ch {
+            ' ' | '\t' | '\n' | '\'' | '"' | '\\' | '|' | '&' | ';' | '(' | ')' | '<' | '>' | '!' | '{' | '}' | '*'
+            | '[' | '?' | ']' | '^' | '$' | '`' => return true,
+            '~' if previous.is_none_or(|before| before == '=' || before == ':') => return true,
+            '#' if previous.is_none() => return true,
+            _ => {}
+        }
+        previous = Some(ch);
+    }
+    false
+}
+
+/// A word as `set -x` writes it (bash's `xtrace_print_word_list`): `''` when empty, [`single`]-quoted when it holds a
+/// shell metacharacter, `$'…'` when it holds a control character, otherwise as it is.
+pub(crate) fn trace_word(text: &str) -> String {
+    if text.is_empty() {
+        "''".to_owned()
+    } else {
+        trace_value(text)
+    }
+}
+
+/// An assignment's value as `set -x` writes it after `name=` (bash's `xtrace_print_assignment`): as [`trace_word`],
+/// but nothing at all when empty.
+pub(crate) fn trace_value(text: &str) -> String {
+    if contains_shell_metas(text) {
+        single(text)
+    } else if text.chars().any(char::is_control) {
+        ansi_c(text)
+    } else {
+        text.to_owned()
+    }
+}
+
 /// A value as `declare -p` prints it: `$'…'` (bash's `ansic_quote`) when it holds a character that is not
 /// printable, otherwise `"…"` with `"`, `$`, `` ` `` and `\` escaped (bash's `sh_double_quote`).
 pub(crate) fn declare_value(text: &str) -> String {
@@ -52,7 +92,7 @@ pub(crate) fn declare_value(text: &str) -> String {
 }
 
 /// Bash's `ansic_quote`: `$'…'` with the C escapes, `\'` and `\\`, and other control characters in octal.
-fn ansi_c(text: &str) -> String {
+pub(crate) fn ansi_c(text: &str) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::with_capacity(text.len() + 3);
@@ -101,5 +141,22 @@ mod tests {
         assert_eq!(declare_value("a\"b$c`d\\"), "\"a\\\"b\\$c\\`d\\\\\"");
         assert_eq!(declare_value("a\nb'"), "$'a\\nb\\''");
         assert_eq!(declare_value("\x01"), "$'\\001'");
+    }
+
+    // KNSH-104: words in `set -x` traces, checked against bash (`+ echo 'a b' '' 'it'\''s' '$x' a~ '#x' x#`).
+    #[test]
+    fn trace_words_are_quoted_like_xtrace() {
+        assert_eq!(trace_word("a b"), "'a b'");
+        assert_eq!(trace_word(""), "''");
+        assert_eq!(trace_word("it's"), "'it'\\''s'");
+        assert_eq!(trace_word("$x"), "'$x'");
+        assert_eq!(trace_word("a~"), "a~");
+        assert_eq!(trace_word("~a"), "'~a'");
+        assert_eq!(trace_word("x=~"), "'x=~'");
+        assert_eq!(trace_word("#x"), "'#x'");
+        assert_eq!(trace_word("x#"), "x#");
+        assert_eq!(trace_word("a\x01"), "$'a\\001'");
+        assert_eq!(trace_value(""), "");
+        assert_eq!(trace_value("x y"), "'x y'");
     }
 }

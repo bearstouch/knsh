@@ -39,6 +39,7 @@ use knsh_bash::CompoundCommand;
 use crate::arith::Failure;
 use crate::error::{InterpError, Unsupported};
 use crate::status::Status;
+use crate::trap::Traps;
 pub(crate) use crate::vars::{Assoc, Key, Kind, Value};
 
 /// Bash's `NAMEREF_MAX`: the most name references followed in one lookup.
@@ -219,8 +220,8 @@ pub(crate) struct Frame {
 
 /// Shell options set by `set` and `shopt`.
 ///
-/// Each has bash's default for a non-interactive shell until set (all off). The `set` and `shopt` builtins arrive
-/// with KNSH-104; until then an embedder sets them as `bash -u` or `bash -O extglob` would, through
+/// Each has bash's default for a non-interactive shell until set (all off). Scripts change them with the `set` and
+/// `shopt` builtins (KNSH-104); an embedder sets them as `bash -u` or `bash -O extglob` would, through
 /// [`ShellState::options_mut`]. A script using `extglob` patterns in its own text must also be parsed with them on
 /// ([`knsh_bash::parse_with`]), as bash reads a line with the options set before it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -267,6 +268,24 @@ pub struct ShellOptions {
     pub xpg_echo: bool,
     /// `set -o physical` (`set -P`): `cd` and `pwd` resolve symbolic links, as if given `-P` (KNSH-101).
     pub physical: bool,
+    /// `set -e` (`set -o errexit`): a command that fails ends the shell with its status, except where bash ignores
+    /// it (a condition, a command of an `&&` or `||` list but the last, a `!` pipeline, and everything run inside
+    /// those) (KNSH-104).
+    pub errexit: bool,
+    /// `set -x` (`set -o xtrace`): each command is written to standard error after expansion, after `PS4`
+    /// (KNSH-104).
+    pub xtrace: bool,
+    /// `set -v` (`set -o verbose`): each line of input is written to standard error as it is read (KNSH-104).
+    pub verbose: bool,
+    /// `set -n` (`set -o noexec`): commands are read but not run; ignored by an interactive shell (KNSH-104).
+    pub noexec: bool,
+    /// `set -E` (`set -o errtrace`): functions and subshells inherit the `ERR` trap (KNSH-104).
+    pub errtrace: bool,
+    /// `set -T` (`set -o functrace`): functions and subshells inherit the `DEBUG` and `RETURN` traps (KNSH-104).
+    pub functrace: bool,
+    /// `shopt -s inherit_errexit`: command substitutions inherit `set -e` (KNSH-104). Held and reported; it acts with
+    /// command substitution (KNSH-105). Subshells always inherit `set -e`, as in bash.
+    pub inherit_errexit: bool,
 }
 
 /// `IFS` as bash sets it at start-up: space, tab, newline.
@@ -289,6 +308,8 @@ const UNEMULATED: &[&str] = &[
     "BASH_SUBSHELL",
     "BASH_VERSINFO",
     "BASH_VERSION",
+    // KNSH-104: bash 4.1 and later write `set -x` traces to this descriptor, which is not reproduced.
+    "BASH_XTRACEFD",
     // A dynamic variable in bash 4 and later, set even in a non-interactive shell.
     "COMP_WORDBREAKS",
     "DIRSTACK",
@@ -321,7 +342,6 @@ const UNEMULATED_WHEN_UNSET: &[&str] = &[
     // Bash's default search path (`DEFAULT_PATH_VALUE`) when the environment has none.
     "PATH",
     "PS2",
-    "PS4",
     "SHELL",
     "TERM",
 ];
@@ -439,6 +459,8 @@ pub struct ShellState {
     /// The file mode creation mask commands and redirections use (`umask`, KNSH-101), or `None` while it is the
     /// process's own, which the shell does not know.
     umask: Option<u32>,
+    /// The traps set and the signals the shell was started ignoring (KNSH-104).
+    traps: Traps,
 }
 
 impl ShellState {
@@ -476,6 +498,7 @@ impl ShellState {
             hash_seq: 0,
             aliases: BTreeMap::new(),
             umask: None,
+            traps: Traps::default(),
         };
         state.start_up(None);
         Ok(state)
@@ -507,6 +530,11 @@ impl ShellState {
     /// value unless inherited (bash's `set_pwd`; the interpreter drops an inherited one that is not a directory).
     fn start_up(&mut self, inherited_level: Option<&OsStr>) {
         self.set_variable("IFS", DEFAULT_IFS);
+        // KNSH-104: bash's `PS4` unless the environment gives one (bash 4.4 and later ignore an inherited one when
+        // running as root, which the state cannot tell).
+        if self.find("PS4").is_none() {
+            self.set_variable("PS4", "+ ");
+        }
         self.globals.entry("OLDPWD".to_owned()).or_insert(Variable {
             value: None,
             attributes: Attributes {
@@ -531,6 +559,25 @@ impl ShellState {
     /// Sets global `name` to `value` and exports it.
     fn set_exported(&mut self, name: &str, value: impl Into<OsString>) {
         self.globals.insert(name.to_owned(), Variable::exported(value.into()));
+    }
+
+    /// The same state for a shell started with `ignored` ignored (the host reads them at start-up, as
+    /// [`knsh_platform::macos::ignored_signals`] does): as in bash, a non-interactive shell can neither trap nor reset
+    /// them, and every command it starts inherits them ignored (KNSH-104).
+    #[must_use]
+    pub fn with_ignored_signals(mut self, ignored: knsh_platform::SignalSet) -> Self {
+        self.traps = Traps::with_hard_ignored(ignored);
+        self
+    }
+
+    /// The traps (KNSH-104).
+    pub(crate) fn traps(&self) -> &Traps {
+        &self.traps
+    }
+
+    /// The traps, to change (KNSH-104).
+    pub(crate) fn traps_mut(&mut self) -> &mut Traps {
+        &mut self.traps
     }
 
     /// Sets the shell's umask (the file mode creation mask commands and redirections start with) to `umask`: the

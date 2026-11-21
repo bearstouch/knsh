@@ -267,6 +267,7 @@ fn interactive_pipelines_get_their_own_process_group() {
             group: GroupMembership::Lead,
             terminal: None,
             signals: ChildSignals::Default,
+            ignore: knsh_platform::SignalSet::new(),
         }
     );
     assert!(h.diagnostics.text().ends_with(&format!("[1] {}\n", FIRST_PID + 3)));

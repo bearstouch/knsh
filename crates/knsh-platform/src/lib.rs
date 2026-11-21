@@ -300,7 +300,7 @@ pub use presence::{Authenticated, NotAuthenticated, PromptReason, UserPresence};
 pub use probe::{ProbeFailure, SystemProbe};
 pub use process::{
     ChildEvent, ChildHandle, ChildOptions, ChildSignals, ExitStatus, GroupMembership, MAX_PLACED_FD, Placement,
-    PlacementSource, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest, Stdio,
+    PlacementSource, ProcessGroupId, Processes, SharedFd, Signal, SignalSet, SpawnRequest, Stdio,
 };
 pub use random::Random;
 pub use regex::{RegexOutcome, regex_match};

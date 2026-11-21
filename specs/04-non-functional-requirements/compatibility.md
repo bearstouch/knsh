@@ -117,12 +117,12 @@ gives the interpreter its local time (`Interpreter::with_local_time`) and the sh
 converts in (the process's own `TZ`); `printf %c` prints the first byte of its argument, as bash 3.2 does (pending a
 5.2 run for a multibyte first character, KNSH-109); a `[[ … ]]` bash's parser would reject is refused before anything
 runs (bash reports a syntax error), as is a redirection after its `]]`; `[[ =~ ]]` in the C locale over UTF-8 text is
-refused when a capture would split a character; `test -o` reports the options the interpreter does not hold yet as
-off (their `set` forms are refused, KNSH-104) and refuses the line-editing and history options of an interactive
+refused when a capture would split a character; `test -o` reports the options the interpreter does not implement at bash's default value (changing them is refused,
+KNSH-104) and refuses the line-editing and history options of an interactive
 shell; an interactive `read` does not print `PS2` before a continuation line (KNSH-107); reading or testing one of the
 spawner's standard descriptors (`read` from standard input, `test -t 1`, `[ -p /dev/stdin ]`) is refused unless the
 host gives them (`Interpreter::with_standard_descriptors`). Refused until the story that implements them: `read -e`
-on a terminal (KNSH-107), `nocasematch` for `[[` (KNSH-104). `[[ =~ ]]` is built on macOS only
+on a terminal (KNSH-107); `shopt -s nocasematch` (for `[[` and `case`) is refused and not scheduled. `[[ =~ ]]` is built on macOS only
 until the Linux backend declares its `regex_t`.
 
 Known differences of the native interpreter from bash 5.2 in the core builtins (KNSH-101): `exec cmd` runs the
@@ -140,7 +140,7 @@ differently (an unterminated quote, a construct the parser does not read) is ref
 a read-only variable gives only bash's second message (`name: cannot assign fd to variable`); `exit` in an
 interactive shell with stopped jobs exits at once (bash first warns `There are stopped jobs.`); `command -p`
 searches macOS's standard path (`/usr/bin:/bin:/usr/sbin:/sbin`). Refused until the story that implements them:
-`set` with options or without arguments (KNSH-104), `. /dev/stdin` and other descriptors as files, a sourced file that
+`set` without arguments (it would list the variables bash maintains itself), `. /dev/stdin` and other descriptors as files, a sourced file that
 is not UTF-8, and the listings that would include variables bash maintains itself (`declare -p` and `declare` without
 names, `readonly -p`, `declare -i` without names, `local` without names).
 
@@ -175,6 +175,49 @@ Known differences of the native interpreter from bash 5.2 in functions, scopes a
   `[key]=value` and plain words; turning an associative array into an indexed one or the reverse by assignment; a
   subscript holding an expansion where bash expands it a second time (`unset 'a[$i]'`, `test -v 'a[$i]'`,
   `printf -v 'a[$i]'`, `x='a[$i]'; ${!x}`); `mapfile -C`. Arrays are never exported, as in bash.
+
+Known differences of the native interpreter from bash 5.2 in traps, signals, `set` and `shopt` (KNSH-104):
+
+- Signals: the interpreter installs no signal handler (it runs inside a multithreaded process it does not own). The
+  host catches the signals meant for the shell and hands them over (`Interpreter::shell_signals`,
+  `ShellSignals::raise`); the shell acts on them after the pipeline running when each arrived ends, as bash runs its
+  pending traps after each command. So a signal arriving while a foreground program runs takes effect once that
+  program ends (bash's handler for a fatal signal ends the shell at once), and a trapped signal does not interrupt
+  `wait`. A signal at its default action that ends a process ends the run with 128 plus its number, after the `EXIT`
+  trap for bash's terminating signals (not for `SIGQUIT` or `SIGPROF`), and `Interpreter::terminating_signal` tells
+  the host to end its own process by it. An interactive shell ignores `SIGINT`, `SIGTERM` and `SIGQUIT` at their
+  default (the line editor handles the terminal's interrupt, KNSH-107). Subshells, being copies, never receive the
+  shell's signals, as bash's forked subshells never receive a signal sent to `$$`.
+- Signals ignored at entry are given by the host (`ShellState::with_ignored_signals`, read at start-up with
+  `knsh_platform::macos::ignored_signals`): a non-interactive shell neither traps nor resets them, and every command
+  starts with them ignored (`ChildOptions::ignore`), as do the signals trapped with `''`. Listing a trap on one
+  (`trap`, `trap -p`) is refused: bash 3.2 leaves them out and later versions print `trap -- '' SIG…`.
+- Refused: a `SIGCHLD` trap with a command (bash runs it as each child ends); `trap` listing in a subshell whose
+  parent had command traps, until the subshell changes one (bash 5.2 still lists the parent's); `set` alone (it
+  lists the variables bash maintains itself); changing an option the interpreter does not implement (`set -a`, `-b`,
+  `-k`, `-t`, `-p`, `-i`, `-r`, `+h`, `+B`, `-H`, `-o history`, `emacs`, `vi`, `ignoreeof`, `nolog`, `posix`
+  (KNSH-106), and every `shopt` option outside `extglob`, `globstar`, `nullglob`, `failglob`, `dotglob`,
+  `nocaseglob`, `lastpipe`, `expand_aliases`, `inherit_errexit` and `xpg_echo`); those are listed and tested at bash
+  5.2's defaults for `bash -c`. In an interactive shell, reading or listing the line-editing and history options is
+  refused (KNSH-107). `BASH_XTRACEFD` and `BASH_COMMAND` are refused as variables bash maintains.
+- `inherit_errexit` is held and reported; it acts on command substitution, which arrives with KNSH-105. Subshells
+  always inherit `set -e`, and the exemption of the context they run in, as in bash.
+- Where bash 3.2 and 5.2 differ, bash 5.2's source is followed (pending a run against bash 5.2 itself, KNSH-109):
+  `[[ … ]]` and `(( … ))` are subject to `set -e` and `ERR` (bash 4.1 and later); the parent runs `ERR` after a
+  failing `( … )` too; a `DEBUG`, `ERR` or `RETURN` trap a function sets while the caller's is set aside is kept
+  after it returns (`trap_if_untrapped`; bash 3.2 puts the caller's back); a `for` head is traced with its words as
+  written, unquoted (bash 3.2 single-quotes a word holding a metacharacter); `export a=1` is traced once (bash 3.2
+  also traces the assignment); `trap -l` lists five names a line (bash 3.2: four); the usage lines are bash 5.2's.
+- `set -x`: `PS4` escapes that need the user, host, time, directory, history or `\$` are refused; an inherited
+  `PS4` is used even when running as root (bash 4.4 and later ignore it then); a trap's commands are traced at the
+  level of the command they interrupt (as bash 3.2 does). Refused while tracing, where bash's trace is not
+  reproduced: a list assignment (`a=(…)`, `declare -a a=(…)`), an element assignment whose value needs expansion,
+  and `=~` with quoted characters. `[[ ! ( a == b ) ]]` is traced as `[[ ! a == b ]]` (bash writes the grouped term
+  without the `!`).
+- `set -v` echoes each line as the evaluator reaches the command ending on it (with the blank and comment lines
+  before it), as bash echoes each line it reads; the parser has read the whole script already, so a syntax error is
+  still reported before anything runs. A trap's or `eval`'s text is echoed when it runs, as bash reads it then.
+- Messages from a trap's commands number lines from the line of the command the trap fired after.
 | Messages under `bash -c` | `bash: message` (no line number on one-line scripts) | `bash: line n: message` |
 | Arithmetic error token after trailing blanks (`$(( 1 + ))`) | `error token is " "` | The last token read: `error token is "+ "` |
 | `base#` with no digits (`$((2#))`) | 0 | Error `invalid integer constant` |

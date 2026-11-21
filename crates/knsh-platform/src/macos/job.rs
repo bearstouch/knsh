@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Operation, PlatformError};
 use crate::job::{CpuTimes, JobTerminal, ShellTimes};
-use crate::process::{ProcessGroupId, SharedFd};
+use crate::process::{ProcessGroupId, SharedFd, SignalSet};
 
 /// Signals an interactive shell with job control ignores itself, as bash does: the terminal's suspend character and
 /// the stops for reading or writing the terminal from a background group (the shell hands the terminal over with
@@ -195,9 +195,36 @@ impl ShellTimes for SystemShellTimes {
     }
 }
 
+/// The signals this process ignores now (`SIG_IGN`), among those [`signals::NAMES`](crate::signals::NAMES) lists.
+/// Read at start-up, before anything changes them, they are the signals a shell was started ignoring, which bash keeps
+/// ignored and never lets a non-interactive script trap (KNSH-104). A signal whose disposition cannot be read is left
+/// out.
+#[must_use]
+pub fn ignored_signals() -> SignalSet {
+    let mut set = SignalSet::new();
+    for &(signal, _) in crate::signals::NAMES {
+        // SAFETY: an all-zero `sigaction` is a valid value (a plain C struct); `sigaction` with a null new action
+        // only reads the disposition into `old`, which lives for the call.
+        let ignored = unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, std::ptr::null(), &raw mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
+        };
+        if ignored {
+            set.insert(signal);
+        }
+    }
+    set
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // KNSH-104: `SIGKILL` can never be ignored, so it is never reported.
+    #[test]
+    fn ignored_signals_never_include_kill() {
+        assert!(!ignored_signals().contains(libc::SIGKILL));
+    }
 
     #[test]
     fn take_refuses_what_is_not_a_terminal() {

@@ -180,22 +180,6 @@ impl Interpreter {
         Ok(Status::SUCCESS)
     }
 
-    /// `set -- args`, `set - args` and `set args`: the positional parameters. Listing variables (`set` alone) and
-    /// options (`set -e`, `set -o …`) are refused: options arrive with KNSH-104, and the listing would miss the
-    /// variables bash maintains itself.
-    pub(super) fn set_builtin(&mut self, args: &[String], span: Span) -> Flow<Status> {
-        let parameters = match args.split_first() {
-            None => return Err(unsupported(Unsupported::Builtin, span).into()),
-            Some((first, rest)) if first == "--" || first == "-" => rest,
-            Some((first, _)) if first.starts_with(['-', '+']) => {
-                return Err(unsupported(Unsupported::Builtin, span).into());
-            }
-            Some(_) => args,
-        };
-        self.state.set_positional(parameters.to_vec());
-        Ok(Status::SUCCESS)
-    }
-
     /// `echo [-neE] args`: the arguments separated by spaces, then a newline. `-n` drops the newline, `-e` (or
     /// `shopt -s xpg_echo`) interprets backslash escapes, `-E` stops that; any leading word of only those letters is
     /// options, as in bash.

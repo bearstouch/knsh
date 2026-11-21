@@ -348,24 +348,15 @@ impl Interpreter {
     }
 
     /// `-o name`: whether shell option `name` is on; `false` for a name `set -o` does not know. The options the
-    /// interpreter does not hold are off (their `set` forms are refused, KNSH-104), except those bash turns on by
-    /// default; the line-editing and history options of an interactive shell are refused.
+    /// interpreter does not implement have bash's default value; the line-editing and history options of an
+    /// interactive shell are refused (KNSH-107).
     fn option_is_set(&self, name: &str, span: Span) -> Flow<bool> {
-        let options = self.state.options();
-        Ok(match name {
-            "noglob" => options.noglob,
-            "nounset" => options.nounset,
-            "noclobber" => options.noclobber,
-            "pipefail" => options.pipefail,
-            "monitor" => options.monitor,
-            "physical" => options.physical,
-            "braceexpand" | "hashall" | "interactive-comments" => true,
-            "emacs" | "vi" | "history" | "histexpand" if self.state.is_interactive() => {
-                return Err(unsupported(Unsupported::Builtin, span).into());
-            }
-            // `allexport`, `errexit`, `xtrace` and the rest, which cannot be on yet, and names `set -o` does not know.
-            _ => false,
-        })
+        // KNSH-104: every `set -o` option bash has; a name it does not know is false.
+        match crate::options::set_o(self.state.options(), self.state.is_interactive(), name) {
+            Ok(on) => Ok(on),
+            Err(crate::options::OptionError::Unknown) => Ok(false),
+            Err(crate::options::OptionError::Refused(feature)) => Err(unsupported(feature, span).into()),
+        }
     }
 
     /// `-v name`: whether variable `name` is set (has a value): for an array, its element 0; `name[subscript]`

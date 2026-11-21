@@ -27,6 +27,13 @@
 //! Nesting is counted per list entered (each compound command body, condition and case arm, and later each function
 //! call), against an explicit limit, so a deep tree ends in [`InterpError::DepthExceeded`] rather than a stack
 //! overflow. Loops do not nest: a loop runs any number of iterations at the same depth.
+//!
+//! Traps and the options `set` and `shopt` change (KNSH-104) act at fixed points, as in bash's `execute_cmd.c`: the
+//! `DEBUG` trap before each simple command, `for` iteration, `case`, `[[ … ]]` and `(( … ))`; `set -x` tracing after
+//! a command's expansion; after each pipeline that ends in failure outside the contexts bash exempts (a condition, an
+//! `&&` or `||` operand but the last, a `!` pipeline, and everything run inside those), the `ERR` trap and then
+//! `set -e`'s exit; after each pipeline, the signals the host handed over; and the `EXIT` trap once, when the shell
+//! (or a subshell) exits.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -72,7 +79,10 @@ mod nested;
 mod printf_builtin;
 mod read;
 mod redirect;
+mod set_shopt;
 pub(crate) mod test;
+pub(crate) mod traps;
+mod xtrace;
 
 use job::JobContext;
 use redirect::FdTable;
@@ -105,8 +115,8 @@ pub(crate) fn is_refused_builtin(name: &str) -> bool {
 }
 
 /// Builtins the interpreter runs itself: `let` (KNSH-097), the job builtins `wait`, `jobs`, `fg`, `bg` and `disown`
-/// (KNSH-100), the core builtins (KNSH-101), `test`, `[`, `printf` and `read` (KNSH-102), and `local`, `mapfile`
-/// and `readarray` (KNSH-103).
+/// (KNSH-100), the core builtins (KNSH-101), `test`, `[`, `printf` and `read` (KNSH-102), `local`, `mapfile` and
+/// `readarray` (KNSH-103), and `trap` and `shopt` (KNSH-104).
 pub(crate) const NATIVE_BUILTINS: &[&str] = &[
     ".",
     ":",
@@ -140,8 +150,10 @@ pub(crate) const NATIVE_BUILTINS: &[&str] = &[
     "return",
     "set",
     "shift",
+    "shopt",
     "source",
     "test",
+    "trap",
     "true",
     "type",
     "typeset",
@@ -169,12 +181,8 @@ pub(crate) fn is_bash_builtin(name: &str) -> bool {
 /// or without arguments (KNSH-104).
 pub(crate) fn refused_form(name: &str, args: &[String]) -> Option<Unsupported> {
     match name {
-        "set" => match args.first().map(String::as_str) {
-            None => Some(Unsupported::Builtin),
-            Some("--" | "-") => None,
-            Some(first) if first.starts_with(['-', '+']) => Some(Unsupported::Builtin),
-            Some(_) => None,
-        },
+        "set" => crate::options::set_refusal(args),
+        "shopt" => crate::options::shopt_refusal(args),
         _ => None,
     }
 }
@@ -336,6 +344,23 @@ pub struct Interpreter {
     /// This is the subshell of a pipeline stage that is not run in the shell itself (KNSH-103): a function it calls
     /// must have been given a thread of its own.
     forked_stage: bool,
+    /// Contexts entered in which `set -e` and the `ERR` trap ignore failures (bash's `CMD_IGNORE_RETURN`): a
+    /// condition, an `&&` or `||` operand but the last, a `!` pipeline (KNSH-104). A subshell starts with its
+    /// parent's count, as bash's forked subshell keeps the flag.
+    errexit_ignored: usize,
+    /// The traps running now, innermost last: `DEBUG` never runs inside a trap, and no trap runs inside itself
+    /// (KNSH-104).
+    traps_running: Vec<crate::trap::TrapId>,
+    /// `eval` and `source` texts being run: `set -x` repeats the first character of `PS4` once more for each, as
+    /// bash's `indirection_level` (KNSH-104).
+    trace_level: usize,
+    /// Where the host hands over the signals sent to the shell; `None` in a subshell, which bash's signals sent to
+    /// the shell never reach (KNSH-104).
+    signals: Option<crate::trap::ShellSignals>,
+    /// The signal whose default action ended the shell, for the host to end itself by (KNSH-104).
+    terminating: Option<i32>,
+    /// The shell is ending by a signal whose default action bash takes without running the `EXIT` trap.
+    skip_exit_trap: bool,
 }
 
 impl fmt::Debug for Interpreter {
@@ -397,6 +422,12 @@ impl Interpreter {
             exit_after_job: false,
             declaration_lists: Vec::new(),
             forked_stage: false,
+            errexit_ignored: 0,
+            traps_running: Vec::new(),
+            trace_level: 0,
+            signals: Some(crate::trap::ShellSignals::default()),
+            terminating: None,
+            skip_exit_trap: false,
         }
         .with_checked_oldpwd()
     }
@@ -475,6 +506,45 @@ impl Interpreter {
         self
     }
 
+    /// The handle through which the host hands the shell the signals sent to it (KNSH-104): the shell runs their
+    /// traps, or takes their default action, after the command running when each arrived.
+    #[must_use]
+    pub fn shell_signals(&self) -> crate::trap::ShellSignals {
+        self.signals.clone().unwrap_or_default()
+    }
+
+    /// The signal whose default action ended the last run (after the `EXIT` trap, if bash runs it for that signal),
+    /// whose status was 128 plus its number: the host ends its own process by that signal, as bash's
+    /// `termsig_handler` does (KNSH-104). `None` when the run ended otherwise.
+    #[must_use]
+    pub fn terminating_signal(&self) -> Option<i32> {
+        self.terminating
+    }
+
+    /// Ends an interactive shell at the end of its input, as bash does: runs the `EXIT` trap, if one is set and has
+    /// not run, with `$?` as it is, and returns the shell's exit status (KNSH-104). A non-interactive shell runs the
+    /// trap when [`Interpreter::run`] ends, so this then only returns `$?`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Interpreter::run`], for what the trap runs.
+    pub fn finish(&mut self) -> Result<Status, InterpError> {
+        std::thread::scope(|scope| {
+            let worker = std::thread::Builder::new()
+                .name("knsh-eval".to_owned())
+                .stack_size(EVAL_STACK_SIZE)
+                .spawn_scoped(scope, || {
+                    let run = Run::new("");
+                    let status = self.state.last_status();
+                    let status = self.run_exit_trap(status, Span::new(0, 0), &run)?;
+                    self.state.set_last_status(status);
+                    Ok(status)
+                })
+                .map_err(|_| InterpError::EvaluationThread)?;
+            worker.join().map_err(|_| InterpError::EvaluationThread)?
+        })
+    }
+
     /// A handle that stops and continues every job's process group: the supervisor's pause and resume (FR-SES-10).
     #[must_use]
     pub fn job_signals(&self) -> JobSignals {
@@ -543,22 +613,34 @@ impl Interpreter {
         self.sourcing = 0;
         self.nested_bytes = 0;
         self.exit_after_job = false;
+        self.errexit_ignored = 0;
+        self.traps_running.clear();
+        self.trace_level = 0;
+        self.terminating = None;
+        self.skip_exit_trap = false;
         let run = Run::new(source);
         let result = self.script(&script.items, &run);
-        self.flush_notes(Span::new(source.len(), source.len()), &run);
-        match result {
-            Ok(status) => Ok(status),
+        let end = Span::new(source.len(), source.len());
+        self.flush_notes(end, &run);
+        let (status, exits) = match result {
+            Ok(status) => (status, !self.state.is_interactive()),
             // Bash exits: the script ends here with this status. `break`, `continue` and `return` never get here
             // (outside a loop or a sourced file they are reported and stop nothing), but would end it the same way.
             Err(
                 Stop::Exit(status) | Stop::Break { status, .. } | Stop::Continue { status, .. } | Stop::Return(status),
-            ) => {
-                self.state.set_last_status(status);
-                Ok(status)
-            }
-            Err(Stop::Discard) => Ok(self.state.last_status()),
-            Err(Stop::Error(error)) => Err(error),
-        }
+            ) => (status, true),
+            Err(Stop::Discard) => (self.state.last_status(), !self.state.is_interactive()),
+            Err(Stop::Error(error)) => return Err(error),
+        };
+        // KNSH-104: the shell exits here (an interactive one only through `exit`, `set -e` or a signal; it ends at the
+        // end of its input through `finish`), so its `EXIT` trap runs, once.
+        let status = if exits && !self.skip_exit_trap {
+            self.run_exit_trap(status, end, &run)?
+        } else {
+            status
+        };
+        self.state.set_last_status(status);
+        Ok(status)
     }
 
     /// Writes one of the shell's own error messages, as bash 5 does: `name: line n: message`, to the shell's
@@ -663,10 +745,13 @@ impl Interpreter {
         }
     }
 
-    /// The text `expression` spans, expanded as an arithmetic expression, then evaluated as for `((`.
+    /// The text `expression` spans, expanded as an arithmetic expression, then evaluated as for `((`: one
+    /// expression of an arithmetic `for`, written under `set -x` and preceded by the `DEBUG` trap (KNSH-104).
     fn arithmetic_span(&mut self, expression: Span, span: Span, run: &Run<'_>) -> Flow<Option<i64>> {
         let result = self.expander(run, &[]).arithmetic_text(expression);
         let text = self.expanded(result, span, run)?;
+        self.trace(&format!("(( {text} ))"), span, run)?;
+        self.debug_trap(span, run)?;
         self.arithmetic(&text, "((", span, run)
     }
 
@@ -693,6 +778,7 @@ impl Interpreter {
                     .is_none_or(|between| between.contains('\n'))
             });
             previous_end = Some(item.and_or.span.end);
+            self.echo_input(item.and_or.span.end, run);
             if starts_line && self.state.options().expand_aliases {
                 // Bash reads a whole line, expanding aliases as they are when it reads it (KNSH-101).
                 self.visible_aliases = Arc::new(self.state.aliases().clone());
@@ -719,7 +805,34 @@ impl Interpreter {
                 Err(stop) => return Err(stop),
             }
         }
+        self.echo_input(run.source.len(), run);
         Ok(status)
+    }
+
+    /// `set -v` (KNSH-104): writes the input lines read to run the command ending at `end` (and any blank or comment
+    /// lines before them), each once, to standard error, as bash echoes each line it reads. Lines read while the
+    /// option was off are never written.
+    fn echo_input(&mut self, end: usize, run: &Run<'_>) {
+        let from = run.read_to.get();
+        if end < from {
+            return;
+        }
+        let line_end = run
+            .source
+            .get(end..)
+            .and_then(|rest| rest.find('\n'))
+            .map_or(run.source.len(), |newline| end + newline + 1);
+        run.read_to.set(line_end);
+        if !self.state.options().verbose || line_end <= from {
+            return;
+        }
+        if let Some(text) = run.source.get(from..line_end) {
+            let mut text = text.to_owned();
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            self.write_shell(2, text.as_bytes());
+        }
     }
 
     /// Runs a list: each and-or list in turn. Its status is the last one's; an empty list leaves `$?` as it was.
@@ -743,18 +856,36 @@ impl Interpreter {
     }
 
     /// `a && b || c`: left to right, each pipeline run or skipped on the status so far.
+    /// Every operand but the last runs where `set -e` and the `ERR` trap ignore failures, as in bash (KNSH-104).
     fn and_or(&mut self, and_or: &AndOr, run: &Run<'_>) -> Flow<Status> {
-        let mut status = self.pipeline(&and_or.first, run)?;
-        for part in &and_or.rest {
+        let mut status = if and_or.rest.is_empty() {
+            self.pipeline(&and_or.first, run)?
+        } else {
+            self.ignoring_errexit(|shell| shell.pipeline(&and_or.first, run))?
+        };
+        let last = and_or.rest.len().saturating_sub(1);
+        for (index, part) in and_or.rest.iter().enumerate() {
             let runs = match part.operator {
                 AndOrOperator::And => status.is_success(),
                 AndOrOperator::Or => !status.is_success(),
             };
             if runs {
-                status = self.pipeline(&part.pipeline, run)?;
+                status = if index == last {
+                    self.pipeline(&part.pipeline, run)?
+                } else {
+                    self.ignoring_errexit(|shell| shell.pipeline(&part.pipeline, run))?
+                };
             }
         }
         Ok(status)
+    }
+
+    /// Runs `body` where `set -e` and the `ERR` trap ignore failures (KNSH-104).
+    fn ignoring_errexit<T>(&mut self, body: impl FnOnce(&mut Self) -> Flow<T>) -> Flow<T> {
+        self.errexit_ignored += 1;
+        let result = body(self);
+        self.errexit_ignored -= 1;
+        result
     }
 
     fn command(&mut self, command: &Command, run: &Run<'_>) -> Flow<Status> {
@@ -796,7 +927,10 @@ impl Interpreter {
     /// `if`: the first clause whose condition succeeds runs its body; otherwise `else`, or status 0.
     fn if_command(&mut self, command: &IfCommand, run: &Run<'_>) -> Flow<Status> {
         for clause in &command.clauses {
-            if self.list(&clause.condition, run)?.is_success() {
+            if self
+                .ignoring_errexit(|shell| shell.list(&clause.condition, run))?
+                .is_success()
+            {
                 return self.list(&clause.body, run);
             }
         }
@@ -821,15 +955,26 @@ impl Interpreter {
             Some(items) => self.arguments(&items.words, run)?,
             None => self.state.positional().to_vec(),
         };
+        let head = Self::for_head(command, run);
         self.loops += 1;
-        let result = self.for_items(&name, values, command, run);
+        let result = self.for_items(&name, values, &head, command, run);
         self.loops -= 1;
         result
     }
 
-    fn for_items(&mut self, name: &str, values: Vec<String>, command: &ForCommand, run: &Run<'_>) -> Flow<Status> {
+    /// The loop of `for`: before each iteration, its head under `set -x`, then the `DEBUG` trap (KNSH-104).
+    fn for_items(
+        &mut self,
+        name: &str,
+        values: Vec<String>,
+        head: &str,
+        command: &ForCommand,
+        run: &Run<'_>,
+    ) -> Flow<Status> {
         let mut status = Status::SUCCESS;
         for value in values {
+            self.trace(head, command.variable.span, run)?;
+            self.debug_trap(command.variable.span, run)?;
             // Bash's `for` ends with 1 when it cannot assign its variable (read-only).
             if let Some(failed) = self.assign_or_report(name, value.into(), false, command.variable.span, run)? {
                 return Ok(failed);
@@ -854,7 +999,7 @@ impl Interpreter {
         let mut status = Status::SUCCESS;
         loop {
             // `break` and `continue` in the condition act on this loop too, as in bash.
-            let condition = match loop_step(self.list(&command.condition, run))? {
+            let condition = match loop_step(self.ignoring_errexit(|shell| shell.list(&command.condition, run)))? {
                 Step::Next(condition) => condition,
                 Step::Leave(done) => return Ok(done),
             };
@@ -870,7 +1015,12 @@ impl Interpreter {
 
     /// `case`: the first arm with a matching pattern runs; `;&` runs the next arm's body too, `;;&` goes on testing.
     /// Patterns are expanded only when they are tried, as in bash.
+    /// Under `set -x` its head is written as written, then the `DEBUG` trap runs, before the word is expanded
+    /// (KNSH-104).
     fn case_command(&mut self, command: &CaseCommand, run: &Run<'_>) -> Flow<Status> {
+        let word = command.subject.span.text(run.source).unwrap_or_default();
+        self.trace(&format!("case {word} in"), command.subject.span, run)?;
+        self.debug_trap(command.subject.span, run)?;
         let subject = self.string(&command.subject, run)?;
         let mut status = Status::SUCCESS;
         let mut fall_through = false;
@@ -919,7 +1069,12 @@ impl Interpreter {
                 if let Some(redirect) = trailing_redirection(run.source, close.end, construct.span) {
                     return Err(unsupported(Unsupported::Redirection, redirect).into());
                 }
-                Ok(match self.arithmetic_span(*expression, construct.span, run)? {
+                // KNSH-104: the `DEBUG` trap before the expression is expanded, the trace after.
+                self.debug_trap(construct.span, run)?;
+                let result = self.expander(run, &[]).arithmetic_text(*expression);
+                let text = self.expanded(result, construct.span, run)?;
+                self.trace(&format!("(( {text} ))"), construct.span, run)?;
+                Ok(match self.arithmetic(&text, "((", construct.span, run)? {
                     Some(value) if value != 0 => Status::SUCCESS,
                     Some(_) | None => Status::FAILURE,
                 })
@@ -1007,6 +1162,8 @@ impl Interpreter {
 
     /// [`Interpreter::simple`] once aliases are expanded.
     fn simple_command(&mut self, simple: &SimpleCommand, run: &Run<'_>) -> Flow<Status> {
+        // KNSH-104: bash runs the `DEBUG` trap before it expands the command.
+        self.debug_trap(simple.span, run)?;
         let words = self.command_arguments(simple, run)?;
         let lists = std::mem::take(&mut self.declaration_lists);
         let mut assignments: Vec<(String, OsString)> = Vec::with_capacity(simple.assignments.len());
@@ -1017,6 +1174,7 @@ impl Interpreter {
                 if !words.is_empty() {
                     return Err(unsupported(Unsupported::Array, assignment.span).into());
                 }
+                self.trace_array_assignment(assignment, run)?;
                 if self.array_assignment(assignment, run)?.is_some() {
                     self.state.set_last_status(Status::FAILURE);
                     return Err(Stop::Discard);
@@ -1028,6 +1186,7 @@ impl Interpreter {
                 .expander(run, &assignments)
                 .assignment_value(&parts, assignment.span);
             let value = OsString::from(self.expanded(result, assignment.span, run)?);
+            self.trace_assignment(assignment, &value, run)?;
             if words.is_empty() {
                 // Without a command each assignment takes effect at once, so the next one sees it. A failed one
                 // abandons the line, as bash's assignment error does outside POSIX mode.
@@ -1063,6 +1222,9 @@ impl Interpreter {
                 value
             };
             assignments.push((assignment.name.clone(), value));
+        }
+        if !words.is_empty() {
+            self.trace_words(&words, !lists.is_empty(), simple.span, run)?;
         }
         let Some(saved) = self.redirect(&simple.redirections, run)? else {
             return Ok(Status::FAILURE);
@@ -1215,6 +1377,8 @@ struct Run<'a> {
     line_base: usize,
     /// The text as one a function defined in it keeps (KNSH-103), made once on the first definition.
     shared: std::cell::OnceCell<Arc<str>>,
+    /// Where the lines read so far end: what `set -v` has echoed, or would have (KNSH-104).
+    read_to: std::cell::Cell<usize>,
 }
 
 impl<'a> Run<'a> {
@@ -1230,6 +1394,7 @@ impl<'a> Run<'a> {
             origin,
             line_base,
             shared: std::cell::OnceCell::new(),
+            read_to: std::cell::Cell::new(0),
         }
     }
 

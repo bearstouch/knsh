@@ -150,9 +150,18 @@ pub enum Unsupported {
     /// (`$cmd | wc`): the function must run beside the other stages, which is decided before the stage starts, from
     /// the name as written (KNSH-103).
     PipelineFunction,
-    /// A bash builtin the interpreter does not run yet (`trap`, `getopts`, `shopt`, …: KNSH-103 and
-    /// KNSH-104), or a form of one it runs that a later story implements (`set` with options, KNSH-104).
+    /// A bash builtin the interpreter does not run yet (`getopts`, `kill`, `ulimit`, …), or a form of one it runs
+    /// that it does not reproduce.
     Builtin,
+    /// Changing a `set -o` or `shopt` option the interpreter does not implement (`set -a`, `set -o posix`,
+    /// `shopt -s nocasematch`), or reading a line-editing or history option of an interactive shell (KNSH-107)
+    /// (KNSH-104).
+    ShellOption,
+    /// A `trap` form whose behaviour the interpreter does not reproduce (KNSH-104): a `SIGCHLD` trap with a command
+    /// (bash runs it as each child ends), a listing bash 3.2 and 5.2 print differently (a subshell's reset traps,
+    /// signals ignored at entry), a function changing a trap it did not inherit, or `set -x` tracing a form whose
+    /// trace bash prints differently by version.
+    Trap,
     /// A name reference the interpreter does not follow as bash does (KNSH-103): to an array element, more than
     /// eight references deep, circular inside a function, or assigned through a circular chain.
     Nameref,
@@ -215,7 +224,9 @@ impl fmt::Display for Unsupported {
             Self::Time => f.write_str("the time keyword without clocks"),
             Self::FunctionPrint => f.write_str("printing a function definition (KNSH-103)"),
             Self::PipelineFunction => f.write_str("a function named by an expansion in a pipeline stage (KNSH-103)"),
-            Self::Builtin => f.write_str("this builtin (KNSH-103, KNSH-104)"),
+            Self::Builtin => f.write_str("this builtin or builtin form"),
+            Self::ShellOption => f.write_str("this shell option (KNSH-104)"),
+            Self::Trap => f.write_str("this trap or trace form (KNSH-104)"),
             Self::Nameref => f.write_str("this name reference (KNSH-103)"),
             Self::Alias => f.write_str("this alias's text in place of its command"),
             Self::SourceDescriptor => f.write_str("source of one of the shell's descriptors"),

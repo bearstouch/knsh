@@ -9,12 +9,112 @@
 use std::time::Duration;
 
 /// This platform's numbers of the signals job control names, for code that reports them (`Stopped(SIGTTIN)`,
-/// `Terminated: 15`) without a `libc` dependency of its own.
+/// `Terminated: 15`) without a `libc` dependency of its own, and the names bash gives every signal (`trap -l`,
+/// KNSH-104).
 pub mod signals {
     pub use libc::{
         SIGABRT, SIGALRM, SIGHUP, SIGINT, SIGKILL, SIGPIPE, SIGQUIT, SIGSEGV, SIGSTOP, SIGTERM, SIGTSTP, SIGTTIN,
         SIGTTOU,
     };
+
+    /// Every signal of this platform with the name bash gives it (its `signal_names` table, as `trap -l` prints
+    /// it), in increasing order of number: 1 to 31 on macOS.
+    #[cfg(target_os = "macos")]
+    pub const NAMES: &[(i32, &str)] = &[
+        (libc::SIGHUP, "SIGHUP"),
+        (libc::SIGINT, "SIGINT"),
+        (libc::SIGQUIT, "SIGQUIT"),
+        (libc::SIGILL, "SIGILL"),
+        (libc::SIGTRAP, "SIGTRAP"),
+        (libc::SIGABRT, "SIGABRT"),
+        (libc::SIGEMT, "SIGEMT"),
+        (libc::SIGFPE, "SIGFPE"),
+        (libc::SIGKILL, "SIGKILL"),
+        (libc::SIGBUS, "SIGBUS"),
+        (libc::SIGSEGV, "SIGSEGV"),
+        (libc::SIGSYS, "SIGSYS"),
+        (libc::SIGPIPE, "SIGPIPE"),
+        (libc::SIGALRM, "SIGALRM"),
+        (libc::SIGTERM, "SIGTERM"),
+        (libc::SIGURG, "SIGURG"),
+        (libc::SIGSTOP, "SIGSTOP"),
+        (libc::SIGTSTP, "SIGTSTP"),
+        (libc::SIGCONT, "SIGCONT"),
+        (libc::SIGCHLD, "SIGCHLD"),
+        (libc::SIGTTIN, "SIGTTIN"),
+        (libc::SIGTTOU, "SIGTTOU"),
+        (libc::SIGIO, "SIGIO"),
+        (libc::SIGXCPU, "SIGXCPU"),
+        (libc::SIGXFSZ, "SIGXFSZ"),
+        (libc::SIGVTALRM, "SIGVTALRM"),
+        (libc::SIGPROF, "SIGPROF"),
+        (libc::SIGWINCH, "SIGWINCH"),
+        (libc::SIGINFO, "SIGINFO"),
+        (libc::SIGUSR1, "SIGUSR1"),
+        (libc::SIGUSR2, "SIGUSR2"),
+    ];
+
+    /// Every signal of this platform with the name bash gives it, in increasing order of number: the 31 standard
+    /// signals of Linux (bash's real-time signal names are not listed).
+    #[cfg(not(target_os = "macos"))]
+    pub const NAMES: &[(i32, &str)] = &[
+        (libc::SIGHUP, "SIGHUP"),
+        (libc::SIGINT, "SIGINT"),
+        (libc::SIGQUIT, "SIGQUIT"),
+        (libc::SIGILL, "SIGILL"),
+        (libc::SIGTRAP, "SIGTRAP"),
+        (libc::SIGABRT, "SIGABRT"),
+        (libc::SIGBUS, "SIGBUS"),
+        (libc::SIGFPE, "SIGFPE"),
+        (libc::SIGKILL, "SIGKILL"),
+        (libc::SIGUSR1, "SIGUSR1"),
+        (libc::SIGSEGV, "SIGSEGV"),
+        (libc::SIGUSR2, "SIGUSR2"),
+        (libc::SIGPIPE, "SIGPIPE"),
+        (libc::SIGALRM, "SIGALRM"),
+        (libc::SIGTERM, "SIGTERM"),
+        (libc::SIGSTKFLT, "SIGSTKFLT"),
+        (libc::SIGCHLD, "SIGCHLD"),
+        (libc::SIGCONT, "SIGCONT"),
+        (libc::SIGSTOP, "SIGSTOP"),
+        (libc::SIGTSTP, "SIGTSTP"),
+        (libc::SIGTTIN, "SIGTTIN"),
+        (libc::SIGTTOU, "SIGTTOU"),
+        (libc::SIGURG, "SIGURG"),
+        (libc::SIGXCPU, "SIGXCPU"),
+        (libc::SIGXFSZ, "SIGXFSZ"),
+        (libc::SIGVTALRM, "SIGVTALRM"),
+        (libc::SIGPROF, "SIGPROF"),
+        (libc::SIGWINCH, "SIGWINCH"),
+        (libc::SIGIO, "SIGIO"),
+        (libc::SIGPWR, "SIGPWR"),
+        (libc::SIGSYS, "SIGSYS"),
+    ];
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::process::SignalSet;
+
+        // KNSH-104: names follow numbers, as `trap -l` lists them.
+        #[test]
+        fn names_are_in_increasing_order_of_number() {
+            assert!(NAMES.windows(2).all(|pair| pair[0].0 < pair[1].0));
+            assert_eq!(NAMES.first(), Some(&(SIGHUP, "SIGHUP")));
+            assert!(NAMES.iter().all(|(_, name)| name.starts_with("SIG")));
+        }
+
+        // KNSH-104: a set holds only signal numbers 1 to 63.
+        #[test]
+        fn signal_sets_hold_numbers_one_to_sixty_three() {
+            let mut set: SignalSet = [SIGINT, SIGTERM, 0, 64, -1].into_iter().collect();
+            assert!(set.contains(SIGINT) && set.contains(SIGTERM));
+            assert_eq!(set.iter().collect::<Vec<_>>(), [SIGINT, SIGTERM]);
+            set.remove(SIGINT);
+            assert!(!set.contains(SIGINT) && !set.is_empty());
+            assert!(SignalSet::new().is_empty());
+        }
+    }
 }
 
 use crate::error::PlatformError;
