@@ -1,0 +1,75 @@
+# User guide for Kinetic Shell, published at https://bearstouch.com/knsh/docs/ (scripts/build-docs.sh).
+# The pages are docs/; the theme overrides in docs-theme/ keep every page within the landing site's CSP.
+# See docs-theme/README.md for how to write and build the guide.
+site_name: Kinetic Shell
+site_url: https://bearstouch.com/knsh/docs/
+site_description: User guide for Kinetic Shell (knsh), a shell that runs AI agent commands under recording, policy, sandboxing and undo
+repo_url: https://github.com/bearstouch/knsh
+docs_dir: docs
+site_dir: site-docs
+use_directory_urls: true
+
+theme:
+  name: material
+  custom_dir: docs-theme/overrides
+  logo: assets/images/knsh.svg
+  favicon: assets/images/knsh.svg
+  # Fonts are self-hosted on the landing site's own pages only; Google Fonts would break its CSP.
+  font: false
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle: { icon: material/brightness-7, name: Switch to dark mode }
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle: { icon: material/brightness-4, name: Switch to light mode }
+
+extra_css:
+  - assets/stylesheets/knsh.css
+
+extra:
+  homepage: /knsh/
+  generator: false
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.keys
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: false
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Your shell:
+      - Using knsh as your shell: guides/shell.md
+      - Recording and history: guides/recording.md
+      - Native mode: guides/native-mode.md
+  - Running agents:
+      - Agents in envelopes: guides/agents.md
+      - Policy profiles: guides/policy.md
+      - Approvals and grants: guides/approvals.md
+      - Network access: guides/network.md
+      - Secrets: guides/secrets.md
+      - Hooks: guides/hooks.md
+      - Undo and checkpoints: guides/undo.md
+  - Reference:
+      - Commands: reference/commands.md
+      - Files and settings: reference/configuration.md
+      - Limits and defaults: reference/limits.md
+      - Troubleshooting: reference/troubleshooting.md

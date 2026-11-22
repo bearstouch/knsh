@@ -10,3 +10,7 @@ fuzz/coverage/
 crates/*/.knsh-test-home-*/
 # Benchmark results (KNSH-024): written by scripts/startup-bench.sh, recorded in the specs by hand.
 .build/
+
+# User guide build (scripts/build-docs.sh).
+.venv-docs/
+site-docs/
