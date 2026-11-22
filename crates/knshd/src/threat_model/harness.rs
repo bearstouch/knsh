@@ -251,6 +251,8 @@ impl Stack {
             home: canonical_home.clone(),
             limits: Limits::DEFAULT,
             proxy: Arc::clone(&proxy),
+            // KNSH-108: native-mode lines run in the `knsh` built beside this test binary.
+            knsh: Some(binaries.knsh.clone()),
         };
         let grants = GrantStore::new();
         let spawner: Arc<dyn Spawner> = wiring.spawner.unwrap_or_else(|| Arc::new(spawner));
@@ -268,6 +270,7 @@ impl Stack {
             grants: Arc::clone(&grants),
             spawner,
             redactors: wiring.redactors.unwrap_or_else(crate::redaction::Redactors::none),
+            shim_dir: std::path::PathBuf::from("/nonexistent/knsh-shims"),
         });
         let launcher = TrampolineLauncher {
             processes: Arc::new(SystemProcesses::new()),
@@ -395,6 +398,7 @@ impl Stack {
             timeout_s,
             checkpoint_wait: true,
             control: crate::jobs::LineControl::new(),
+            parent_record_id: None,
         };
         crate::exec::Supervisor::run(&*self.lifecycle, line, &StillWaiting)
     }

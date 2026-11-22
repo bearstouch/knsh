@@ -133,6 +133,7 @@ impl Daemon {
                 release: Mutex::new(release_rx),
             }),
             redactors: crate::redaction::Redactors::none(),
+            shim_dir: std::path::PathBuf::from("/Users/u/.knsh/shims"),
         });
         Self {
             fixture,

@@ -35,9 +35,19 @@ knsh-exec [--keep-fd <n>]... [--status-fd <n>] --profile <absolute path> --inter
           --line <line> [--arg <operand>]...
   => execve("/usr/bin/sandbox-exec", ["/usr/bin/sandbox-exec", "-f", <profile>, <interpreter>, "-c", "--", <line>,
             <operand>...], env)
+
+knsh-exec [--keep-fd <n>]... [--status-fd <n>] [--in-group] --profile <absolute path> --program <absolute path>
+          [--arg <argument>]...
+  => execve("/usr/bin/sandbox-exec", ["/usr/bin/sandbox-exec", "-f", <profile>, <program>, <argument>...], env)
 ```
 
-- **Arguments.** `--profile`, `--interpreter` and `--line` are each required exactly once, in any order; `--keep-fd`
+**Program mode (KNSH-108).** With `--program` instead of `--interpreter` and `--line`, the program itself runs under
+the profile with the `--arg` values as `argv[1..]` (its `argv[0]` is its path): one simple command of a native-mode
+line, or the native interpreter of such a line ([command lifecycle](../03-functional-requirements/command-lifecycle.md#native-mode-knsh-108)).
+`--program` excludes `--interpreter` and `--line`, and one of the two modes is required. `--in-group` skips
+`setpgid(0, 0)`: `knshd` has already placed the process in the line's process group before it executed `knsh-exec`.
+
+- **Arguments.** `--profile`, and either `--program` or both `--interpreter` and `--line`, are each required exactly once, in any order; `--keep-fd`
   (a descriptor number of 3 or more, at most 16, no repeats) is optional. `--arg` (at most 4096, in order) passes
   the line's operands, which the interpreter sees as `$0`, `$1`, … (KNSH-051). `--status-fd` (at most once, a
   descriptor number of 3 or more that is not also kept) names where a failure is reported (below). Paths must be

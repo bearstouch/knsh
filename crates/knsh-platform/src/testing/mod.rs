@@ -79,6 +79,7 @@ mod process;
 mod random;
 mod resolver;
 mod secrets;
+mod supervision;
 mod users;
 mod volumes;
 
@@ -104,6 +105,7 @@ pub use process::{Script, ScriptedProcesses};
 pub use random::SeededRandom;
 pub use resolver::FakeResolver;
 pub use secrets::MemSecretStore;
+pub use supervision::FakeSupervisor;
 pub use users::FakeUserHomes;
 pub use volumes::FakeVolumes;
 

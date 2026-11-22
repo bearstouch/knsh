@@ -91,10 +91,10 @@ use std::time::Duration;
 use knsh_checkpoint::{Gate, ShadowProgress, gate, line_touches_root};
 use knsh_core::{
     Actor, Allowed, Authority, BinaryLookup, Caller, CancelReason, CanonicalPath, CheckpointId, Counted, Decision,
-    DecisionSource, DenialLimiter, Effects, EventData, ExecutionRecord, Hooks, INTERNAL_ERROR, LineInput, LineKey,
-    LocalApprovals, NetworkEntry, Observer, Outcome, OutputStream, Profile, Proposal, RateLimits, RecordDetails,
-    RecordId, Redacted, Redactor, Refusal, RefusalKind, RequestId, SessionId, Timestamp, Ulid, UnprotectedReason,
-    UnprotectedRoot, argv_of, decide, mark_observed,
+    DecisionSource, DenialLimiter, Effects, EventData, ExecMode, ExecutionRecord, Hooks, INTERNAL_ERROR, LineInput,
+    LineKey, LocalApprovals, NetworkEntry, Observer, Outcome, OutputStream, Profile, Proposal, RateLimits,
+    RecordDetails, RecordId, Redacted, Redactor, Refusal, RefusalKind, RequestId, SessionId, Timestamp, Ulid,
+    UnprotectedReason, UnprotectedRoot, argv_of, decide, mark_observed,
 };
 use knsh_json::{Object, ToJson, Value};
 use knsh_platform::{Clock, ExecVerdict, ProcessGroupId, Processes, Random};
@@ -113,6 +113,9 @@ use crate::policy::ProfileLoader;
 use crate::redaction::{Redactors, redact_or_hide};
 use crate::sessions::Sessions;
 use crate::shadows::ClosedLine;
+
+#[cfg(target_os = "macos")]
+mod native;
 
 /// How long an ask waits for an answer by default (FR-AUTH-23).
 pub(crate) const DEFAULT_ASK_TIMEOUT: Duration = Duration::from_secs(90);
@@ -158,6 +161,54 @@ const SHADOW_WAIT_SLICE: Duration = Duration::from_millis(100);
 pub(crate) trait Spawner: Send + Sync {
     /// Runs `plan`, reports its start and a long run through `events`, and waits for it to end.
     fn spawn(&self, plan: SpawnPlan, events: &dyn LineEvents) -> SpawnReport;
+
+    /// Runs a native-mode line's interpreter (KNSH-108, FR-LC-52) as [`Spawner::spawn`] runs a line, and kills what is
+    /// left of its process group once it exits (FR-LC-58). A spawner without native mode starts nothing.
+    fn spawn_native(&self, plan: NativePlan, events: &dyn LineEvents) -> SpawnReport {
+        let _ = (plan, events);
+        not_started()
+    }
+
+    /// Starts one allowed command of a native-mode line in the line's process group and waits for it to end
+    /// (FR-LC-56), telling `events` once it runs. A spawner without native mode starts nothing.
+    fn run_command(
+        &self,
+        plan: &crate::spawn::CommandPlan<'_>,
+        events: &dyn crate::spawn::CommandEvents,
+    ) -> SpawnReport {
+        let _ = (plan, events);
+        not_started()
+    }
+
+    /// Kills the members of `group` (a native-mode line's) still running, while one is held unreaped (FR-LC-58).
+    fn kill_members(&self, group: ProcessGroupId) {
+        let _ = group;
+    }
+}
+
+/// The report of a spawner that cannot start what it was given.
+fn not_started() -> SpawnReport {
+    SpawnReport {
+        sandbox_profile: None,
+        outcome: Err(SpawnFailure::Start(knsh_platform::PlatformError::InvalidPath)),
+        output: None,
+        network: Vec::new(),
+    }
+}
+
+/// A native-mode line, admitted and ready to run in its interpreter (KNSH-108).
+#[derive(Debug)]
+pub(crate) struct NativePlan {
+    /// The line record.
+    pub(crate) record_id: RecordId,
+    /// The line as received: operands, environment, descriptors, timeout.
+    pub(crate) line: ForwardedLine,
+    /// The session's profile: the interpreter's file rules.
+    pub(crate) profile: Profile,
+    /// How its output is captured, as for a line.
+    pub(crate) capture: Option<CapturePlan>,
+    /// The interpreter's end of the line's supervision channel.
+    pub(crate) channel: std::os::fd::OwnedFd,
 }
 
 /// Where a line's irreversible marks go once it has run (KNSH-093, FR-IRR-03, FR-IRR-06): the checkpoint history, so
@@ -275,6 +326,9 @@ pub(crate) struct Parts {
     pub(crate) spawner: Arc<dyn Spawner>,
     /// Each session's redactor, taken once per line for every path of the line (KNSH-091, module documentation).
     pub(crate) redactors: Arc<Redactors>,
+    /// [`knsh_platform::EnginePaths::shim_dir`]: removed from the `PATH` of every command of a native-mode line, as
+    /// from a forwarded line's (FR-LC-16, KNSH-108).
+    pub(crate) shim_dir: std::path::PathBuf,
 }
 
 /// `command.started` and `command.long_running` for one line, from the [`Spawner`] (FR-LC-17).
@@ -298,6 +352,8 @@ struct RunningEvents<'a> {
     secrets: Vec<String>,
     /// Whether the line was spawned: only then was it given its secrets, and its record names them.
     spawned: AtomicBool,
+    /// The line record of a native-mode line's command (FR-LC-54), named by `command.started`.
+    parent_record_id: Option<RecordId>,
 }
 
 impl RunningEvents<'_> {
@@ -332,6 +388,7 @@ impl LineEvents for RunningEvents<'_> {
             command: self.command.clone(),
             cwd: self.cwd.clone(),
             started_at: self.started_at,
+            parent_record_id: self.parent_record_id,
         });
         // FR-SEC-06: the name and the line, never the value.
         for name in self
@@ -448,6 +505,19 @@ struct Evaluated {
     outcome: Outcome,
 }
 
+/// What every line needs before it is decided: its record, the session's actor, profile and redactor
+/// ([`Lifecycle::context`]).
+pub(super) struct Context {
+    record_id: RecordId,
+    /// When the line was received.
+    received_at: Timestamp,
+    actor: Actor,
+    /// The session's profile, as loaded for the line.
+    profile: Profile,
+    /// The session's redactor for every path of the line (KNSH-091).
+    redactor: Redactor,
+}
+
 /// Where a decided line came from: what the record's `decision.source` says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
@@ -484,8 +554,9 @@ impl Lifecycle {
         let _ = self.marks.set(marks);
     }
 
-    /// Steps 1 to 8 and the handling of a refusal, for `line` from `caller` (module documentation).
-    fn prepare(&self, line: &ForwardedLine, caller: &dyn Caller) -> Result<Ready, RpcError> {
+    /// Steps 1 to 8 and the handling of a refusal, for `line` from `caller` (module documentation), once its
+    /// `context` is set up.
+    fn prepare(&self, line: &ForwardedLine, caller: &dyn Caller, context: Context) -> Result<Ready, RpcError> {
         let parts = &self.parts;
         let session_id = line.session_id;
         let Evaluated {
@@ -496,7 +567,7 @@ impl Lifecycle {
             profile,
             redactor,
             outcome,
-        } = self.evaluate(line, caller, Origin::Line)?;
+        } = self.decide_in(line, caller, context);
         let refusal = match outcome {
             // FR-LC-41: the caller left after the decision but before the spawn: the line still never runs. Nobody
             // decided this, so it is recorded like a cancellation inside the pipeline: a deny by standalone rules.
@@ -559,6 +630,14 @@ impl Lifecycle {
     /// session's actor and profile, a record ID, the session's redactor, then the pipeline ([`decide`]). A deny made
     /// before the pipeline runs is recorded and reported here, with `origin`'s source, and returned as its answer.
     fn evaluate(&self, line: &ForwardedLine, caller: &dyn Caller, origin: Origin) -> Result<Evaluated, RpcError> {
+        let context = self.context(line, origin)?;
+        Ok(self.decide_in(line, caller, context))
+    }
+
+    /// What `line` needs before it is decided: the session's actor and profile, a record ID and the session's
+    /// redactor. A deny made here is recorded and reported, with `origin`'s source, and returned as its answer; a held
+    /// or ended session is answered at once, with nothing recorded.
+    fn context(&self, line: &ForwardedLine, origin: Origin) -> Result<Context, RpcError> {
         let parts = &self.parts;
         let session_id = line.session_id;
         // The session ended under the call: there is no one to record for, and nothing runs. A session that holds its
@@ -583,7 +662,26 @@ impl Lifecycle {
         let Ok(redactor) = parts.redactors.for_session(session_id, Some(&profile)) else {
             return Err(self.refuse_early(line, &actor, record, None, NO_REDACTION, origin));
         };
+        Ok(Context {
+            record_id,
+            received_at,
+            actor,
+            profile,
+            redactor,
+        })
+    }
 
+    /// The pipeline ([`decide`]) for `line` in its `context`.
+    fn decide_in(&self, line: &ForwardedLine, caller: &dyn Caller, context: Context) -> Evaluated {
+        let parts = &self.parts;
+        let session_id = line.session_id;
+        let Context {
+            record_id,
+            received_at,
+            actor,
+            profile,
+            redactor,
+        } = context;
         let observer = ProposedEvents {
             events: &parts.events,
             session_id,
@@ -618,7 +716,7 @@ impl Lifecycle {
         };
         let outcome = decide(&input, &effects);
         let latency_ms = self.since(received_at);
-        Ok(Evaluated {
+        Evaluated {
             record_id,
             received_at,
             latency_ms,
@@ -626,7 +724,7 @@ impl Lifecycle {
             profile,
             redactor,
             outcome,
-        })
+        }
     }
 
     /// The checkpoint gate, then the secrets for an allowed line (KNSH-092): last, so a line that waited on a shadow
@@ -885,6 +983,7 @@ impl Lifecycle {
             ended_at: Some(self.parts.clock.now().unwrap_or(received_at)),
             exit_code: None,
             details: RecordDetails {
+                parent_record_id: line.parent_record_id,
                 rewritten_from: refusal
                     .rewritten_from
                     .as_deref()
@@ -965,6 +1064,7 @@ impl Lifecycle {
                 .as_deref()
                 .map(|rule| redact_or_hide(redactor, rule)),
             reason: refusal.reason.as_deref().map(|reason| redact_or_hide(redactor, reason)),
+            parent_record_id: line.parent_record_id,
         };
         let _ = self.parts.events.publish(line.session_id, actor, data);
     }
@@ -999,9 +1099,10 @@ impl Lifecycle {
         report: &SpawnReport,
         record_output: bool,
         unprotected: Vec<UnprotectedRoot>,
-        closed: &ClosedLine,
+        closed: Option<&ClosedLine>,
         secrets_injected: Vec<String>,
         profile: &Profile,
+        parent_record_id: Option<RecordId>,
     ) -> (bool, Timestamp) {
         let ended_at = self.parts.clock.now().unwrap_or(started_at);
         let irreversible = self.mark_irreversible(allowed, profile, report, closed);
@@ -1032,6 +1133,8 @@ impl Lifecycle {
             ended_at: Some(ended_at),
             exit_code,
             details: RecordDetails {
+                // FR-LC-54: a native-mode line's command names its line.
+                parent_record_id,
                 rewritten_from: allowed.rewritten_from.as_deref().map(|from| redactor.redact_text(from)),
                 decision: Some(allowed.decision.to_record(latency_ms)),
                 argv: argv_of(&allowed.classification, redactor),
@@ -1041,12 +1144,15 @@ impl Lifecycle {
                 network: report.network.clone(),
                 // FR-CKP-02 with `required = false`: the roots this line changed unprotected (KNSH-079).
                 unprotected,
-                // FR-CKP-05, FR-CKP-07: the line's own changes (`command`), or a set it overlapped (`concurrent`).
-                attribution: Some(closed.attribution),
+                // FR-CKP-05, FR-CKP-07: the line's own changes (`command`), or a set it overlapped (`concurrent`). A
+                // native-mode line's command has none of its own: its changes are its line's (KNSH-108).
+                attribution: closed.map(|closed| closed.attribution),
                 // KNSH-082, FR-CKP-11: its checkpoint, and the paths it changed with their post-image identities;
                 // nothing for a line that touched no protected root.
-                checkpoint_id: closed.checkpoint.as_ref().map(|checkpoint| checkpoint.id),
-                files_changed: closed.protected.then(|| {
+                checkpoint_id: closed
+                    .and_then(|closed| closed.checkpoint.as_ref())
+                    .map(|checkpoint| checkpoint.id),
+                files_changed: closed.filter(|closed| closed.protected).map(|closed| {
                     closed
                         .checkpoint
                         .as_ref()
@@ -1078,6 +1184,7 @@ impl Lifecycle {
                 started_at,
                 ended_at,
                 exit_code,
+                parent_record_id,
             };
             let _ = self.parts.events.publish(session_id, actor, data);
         }
@@ -1092,18 +1199,28 @@ impl Lifecycle {
         allowed: &Allowed,
         profile: &Profile,
         report: &SpawnReport,
-        closed: &ClosedLine,
+        closed: Option<&ClosedLine>,
     ) -> knsh_core::Irreversibility {
         let mut irreversible = allowed.irreversible.clone();
         // Coverage (KNSH-093): file events are watched only under the checkpoint roots, so no write outside them is
         // observed yet; the proxy reports every connection.
         mark_observed(profile, &mut irreversible, &report.network, &[]);
         if irreversible.value()
-            && let (Some(checkpoint), Some(marks)) = (closed.checkpoint.as_ref(), self.marks.get())
+            && let (Some(checkpoint), Some(marks)) =
+                (closed.and_then(|closed| closed.checkpoint.as_ref()), self.marks.get())
         {
             marks.mark(checkpoint.id, irreversible.reasons());
         }
         irreversible
+    }
+
+    /// Whether the session records output: what `recording.set` set for it, in place of its profile's
+    /// `recording.output` (KNSH-071). Read once per line, so its capture and its record agree.
+    fn records_output(&self, session_id: SessionId, profile: &Profile) -> bool {
+        self.parts
+            .sessions
+            .output_recording_of(session_id)
+            .unwrap_or(profile.recording.output)
     }
 
     /// How `line` is captured (module documentation, "Output"), given whether its session records output: `None` when
@@ -1144,6 +1261,24 @@ impl Lifecycle {
 impl Supervisor for Lifecycle {
     fn run(&self, line: ForwardedLine, caller: &dyn Caller) -> Result<Finished, RpcError> {
         // Defence in depth (NFR-REL-07): a panic before the spawn is a deny. Only shared references cross.
+        let context = panic::catch_unwind(AssertUnwindSafe(|| self.context(&line, Origin::Line)))
+            .unwrap_or_else(|_| Err(denial(None, Some(INTERNAL_ERROR.to_owned()), DecisionSource::Rule)))?;
+        // KNSH-108 (FR-LC-50): the session's profile alone chooses native mode.
+        if context.profile.exec.mode == ExecMode::Native {
+            return self.run_native(line, caller, context);
+        }
+        self.run_line(line, caller, context)
+    }
+
+    fn session_live(&self, session_id: SessionId) -> bool {
+        self.parts.sessions.agent_of(session_id).is_ok()
+    }
+}
+
+impl Lifecycle {
+    /// A line-mode line once its `context` is set up (module documentation): decided as a whole, then run by a stock
+    /// interpreter.
+    fn run_line(&self, line: ForwardedLine, caller: &dyn Caller, context: Context) -> Result<Finished, RpcError> {
         let Ready {
             record_id,
             redactor,
@@ -1153,18 +1288,12 @@ impl Supervisor for Lifecycle {
             latency_ms,
             received_at,
             admitted,
-        } = panic::catch_unwind(AssertUnwindSafe(|| self.prepare(&line, caller)))
+        } = panic::catch_unwind(AssertUnwindSafe(|| self.prepare(&line, caller, context)))
             .unwrap_or_else(|_| Err(denial(None, Some(INTERNAL_ERROR.to_owned()), DecisionSource::Rule)))?;
         let session_id = line.session_id;
         let cwd = line.proposal.cwd.clone();
         let control = Arc::clone(&line.control);
-        // KNSH-071: `recording.set` may have set output recording for the session in place of its profile's. Read
-        // once, so the capture and the record agree for the whole line.
-        let record_output = self
-            .parts
-            .sessions
-            .output_recording_of(session_id)
-            .unwrap_or(profile.recording.output);
+        let record_output = self.records_output(session_id, &profile);
         let default_mode = profile.output.mode;
         let capture = self.capture_plan(&line, record_output, &actor, record_id, &redactor);
         // Never a 1970 start, which retention would expire at once.
@@ -1182,6 +1311,7 @@ impl Supervisor for Lifecycle {
             group: Mutex::new(None),
             secrets: injection::injected_names(&admitted.secrets),
             spawned: AtomicBool::new(false),
+            parent_record_id: None,
         };
         // What the line reached is judged against the profile it ran with (KNSH-093), after the plan takes it.
         let observing = profile.clone();
@@ -1227,9 +1357,10 @@ impl Supervisor for Lifecycle {
             &report,
             record_output,
             admitted.unprotected,
-            &closed,
+            Some(&closed),
             events.secrets_injected(),
             &observing,
+            None,
         );
         let record_id = written.then_some(record_id);
         // FR-CKP-04: the line's checkpoints in these roots are uncertain (the roots were rescanned).
@@ -1262,10 +1393,6 @@ impl Supervisor for Lifecycle {
             // The line did not run to its end; its record says so (no exit code, no signal).
             Err(_) => Err(RpcError::new(ErrorCode::InternalError)),
         }
-    }
-
-    fn session_live(&self, session_id: SessionId) -> bool {
-        self.parts.sessions.agent_of(session_id).is_ok()
     }
 }
 
@@ -1356,6 +1483,7 @@ impl Lifecycle {
             ended_at: Some(self.parts.clock.now().unwrap_or(received_at)),
             exit_code: None,
             details: RecordDetails {
+                parent_record_id: line.parent_record_id,
                 decision: Some(decision.to_record(latency_ms)),
                 argv: argv_of(&allowed.classification, redactor),
                 irreversible: Some(allowed.irreversible.clone()),
@@ -1383,6 +1511,26 @@ fn exec_line(request: &ExecRequest) -> ForwardedLine {
         timeout_s: None,
         checkpoint_wait: false,
         control: LineControl::new(),
+        parent_record_id: None,
+    }
+}
+
+/// Native mode needs the macOS supervision channel (KNSH-108): elsewhere a native-mode line is denied (fail closed).
+#[cfg(not(target_os = "macos"))]
+impl Lifecycle {
+    fn run_native(&self, line: ForwardedLine, _caller: &dyn Caller, context: Context) -> Result<Finished, RpcError> {
+        let refusal = Refusal {
+            decision: Decision::deny(DecisionSource::Standalone, None, None),
+            command: line.proposal.command.clone(),
+            rewritten_from: None,
+            reason: Some("native mode is not available on this platform, so the line was denied".to_owned()),
+            kind: RefusalKind::Denied,
+            classification: None,
+            line_key: None,
+            irreversible: None,
+        };
+        let record = (context.record_id, context.received_at, 0);
+        Err(self.refused(&line, &context.actor, Some(&context.redactor), record, &refusal))
     }
 }
 

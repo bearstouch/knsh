@@ -105,6 +105,8 @@ fn argv_summary(argv: &[ArgvEntry]) -> Vec<ArgvSummary> {
 
 fn full_details() -> RecordDetails {
     RecordDetails {
+        // KNSH-108: a native-mode line's command names its line record (schema version 3).
+        parent_record_id: Some(RecordId::from_ulid(Ulid::from_u128(0x0108))),
         rewritten_from: Some(Redacted::new(String::from("npm  test"))),
         pipestatus: vec![0, 1],
         signal: Some(String::from("SIGKILL")),

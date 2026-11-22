@@ -109,6 +109,9 @@ pub enum CommandOutcome {
     /// `exec` refused to run the program (`EACCES`, `EISDIR`, `ENOEXEC`, a bad binary format and the like): bash
     /// reports 126.
     NotExecutable,
+    /// A deciding spawner refused it before it started and already reported why on the command's standard error
+    /// (KNSH-108, FR-LC-55): 126, with no message of the interpreter's own.
+    Denied,
 }
 
 /// What [`CommandSpawner::start`] did with a command.
@@ -124,7 +127,7 @@ pub enum Started {
 /// Starts external commands and waits for them. Object safe: hold it as `Arc<dyn CommandSpawner>`.
 ///
 /// Implementations may refuse a command before it starts (KNSH-108) by returning
-/// [`Started::Refused`] with [`CommandOutcome::NotExecutable`] after reporting the reason themselves.
+/// [`Started::Refused`] with [`CommandOutcome::Denied`] after reporting the reason themselves.
 pub trait CommandSpawner: Send + Sync {
     /// Starts `request` placed as `options` says, without waiting for it.
     ///

@@ -102,6 +102,9 @@ pub enum EventData {
         ended_at: Timestamp,
         /// Its exit code; `None` when it is not known (for example, killed by a signal).
         exit_code: Option<i32>,
+        /// The line record of the native-mode line this command belongs to (FR-LC-54, KNSH-108); `None` for every
+        /// other line.
+        parent_record_id: Option<RecordId>,
     },
     /// `cwd.changed`: the session's working directory changed.
     CwdChanged {
@@ -135,6 +138,9 @@ pub enum EventData {
         rule_id: Option<Redacted<String>>,
         /// Why, in words, when the engine has a reason.
         reason: Option<Redacted<String>>,
+        /// The line record of the native-mode line this command belongs to (FR-LC-54, KNSH-108); `None` for every
+        /// other line.
+        parent_record_id: Option<RecordId>,
     },
     /// `command.denied_repeatedly`: the same normalised line was denied often enough in its session that it is now
     /// denied without asking anyone until `until` (FR-HOOK-20, FR-HOOK-21, KNSH-055). Published once when limiting
@@ -157,6 +163,9 @@ pub enum EventData {
         cwd: CanonicalPath,
         /// When it was spawned.
         started_at: Timestamp,
+        /// The line record of the native-mode line this command belongs to (FR-LC-54, KNSH-108); `None` for every
+        /// other line.
+        parent_record_id: Option<RecordId>,
     },
     /// `secret.injected`: a secret was given to a line as an environment variable (FR-SEC-06, KNSH-092). Names the
     /// secret and the line, never the value. Published once per secret, right after the line's `command.started`.
@@ -1385,6 +1394,7 @@ mod tests {
                 started_at: at,
                 ended_at: at,
                 exit_code: Some(0),
+                parent_record_id: None,
             },
             EventData::CwdChanged { cwd: path },
         ]

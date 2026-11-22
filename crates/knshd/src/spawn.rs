@@ -46,6 +46,18 @@
 //!    otherwise. A byte there means the profile was never applied and the line never ran: the spawn is reported as a
 //!    failure, never as the line's exit code.
 //!
+//! # Native-mode lines (KNSH-108)
+//!
+//! [`TrampolineSpawner::spawn_native`] runs a native-mode line's interpreter instead of a stock shell: `knsh
+//! --native-line <fd> <line> <operand>…` through `knsh-exec`'s program mode, under the interpreter profile
+//! ([`CommandTag::Interpreter`]: exec of `knsh` only, no `fork`, no network, so no proxy credentials), keeping its end
+//! of the supervision channel (`--keep-fd`). It is watched as a line is (steps 4 and 5), and once it exits whatever is
+//! left of its process group is killed before it is reaped (FR-LC-58). [`TrampolineSpawner::run_command`] starts one
+//! allowed command of such a line: its own proxy credentials and profile (tagged with its record, allowing exec of
+//! what it resolved to), `knsh-exec --in-group … --program <canonical path> --arg …` as a member of the line's group,
+//! on exactly the descriptors the interpreter passed (numbers above 2 kept with `--keep-fd`, a standard number the
+//! interpreter closed given `/dev/null`, as `knsh-exec` refuses closed stdio), and waits for it to end.
+//!
 //! # Known limits
 //!
 //! - `sandbox-exec` itself exits 65 (profile not compiled) or 71 (interpreter not executable) before the line starts;
@@ -68,8 +80,8 @@ use std::time::Duration;
 
 use knsh_core::{Allowed, CanonicalPath, LineAccess, NetworkEntry, Profile, RecordId, SessionId};
 use knsh_platform::{
-    Clock, ExitStatus, Field, Level, Operation, PlatformError, ProcessGroupId, Processes, SharedFd, Signal,
-    SpawnRequest, Stdio, SystemLog, Value,
+    ChildEvent, ChildOptions, Clock, ExitStatus, Field, GroupMembership, Level, Operation, Placement, PlacementSource,
+    PlatformError, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest, Stdio, SystemLog, Value,
 };
 use knsh_proto::{Interpreter, LineStatus};
 use knsh_sandbox::{CommandTag, ProfileInput, compile};
@@ -81,7 +93,7 @@ use crate::injection::Injected;
 use crate::jobs::LineControl;
 use crate::profiles::ProfileFiles;
 use crate::proxy::{ProxyCredential, ProxyIssuer, command_env};
-use crate::supervisor::{LineEvents, Ran, SpawnFailure, SpawnPlan, SpawnReport, Spawner};
+use crate::supervisor::{LineEvents, NativePlan, Ran, SpawnFailure, SpawnPlan, SpawnReport, Spawner};
 
 /// `sh` lines (FR-LC-14): bash in POSIX mode on macOS.
 pub(crate) const SH: &str = "/bin/sh";
@@ -136,8 +148,19 @@ pub(crate) fn resolved_binaries(allowed: &Allowed) -> Vec<CanonicalPath> {
     binaries
 }
 
+/// The native interpreter of a native-mode line (KNSH-108): the `knsh` binary, given its end of the line's
+/// supervision channel.
+pub(crate) struct NativeInterpreter<'a> {
+    /// The canonical `knsh` binary beside `knshd`: the one binary its profile lets it execute.
+    pub(crate) knsh: &'a CanonicalPath,
+    /// Its end of the channel, kept open across the exec under its own number.
+    pub(crate) channel: SharedFd,
+}
+
 /// Everything one spawn needs, independent of how the decision was made.
 pub(crate) struct LineToRun<'a> {
+    /// For a native-mode line, its interpreter; `None` for a line run by a stock interpreter.
+    pub(crate) native: Option<NativeInterpreter<'a>>,
     /// The line's record: named in every sandbox tag (FR-SBX-06).
     pub(crate) record_id: RecordId,
     /// Its session: named in every sandbox tag.
@@ -189,6 +212,43 @@ pub(crate) struct TrampolineSpawner {
     pub(crate) limits: Limits,
     /// Issues and revokes each line's proxy credentials (step 0).
     pub(crate) proxy: Arc<dyn ProxyIssuer>,
+    /// The canonical `knsh` binary that runs native-mode lines (KNSH-108); `None` when it could not be found, and then
+    /// no native-mode line starts.
+    pub(crate) knsh: Option<CanonicalPath>,
+}
+
+/// One allowed command of a native-mode line, ready to start (KNSH-108, FR-LC-56).
+pub(crate) struct CommandPlan<'a> {
+    /// The command's own record: named in its sandbox tags and proxy credentials.
+    pub(crate) record_id: RecordId,
+    /// Its session.
+    pub(crate) session_id: SessionId,
+    /// The session's profile, the baseline its profile is compiled from.
+    pub(crate) profile: &'a Profile,
+    /// Its decision: what it resolved to (the binaries its profile allows) and what it presents to the proxy.
+    pub(crate) allowed: &'a Allowed,
+    /// The canonical program to run.
+    pub(crate) program: &'a CanonicalPath,
+    /// `argv[1..]`.
+    pub(crate) args: &'a [OsString],
+    /// The complete environment, before its proxy settings are replaced.
+    pub(crate) env: &'a [(String, String)],
+    /// The working directory.
+    pub(crate) cwd: &'a CanonicalPath,
+    /// The file mode creation mask the interpreter has.
+    pub(crate) umask: Option<u32>,
+    /// The descriptor table the interpreter passed: each number with its descriptor, increasing.
+    pub(crate) descriptors: Vec<(i32, OwnedFd)>,
+    /// The line's process group, which the command joins.
+    pub(crate) group: ProcessGroupId,
+    /// The secrets it receives (KNSH-092).
+    pub(crate) secrets: &'a [Injected],
+}
+
+/// What [`TrampolineSpawner::run_command`] reports while a command runs.
+pub(crate) trait CommandEvents {
+    /// The command was spawned as process `pid`: the interpreter is told it runs, and `command.started` follows.
+    fn started(&self, pid: i32);
 }
 
 /// Revokes a line's proxy credentials when dropped, so every way out of [`TrampolineSpawner::run`] revokes them;
@@ -237,6 +297,7 @@ impl Spawner for TrampolineSpawner {
                 args: &line.args,
                 env: &line.env,
                 cwd: &line.proposal.cwd,
+                native: None,
                 stdio: line.stdio,
                 timeout: line.timeout_s.map(Duration::from_secs),
                 capture,
@@ -247,11 +308,69 @@ impl Spawner for TrampolineSpawner {
             events,
         )
     }
+
+    fn spawn_native(&self, plan: NativePlan, events: &dyn LineEvents) -> SpawnReport {
+        let NativePlan {
+            record_id,
+            line,
+            profile,
+            capture,
+            channel,
+        } = plan;
+        let Some(knsh) = self.knsh.as_ref() else {
+            // No `knsh` beside `knshd`: nothing can run the line (fail closed).
+            return self.not_run(None, SpawnFailure::Start(PlatformError::InvalidPath), record_id);
+        };
+        // `knsh --native-line <fd> <line> <operand>…` (`crate::supervisor::native`); the operands are `$0`, `$1`, ….
+        let channel = SharedFd::new(channel);
+        let mut args = vec![
+            "--native-line".to_owned(),
+            channel.as_raw_fd().to_string(),
+            line.proposal.command.clone(),
+        ];
+        args.extend(line.args.iter().cloned());
+        self.run(
+            LineToRun {
+                record_id,
+                session_id: line.session_id,
+                profile: &profile,
+                executed: &line.proposal.command,
+                binaries: &[],
+                interpreter: line.interpreter,
+                args: &args,
+                env: &line.env,
+                cwd: &line.proposal.cwd,
+                native: Some(NativeInterpreter { knsh, channel }),
+                stdio: line.stdio,
+                timeout: line.timeout_s.map(Duration::from_secs),
+                capture,
+                control: &line.control,
+                access: LineAccess::default(),
+                secrets: &[],
+            },
+            events,
+        )
+    }
+
+    fn run_command(&self, plan: &CommandPlan<'_>, events: &dyn CommandEvents) -> SpawnReport {
+        self.start_command(plan, events)
+    }
+
+    fn kill_members(&self, group: ProcessGroupId) {
+        // Only while a member is held unreaped (the group id is then still the line's): `EPERM` or an unknown group
+        // means nothing is left.
+        let _ = self.processes.signal_job(group, Signal::Kill);
+    }
 }
 
 impl TrampolineSpawner {
     /// Steps 0 to 5 of the module documentation for `line`.
     pub(crate) fn run(&self, line: LineToRun<'_>, events: &dyn LineEvents) -> SpawnReport {
+        // KNSH-108: a native-mode line's interpreter has no network, so it gets no proxy credentials; each of its
+        // commands gets its own ([`TrampolineSpawner::run_command`]).
+        if line.native.is_some() {
+            return self.run_with(line, None, events);
+        }
         // KNSH-092: one narrowed profile for the proxy scope and the sandbox profile alike.
         let narrowed = narrowed_profile(line.profile, &line.access);
         let line = LineToRun {
@@ -290,12 +409,20 @@ impl TrampolineSpawner {
         let env = command_env(line.env, credential);
 
         // Step 1. The file stays until `compiled` is dropped, after the line has ended.
+        let (command, executables) = match &line.native {
+            // FR-LC-52: the interpreter may execute only `knsh` itself.
+            Some(native) => (
+                CommandTag::Interpreter(line.record_id),
+                std::slice::from_ref(native.knsh),
+            ),
+            None => (CommandTag::Line(line.record_id), line.binaries),
+        };
         let text = compile(&ProfileInput {
             session: line.session_id,
-            command: CommandTag::Line(line.record_id),
+            command,
             profile: line.profile,
             home: &self.home,
-            executables: line.binaries,
+            executables,
             proxy_port: credential.map(ProxyCredential::port),
         });
         let Ok(compiled) = self.files.write(&line.profile.name, &text) else {
@@ -334,7 +461,7 @@ impl TrampolineSpawner {
         events.started();
 
         // Step 4.
-        let watched = self.watch(group, kept, line.timeout, line.control, events);
+        let watched = self.watch(group, kept, line.timeout, line.control, events, line.native.is_some());
         drop(compiled);
         let output = capture.map(|capture| capture.finish(DRAIN_GRACE));
         let (exit, timed_out) = match watched {
@@ -363,12 +490,107 @@ impl TrampolineSpawner {
         }
     }
 
+    /// One allowed command of a native-mode line (module documentation, "Native-mode lines"): proxy credentials,
+    /// profile, `knsh-exec` in program mode in the line's group, then waits for it to end. Its credentials are revoked
+    /// however it ends, and their report is the record's `network`.
+    pub(crate) fn start_command(&self, plan: &CommandPlan<'_>, events: &dyn CommandEvents) -> SpawnReport {
+        let access = LineAccess::of(plan.allowed);
+        let narrowed = narrowed_profile(plan.profile, &access);
+        let revoke = RevokeOnDrop {
+            proxy: self.proxy.as_ref(),
+            record_id: plan.record_id,
+            revoked: false,
+        };
+        let issued = self
+            .proxy
+            .issue_line(plan.session_id, plan.record_id, &narrowed.network, access);
+        let mut report = match issued {
+            Ok(credential) => self.start_command_with(plan, &narrowed, credential.as_ref(), events),
+            Err(_) => self.not_run(None, SpawnFailure::ProxyCredentials, plan.record_id),
+        };
+        report.network = revoke.finish();
+        report
+    }
+
+    /// [`TrampolineSpawner::start_command`] once the command's credentials are `credential`.
+    fn start_command_with(
+        &self,
+        plan: &CommandPlan<'_>,
+        profile: &Profile,
+        credential: Option<&ProxyCredential>,
+        events: &dyn CommandEvents,
+    ) -> SpawnReport {
+        let env = command_env(plan.env, credential);
+        let binaries = resolved_binaries(plan.allowed);
+        let text = compile(&ProfileInput {
+            session: plan.session_id,
+            command: CommandTag::Line(plan.record_id),
+            profile,
+            home: &self.home,
+            executables: &binaries,
+            proxy_port: credential.map(ProxyCredential::port),
+        });
+        let Ok(compiled) = self.files.write(&profile.name, &text) else {
+            return self.not_run(None, SpawnFailure::ProfileFile, plan.record_id);
+        };
+        let sandbox_profile = Some(compiled.sandbox_profile().to_owned());
+        let (mut status, status_writer) = match std::io::pipe() {
+            Ok(pipe) => pipe,
+            Err(error) => return self.not_run(sandbox_profile, start_failure(&error), plan.record_id),
+        };
+        let request = match command_request(&self.trampoline, compiled.path(), plan, &env, status_writer.into()) {
+            Ok(request) => request,
+            Err(error) => return self.not_run(sandbox_profile, start_failure(&error), plan.record_id),
+        };
+        let options = ChildOptions {
+            group: GroupMembership::Join(plan.group),
+            ..ChildOptions::default()
+        };
+        let spawned = self.processes.spawn_child(&request, &options);
+        // This process's copies of the passed descriptors and of the status pipe's write end are closed now.
+        drop(request);
+        let child = match spawned {
+            Ok(child) => child,
+            Err(error) => return self.not_run(sandbox_profile, SpawnFailure::Start(error), plan.record_id),
+        };
+        events.started(child.pid());
+        // Stops (a paused session's `SIGSTOP` to the line's group) and continues are waited through.
+        let exit = loop {
+            match self.processes.wait_child(child) {
+                Ok(ChildEvent::Exited(exit)) => break exit,
+                Ok(ChildEvent::Stopped(_) | ChildEvent::Continued) => {}
+                Err(error) => return self.not_run(sandbox_profile, SpawnFailure::Wait(error), plan.record_id),
+            }
+        };
+        drop(compiled);
+        match read_status(&mut status) {
+            Ok(None) => {}
+            Ok(Some(code)) => return self.not_run(sandbox_profile, SpawnFailure::Trampoline(code), plan.record_id),
+            Err(error) => return self.not_run(sandbox_profile, SpawnFailure::Wait(error), plan.record_id),
+        }
+        let outcome = line_status(exit)
+            .map(|status| Ran {
+                status,
+                timed_out: false,
+            })
+            .ok_or(SpawnFailure::Wait(PlatformError::UnknownProcessGroup));
+        SpawnReport {
+            sandbox_profile,
+            outcome,
+            output: None,
+            network: Vec::new(),
+        }
+    }
+
     /// Polls the group until its leader exits, publishing `command.long_running` once and enforcing `timeout` and
     /// `exec.kill`, then reaps it. Returns how the leader ended and whether the timeout fired.
     ///
     /// Time the session spends paused does not count towards `timeout` (KNSH-054): a paused line is stopped, not
     /// slow, and must not be killed for it once resumed. `kept` is dropped before the leader is reaped, so a pause
     /// never signals the group id once it may be reused.
+    ///
+    /// With `kill_leftovers` (a native-mode line's interpreter, FR-LC-58), what is left of the group once the leader
+    /// exited is killed before it is reaped, as after a timeout.
     fn watch(
         &self,
         group: ProcessGroupId,
@@ -376,6 +598,7 @@ impl TrampolineSpawner {
         timeout: Option<Duration>,
         control: &LineControl,
         events: &dyn LineEvents,
+        kill_leftovers: bool,
     ) -> Result<(ExitStatus, bool), PlatformError> {
         let processes = self.processes.as_ref();
         let start = self.clock.monotonic();
@@ -430,7 +653,7 @@ impl TrampolineSpawner {
             self.clock.sleep(pause);
             pause = (pause * 2).min(POLL_MAX);
         }
-        if terminated_at.is_some() {
+        if terminated_at.is_some() || kill_leftovers {
             // The leader is gone but still unreaped, so the group id is still ours: members that ignored `SIGTERM`
             // or were started after it are killed before the id is given up. `EPERM` (nothing left) is expected.
             let _ = processes.signal(group, Signal::Kill);
@@ -577,15 +800,30 @@ fn request(
         .arg("--status-fd")
         .arg(status_writer.as_raw_fd().to_string())
         .arg("--profile")
-        .arg(profile_file)
-        .arg("--interpreter")
-        .arg(interpreter_path(line.interpreter, line.profile))
-        .arg("--line")
-        .arg(if line.executed.is_empty() {
-            EMPTY_LINE
-        } else {
-            line.executed
-        });
+        .arg(profile_file);
+    let mut inherit = vec![status_writer];
+    match &line.native {
+        // KNSH-108: `knsh` itself in program mode, keeping its end of the channel under its own number.
+        Some(native) => {
+            request = request
+                .arg("--keep-fd")
+                .arg(native.channel.as_raw_fd().to_string())
+                .arg("--program")
+                .arg(native.knsh.as_path());
+            inherit.push(native.channel.clone());
+        }
+        None => {
+            request = request
+                .arg("--interpreter")
+                .arg(interpreter_path(line.interpreter, line.profile))
+                .arg("--line")
+                .arg(if line.executed.is_empty() {
+                    EMPTY_LINE
+                } else {
+                    line.executed
+                });
+        }
+    }
     for operand in line.args {
         request = request.arg("--arg").arg(operand);
     }
@@ -604,9 +842,80 @@ fn request(
         }))
         .collect();
     request.cwd = Some(line.cwd.as_path().to_path_buf());
-    request.inherit = vec![status_writer];
+    request.inherit = inherit;
     request.stdio = stdio;
     request
+}
+
+/// The `knsh-exec` invocation for one command of a native-mode line (module documentation, "Native-mode lines"):
+/// program mode in the line's group, the interpreter's descriptors placed at their numbers (those above 2 kept), the
+/// environment without the dynamic linker's variables and with the command's secrets.
+///
+/// # Errors
+///
+/// The status pipe's write end could not be moved off a number the table uses.
+fn command_request(
+    trampoline: &Path,
+    profile_file: &Path,
+    plan: &CommandPlan<'_>,
+    env: &[(String, String)],
+    status_writer: OwnedFd,
+) -> std::io::Result<SpawnRequest> {
+    // An inherited descriptor may not share a number with a placement: duplicated until it does not (each copy holds
+    // a new number while the earlier ones stay open, so this ends within the table's size).
+    let mut status_writer = status_writer;
+    let mut held = Vec::new();
+    while plan
+        .descriptors
+        .iter()
+        .any(|(number, _)| *number == status_writer.as_raw_fd())
+    {
+        let copy = status_writer.try_clone()?;
+        held.push(std::mem::replace(&mut status_writer, copy));
+    }
+    drop(held);
+    let status_writer = SharedFd::new(status_writer);
+    let mut request = SpawnRequest::new(trampoline)
+        .arg("--status-fd")
+        .arg(status_writer.as_raw_fd().to_string())
+        .arg("--in-group")
+        .arg("--profile")
+        .arg(profile_file);
+    for (number, _) in plan.descriptors.iter().filter(|(number, _)| *number > 2) {
+        request = request.arg("--keep-fd").arg(number.to_string());
+    }
+    request = request.arg("--program").arg(plan.program.as_path());
+    for arg in plan.args {
+        request = request.arg("--arg").arg(arg);
+    }
+    request.env = env
+        .iter()
+        .filter(|(name, _)| !read_by_dynamic_linker(name))
+        .filter(|(name, _)| !plan.secrets.iter().any(|secret| secret.variable == *name))
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .chain(plan.secrets.iter().map(|secret| {
+            (
+                OsString::from(&secret.variable),
+                OsString::from_vec(secret.value.expose().to_vec()),
+            )
+        }))
+        .collect();
+    request.cwd = Some(plan.cwd.as_path().to_path_buf());
+    request.umask = plan.umask;
+    // A standard number the interpreter closed stays `/dev/null`: `knsh-exec` refuses closed stdio.
+    request.stdio = Stdio::Null;
+    request.placements = plan
+        .descriptors
+        .iter()
+        .map(|(number, fd)| {
+            fd.try_clone().map(|fd| Placement {
+                target: *number,
+                source: Some(PlacementSource::Shared(SharedFd::new(fd))),
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    request.inherit = vec![status_writer];
+    Ok(request)
 }
 
 /// The status `exec.run` reports for a reaped leader, or `None` for one outside the shell's range.

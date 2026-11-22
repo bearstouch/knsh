@@ -230,14 +230,14 @@ pub use path::CanonicalPath;
 pub use policy::{
     AGENT_SOCKET, ApprovalsPolicy, BUILTIN_UPLOAD_HOSTS, CONTROL_SERVICE, CheckpointPolicy, ClassHosts, CommandVerdict,
     DEFAULT_AGENT_BASH, DEFAULT_CHECKPOINT_EXCLUDES, DEFAULT_RETENTION_DAYS, DecisionSource, ENGINE_CONFIG_DIR,
-    ENGINE_DATA_DIR, ENGINE_RUN_DIR, ExecPolicy, FixedDenies, FsPolicy, Grant, GrantScope, GrantSet, HostAccess,
-    HostRefusal, LineAccess, LineCapabilities, LineCheck, LineDecision, LineReason, LineResolver, LoadedProfiles,
-    LookupError, MAX_EXTENDS_DEPTH, MAX_GRANTS, MAX_PROFILE_LEN, MatchedRule, NetworkMode, NetworkPolicy, OutputMode,
-    OutputPolicy, PRESETS, PathContext, PolicyFs, Profile, ProfileSource, RETENTION_DAYS_RANGE, ReadScope,
-    RecordingPolicy, Requester, RuleAction, RuleId, SecretInjection, UNATTENDED_PROFILE, UNATTENDED_PROFILE_TEXT,
-    USER_SOCKET, VOLUME_CHECKPOINT_DIR, at_least_as_strict, check_host, check_line, classify_irreversible,
-    evaluate_command, evaluate_line, evaluate_line_with_grants, host_matches, is_non_tls_host, line_grant_rule,
-    load_profile, load_profile_text, load_unattended, mark_observed, project_root,
+    ENGINE_DATA_DIR, ENGINE_RUN_DIR, ExecMode, ExecPolicy, FixedDenies, FsPolicy, Grant, GrantScope, GrantSet,
+    HostAccess, HostRefusal, LineAccess, LineCapabilities, LineCheck, LineDecision, LineReason, LineResolver,
+    LoadedProfiles, LookupError, MAX_EXTENDS_DEPTH, MAX_GRANTS, MAX_PROFILE_LEN, MatchedRule, NetworkMode,
+    NetworkPolicy, OutputMode, OutputPolicy, PRESETS, PathContext, PolicyFs, Profile, ProfileSource,
+    RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy, Requester, RuleAction, RuleId, SecretInjection,
+    UNATTENDED_PROFILE, UNATTENDED_PROFILE_TEXT, USER_SOCKET, VOLUME_CHECKPOINT_DIR, at_least_as_strict, check_host,
+    check_line, classify_irreversible, evaluate_command, evaluate_line, evaluate_line_with_grants, host_matches,
+    is_non_tls_host, line_grant_rule, load_profile, load_profile_text, load_unattended, mark_observed, project_root,
 };
 pub use ratelimit::{
     Counted, DenialLimiter, LIMIT_DENIALS, LIMIT_DURATION, LIMIT_WINDOW, LineKey, MAX_TRACKED_LINES,

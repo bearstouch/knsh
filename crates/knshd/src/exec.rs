@@ -112,6 +112,9 @@ pub(crate) struct ForwardedLine {
     pub(crate) checkpoint_wait: bool,
     /// Its handle: start mark, kill flag and answer (`exec.start`, `exec.kill`).
     pub(crate) control: Arc<LineControl>,
+    /// For one command of a native-mode line, the line's record (FR-LC-54, KNSH-108): its record and events name it.
+    /// `None` for every line received from a caller.
+    pub(crate) parent_record_id: Option<RecordId>,
 }
 
 /// How a supervised line ended.
@@ -398,6 +401,7 @@ fn forwarded(session_id: SessionId, params: ExecRunParams, stdio: Option<Stdio>,
         timeout_s: params.timeout_s,
         checkpoint_wait: params.checkpoint_wait,
         control: LineControl::new(),
+        parent_record_id: None,
     }
 }
 

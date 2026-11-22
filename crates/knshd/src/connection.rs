@@ -1381,6 +1381,7 @@ mod tests {
                 started_at: at,
                 ended_at: at,
                 exit_code: Some(0),
+                parent_record_id: None,
             },
         )
         .unwrap();

@@ -929,6 +929,12 @@ impl Supervision<'_> {
             home,
             limits: Limits::DEFAULT,
             proxy,
+            // KNSH-108: the `knsh` beside this binary runs native-mode lines; without it none starts.
+            knsh: std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|dir| dir.join("knsh")))
+                .and_then(|knsh| std::fs::canonicalize(knsh).ok())
+                .and_then(|knsh| CanonicalPath::new(knsh).ok()),
         };
         let lifecycle = Lifecycle::new(Parts {
             sessions: Arc::clone(self.sessions),
@@ -944,6 +950,8 @@ impl Supervision<'_> {
             spawner: Arc::new(spawner),
             // KNSH-091: every path of every line is redacted with its session's redactor.
             redactors: Arc::clone(&self.redactors),
+            // FR-LC-16, KNSH-108: a native-mode line's commands lose the shims too.
+            shim_dir: self.paths.shim_dir(),
         });
         // KNSH-093: an irreversible line's marks go to its checkpoint, so its undo lists what it cannot take back.
         lifecycle.attach_marks(Arc::clone(self.history) as Arc<dyn supervisor::IrreversibleMarks>);

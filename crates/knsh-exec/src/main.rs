@@ -8,14 +8,20 @@
 //! knsh-exec [--keep-fd <n>]... [--status-fd <n>] --profile <absolute path> --interpreter <absolute path>
 //!           --line <line> [--arg <operand>]...
 //!   => execve /usr/bin/sandbox-exec -f <profile> <interpreter> -c -- <line> [<operand>...]
+//! knsh-exec [--keep-fd <n>]... [--status-fd <n>] [--in-group] --profile <absolute path> --program <absolute path>
+//!           [--arg <argument>]...
+//!   => execve /usr/bin/sandbox-exec -f <profile> <program> [<argument>...]
 //! ```
+//!
+//! Program mode (KNSH-108) runs one simple command of a native-mode line, or that line's interpreter; with
+//! `--in-group` step 3 is skipped, as `knshd` already placed the process in the line's group.
 //!
 //! In order, before the exec:
 //!
 //! 1. The arguments are read strictly ([`args`]); anything malformed exits with [`exit::USAGE`].
 //! 2. The profile must be a regular file of this user that nobody else can write ([`profile`]), else
 //!    [`exit::PROFILE`].
-//! 3. The process leads its own process group (`setpgid(0, 0)`).
+//! 3. The process leads its own process group (`setpgid(0, 0)`), unless `--in-group` was given.
 //! 4. Every descriptor except stdio and those named with `--keep-fd` gets `FD_CLOEXEC` ([`descriptors`]).
 //! 5. `SIGPIPE`, which the Rust runtime ignores, is reset to its default action.
 //! 6. The process must have exactly one thread.
@@ -96,7 +102,7 @@ fn run(arguments: impl IntoIterator<Item = std::ffi::OsString>, status: &mut Opt
     if let Err(error) = profile::check(&invocation.profile, sys::effective_uid()) {
         return Failure::Profile(error);
     }
-    if let Err(failure) = prepare(&invocation.keep) {
+    if let Err(failure) = prepare(&invocation.keep, invocation.in_group) {
         return failure;
     }
     // Allocated before the thread check, so nothing runs between the check and the exec but the exec itself.
@@ -127,10 +133,12 @@ fn environment() -> Vec<std::ffi::OsString> {
         .collect()
 }
 
-/// Steps 3 to 5: process group, descriptors, `SIGPIPE`.
+/// Steps 3 to 5: process group (kept with `in_group`), descriptors, `SIGPIPE`.
 #[cfg(target_os = "macos")]
-fn prepare(keep: &[i32]) -> Result<(), Failure> {
-    sys::lead_own_process_group().map_err(os_failure("setpgid"))?;
+fn prepare(keep: &[i32], in_group: bool) -> Result<(), Failure> {
+    if !in_group {
+        sys::lead_own_process_group().map_err(os_failure("setpgid"))?;
+    }
     let open = sys::open_descriptors().map_err(os_failure("descriptor list"))?;
     let plan = descriptors::plan(&open, keep).map_err(|error| match error {
         // A listed descriptor that is not open is malformed input (exit 64); closed stdio is the environment's

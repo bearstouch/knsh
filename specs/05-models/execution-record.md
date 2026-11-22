@@ -12,6 +12,7 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 | `rewritten_from` | string or null | The original line when a rewrite was accepted, whether the rewritten line then ran (verdict `rewrite`) or was denied (verdict `deny`) |
 | `argv` | array | Each simple command with resolved absolute path and class (`static`, `wrapper`, `dynamic`, `project_executable`). A wrapper and the command it runs are separate entries, the inner one linked to its wrapper; a dynamic entry carries its reason code |
 | `cwd` | path | Working directory at start |
+| `parent_record_id` | ULID or null | For one simple command of a native-mode line, the line's record (FR-LC-54, KNSH-108); null for every other record. Stored from record schema version 3 |
 | `decision` | object | See below |
 | `sandbox_profile` | string | Profile name and a hash of the compiled profile: `<profile name>@<first 16 lower-case hex digits of the SHA-256 of the compiled profile bytes>`, for example `web-app@ba7816bf8f01cfea`. The profile file `knsh-exec` applied is named by the full hash (FR-SBX-07, KNSH-045) |
 | `secrets_injected` | array | Secret names only, never values |
@@ -33,7 +34,7 @@ One record per agent command line that reaches lifecycle step 2. Stored in the r
 | Field | Values |
 | --- | --- |
 | `verdict` | `allow`, `deny`, `rewrite` (final effective verdict) |
-| `source` | `rule`, `hook`, `authority`, `user`, `standalone`, `rate_limit`, `grant` (a grant answered the rules' ask, KNSH-042), `endpoint_security` (an exec inside an envelope seen by the Endpoint Security descendant client, decided by the same pipeline; `rule_id` and `decided_by` still name the rule, hook, authority or user behind the verdict, KNSH-094) |
+| `source` | `rule`, `hook`, `authority`, `user`, `standalone`, `rate_limit`, `grant` (a grant answered the rules' ask, KNSH-042), `endpoint_security` (an exec inside an envelope seen by the Endpoint Security descendant client, decided by the same pipeline; `rule_id` and `decided_by` still name the rule, hook, authority or user behind the verdict, KNSH-094), `native` (the line record of a native-mode line, which is admitted without a decision of its own: each of its commands has a record with its own decision, FR-LC-51, KNSH-108) |
 | `rule_id` | e.g. `exec.allow[1]`, `exec.ask[0]` |
 | `decided_by` | Who decided (hook, authority, user) |
 | `latency_ms` | Time to decide: from receiving the line to its final decision, in milliseconds |

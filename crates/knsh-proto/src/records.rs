@@ -260,6 +260,11 @@ impl ToJson for RecordEntry<'_> {
             .with("exit_code", record.exit_code.to_json()?)?;
         if record.actor.agent_id().is_some() {
             let details = &record.details;
+            // KNSH-108 (FR-LC-54): the line record of a native-mode line's command, null for every other record.
+            object.insert(
+                "parent_record_id",
+                details.parent_record_id.map(|id| id.to_string()).to_json()?,
+            )?;
             object.insert(
                 "rewritten_from",
                 details

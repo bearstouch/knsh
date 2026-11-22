@@ -10,7 +10,9 @@
 //!    writes to (`2>/dev/null`, `> /dev/stdout`) and which reach no file.
 //! 4. **Executables** (FR-SBX-04, FR-LC-15): `fork`, and `exec` of binaries in the trusted folders, the system tool
 //!    folders ([`SYSTEM_TOOL_FOLDERS`]), `exec.bash`, the binaries the supervisor names
-//!    ([`ProfileInput::executables`]) and, when `exec.project_executables = "allow"`, the write roots.
+//!    ([`ProfileInput::executables`]) and, when `exec.project_executables = "allow"`, the write roots. The native
+//!    interpreter of a native-mode line ([`CommandTag::Interpreter`], KNSH-108) gets no `fork` and `exec` of the
+//!    named binaries only, and step 7 gives it no network.
 //! 5. **System**: Mach services (all but the denies of step 9), POSIX shared memory and semaphores, descriptor
 //!    `ioctl`s, `sysctl` reads, and system settings read-only (`user-preference-read`, never `-write`).
 //! 6. **Processes** (decision 8, FR-SEC-05): signals and process information only within this sandbox. `(deny
@@ -194,13 +196,17 @@ pub enum CommandTag {
     Envelope,
     /// A supervised line, by its record.
     Line(RecordId),
+    /// The native interpreter of a native-mode line, by the line's record (FR-LC-52, KNSH-108): it may `exec` only the
+    /// binaries the supervisor names (the `knsh` binary itself), never `fork`, and has no network at all. Every
+    /// program it wants to run is started by the supervisor under a profile of its own.
+    Interpreter(RecordId),
 }
 
 impl fmt::Display for CommandTag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Envelope => f.write_str("env"),
-            Self::Line(record_id) => write!(f, "{record_id}"),
+            Self::Line(record_id) | Self::Interpreter(record_id) => write!(f, "{record_id}"),
         }
     }
 }
@@ -356,6 +362,7 @@ fn header(out: &mut Writer, input: &ProfileInput<'_>) {
     let kind = match input.command {
         CommandTag::Envelope => "envelope",
         CommandTag::Line(_) => "command",
+        CommandTag::Interpreter(_) => "interpreter",
     };
     out.raw(";; knsh ")
         .raw(kind)
@@ -370,6 +377,16 @@ fn header(out: &mut Writer, input: &ProfileInput<'_>) {
 
 /// Step 4: `fork`, and `exec` of trusted, system and named binaries, and of project executables if allowed.
 fn executables(out: &mut Writer, input: &ProfileInput<'_>) {
+    // KNSH-108 (FR-LC-52): the native interpreter runs nothing itself. It is exec'd by `sandbox-exec` (so its own
+    // binary is allowed) and asks the supervisor for every program; without `fork` it cannot even start a copy.
+    if let CommandTag::Interpreter(_) = input.command {
+        out.raw("(allow process-exec");
+        for binary in input.executables {
+            out.literal(binary);
+        }
+        out.end();
+        return;
+    }
     let exec = &input.profile.exec;
     out.raw("(allow process-fork)").newline();
     out.raw("(allow process-exec");
@@ -411,6 +428,11 @@ fn system(out: &mut Writer, tag: &Tag) {
 /// Step 7: the proxy and loopback ports, Unix sockets bound under the write roots, and `agent.sock` for an
 /// envelope.
 fn network(out: &mut Writer, input: &ProfileInput<'_>, engine: &FixedDenies) {
+    // KNSH-108 (FR-LC-52): the native interpreter has no network: no port, no socket of its own. Its supervision
+    // channel is a socket pair it inherited, which needs no rule.
+    if let CommandTag::Interpreter(_) = input.command {
+        return;
+    }
     // Port 0 allows nothing (the loader refuses it in `network.loopback`), so it is left out.
     let loopback: Vec<u16> = input
         .profile
@@ -455,8 +477,9 @@ fn network(out: &mut Writer, input: &ProfileInput<'_>, engine: &FixedDenies) {
                 .unix_socket(engine.agent_socket())
                 .end();
         }
-        // Commands talk to nothing over Unix sockets: the default deny covers every one.
-        CommandTag::Line(_) => {}
+        // Commands talk to nothing over Unix sockets: the default deny covers every one. The interpreter returned
+        // above: no network at all.
+        CommandTag::Line(_) | CommandTag::Interpreter(_) => {}
     }
 }
 

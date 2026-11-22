@@ -279,6 +279,7 @@ fn fixture_writing(behaviour: Behaviour, writes: Option<(&'static [u8], &'static
         home: CanonicalPath::new(HOME).unwrap(),
         limits: Limits::DEFAULT,
         proxy: Arc::new(crate::proxy::NoProxy),
+        knsh: None,
     };
     Fixture {
         clock,
@@ -325,6 +326,7 @@ impl Line {
 
     fn to_run(&self, stdio: Option<LineStdio>) -> LineToRun<'_> {
         LineToRun {
+            native: None,
             record_id: RecordId::from_ulid(Ulid::from_u128(7)),
             session_id: SessionId::from_ulid(Ulid::from_u128(3)),
             profile: &self.profile,
@@ -958,6 +960,7 @@ mod platform {
             home: CanonicalPath::new(home).unwrap(),
             limits: Limits::DEFAULT,
             proxy: Arc::new(crate::proxy::NoProxy),
+            knsh: None,
         }
     }
 
@@ -990,6 +993,7 @@ mod platform {
         };
         let cwd = CanonicalPath::new(std::fs::canonicalize("/tmp").unwrap()).unwrap();
         let line = LineToRun {
+            native: None,
             record_id: RecordId::from_ulid(Ulid::from_u128(7)),
             session_id: SessionId::from_ulid(Ulid::from_u128(3)),
             profile,
@@ -1021,6 +1025,7 @@ mod platform {
     ) -> SpawnReport {
         let cwd = CanonicalPath::new(std::fs::canonicalize("/tmp").unwrap()).unwrap();
         let line = LineToRun {
+            native: None,
             record_id: RecordId::from_ulid(Ulid::from_u128(7)),
             session_id: SessionId::from_ulid(Ulid::from_u128(3)),
             profile,

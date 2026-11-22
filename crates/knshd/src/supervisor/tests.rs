@@ -145,6 +145,9 @@ pub(super) struct FakeSpawner {
     pub(super) writes: (&'static [u8], &'static [u8]),
     /// What the proxy reported for the line: the record's `network` field (KNSH-060).
     pub(super) network: Vec<knsh_core::NetworkEntry>,
+    /// For a native-mode line (KNSH-108), the commands its interpreter submits, in order, as the real interpreter
+    /// would after expansion: each answer, and each allowed command's exit, goes to the journal.
+    pub(super) native: Vec<knsh_platform::supervision::Submission>,
 }
 
 impl FakeSpawner {
@@ -159,11 +162,80 @@ impl FakeSpawner {
             long_running: false,
             writes: (b"", b""),
             network: Vec::new(),
+            native: Vec::new(),
         }
     }
 }
 
 impl Spawner for FakeSpawner {
+    /// The interpreter of a native-mode line, played over the real channel (KNSH-108): kept as group 4242, then each
+    /// scripted command is submitted and, once running, waited for.
+    fn spawn_native(&self, plan: NativePlan, events: &dyn LineEvents) -> SpawnReport {
+        use knsh_platform::macos::SocketLink;
+        use knsh_platform::supervision::{StartAnswer, SupervisorLink};
+
+        self.journal
+            .push(format!("spawn native {}", plan.line.proposal.command));
+        let kept = events.keep(
+            ProcessGroupId::from_raw(4242),
+            Arc::new(knsh_platform::testing::ScriptedProcesses::new()),
+        );
+        events.started();
+        let link = SocketLink::new(std::os::unix::net::UnixStream::from(plan.channel)).unwrap();
+        for submission in &self.native {
+            let answer = link.start(submission, &[]);
+            let program = submission.program.display();
+            match answer {
+                Ok(StartAnswer::Running { child, .. }) => {
+                    let exit = link.wait(child);
+                    self.journal.push(format!("ran {program}: {exit:?}"));
+                }
+                Ok(StartAnswer::Denied(reason)) => self.journal.push(format!("denied {program}: {reason}")),
+                other => self.journal.push(format!("answer {program}: {other:?}")),
+            }
+        }
+        drop(link);
+        drop(kept);
+        SpawnReport {
+            sandbox_profile: Some(format!("{}@interpreter00000", plan.profile.name)),
+            outcome: Ok(Ran {
+                status: LineStatus::Exited(0),
+                timed_out: false,
+            }),
+            output: None,
+            network: Vec::new(),
+        }
+    }
+
+    /// One command of a native-mode line: noted, started as pid 4343, ended with 7.
+    fn run_command(
+        &self,
+        plan: &crate::spawn::CommandPlan<'_>,
+        events: &dyn crate::spawn::CommandEvents,
+    ) -> SpawnReport {
+        self.journal.push(format!(
+            "command {} {:?} in group {} record {}",
+            plan.program.as_path().display(),
+            plan.args,
+            plan.group.as_raw(),
+            plan.record_id
+        ));
+        events.started(4343);
+        SpawnReport {
+            sandbox_profile: Some(format!("{}@command000000000", plan.profile.name)),
+            outcome: Ok(Ran {
+                status: LineStatus::Exited(7),
+                timed_out: false,
+            }),
+            output: None,
+            network: Vec::new(),
+        }
+    }
+
+    fn kill_members(&self, group: ProcessGroupId) {
+        self.journal.push(format!("kill members of {}", group.as_raw()));
+    }
+
     fn spawn(&self, plan: SpawnPlan, events: &dyn LineEvents) -> SpawnReport {
         self.journal.push(format!(
             "spawn {} as {}",
@@ -346,6 +418,7 @@ impl Daemon {
                     .unwrap_or_else(|| FakeSpawner::new(Arc::clone(&self.journal))),
             ),
             redactors: setup.redactors.unwrap_or_else(crate::redaction::Redactors::none),
+            shim_dir: std::path::PathBuf::from("/Users/u/.knsh/shims"),
         })
     }
 
@@ -409,6 +482,7 @@ pub(super) fn forwarded(session_id: SessionId, command: &str) -> ForwardedLine {
         timeout_s: None,
         checkpoint_wait: true,
         control: crate::jobs::LineControl::new(),
+        parent_record_id: None,
     }
 }
 
@@ -869,6 +943,7 @@ fn runs_with_no_hooks_and_no_authority() {
         grants: crate::grants::GrantStore::new(),
         spawner: Arc::new(FakeSpawner::new(Arc::clone(&daemon.journal))),
         redactors: crate::redaction::Redactors::none(),
+        shim_dir: std::path::PathBuf::from("/Users/u/.knsh/shims"),
     });
     // `echo` is a builtin and stays as written; `ls` runs by its absolute path.
     lifecycle.run(daemon.line("echo hi; ls"), &StillWaiting).unwrap();
@@ -884,6 +959,7 @@ fn spawning(daemon: &Daemon, outcome: Result<Ran, SpawnFailure>, long_running: b
             long_running,
             writes: (b"", b""),
             network: Vec::new(),
+            native: Vec::new(),
         }),
         ..Setup::default()
     })
@@ -1087,6 +1163,7 @@ fn writes_one_record_per_line_reaching_parse() {
                 long_running: false,
                 writes: (b"", b""),
                 network: Vec::new(),
+                native: Vec::new(),
             }),
             ..Setup::default()
         },
@@ -1263,6 +1340,7 @@ fn exit_code_null_for_denied_line() {
         long_running: false,
         writes: (b"", b""),
         network: Vec::new(),
+        native: Vec::new(),
     };
     daemon
         .next(
@@ -2616,3 +2694,5 @@ fn absolute_path_bash_in_envelope_is_decided() {
     assert!(decision.rule_id.is_some());
     assert_eq!(decision.source, DecisionSource::EndpointSecurity);
 }
+
+mod native;

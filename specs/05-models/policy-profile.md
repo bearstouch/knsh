@@ -75,6 +75,7 @@ Outside the subset, and rejected as such: dates and times, floats (including `in
 | `exec.trusted_folders` | list of paths | Folders added to the default trusted folders (FR-POL-13). **Proposed** (KNSH-039) |
 | `exec.trusted_tools` | list of patterns | Tools run without a per-command profile, after an approval or grant (FR-SBX-09). **Proposed** (KNSH-039) |
 | `exec.bash` | path | The bash that runs agent lines. **Proposed** (KNSH-039) |
+| `exec.mode` | `line` \| `native` | How agent lines are decided and run: `line` decides the whole line, then runs it in a stock interpreter (phase 2); `native` runs it in `knsh`'s interpreter and decides every simple command it starts ([command lifecycle](../03-functional-requirements/command-lifecycle.md#native-mode-knsh-108), FR-LC-50). A preset may not set it. KNSH-108 |
 | `network.mode` | `none` \| `allowlist` | |
 | `network.hosts` | list | Open to every command. Entries are names, `*.` wildcards (every name strictly below) or IP addresses ([matching](../03-functional-requirements/network-proxy.md#host-rules-name-resolution-and-address-checks-knsh-060)) |
 | `network.approval_hosts` | list | Only for commands whose class or approval includes them |
@@ -133,6 +134,7 @@ Every key is optional except `name`. An unset key takes its default:
 | `exec.default` | `ask`: a command no rule names is never run without a decision |
 | `exec.trusted_folders` | none beyond the defaults (`/usr/bin`, `/bin`, `/usr/sbin`, `/opt/homebrew/bin`, `/usr/local/bin`) |
 | `exec.bash` | `/bin/bash` |
+| `exec.mode` | `line`: native mode stays opt-in until the phase 4 gate (KNSH-109) |
 | `network.mode` | `none` |
 | `network.hosts`, `network.approval_hosts`, `network.loopback` | none |
 | `approvals.irreversible` | `ask` |

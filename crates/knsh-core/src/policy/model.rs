@@ -131,6 +131,35 @@ pub struct ExecPolicy {
     pub trusted_tools: Vec<String>,
     /// `exec.bash` (proposed): the bash that runs agent lines. Default [`DEFAULT_AGENT_BASH`].
     pub bash: CanonicalPath,
+    /// `exec.mode`: how agent lines are decided and run (FR-LC-50, KNSH-108). Default [`ExecMode::Line`].
+    pub mode: ExecMode,
+}
+
+/// `exec.mode` (FR-LC-50, KNSH-108): how a session's agent lines are decided and run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ExecMode {
+    /// `line`: the whole line is decided, then run by a stock interpreter (phase 2). The default.
+    #[default]
+    Line,
+    /// `native`: the line runs in `knsh`'s own interpreter and every simple command it starts is decided.
+    Native,
+}
+
+impl ExecMode {
+    /// The profile spelling: `line` or `native`.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Line => "line",
+            Self::Native => "native",
+        }
+    }
+
+    /// The mode spelled `code`, or `None` for any other text.
+    #[must_use]
+    pub fn parse(code: &str) -> Option<Self> {
+        [Self::Line, Self::Native].into_iter().find(|mode| mode.code() == code)
+    }
 }
 
 /// `network.mode`.

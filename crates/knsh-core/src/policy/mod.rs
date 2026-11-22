@@ -64,8 +64,8 @@ pub use line::{
 };
 pub use model::{
     ApprovalsPolicy, CheckpointPolicy, ClassHosts, DEFAULT_AGENT_BASH, DEFAULT_CHECKPOINT_EXCLUDES,
-    DEFAULT_RETENTION_DAYS, ExecPolicy, FsPolicy, NetworkMode, NetworkPolicy, OutputMode, OutputPolicy, Profile,
-    RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy, RuleAction, SecretInjection,
+    DEFAULT_RETENTION_DAYS, ExecMode, ExecPolicy, FsPolicy, NetworkMode, NetworkPolicy, OutputMode, OutputPolicy,
+    Profile, RETENTION_DAYS_RANGE, ReadScope, RecordingPolicy, RuleAction, SecretInjection,
 };
 pub use network::{HostAccess, HostRefusal, LineAccess, Requester, check_host, host_matches, is_non_tls_host};
 pub use paths::{LookupError, PathContext, PolicyFs, project_root};
@@ -237,6 +237,7 @@ fn override_layer(parent: Layer, child: Layer) -> Layer {
         exec_trusted_folders: child.exec_trusted_folders.or(parent.exec_trusted_folders),
         exec_trusted_tools: child.exec_trusted_tools.or(parent.exec_trusted_tools),
         exec_bash: child.exec_bash.or(parent.exec_bash),
+        exec_mode: child.exec_mode.or(parent.exec_mode),
         network_mode: child.network_mode.or(parent.network_mode),
         network_hosts: child.network_hosts.or(parent.network_hosts),
         network_approval_hosts: child.network_approval_hosts.or(parent.network_approval_hosts),
@@ -443,6 +444,7 @@ fn build<F: PolicyFs + ?Sized>(
             trusted_folders,
             trusted_tools: layer.exec_trusted_tools.unwrap_or_default(),
             bash,
+            mode: layer.exec_mode.unwrap_or_default(),
         },
         network,
         approvals: ApprovalsPolicy {

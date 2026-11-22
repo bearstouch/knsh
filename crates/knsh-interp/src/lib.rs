@@ -66,7 +66,9 @@
 //!   for pathname expansion through [`knsh_platform::Fs`], file names sorted through [`knsh_platform::Collation`]
 //!   (bash's `strcoll` order), redirection files opened through [`knsh_platform::Descriptors`], and commands run
 //!   through [`knsh_platform::CommandSpawner`] with exactly the shell's descriptor table, so tests run without
-//!   processes or a real filesystem and no descriptor of the interpreter's own process reaches a command. That spawner is where KNSH-108 inserts a decision before each command.
+//!   processes or a real filesystem and no descriptor of the interpreter's own process reaches a command. That spawner is where KNSH-108 decides each command: a native-mode agent line's interpreter runs with
+//!   `knsh_platform::supervision::SupervisedSpawner`, which asks the supervisor to decide and start every command
+//!   (with its real argv, after expansion) and fails closed.
 //! - A subshell is a copy of the interpreter, never a forked process (the process is multithreaded, and every program
 //!   must start through the spawner): pipeline stages and background lists that the shell runs itself run on threads
 //!   of their own (decision 19). Children are known by handle, waited for by one thread each, and a job's process

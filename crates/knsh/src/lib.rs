@@ -34,6 +34,9 @@
 //! - `specs/08-integrations/terminals-and-shells.md#native-mode-knsh-107` — `native`, KNSH-107: the native interpreter
 //!   (`knsh-interp`) as a human's interactive shell with its line editor, opt-in with `[shell] hosted = "native"`,
 //!   NFR-COMPAT-06, NFR-COMPAT-10, NFR-PERF-04, FR-SES-22
+//! - `specs/03-functional-requirements/command-lifecycle.md#native-mode-knsh-108` — [`native_line`], KNSH-108: the
+//!   sandboxed interpreter of a native-mode agent line, every command of which the supervisor decides and starts,
+//!   FR-LC-52 to FR-LC-57, NFR-SEC-02, NFR-REL-01
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
@@ -45,3 +48,4 @@ pub mod cli;
 pub mod integration;
 #[cfg(target_os = "macos")]
 pub mod native;
+pub mod native_line;

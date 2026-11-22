@@ -27,14 +27,19 @@ use std::os::unix::net::UnixStream;
 /// Most descriptors one message may carry: a caller's stdin, stdout and stderr.
 pub const MAX_PASSED_DESCRIPTORS: usize = 3;
 
+/// Most descriptors one message of a native-mode line's supervision channel may carry: one command's whole descriptor
+/// table (KNSH-108, `specs/09-reference/defaults-and-limits.md`).
+pub const MAX_COMMAND_DESCRIPTORS: usize = 64;
+
 /// Bytes of one descriptor in the control data.
 const FD_LEN: usize = std::mem::size_of::<RawFd>();
 
-/// Bytes of control data for [`MAX_PASSED_DESCRIPTORS`] descriptors in one `SCM_RIGHTS` message, header included.
-// `MAX_PASSED_DESCRIPTORS * FD_LEN` is 12: the cast cannot truncate.
+/// Bytes of control data for [`MAX_COMMAND_DESCRIPTORS`] descriptors in one `SCM_RIGHTS` message, header included:
+/// room for the largest message any sender here may send.
+// `MAX_COMMAND_DESCRIPTORS * FD_LEN` is 256: the cast cannot truncate.
 #[allow(clippy::cast_possible_truncation)]
 // SAFETY: `CMSG_SPACE` is pure arithmetic on its argument; it is `unsafe` only because libc declares it so.
-const CONTROL_LEN: usize = unsafe { libc::CMSG_SPACE((MAX_PASSED_DESCRIPTORS * FD_LEN) as libc::c_uint) } as usize;
+const CONTROL_LEN: usize = unsafe { libc::CMSG_SPACE((MAX_COMMAND_DESCRIPTORS * FD_LEN) as libc::c_uint) } as usize;
 
 /// Most descriptors a receive buffer has room for: well above what macOS lets one message carry (one `SCM_RIGHTS`
 /// message of at most 254 descriptors, observed on macOS 26; `sendmsg` refuses more with `EINVAL`), so the kernel
@@ -60,7 +65,23 @@ struct ControlBuffer<const N: usize>([u8; N]);
 /// descriptor needs a byte to ride on); otherwise the error of `sendmsg`, for example `EPIPE` when the peer has
 /// closed. `EINTR` is retried.
 pub fn send_with_descriptors(stream: &UnixStream, bytes: &[u8], descriptors: &[BorrowedFd<'_>]) -> io::Result<()> {
-    if descriptors.len() > MAX_PASSED_DESCRIPTORS || bytes.is_empty() {
+    send_with_descriptors_up_to(stream, bytes, descriptors, MAX_PASSED_DESCRIPTORS)
+}
+
+/// As [`send_with_descriptors`], with at most `limit` descriptors (itself at most [`MAX_COMMAND_DESCRIPTORS`]): a
+/// native-mode line's interpreter passes a command's whole descriptor table (KNSH-108).
+///
+/// # Errors
+///
+/// As [`send_with_descriptors`], with [`io::ErrorKind::InvalidInput`] for more than `limit` descriptors or a `limit`
+/// above [`MAX_COMMAND_DESCRIPTORS`].
+pub fn send_with_descriptors_up_to(
+    stream: &UnixStream,
+    bytes: &[u8],
+    descriptors: &[BorrowedFd<'_>],
+    limit: usize,
+) -> io::Result<()> {
+    if limit > MAX_COMMAND_DESCRIPTORS || descriptors.len() > limit || bytes.is_empty() {
         return Err(io::ErrorKind::InvalidInput.into());
     }
     let mut control = ControlBuffer::<CONTROL_LEN>([0; CONTROL_LEN]);
@@ -79,7 +100,7 @@ pub fn send_with_descriptors(stream: &UnixStream, bytes: &[u8], descriptors: &[B
         // passed exactly once.
         if sent == 0 && !descriptors.is_empty() {
             let data_len = descriptors.len() * FD_LEN;
-            // At most 12 bytes (checked above): no truncation.
+            // At most 256 bytes (checked above): no truncation.
             #[allow(clippy::cast_possible_truncation)]
             let data_len_c = data_len as libc::c_uint;
             // SAFETY: pure arithmetic, as for `CONTROL_LEN`.
@@ -130,6 +151,21 @@ pub fn send_with_descriptors(stream: &UnixStream, bytes: &[u8], descriptors: &[B
 ///   data was truncated, or it holds anything but descriptors. Every descriptor that arrived is closed.
 /// - The error of `recvmsg` or `fcntl`. `EINTR` is retried.
 pub fn recv_with_descriptors(stream: &UnixStream, buf: &mut [u8], received: &mut Vec<OwnedFd>) -> io::Result<usize> {
+    recv_with_descriptors_up_to(stream, buf, received, MAX_PASSED_DESCRIPTORS)
+}
+
+/// As [`recv_with_descriptors`], accepting at most `limit` descriptors at once (KNSH-108: the supervision channel of
+/// a native-mode line, [`MAX_COMMAND_DESCRIPTORS`]).
+///
+/// # Errors
+///
+/// As [`recv_with_descriptors`], with `limit` in place of [`MAX_PASSED_DESCRIPTORS`].
+pub fn recv_with_descriptors_up_to(
+    stream: &UnixStream,
+    buf: &mut [u8],
+    received: &mut Vec<OwnedFd>,
+    limit: usize,
+) -> io::Result<usize> {
     loop {
         let mut control = ControlBuffer::<RECV_CONTROL_LEN>([0; RECV_CONTROL_LEN]);
         let mut iov = libc::iovec {
@@ -156,7 +192,7 @@ pub fn recv_with_descriptors(stream: &UnixStream, buf: &mut [u8], received: &mut
         let arrived = take_descriptors(&header);
         let truncated = header.msg_flags & libc::MSG_CTRUNC != 0;
         let mut arrived = match arrived {
-            Ok(arrived) if !truncated && arrived.len() <= MAX_PASSED_DESCRIPTORS => arrived,
+            Ok(arrived) if !truncated && arrived.len() <= limit => arrived,
             // Dropping `arrived` closes whatever did arrive.
             Ok(_) | Err(()) => return Err(io::ErrorKind::InvalidData.into()),
         };
