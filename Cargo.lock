@@ -29,6 +29,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "knsh-conformance"
+version = "0.0.0"
+dependencies = [
+ "knsh-bash",
+ "knsh-corpus",
+ "knsh-interp",
+ "knsh-platform",
+]
+
+[[package]]
 name = "knsh-core"
 version = "0.0.0"
 dependencies = [

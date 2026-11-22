@@ -750,7 +750,13 @@ mod tests {
 
         fn connect(&self, socket: &str) -> UnixStream {
             let stream = UnixStream::connect(self.dir.0.join(socket)).unwrap();
-            stream.set_read_timeout(Some(PROMPTLY)).unwrap();
+            match stream.set_read_timeout(Some(PROMPTLY)) {
+                Ok(()) => {}
+                // macOS refuses `setsockopt` with `EINVAL` on a socket whose peer already closed it (the server
+                // closing a refused peer can win the race); reads then end at once, so no timeout is needed.
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
+                Err(error) => panic!("cannot set the read timeout: {error}"),
+            }
             stream
         }
 

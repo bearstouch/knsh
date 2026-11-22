@@ -1,0 +1,4 @@
+INFO start
+ERROR first failure
+INFO working
+ERROR second failure

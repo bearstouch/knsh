@@ -304,3 +304,34 @@ Known differences in POSIX mode (KNSH-106):
 | Arithmetic error token after trailing blanks (`$(( 1 + ))`) | `error token is " "` | The last token read: `error token is "+ "` |
 | `base#` with no digits (`$((2#))`) | 0 | Error `invalid integer constant` |
 | Division by zero inside a longer expression (`$((4/0+1))`) | `error token is "+1"` (the token after the divisor) | `error token is "0+1"` (from the divisor on) |
+
+## Native mode: known differences
+
+Measured by the phase 4 conformance gate (KNSH-109, [conformance](../07-testing/conformance.md#phase-4-native-mode)):
+each corpus line, Oils case or bash test driver on which native mode does not behave as bash 5.2 is listed in
+`tests/conformance/known-differences.tsv` with the heading below that documents it. The gate checks that every
+listed heading exists and fails a release run on a corpus difference that is not listed.
+
+### Variables bash maintains itself
+
+`EPOCHSECONDS`, `EPOCHREALTIME`, `RANDOM`, `SRANDOM`, `SECONDS`, `LINENO`, `BASHPID`, `PPID`, `UID`, `EUID`,
+`GROUPS`, `BASH_VERSION`, `BASH_VERSINFO`, `HISTCMD`, `OPTIND`, `SHELLOPTS` and the other dynamic variables bash
+updates itself are refused rather than given a value that might differ from bash's: reading one stops the line with
+`a variable bash maintains itself is not supported by the native interpreter yet` and status 1. Corpus:
+`echo $EPOCHSECONDS`.
+
+### The `kill` builtin
+
+`kill` is not implemented: it signals process ids the script names, which the engine never does with an id that may
+have been reused (it signals process groups it holds), and in native mode a signal to another process is a decision
+of the supervisor. A line using it stops with `this builtin or builtin form is not supported by the native
+interpreter yet` and status 1. The corpus line `kill -9 12345` still passes the comparison (bash fails too, with one
+message from the shell and status 1), so it is not listed as a difference; a `kill` of a process that exists would
+differ.
+
+### The conformance runner
+
+What the gate runs as the native shell (`knsh-conformance native`) reads a whole script before running it, as the
+interpreter does: a syntax error late in a script file runs none of it (bash runs the lines before it), and a script
+read from standard input (the Oils suite) is read to its end first, so the script's own `read` sees none of it.
+Interactive and login shells (`-i`, `-l`, `--login`, `--rcfile`) are refused with status 2.

@@ -1,0 +1,3 @@
+# knsh-conformance known-differences 1
+# suite<TAB>id<TAB>compatibility.md#<anchor>; see tests/conformance/README.md
+corpus	echo $EPOCHSECONDS	compatibility.md#variables-bash-maintains-itself

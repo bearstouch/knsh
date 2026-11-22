@@ -271,9 +271,18 @@ fn interactive_pipelines_get_their_own_process_group() {
         }
     );
     assert!(h.diagnostics.text().ends_with(&format!("[1] {}\n", FIRST_PID + 3)));
-    std::thread::sleep(Duration::from_millis(80));
-    h.interpreter.notify_jobs().unwrap();
-    assert!(h.diagnostics.text().ends_with("[1]+  Done                    c\n"));
+    // The job ends 30 ms after it started; a loaded CI runner may take longer, so wait for it up to a deadline
+    // rather than a fixed time (it failed on GitHub's runner with a fixed 80 ms).
+    let done = "[1]+  Done                    c\n";
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        std::thread::sleep(Duration::from_millis(20));
+        h.interpreter.notify_jobs().unwrap();
+        if h.diagnostics.text().ends_with(done) || std::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    assert!(h.diagnostics.text().ends_with(done), "{}", h.diagnostics.text());
     h.on("x", &[exited(0)]);
     h.status("x $-");
     assert_eq!(last_args(&h), ["himB"]);

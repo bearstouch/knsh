@@ -159,8 +159,15 @@ pub fn run(args: &[OsString]) -> u8 {
     let status = match shell.run(&script, &native.line) {
         Ok(status) => status.code(),
         Err(error) => {
+            // A line the interpreter could not finish (a construct it refuses, a command that could not start)
+            // fails: `$?` was never set, so `finish` would report the status from before the error, often 0
+            // (found by the KNSH-109 conformance gate). The `EXIT` trap still runs, as bash runs it after a fatal
+            // error (an agent's cleanup, `trap 'rm -f "$tmp"' EXIT`), but its status is not the line's.
             report(&format!("knsh: {error}\n"));
-            1
+            if let Err(error) = shell.finish() {
+                report(&format!("knsh: {error}\n"));
+            }
+            return 1;
         }
     };
     if shell.has_exited() {
@@ -207,5 +214,32 @@ mod tests {
         for bad in [&["x", "ls"][..], &["-1", "ls"], &["7"], &[], &["", "ls"]] {
             assert_eq!(parse(&args(bad)), None, "{bad:?}");
         }
+    }
+
+    // KNSH-109: a line the interpreter refuses fails (status 1), never 0: `$?` was not set by the aborted run. Fd
+    // 999 is not a socket, so there is no supervisor, and the refused expansion needs none.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn refused_line_fails_instead_of_reporting_the_old_status() {
+        assert_eq!(run(&args(&["999", "true; echo $EPOCHSECONDS"])), 1);
+    }
+
+    // KNSH-109: the `EXIT` trap still runs after a line the interpreter could not finish (bash runs it after a
+    // fatal error), and the line still fails.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn refused_line_still_runs_the_exit_trap() {
+        let dir = std::env::temp_dir().join(format!("knsh-native-line-exit-trap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("trapped");
+        // `eval` defers the refusal to run time (a refused construct in the line itself runs nothing at all).
+        let line = format!(
+            "trap 'echo ran > \"{}\"' EXIT; eval 'echo $EPOCHSECONDS'",
+            marker.display()
+        );
+        assert_eq!(run(&args(&["999", &line])), 1);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran\n");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
