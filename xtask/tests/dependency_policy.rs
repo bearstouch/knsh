@@ -54,10 +54,19 @@ const LAYOUT: &[(&str, &[&str])] = &[
             "knsh-bash",
         ],
     ),
-    // knsh-platform for engine paths and the launchd agent behind `knsh daemon install` (KNSH-012).
+    // knsh-platform for engine paths and the launchd agent behind `knsh daemon install` (KNSH-012); knsh-interp for
+    // native mode (KNSH-107) and knsh-bash for native-mode agent lines (KNSH-108), as CLAUDE.md's layout table says.
     (
         "knsh",
-        &["knsh-proto", "knsh-json", "knsh-core", "knsh-platform", "knsh-toml"],
+        &[
+            "knsh-proto",
+            "knsh-json",
+            "knsh-core",
+            "knsh-platform",
+            "knsh-toml",
+            "knsh-interp",
+            "knsh-bash",
+        ],
     ),
     ("knsh-exec", &[]),
     // The native interpreter walks the parser's tree and runs commands through platform traits (KNSH-096).

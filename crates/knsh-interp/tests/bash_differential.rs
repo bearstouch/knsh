@@ -388,7 +388,7 @@ cat <out
 if true; then echo in-if; fi >ifout; cat ifout
 for i in 1 2; do echo "$i"; done >loop; cat loop
 exec 3>fd3; echo three >&3; /bin/cat /dev/fd/3 </dev/null 2>/dev/null; exec 3>&-; cat fd3
-/bin/ls /dev/fd/; exec 4>f4; /bin/ls /dev/fd/; exec 4>&-; /bin/ls /dev/fd/
+fds() { /bin/ls /dev/fd/ | /usr/bin/grep -E '^[0-9]$'; }; fds; exec 4>f4; fds; exec 4>&-; fds
 exec 6>&1; exec >redirected; echo hidden; exec >&6 6>&-; cat redirected
 cat <<< "here  string"
 y='v  w'; cat <<<"$y"
@@ -407,6 +407,9 @@ echo end
 "#;
 
 // NFR-COMPAT-02, KNSH-099: redirections, `exec` and the descriptors a command receives match bash.
+// The descriptor listings keep 0 to 9 only: a CI runner leaves descriptors open in the test process (131 and up on
+// GitHub's macOS images), which `bash` passes on to `ls` and the native interpreter does not, so they say nothing
+// about either shell.
 #[test]
 fn redirection_script_matches_bash() {
     let bash_dir = temp_dir("bash-redirect");
