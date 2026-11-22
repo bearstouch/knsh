@@ -15,29 +15,32 @@ A bash/zsh-compatible shell that lets AI agents run commands under recording, po
 
 ## Features
 
-Phases 1 to 4 of the [roadmap](specs/01-overview/roadmap.md) are implemented on macOS; [CHANGELOG.md](CHANGELOG.md) lists what each version added.
-
-| Phase | Name | Status | Delivers |
-| --- | --- | --- | --- |
-| 1 | **Observe** | Done | Integration mode for your own zsh or bash, opt-in recording, records, events, `user.sock` and the CLI |
-| 2 | **Contain and decide** | Done; release gates open | Envelopes, the supervisor, `knsh-exec`, deny-by-default Seatbelt profiles, the network proxy, `agent.sock`, the XPC control service and authority, signed policy, approvals, rate limiting |
-| 3 | **Reverse and protect** | Done | APFS checkpoints with undo and redo, secrets and redaction, irreversible-action flags |
-| 4 | **Native interpreter** | Done; opt-in | `knsh`'s own bash 5.2 interpreter, with a decision per simple command, including inside scripts and functions |
-| 5 | **Linux** | Planned | Landlock and seccomp backends behind the same API |
-| 6 | **Later** | Planned | Command introspection, an MCP client, session replay, optional structured pipelines |
+See the [user guide](docs/index.md) for how to use each feature, and [CHANGELOG.md](CHANGELOG.md) for what each version added.
 
 Highlights:
 
 - **Integration mode:** `knsh` hosts your own zsh or bash unchanged, with no dotfile edits. It picks the shell named by `[shell] hosted`, else your `$SHELL` if it is bash, else zsh, and starts it as a login shell when invoked as one (`-l`, `--login`, `-knsh`). OSC 7 and OSC 133 marks let terminals track directories and prompts.
 - **Recording and records:** with `[recording] human = true`, human command lines are recorded by `knshd` (system SQLite, redaction at write time, retention), and `knsh history`, `knsh events` and `knsh forget` query, stream and delete them.
 - **Agents in envelopes:** `knsh agent` starts an agent CLI (presets for Claude Code and Codex CLI) in a Seatbelt envelope. Each line is parsed, checked against signed policy, decided by the authority or a local approval, and run by the supervisor through `knsh-exec`; network traffic goes through the proxy.
-- **Undo:** checkpoints capture what each agent line changes; `knsh undo`, `knsh redo` and `knsh checkpoints` move between states.
+- **Undo:** APFS checkpoints capture what each agent line changes; `knsh undo`, `knsh redo` and `knsh checkpoints` move between states, and irreversible actions such as `git push` are flagged for approval before they run.
+- **Approvals and grants:** `knsh approvals`, `approve` and `deny`, time-limited grants with Touch ID, signed policy edited with `knsh policy edit`, and hooks that check every agent line.
 - **Secrets:** from the Keychain or the authority, injected per command and redacted on every output path.
 - **Native mode:** `[shell] hosted = "native"` runs `knsh`'s own bash 5.2 interpreter; agent lines in native mode are decided per simple command. A conformance gate measures it against bash 5.2 (99.57% of the agent-command corpus).
 - **Fast start-up:** under 9 ms added to the first prompt at p95 on an M1 Pro, against a 50 ms target ([performance validation](specs/07-testing/performance-validation.md)).
 - **Minimal supply chain:** one third-party runtime crate (`libc`), vendored and exactly pinned. JSON, TOML, the frame codec, CLI parsing and the SQLite binding are written in-house, and every parser is fuzzed.
 
-Not implemented yet: `knsh run` and `knsh policy check` report so.
+Not implemented yet: `knsh run` and `knsh policy check` say so and exit with 1. Planned: Linux support (Landlock and seccomp), command introspection, an MCP client, session replay and optional structured pipelines.
+
+## Documentation
+
+The user guide is in [`docs/`](docs/index.md) and is built into static HTML for the website:
+
+```sh
+scripts/build-docs.sh               # builds site-docs/ (needs python3)
+.venv-docs/bin/mkdocs serve         # live preview at http://127.0.0.1:8000/
+```
+
+Writing rules for the guide are in [`docs-theme/README.md`](docs-theme/README.md).
 
 ## Quick start
 
@@ -60,6 +63,8 @@ target/debug/knsh history --limit 10
 ```
 
 Remove the launch agent with `knsh daemon uninstall`; engine data is kept until you delete it (or use `knsh forget`).
+
+To run an agent in a sandbox, see [Getting started](docs/getting-started.md).
 
 ## Development setup
 
@@ -112,7 +117,7 @@ scripts/check.sh fmt test   # only the named steps
 | --- | --- |
 | `target/debug/knsh` | Hosts your stock zsh or bash in integration mode |
 | `target/debug/knsh -l` | The same, as a login shell |
-| `target/debug/knsh -c '<line>'` | Runs one line in the hosted shell, then exits |
+| `target/debug/knsh -c '<line>'` | Not for your own commands: a non-interactive line is treated as an agent line, supervised under the locked-down built-in `unattended` profile (inside an envelope it follows the agent's profile) |
 | `target/debug/knsh daemon install` / `uninstall` | Installs or removes the per-user `knshd` launch agent |
 | `target/debug/knsh shell install` | Adds `knsh` to `/etc/shells` (after asking), so `chsh -s` accepts it |
 | `target/debug/knsh <command> --help` | Options for any command |
@@ -161,6 +166,7 @@ Each crate has one concern, and dependencies point downwards only (binaries → 
 | `knsh-proxy` | HTTP CONNECT and SOCKS proxy, TLS server-name checks |
 | `knsh-store` | Record store, retention, redaction at write time |
 | `knsh-checkpoint` | Shadows, capture, history tree, restore rules |
+| `knsh-interp` | Native bash 5.2 interpreter: walks the `knsh-bash` tree, runs commands through platform traits |
 | `knshd`, `knsh`, `knsh-exec` | The three binaries; thin, with logic in the libraries |
 
 `spikes/` holds throwaway prototypes that verify platform claims (Seatbelt behaviour, code-signed identity). They are not built by Cargo or shipped; their results are written up in [verification claims](specs/07-testing/verification-claims.md).
@@ -169,7 +175,7 @@ Each crate has one concern, and dependencies point downwards only (binaries → 
 
 [`ci.yml`](.github/workflows/ci.yml) runs on every push and pull request, on a pinned `macos-15` Apple silicon runner with Xcode 16.4. Each job step calls `scripts/check.sh <step>`, so CI and local runs cannot drift apart: format, clippy, an offline no-network build with `-D warnings`, docs, tests, and `cargo deny` (licences, advisories, duplicate versions). No step may fail.
 
-The current version is **0.1.0**; what each version changed is in the [changelog](CHANGELOG.md). Builds stay labelled advisory until the phase 2 gates in the [roadmap](specs/01-overview/roadmap.md) are met.
+The current version is **0.1.0**; what each version changed is in the [changelog](CHANGELOG.md). Builds stay labelled advisory until the release gates in the [roadmap](specs/01-overview/roadmap.md) are met.
 
 ## Specification
 
