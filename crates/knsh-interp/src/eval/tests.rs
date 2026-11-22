@@ -1325,6 +1325,7 @@ fn moving_a_descriptor_onto_itself_keeps_it() {
 
 mod builtins;
 mod functions_arrays;
+mod interactive;
 mod jobs;
 mod posix;
 mod substitution;

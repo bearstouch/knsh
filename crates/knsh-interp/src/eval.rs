@@ -72,6 +72,7 @@ mod conditional;
 mod control;
 mod declare;
 mod function;
+pub(crate) mod interactive;
 mod job;
 mod job_builtins;
 mod mapfile;
@@ -117,7 +118,7 @@ pub(crate) fn is_refused_builtin(name: &str) -> bool {
 
 /// Builtins the interpreter runs itself: `let` (KNSH-097), the job builtins `wait`, `jobs`, `fg`, `bg` and `disown`
 /// (KNSH-100), the core builtins (KNSH-101), `test`, `[`, `printf` and `read` (KNSH-102), `local`, `mapfile` and
-/// `readarray` (KNSH-103), and `trap` and `shopt` (KNSH-104).
+/// `readarray` (KNSH-103), `trap` and `shopt` (KNSH-104), and `history`, `complete` and `compgen` (KNSH-107).
 pub(crate) const NATIVE_BUILTINS: &[&str] = &[
     ".",
     ":",
@@ -128,6 +129,8 @@ pub(crate) const NATIVE_BUILTINS: &[&str] = &[
     "builtin",
     "cd",
     "command",
+    "compgen",
+    "complete",
     "continue",
     "declare",
     "disown",
@@ -139,6 +142,7 @@ pub(crate) const NATIVE_BUILTINS: &[&str] = &[
     "false",
     "fg",
     "hash",
+    "history",
     "jobs",
     "let",
     "local",
@@ -378,6 +382,8 @@ pub struct Interpreter {
     /// `command` builtins running (bash's `executing_command_builtin`): inside one, `.` not finding its file and a
     /// syntax error in `eval` or `.` text do not end the shell in POSIX mode (KNSH-106).
     command_depth: usize,
+    /// The interactive shell ended (`exit`, `set -e`, a signal, `exec`): its host stops reading lines (KNSH-107).
+    exited: bool,
 }
 
 impl fmt::Debug for Interpreter {
@@ -450,6 +456,7 @@ impl Interpreter {
             usage_error: false,
             bad_assignment: false,
             command_depth: 0,
+            exited: false,
         }
         .with_checked_oldpwd()
     }
@@ -657,6 +664,9 @@ impl Interpreter {
         };
         // KNSH-104: the shell exits here (an interactive one only through `exit`, `set -e` or a signal; it ends at the
         // end of its input through `finish`), so its `EXIT` trap runs, once.
+        if exits && self.state.is_interactive() && !self.is_subshell {
+            self.exited = true;
+        }
         let status = if exits && !self.skip_exit_trap {
             self.run_exit_trap(status, end, &run)?
         } else {
@@ -671,10 +681,14 @@ impl Interpreter {
     ///
     /// Inside `source` the name is the file's, as bash names its errors after `BASH_SOURCE`; inside `eval` lines
     /// count on from the `eval` command's line (KNSH-101).
+    ///
+    /// An interactive shell's messages about what was typed at the prompt carry no line number, as bash's
+    /// (`bash: cd: x: No such file or directory`, KNSH-107).
     fn report(&mut self, span: Span, run: &Run<'_>, message: fmt::Arguments<'_>) {
         let line = run.line(span);
         let text = match run.origin {
             Some(origin) => format!("{origin}: line {line}: {message}\n"),
+            None if self.state.is_interactive() && !self.is_subshell => format!("{}: {message}\n", self.state.name()),
             None => format!("{}: line {line}: {message}\n", self.state.name()),
         };
         self.write_shell(2, text.as_bytes());

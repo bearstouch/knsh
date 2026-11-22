@@ -26,7 +26,7 @@ use crate::status::Status;
 pub(super) const STANDARD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// Bash's reserved words, which `type` and `command -v` report as keywords.
-const KEYWORDS: &[&str] = &[
+pub(super) const KEYWORDS: &[&str] = &[
     "!", "[[", "]]", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if", "in",
     "select", "then", "time", "until", "while", "{", "}",
 ];
@@ -166,6 +166,9 @@ impl Interpreter {
             "test" | "[" => self.test_builtin(name, args, span, run),
             "printf" => self.printf_builtin(args, span, run),
             "read" => self.read_builtin(args, span, run),
+            "history" => Ok(self.history_builtin(args, span, run)),
+            "complete" => Ok(self.complete_builtin(args, span, run)),
+            "compgen" => Ok(self.compgen_builtin(args, span, run)),
             _ => match self.job_builtin(name, args, span, run) {
                 Some(result) => result,
                 None => Err(unsupported(Unsupported::Builtin, span).into()),

@@ -352,7 +352,7 @@ impl Interpreter {
     /// interactive shell are refused (KNSH-107).
     fn option_is_set(&self, name: &str, span: Span) -> Flow<bool> {
         // KNSH-104: every `set -o` option bash has; a name it does not know is false.
-        match crate::options::set_o(self.state.options(), self.state.is_interactive(), name) {
+        match crate::options::set_o(self.state.options(), name) {
             Ok(on) => Ok(on),
             Err(crate::options::OptionError::Unknown) => Ok(false),
             Err(crate::options::OptionError::Refused(feature)) => Err(unsupported(feature, span).into()),

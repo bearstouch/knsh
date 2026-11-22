@@ -38,6 +38,8 @@ use knsh_bash::CompoundCommand;
 
 use crate::arith::Failure;
 use crate::error::{InterpError, Unsupported};
+use crate::interactive::complete::CompletionTable;
+use crate::interactive::history::History;
 use crate::status::Status;
 use crate::trap::Traps;
 pub(crate) use crate::vars::{Assoc, Key, Kind, Value};
@@ -289,6 +291,23 @@ pub struct ShellOptions {
     /// `shopt -s shift_verbose`: `shift` past the last positional parameter says `shift count out of range`
     /// (KNSH-106; POSIX mode turns it on).
     pub shift_verbose: bool,
+    /// `set -o emacs`: the line editor reads lines with emacs keys (KNSH-107). On in an interactive shell unless
+    /// `vi` is; at most one of `emacs` and `vi` is on, and neither means no line editing.
+    pub emacs: bool,
+    /// `set -o vi`: the line editor reads lines with vi keys (KNSH-107).
+    pub vi: bool,
+    /// `set -o history`: lines read by the interactive shell are saved in the history list (KNSH-107). On in an
+    /// interactive shell.
+    pub history: bool,
+    /// `set -H` (`set -o histexpand`): `!` history expansion of each line read (KNSH-107). On in an interactive
+    /// shell.
+    pub histexpand: bool,
+    /// `shopt -s histappend`: the history list is appended to `HISTFILE` when the shell exits, instead of replacing
+    /// it (KNSH-107).
+    pub histappend: bool,
+    /// `shopt -s lithist`: a command read over several lines is saved with its newlines, not joined with `;`
+    /// (KNSH-107).
+    pub lithist: bool,
     /// `set -o posix`: bash's POSIX mode (KNSH-106). Read with [`ShellOptions::posix`]; turned on with
     /// [`ShellState::with_posix_mode`] or by the script (`set -o posix`, `POSIXLY_CORRECT`), which also make the
     /// changes bash's `posix_initialize` makes.
@@ -547,6 +566,11 @@ pub struct ShellState {
     umask: Option<u32>,
     /// The traps set and the signals the shell was started ignoring (KNSH-104).
     traps: Traps,
+    /// The history list (KNSH-107), shared with copies until one changes it: a subshell sees it (`$(history)`) but
+    /// what it adds never reaches the shell.
+    history: Arc<History>,
+    /// The completion specifications `complete` defined (KNSH-107), shared with copies as the history is.
+    completions: Arc<CompletionTable>,
 }
 
 impl ShellState {
@@ -587,6 +611,8 @@ impl ShellState {
             aliases: BTreeMap::new(),
             umask: None,
             traps: Traps::default(),
+            history: Arc::new(History::new()),
+            completions: Arc::new(CompletionTable::default()),
         };
         state.start_up(None);
         Ok(state)
@@ -1883,6 +1909,27 @@ impl ShellState {
     /// Sets `PIPESTATUS`.
     pub(crate) fn set_pipestatus(&mut self, statuses: Vec<Status>) {
         self.pipestatus = statuses;
+    }
+
+    /// The history list (KNSH-107).
+    #[must_use]
+    pub fn history(&self) -> &History {
+        &self.history
+    }
+
+    /// The history list, to change (copied first if a subshell still shares it).
+    pub fn history_mut(&mut self) -> &mut History {
+        Arc::make_mut(&mut self.history)
+    }
+
+    /// The completion specifications (KNSH-107).
+    pub(crate) fn completions(&self) -> &CompletionTable {
+        &self.completions
+    }
+
+    /// The completion specifications, to change.
+    pub(crate) fn completions_mut(&mut self) -> &mut CompletionTable {
+        Arc::make_mut(&mut self.completions)
     }
 
     /// Whether this is an interactive shell.

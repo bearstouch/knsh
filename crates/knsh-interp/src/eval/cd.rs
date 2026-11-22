@@ -153,7 +153,7 @@ impl Interpreter {
     }
 
     /// The value of `name` as text, if it is set (a value that is not UTF-8 counts as unset here).
-    fn variable_text(&self, name: &str) -> Option<String> {
+    pub(super) fn variable_text(&self, name: &str) -> Option<String> {
         self.state
             .variable(name)
             .and_then(|value| value.to_str())

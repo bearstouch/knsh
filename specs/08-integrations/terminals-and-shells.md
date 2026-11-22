@@ -158,6 +158,57 @@ Any terminal that supports them can mark commands.
   next prompt puts `_knsh_arm` back at the end. A line that runs no simple command in bash itself (a subshell, a
   function definition) gets no `C` or `D`.
 
+### In native mode (KNSH-107)
+
+The native shell writes the same bytes itself (`knsh_interp::interactive::marks`, the reference being
+`knsh::integration::marks`), only when `knsh`'s standard output is a terminal: before each prompt `D;<exit>` for the
+line that ran, OSC 7 for the working directory and `A`; `B` once after the prompt is drawn (not with every redraw of
+the line); `C` when the typed line is about to run, also when it runs nothing (an assignment, a builtin). The host is
+the system's host name (`gethostname`).
+
+## Native mode (KNSH-107)
+
+`[shell] hosted = "native"` runs `knsh`'s own interpreter (`knsh-interp`) as the human's interactive shell instead
+of hosting zsh or bash. It is opt-in: until the phase 4 gate (KNSH-109) is green it is never the default, and zsh users
+stay in integration mode (NFR-COMPAT-06).
+
+- **Process:** `knsh` itself is the shell. It takes the terminal for job control (its own process group, the terminal's
+  foreground group), ignores `SIGINT`, `SIGQUIT` and `SIGTSTP` itself while its foreground jobs get them with their
+  default actions, and exits with the shell's status or by the signal that ended it. Commands start through the
+  platform spawner directly: nothing in a human session is decided, rewritten or blocked (FR-SES-22), and every error
+  (a construct the interpreter refuses, a failed expansion, an unreadable history file) is reported while the shell
+  goes on.
+- **Startup files, as bash:** a login shell (`-knsh`, `-l`, `--login`) reads `/etc/profile` and the first of
+  `~/.bash_profile`, `~/.bash_login`, `~/.profile`, and `~/.bash_logout` when it exits; any other interactive shell
+  reads `~/.bashrc`. `--norc`, `--noprofile` and `--rcfile` are not taken yet.
+- **Line editor:** in-house (no readline or line-editing crate, per the dependency policy). Emacs keys as readline's
+  defaults (movement by character and word, kills into a 10-entry kill ring with yank and yank-pop, transpose, case
+  changes, undo and revert, history walk, incremental search with Ctrl-R and Ctrl-S, Meta-. for the last argument,
+  quoted insert, clear screen) and vi mode basics (`set -o vi`: insert and command modes, counts, the motions
+  `h l 0 ^ $ w b e W B E f F t T`, the operators `d c y` and `dd cc yy`, `x X D C S s r ~ p P u i a I A`, `k j`
+  for history). The cursor moves over whole cells: a wide character takes two columns, and a character with its
+  combining marks is one step. A lone `ESC` waits 100 ms for the rest of a key sequence. While a line is edited the
+  terminal delivers Ctrl-C, Ctrl-Z and Ctrl-\ as keys: Ctrl-C abandons the line (`^C`, `$?` 130).
+- **Prompts:** `PS1` and `PS2` with every bash escape (`\u \h \H \w \W \d \t \T \@ \A \D{…} \j \l \s \v \V \!
+  \# \$ \nnn \[ \]` …), then expanded as a here-document is (`promptvars`); `PROMPT_DIRTRIM`; `PROMPT_COMMAND`
+  (string or array) before each prompt. Bash's defaults when unset: `PS1='\s-\v\$ '`, `PS2='> '`.
+- **History:** the list with `HISTSIZE` and `HISTFILESIZE` (500 by default), `HISTCONTROL` (`ignorespace`,
+  `ignoredups`, `ignoreboth`, `erasedups`), `HISTFILE` (default `~/.bash_history`) read after the startup files and
+  written at exit (replaced, or appended to with `shopt -s histappend`, then cut to `HISTFILESIZE` lines; owner-only,
+  by atomic replace); a command read over several lines is one entry (`cmdhist`, `lithist`). History expansion
+  (`set -H`): `!!`, `!n`, `!-n`, `!string`, `!?string?`, `!#`, `^old^new`, word designators and the modifiers
+  `h t r e p q x s & g a`; `:G` is reported as not supported, never expanded differently. The `history` builtin takes
+  `-c -d -a -r -w -p -s` and a count (`-n` is reported as not supported).
+- **Completion:** Tab completes the word before the cursor, a second Tab lists the possibilities in columns (asking
+  first above 100): command names in command position, variable names after `$`, file names otherwise (quoted, `/`
+  after directories), or what `complete` specifies for the command (`-W`, `-F` with `COMP_WORDS`, `COMP_CWORD`,
+  `COMP_LINE`, `COMP_POINT` and `COMPREPLY`, the actions, `-X`, `-P`, `-S`, `-o` options, `-D`, `-E`, `-I`).
+  `compgen` prints the same matches. Not supported: `-C`, `-G`, and the user, group, host and service actions.
+- **Not yet:** `.inputrc` and `bind`, `fc`, `HISTIGNORE`, `HISTTIMEFORMAT`, `compopt`, `IGNOREEOF`; recording a native
+  session (with `[recording] human = true` native mode says once that the session is not recorded); Ctrl-C does not
+  interrupt a loop the shell runs itself (its programs get it).
+- **Start-up time (NFR-PERF-04):** measured in the story ([KNSH-107](../00-stories/KNSH-107-interactive-line-editor-and-history.md)).
+
 ## Login shell
 
 `knsh` can be added to `/etc/shells`, with the user's permission, so it works as a login shell with `chsh`. Login and startup-file behaviour follow the hosted shell.
@@ -170,7 +221,8 @@ Any terminal that supports them can mark commands.
 
   ```toml
   [shell]
-  hosted = "zsh"   # "zsh" (/bin/zsh), "bash" (/bin/bash), or an absolute path to a program named zsh or bash
+  hosted = "zsh"   # "zsh" (/bin/zsh), "bash" (/bin/bash), "native" (knsh's own interpreter, KNSH-107),
+                   # or an absolute path to a program named zsh or bash
   ```
 
   Without the setting, `knsh` hosts the bash `$SHELL` names, if it is one (KNSH-020), and `/bin/zsh` otherwise, so

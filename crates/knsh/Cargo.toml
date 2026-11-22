@@ -26,6 +26,9 @@ knsh-json = { path = "../knsh-json" }
 knsh-platform = { path = "../knsh-platform" }
 # The recording switch in `~/.config/knsh/config.toml` (KNSH-021), read with the engine's own TOML subset parser.
 knsh-toml = { path = "../knsh-toml" }
+# Native mode for humans (KNSH-107): the native interpreter and its line editor, opt-in with `[shell] hosted =
+# "native"`.
+knsh-interp = { path = "../knsh-interp" }
 
 [dev-dependencies]
 knsh-platform = { path = "../knsh-platform", features = ["testing"] }

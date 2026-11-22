@@ -51,13 +51,14 @@ pub fn choose_hosted_shell(
         warning: Some(warning),
     };
     match setting {
-        Ok(Some(shell)) if usable(shell.path()) => Choice {
+        // Native mode runs no other program: always usable (KNSH-107).
+        Ok(Some(shell)) if shell.path().is_none_or(usable) => Choice {
             shell: shell.clone(),
             warning: None,
         },
         Ok(Some(shell)) => fallback(format!(
             "the hosted shell {} cannot be run; starting {SYSTEM_ZSH}",
-            shell.path().display()
+            shell.path().map_or_else(String::new, |path| path.display().to_string())
         )),
         Ok(None) => match bash::user_bash(login_shell) {
             Some(path) if usable(path) => Choice {
@@ -240,5 +241,13 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    // KNSH-107: native mode needs no program, so it is always usable.
+    #[test]
+    fn native_mode_is_always_usable() {
+        let choice = choose_hosted_shell(&Ok(Some(HostedShell::Native)), None, &|_| false);
+        assert_eq!(choice.shell, HostedShell::Native);
+        assert_eq!(choice.warning, None);
     }
 }

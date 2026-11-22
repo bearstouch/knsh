@@ -11,7 +11,7 @@
 //! human = true
 //!
 //! [shell]
-//! hosted = "bash"     # "zsh", "bash", or an absolute path to a program named zsh or bash
+//! hosted = "bash"     # "zsh", "bash", "native", or an absolute path to a program named zsh or bash
 //! ```
 //!
 //! Each setting is read on its own: an unclear one never changes the other. [`read_settings`] reads the file once.
@@ -26,7 +26,9 @@
 //!
 //! ## `[shell] hosted`
 //!
-//! Which shell integration mode hosts. Absent means the default ([`super::shells::choose_hosted_shell`]). Anything
+//! Which shell integration mode hosts. Absent means the default ([`super::shells::choose_hosted_shell`]).
+//! `"native"` chooses `knsh`'s own interpreter with its line editor instead (KNSH-107, phase 4): opt-in until the
+//! phase 4 gate (KNSH-109) is green, so it is never the default. Anything
 //! else that is not one of the accepted values (another type, a relative path, a program not named `zsh` or `bash`, an
 //! unknown key inside `[shell]`), and a file that cannot be read, is an invalid choice: `/bin/zsh` starts, with a
 //! warning, so that a typo never leaves the user without a shell.
@@ -94,21 +96,24 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// The shell integration mode hosts, as `[shell] hosted` names it (KNSH-022).
+/// The shell integration mode hosts, as `[shell] hosted` names it (KNSH-022), or native mode (KNSH-107).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostedShell {
     /// zsh, at this path.
     Zsh(PathBuf),
     /// bash, at this path.
     Bash(PathBuf),
+    /// No hosted shell: `knsh`'s own interpreter and line editor (`hosted = "native"`, KNSH-107).
+    Native,
 }
 
 impl HostedShell {
-    /// The program to run.
+    /// The program to run; `None` for native mode, which runs no other program.
     #[must_use]
-    pub fn path(&self) -> &Path {
+    pub fn path(&self) -> Option<&Path> {
         match self {
-            Self::Zsh(path) | Self::Bash(path) => path,
+            Self::Zsh(path) | Self::Bash(path) => Some(path),
+            Self::Native => None,
         }
     }
 }
@@ -182,11 +187,12 @@ fn hosted_shell_setting(root: &Table) -> Result<Option<HostedShell>, ConfigError
 }
 
 /// `"zsh"` and `"bash"` are the system shells; an absolute path is accepted when the program is named `zsh` or
-/// `bash` (Homebrew's, for example), since only those two can be hosted.
+/// `bash` (Homebrew's, for example), since only those two can be hosted; `"native"` is `knsh`'s own interpreter.
 fn parse_hosted_shell(name: &str) -> Result<HostedShell, ConfigError> {
     match name {
         "zsh" => return Ok(HostedShell::Zsh(PathBuf::from(super::zsh::SYSTEM_ZSH))),
         "bash" => return Ok(HostedShell::Bash(PathBuf::from(super::bash::SYSTEM_BASH))),
+        "native" => return Ok(HostedShell::Native),
         _ => {}
     }
     let path = Path::new(name);
@@ -318,6 +324,12 @@ mod tests {
         ] {
             assert_eq!(hosted(invalid), Err(ConfigError::InvalidHostedShell), "{invalid}");
         }
+        // KNSH-107: native mode is chosen by name only.
+        assert_eq!(hosted("[shell]\nhosted = \"native\"\n"), Ok(Some(HostedShell::Native)));
+        assert_eq!(
+            hosted("[shell]\nhosted = \"/bin/native\"\n"),
+            Err(ConfigError::InvalidHostedShell)
+        );
         assert_eq!(hosted("[shell]\nhost = \"zsh\"\n"), Err(ConfigError::UnknownShellKey));
         assert_eq!(hosted("shell = \"zsh\"\n"), Err(ConfigError::ShellNotATable));
     }

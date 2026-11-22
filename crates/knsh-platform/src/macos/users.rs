@@ -31,8 +31,29 @@ enum Key<'a> {
     Uid(libc::uid_t),
 }
 
-/// The home directory of the entry `key` names, growing the buffer on `ERANGE` up to [`MAX_BUFFER`].
+/// Which text field of an entry to copy.
+#[derive(Clone, Copy)]
+enum Field {
+    /// `pw_dir`.
+    Home,
+    /// `pw_name`.
+    Name,
+}
+
+/// The home directory of the entry `key` names.
 fn home(key: &Key<'_>) -> Option<PathBuf> {
+    field(key, Field::Home).map(|bytes| PathBuf::from(OsStr::from_bytes(&bytes)))
+}
+
+/// The login name of user `uid` (`getpwuid`'s `pw_name`): what bash's `\u` prompt escape shows (KNSH-107). `None`
+/// when the user database has no entry for it.
+#[must_use]
+pub fn user_name(uid: u32) -> Option<String> {
+    field(&Key::Uid(uid), Field::Name).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Field `wanted` of the entry `key` names, growing the buffer on `ERANGE` up to [`MAX_BUFFER`].
+fn field(key: &Key<'_>, wanted: Field) -> Option<Vec<u8>> {
     let mut buffer = vec![0_u8; FIRST_BUFFER];
     loop {
         // SAFETY: an all-zero `passwd` is a valid value (integers zero, pointers null); the call overwrites it.
@@ -65,13 +86,17 @@ fn home(key: &Key<'_>) -> Option<PathBuf> {
             buffer.resize(buffer.len() * 2, 0);
             continue;
         }
-        if status != 0 || found.is_null() || entry.pw_dir.is_null() {
+        let pointer = match wanted {
+            Field::Home => entry.pw_dir,
+            Field::Name => entry.pw_name,
+        };
+        if status != 0 || found.is_null() || pointer.is_null() {
             return None;
         }
-        // SAFETY: on success `pw_dir` points to a NUL-terminated string inside `buffer`, which is still alive and
+        // SAFETY: on success the field points to a NUL-terminated string inside `buffer`, which is still alive and
         // not written to until the copy below is made.
-        let dir = unsafe { CStr::from_ptr(entry.pw_dir) };
-        return Some(PathBuf::from(OsStr::from_bytes(dir.to_bytes())));
+        let text = unsafe { CStr::from_ptr(pointer) };
+        return Some(text.to_bytes().to_vec());
     }
 }
 
@@ -100,5 +125,12 @@ mod tests {
         assert_eq!(homes.home_of("knsh-no-such-user-097"), None);
         assert_eq!(homes.home_of("a\0b"), None);
         assert!(homes.current_home().is_some());
+    }
+
+    // KNSH-107: `\u` shows the login name of the user.
+    #[test]
+    fn user_names_come_from_the_user_database() {
+        assert_eq!(user_name(0).as_deref(), Some("root"));
+        assert_eq!(user_name(4_000_000_000), None);
     }
 }

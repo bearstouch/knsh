@@ -957,6 +957,30 @@ fn human_shell(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
     match &host.hosted {
         HostedShell::Bash(bash) => human_bash(&host, shell, bash),
         HostedShell::Zsh(zsh) => human_zsh(&host, shell, zsh),
+        HostedShell::Native => human_native(&host, shell),
+    }
+}
+
+/// Runs `knsh`'s own interactive shell (KNSH-107, `[shell] hosted = "native"`), and exits as it did: with its
+/// status, or by the signal whose default action ended it.
+#[cfg(target_os = "macos")]
+fn human_native(host: &Host, shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
+    use knsh::native::{self, NativeExit, NativeStart};
+
+    if host.recording {
+        // Said, never hidden: the setting asks for recording, which native mode does not do yet.
+        report("knsh: recording is not available in native mode yet; this session is not recorded\n");
+    }
+    let start = NativeStart {
+        login: shell.login,
+        marks: host.marks,
+    };
+    match native::run(start) {
+        NativeExit::Status(code) => ExitCode::from(code),
+        NativeExit::Signal(signal) => {
+            knsh_platform::macos::reraise_default(signal);
+            ExitCode::from(128_u8.saturating_add(u8::try_from(signal).unwrap_or(0)))
+        }
     }
 }
 

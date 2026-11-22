@@ -19,9 +19,13 @@ enum Held {
     Field(fn(&mut ShellOptions) -> &mut bool),
     /// Not implemented: always this value.
     Fixed(bool),
-    /// Not implemented, and its value differs in an interactive shell, where the line editor and history keep it
-    /// (KNSH-107): this value in a non-interactive shell, refused in an interactive one.
-    Editing(bool),
+    /// `set -o emacs` (`vi: false`) or `set -o vi` (`vi: true`), the line editor's mode (KNSH-107): turning one on
+    /// turns the other off; turning off the one in use leaves the shell without line editing, as bash's
+    /// `set_edit_mode`.
+    Mode {
+        /// This is `vi`, not `emacs`.
+        vi: bool,
+    },
     /// `set -o posix` (KNSH-106): [`ShellOptions::posix`], changed with bash's `posix_initialize`. The `set`
     /// builtin sets or removes `POSIXLY_CORRECT` after the change, as bash's `set_posix_mode` does.
     Posix,
@@ -49,7 +53,7 @@ const SET_OPTIONS: &[SetOption] = &[
     SetOption {
         name: "emacs",
         letter: None,
-        held: Held::Editing(false),
+        held: Held::Mode { vi: false },
     },
     SetOption {
         name: "errexit",
@@ -74,12 +78,12 @@ const SET_OPTIONS: &[SetOption] = &[
     SetOption {
         name: "histexpand",
         letter: Some('H'),
-        held: Held::Editing(false),
+        held: Held::Field(|options| &mut options.histexpand),
     },
     SetOption {
         name: "history",
         letter: None,
-        held: Held::Editing(false),
+        held: Held::Field(|options| &mut options.history),
     },
     SetOption {
         name: "ignoreeof",
@@ -164,7 +168,7 @@ const SET_OPTIONS: &[SetOption] = &[
     SetOption {
         name: "vi",
         letter: None,
-        held: Held::Editing(false),
+        held: Held::Mode { vi: true },
     },
     SetOption {
         name: "xtrace",
@@ -206,7 +210,7 @@ const SHOPT_OPTIONS: &[(&str, Held)] = &[
     ("globskipdots", Held::Fixed(true)),
     ("globstar", Held::Field(|options| &mut options.globstar)),
     ("gnu_errfmt", Held::Fixed(false)),
-    ("histappend", Held::Fixed(false)),
+    ("histappend", Held::Field(|options| &mut options.histappend)),
     ("histreedit", Held::Fixed(false)),
     ("histverify", Held::Fixed(false)),
     ("hostcomplete", Held::Fixed(true)),
@@ -214,7 +218,7 @@ const SHOPT_OPTIONS: &[(&str, Held)] = &[
     ("inherit_errexit", Held::Field(|options| &mut options.inherit_errexit)),
     ("interactive_comments", Held::Fixed(true)),
     ("lastpipe", Held::Field(|options| &mut options.lastpipe)),
-    ("lithist", Held::Fixed(false)),
+    ("lithist", Held::Field(|options| &mut options.lithist)),
     ("localvar_inherit", Held::Fixed(false)),
     ("localvar_unset", Held::Fixed(false)),
     ("login_shell", Held::Fixed(false)),
@@ -246,16 +250,22 @@ pub(crate) enum OptionError {
     Refused(Unsupported),
 }
 
-/// The value of `held` in `options` (`interactive`: the shell is interactive).
-fn value(held: Held, options: &ShellOptions, interactive: bool) -> Result<bool, OptionError> {
+/// The value of `held` in `options`.
+fn value(held: Held, options: &ShellOptions) -> bool {
     match held {
         Held::Field(field) => {
             let mut copy = options.clone();
-            Ok(*field(&mut copy))
+            *field(&mut copy)
         }
-        Held::Editing(_) if interactive => Err(OptionError::Refused(Unsupported::ShellOption)),
-        Held::Fixed(value) | Held::Editing(value) => Ok(value),
-        Held::Posix => Ok(options.posix),
+        Held::Mode { vi } => {
+            if vi {
+                options.vi
+            } else {
+                options.emacs
+            }
+        }
+        Held::Fixed(value) => value,
+        Held::Posix => options.posix,
     }
 }
 
@@ -273,8 +283,23 @@ fn change(held: Held, options: &mut ShellOptions, interactive: bool, on: bool) -
             }
             Ok(())
         }
-        Held::Fixed(_) | Held::Editing(_) if value(held, options, interactive)? == on => Ok(()),
-        Held::Fixed(_) | Held::Editing(_) => Err(OptionError::Refused(Unsupported::ShellOption)),
+        Held::Mode { vi } => {
+            let (mine, other) = if vi {
+                (&mut options.vi, &mut options.emacs)
+            } else {
+                (&mut options.emacs, &mut options.vi)
+            };
+            if on {
+                *mine = true;
+                *other = false;
+            } else {
+                // Bash turns line editing off only when the mode named is the one in use.
+                *mine = false;
+            }
+            Ok(())
+        }
+        Held::Fixed(_) if value(held, options) == on => Ok(()),
+        Held::Fixed(_) => Err(OptionError::Refused(Unsupported::ShellOption)),
     }
 }
 
@@ -295,9 +320,9 @@ fn shopt_option(name: &str) -> Option<Held> {
 ///
 /// [`OptionError::Unknown`] for a name bash does not have; [`OptionError::Refused`] for a line-editing or history
 /// option of an interactive shell (KNSH-107).
-pub(crate) fn set_o(options: &ShellOptions, interactive: bool, name: &str) -> Result<bool, OptionError> {
+pub(crate) fn set_o(options: &ShellOptions, name: &str) -> Result<bool, OptionError> {
     let option = set_option(name).ok_or(OptionError::Unknown)?;
-    value(option.held, options, interactive)
+    Ok(value(option.held, options))
 }
 
 /// Sets `set -o` option `name` to `on`.
@@ -340,18 +365,10 @@ pub(crate) fn change_letter(
 }
 
 /// Every `set -o` option with its value, in bash's order: what `set -o` and `set +o` list.
-///
-/// # Errors
-///
-/// [`OptionError::Refused`] in an interactive shell, whose line-editing and history options the interpreter does not
-/// know (KNSH-107).
-pub(crate) fn set_o_listing(
-    options: &ShellOptions,
-    interactive: bool,
-) -> Result<Vec<(&'static str, bool)>, OptionError> {
+pub(crate) fn set_o_listing(options: &ShellOptions) -> Vec<(&'static str, bool)> {
     SET_OPTIONS
         .iter()
-        .map(|option| Ok((option.name, value(option.held, options, interactive)?)))
+        .map(|option| (option.name, value(option.held, options)))
         .collect()
 }
 
@@ -362,7 +379,7 @@ pub(crate) fn set_o_listing(
 /// [`OptionError::Unknown`] for a name bash does not have.
 pub(crate) fn shopt(options: &ShellOptions, name: &str) -> Result<bool, OptionError> {
     let held = shopt_option(name).ok_or(OptionError::Unknown)?;
-    value(held, options, false)
+    Ok(value(held, options))
 }
 
 /// Sets `shopt` option `name` to `on`.
@@ -380,7 +397,7 @@ pub(crate) fn change_shopt(options: &mut ShellOptions, name: &str, on: bool) -> 
 pub(crate) fn shopt_listing(options: &ShellOptions) -> Vec<(&'static str, bool)> {
     SHOPT_OPTIONS
         .iter()
-        .map(|(name, held)| (*name, value(*held, options, false).unwrap_or(false)))
+        .map(|(name, held)| (*name, value(*held, options)))
         .collect()
 }
 
@@ -559,7 +576,7 @@ pub(crate) fn dash_flags(options: &ShellOptions, interactive: bool) -> String {
             SET_OPTIONS
                 .iter()
                 .find(|option| option.letter == Some(letter))
-                .is_some_and(|option| value(option.held, options, interactive).unwrap_or(false))
+                .is_some_and(|option| value(option.held, options))
         };
         if on {
             flags.push(letter);
@@ -583,11 +600,7 @@ mod tests {
     #[test]
     fn listings_follow_bash_order() {
         let options = ShellOptions::default();
-        let names: Vec<&str> = set_o_listing(&options, false)
-            .unwrap()
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
+        let names: Vec<&str> = set_o_listing(&options).into_iter().map(|(name, _)| name).collect();
         let mut sorted = names.clone();
         sorted.sort_unstable();
         assert_eq!(names, sorted);
@@ -595,7 +608,6 @@ mod tests {
         let shopts = shopt_listing(&options);
         assert!(shopts.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert!(shopts.contains(&("checkwinsize", true)));
-        assert!(set_o_listing(&options, true).is_err());
     }
 
     // KNSH-104: `$-` holds the letters of the options that are on, in bash's order.

@@ -88,7 +88,7 @@ pub use collation::FakeCollation;
 pub use command::ScriptedCommands;
 pub use control::FakeCodeSigning;
 pub use denials::{ScriptedDenialLog, kernel_entry};
-pub use descriptor::{FakeDescriptors, FakeOpened};
+pub use descriptor::{FAKE_TERMINAL_COLUMNS, FakeDescriptors, FakeOpened};
 pub use endpoint_security::ScriptedDescendantClients;
 pub use file_events::{FlushHook, ScriptedFileEvents, watch_failure};
 pub use fs::{DEFAULT_GID, DEFAULT_UID, MemFs};

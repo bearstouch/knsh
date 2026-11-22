@@ -14,6 +14,7 @@ mod endpoint_security;
 mod fs;
 mod fsevents;
 mod holders;
+mod host;
 mod job;
 mod keychain;
 mod kqueue;
@@ -42,6 +43,7 @@ pub use endpoint_security::SystemDescendantClients;
 pub use fs::RealFs;
 pub use fsevents::{FsEventStreams, MAX_WATCHED_PATHS};
 pub use holders::SystemWriteHolders;
+pub use host::{host_name, terminal_name};
 pub use job::{SystemShellTimes, SystemTerminal, ignored_signals};
 pub use keychain::{
     KeychainSecrets, KeychainSigningKey, KeychainTrustStore, SECRET_SERVICE, SIGNING_KEY_ACCOUNT, SIGNING_KEY_SERVICE,
@@ -59,7 +61,7 @@ pub use redirect::SystemDescriptors;
 pub use resolver::SystemResolver;
 pub use shell_host::{JobSignalsIgnored, TelemetryPipe, reraise_default};
 pub use thread::set_current_thread_utility_qos;
-pub use users::SystemUserHomes;
+pub use users::{SystemUserHomes, user_name};
 pub use volumes::SystemVolumes;
 pub use xpc::{SecCodeSigning, XpcControlService, XpcMessage};
 
