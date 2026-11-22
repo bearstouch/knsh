@@ -3,9 +3,13 @@
 //! ```text
 //! knsh-exec [--keep-fd <n>]... [--status-fd <n>] --profile <absolute path> --interpreter <absolute path>
 //!           --line <line> [--arg <operand>]...
+//! knsh-exec [--keep-fd <n>]... [--status-fd <n>] [--in-group] --profile <absolute path> --program <absolute path>
+//!           [--arg <argument>]...
 //! ```
 //!
-//! `--profile`, `--interpreter` and `--line` must appear exactly once, in any order; `--status-fd` at most once;
+//! `--profile` must appear exactly once, and with it either `--interpreter` and `--line` (line mode) or `--program`
+//! (program mode, KNSH-108: one simple command of a native-mode line, or its interpreter), never both; `--in-group`
+//! (no value) at most once; `--status-fd` at most once;
 //! `--keep-fd` up to [`MAX_KEPT`] times; `--arg` up to [`MAX_ARGS`] times, its values kept in order (the line's
 //! operands: `$0`, then `$1`, …, as with `bash -c 'line' name arg…`). Anything else (an unknown option, a positional
 //! argument, a repeated option, a missing value) is rejected: the trampoline never guesses what the supervisor meant,
@@ -29,17 +33,33 @@ pub(crate) const MAX_KEPT: usize = 16;
 /// (`specs/06-api/agent-socket.md#execrun`).
 pub(crate) const MAX_ARGS: usize = 4096;
 
-/// A complete, well-formed request to run one line.
+/// What runs under the profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// Line mode: `interpreter -c -- line operand…`.
+    Line {
+        /// The interpreter that runs the line (for example `/bin/bash`), absolute and normal (FR-LC-14).
+        interpreter: PathBuf,
+        /// The line, passed to the interpreter's `-c`. Never empty.
+        line: OsString,
+    },
+    /// Program mode (KNSH-108, FR-LC-56): the program itself, absolute and normal, with the operands as
+    /// `argv[1..]`.
+    Program(PathBuf),
+}
+
+/// A complete, well-formed request to run one line or one program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Invocation {
     /// The compiled Seatbelt profile file, absolute and normal.
     pub(crate) profile: PathBuf,
-    /// The interpreter that runs the line (for example `/bin/bash`), absolute and normal (FR-LC-14).
-    pub(crate) interpreter: PathBuf,
-    /// The line, passed to the interpreter's `-c`. Never empty.
-    pub(crate) line: OsString,
-    /// The operands after the line (`$0`, `$1`, …), in the order given. May be empty.
+    /// What runs.
+    pub(crate) target: Target,
+    /// The operands after the line (`$0`, `$1`, …), or the program's arguments, in the order given. May be empty.
     pub(crate) operands: Vec<OsString>,
+    /// `--in-group`: the process is already in the process group `knshd` placed it in (a native-mode line's), so it
+    /// does not lead a group of its own.
+    pub(crate) in_group: bool,
     /// Descriptors above stdio to keep open across the exec, in the order given, without duplicates.
     pub(crate) keep: Vec<i32>,
     /// Where to report a failure (`--status-fd`): one byte, the exit code, written before exiting. Never kept
@@ -72,6 +92,8 @@ pub(crate) enum UsageError {
     BadStatusDescriptor,
     /// More than [`MAX_ARGS`] operands are given.
     TooManyOperands,
+    /// `--program` given with `--interpreter` or `--line`.
+    BothModes,
 }
 
 impl fmt::Display for UsageError {
@@ -90,6 +112,7 @@ impl fmt::Display for UsageError {
                 f.write_str("--status-fd must be a descriptor number of 3 or more, not given with --keep-fd")
             }
             Self::TooManyOperands => write!(f, "--arg given more than {MAX_ARGS} times"),
+            Self::BothModes => f.write_str("--program cannot be given with --interpreter or --line"),
         }
     }
 }
@@ -102,6 +125,8 @@ const LINE: &str = "--line";
 const KEEP_FD: &str = "--keep-fd";
 const STATUS_FD: &str = "--status-fd";
 const ARG: &str = "--arg";
+const PROGRAM: &str = "--program";
+const IN_GROUP: &str = "--in-group";
 
 /// Reads the arguments after `argv[0]`.
 ///
@@ -112,14 +137,24 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Invocati
     let mut profile = None;
     let mut interpreter = None;
     let mut line = None;
+    let mut program = None;
+    let mut in_group = false;
     let mut status = None;
     let mut keep = Vec::new();
     let mut operands = Vec::new();
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
+        // The one option without a value.
+        if arg == OsStr::new(IN_GROUP) {
+            if in_group {
+                return Err(UsageError::Repeated(IN_GROUP));
+            }
+            in_group = true;
+            continue;
+        }
         // Options are matched exactly; `--profile=/x` and other spellings are unexpected arguments.
-        let Some(option) = [PROFILE, INTERPRETER, LINE, KEEP_FD, STATUS_FD, ARG]
+        let Some(option) = [PROFILE, INTERPRETER, LINE, PROGRAM, KEEP_FD, STATUS_FD, ARG]
             .into_iter()
             .find(|o| arg == OsStr::new(o))
         else {
@@ -130,6 +165,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Invocati
             PROFILE => set_once(&mut profile, option, value)?,
             INTERPRETER => set_once(&mut interpreter, option, value)?,
             LINE => set_once(&mut line, option, value)?,
+            PROGRAM => set_once(&mut program, option, value)?,
             STATUS_FD => set_once(&mut status, option, value)?,
             ARG if operands.len() == MAX_ARGS => return Err(UsageError::TooManyOperands),
             ARG => operands.push(value),
@@ -138,11 +174,18 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Invocati
     }
 
     let profile = absolute(profile.ok_or(UsageError::Missing(PROFILE))?, PROFILE)?;
-    let interpreter = absolute(interpreter.ok_or(UsageError::Missing(INTERPRETER))?, INTERPRETER)?;
-    let line = line.ok_or(UsageError::Missing(LINE))?;
-    if line.is_empty() {
-        return Err(UsageError::EmptyLine);
-    }
+    let target = match (program, interpreter, line) {
+        (Some(program), None, None) => Target::Program(absolute(program, PROGRAM)?),
+        (Some(_), _, _) => return Err(UsageError::BothModes),
+        (None, interpreter, line) => {
+            let interpreter = absolute(interpreter.ok_or(UsageError::Missing(INTERPRETER))?, INTERPRETER)?;
+            let line = line.ok_or(UsageError::Missing(LINE))?;
+            if line.is_empty() {
+                return Err(UsageError::EmptyLine);
+            }
+            Target::Line { interpreter, line }
+        }
+    };
     // Kept descriptors survive the exec; the status descriptor must not, or end of file would never say "started".
     let status = match status {
         None => None,
@@ -153,9 +196,9 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Invocati
     };
     Ok(Invocation {
         profile,
-        interpreter,
-        line,
+        target,
         operands,
+        in_group,
         keep,
         status,
     })
@@ -210,22 +253,22 @@ fn absolute(value: OsString, option: &'static str) -> Result<PathBuf, UsageError
     }
 }
 
-/// The exact `argv` for `execve`: `sandbox-exec -f <profile> <interpreter> -c -- <line> [<operand>…]`.
+/// The exact `argv` for `execve`: `sandbox-exec -f <profile> <interpreter> -c -- <line> [<operand>…]` in line mode,
+/// `sandbox-exec -f <profile> <program> [<argument>…]` in program mode (the program is absolute, so `sandbox-exec`
+/// cannot read it as one of its own options).
 ///
 /// `--` ends the interpreter's options, so a line that starts with `-` (for example `-i` or `--rcfile=…`) is run as
 /// a command, never read as an interpreter option. `/bin/sh`, `/bin/bash` and `/bin/zsh` all accept it, and take the
 /// words after the line as `$0`, `$1`, …. The interpreter is absolute, so `sandbox-exec` cannot read it as one of its
 /// own options either.
 pub(crate) fn exec_argv(invocation: Invocation) -> Vec<OsString> {
-    let mut argv: Vec<OsString> = vec![
-        SANDBOX_EXEC.into(),
-        "-f".into(),
-        invocation.profile.into_os_string(),
-        invocation.interpreter.into_os_string(),
-        "-c".into(),
-        "--".into(),
-        invocation.line,
-    ];
+    let mut argv: Vec<OsString> = vec![SANDBOX_EXEC.into(), "-f".into(), invocation.profile.into_os_string()];
+    match invocation.target {
+        Target::Line { interpreter, line } => {
+            argv.extend([interpreter.into_os_string(), "-c".into(), "--".into(), line]);
+        }
+        Target::Program(program) => argv.push(program.into_os_string()),
+    }
     argv.extend(invocation.operands);
     argv
 }
@@ -264,9 +307,12 @@ mod tests {
             parsed,
             Ok(Invocation {
                 profile: "/a.sb".into(),
-                interpreter: "/bin/zsh".into(),
-                line: "ls".into(),
+                target: Target::Line {
+                    interpreter: "/bin/zsh".into(),
+                    line: "ls".into(),
+                },
                 operands: Vec::new(),
+                in_group: false,
                 keep: vec![7],
                 status: None,
             })
@@ -443,5 +489,60 @@ mod tests {
         secret.push("TOKEN=hunter2".into());
         let message = parse(secret).unwrap_err().to_string();
         assert!(!message.contains("hunter2"), "{message}");
+    }
+
+    // KNSH-108, FR-LC-56: program mode runs the program itself with its arguments, and `--in-group` keeps the
+    // group `knshd` placed the process in.
+    #[test]
+    fn parses_program_mode() {
+        let parsed = parse(args(&[
+            "--in-group",
+            "--profile",
+            "/p/c.sb",
+            "--program",
+            "/usr/bin/git",
+            "--arg",
+            "push",
+            "--arg",
+            "-f",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.target, Target::Program("/usr/bin/git".into()));
+        assert!(parsed.in_group);
+        assert_eq!(
+            exec_argv(parsed),
+            args(&["/usr/bin/sandbox-exec", "-f", "/p/c.sb", "/usr/bin/git", "push", "-f"])
+        );
+        assert!(!parse(args(VALID)).unwrap().in_group);
+    }
+
+    // Program mode is exclusive with line mode, its path is checked like every other, and `--in-group` is a flag
+    // given at most once.
+    #[test]
+    fn refuses_malformed_program_mode() {
+        assert_eq!(parse(valid_with(&["--program", "/bin/ls"])), Err(UsageError::BothModes));
+        assert_eq!(
+            parse(args(&["--profile", "/p.sb", "--program", "/bin/ls", "--line", "x"])),
+            Err(UsageError::BothModes)
+        );
+        assert_eq!(
+            parse(args(&["--profile", "/p.sb", "--program", "ls"])),
+            Err(UsageError::NotAbsolute("--program"))
+        );
+        assert_eq!(
+            parse(args(&[
+                "--profile",
+                "/p.sb",
+                "--program",
+                "/bin/ls",
+                "--in-group",
+                "--in-group"
+            ])),
+            Err(UsageError::Repeated("--in-group"))
+        );
+        assert_eq!(
+            parse(args(&["--profile", "/p.sb"])),
+            Err(UsageError::Missing("--interpreter"))
+        );
     }
 }

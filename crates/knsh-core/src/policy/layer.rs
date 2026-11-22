@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use knsh_bash::Interpreter;
 use knsh_toml::{Item, Table, Value};
 
-use super::model::{NetworkMode, OutputMode, RETENTION_DAYS_RANGE, RuleAction};
+use super::model::{ExecMode, NetworkMode, OutputMode, RETENTION_DAYS_RANGE, RuleAction};
 use super::paths::PathTemplate;
 use crate::error::{ProfileError, ProfileErrorKind};
 use crate::session::ProfileName;
@@ -65,6 +65,7 @@ pub(crate) struct Layer {
     pub(crate) exec_trusted_folders: Option<Vec<PathTemplate>>,
     pub(crate) exec_trusted_tools: Option<Vec<String>>,
     pub(crate) exec_bash: Option<PathTemplate>,
+    pub(crate) exec_mode: Option<ExecMode>,
     pub(crate) network_mode: Option<NetworkMode>,
     pub(crate) network_hosts: Option<Vec<String>>,
     pub(crate) network_approval_hosts: Option<Vec<String>>,
@@ -197,6 +198,7 @@ impl Layer {
             "trusted_folders",
             "trusted_tools",
             "bash",
+            "mode",
         ])?;
         self.exec_allow = exec.list("allow", pattern)?;
         self.exec_ask = exec.list("ask", pattern)?;
@@ -206,6 +208,7 @@ impl Layer {
         self.exec_trusted_folders = exec.list("trusted_folders", path)?;
         self.exec_trusted_tools = exec.list("trusted_tools", pattern)?;
         self.exec_bash = exec.optional("bash", path)?;
+        self.exec_mode = exec.optional("mode", exec_mode)?;
         if let Some(interpreters) = exec.section("interpreters")? {
             for (family, item) in interpreters.table {
                 let entry = interpreters.child(family, item)?;
@@ -277,6 +280,8 @@ impl Layer {
             ("exec.interpreters", !self.exec_interpreters.is_empty()),
             ("exec.trusted_tools", self.exec_trusted_tools.is_some()),
             ("exec.bash", self.exec_bash.is_some()),
+            // How lines are decided is the profile's choice (FR-LC-50), never a preset's.
+            ("exec.mode", self.exec_mode.is_some()),
             ("network.mode", self.network_mode.is_some()),
             // Lifting the server-name check weakens the proxy: a profile's choice, never a preset's.
             ("network.non_tls_hosts", self.network_non_tls_hosts.is_some()),
@@ -506,6 +511,10 @@ fn name_string(value: &Value) -> Result<String, Refusal> {
 
 fn rule_action(value: &Value) -> Result<RuleAction, Refusal> {
     RuleAction::parse(string(value)?).ok_or(Refusal::Invalid("allow, ask or deny"))
+}
+
+fn exec_mode(value: &Value) -> Result<ExecMode, Refusal> {
+    ExecMode::parse(string(value)?).ok_or(Refusal::Invalid("line or native"))
 }
 
 fn network_mode(value: &Value) -> Result<NetworkMode, Refusal> {

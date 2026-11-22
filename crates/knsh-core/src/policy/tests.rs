@@ -238,7 +238,25 @@ fn unset_keys_take_their_documented_defaults() {
     assert!(!profile.checkpoints.required);
     assert_eq!(profile.recording.retention_days, DEFAULT_RETENTION_DAYS);
     assert_eq!(profile.output.mode, OutputMode::Full);
+    assert_eq!(profile.exec.mode, ExecMode::Line);
     assert!(profile.preset.is_none() && profile.secrets.is_empty());
+}
+
+// FR-LC-50 (KNSH-108): `exec.mode` chooses native mode; it is inherited like any value, and anything but `line` or
+// `native` is refused.
+#[test]
+fn exec_mode_is_read_inherited_and_checked() {
+    let source = Source::default()
+        .with("base", "name = \"base\"\n[exec]\nmode = \"native\"\n")
+        .with("child", "name = \"child\"\nextends = \"base\"\n")
+        .with("back", "name = \"back\"\nextends = \"base\"\n[exec]\nmode = \"line\"\n")
+        .with("bad", "name = \"bad\"\n[exec]\nmode = \"zsh\"\n");
+    assert_eq!(load(&source, "base").unwrap().exec.mode, ExecMode::Native);
+    assert_eq!(load(&source, "child").unwrap().exec.mode, ExecMode::Native);
+    assert_eq!(load(&source, "back").unwrap().exec.mode, ExecMode::Line);
+    let error = load(&source, "bad").unwrap_err();
+    assert!(matches!(error.kind(), ProfileErrorKind::InvalidValue { .. }), "{error}");
+    assert_eq!(error.key(), Some("exec.mode"));
 }
 
 #[test]

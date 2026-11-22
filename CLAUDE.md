@@ -63,8 +63,8 @@ Each crate has one concern. Dependencies point downwards only: binaries → serv
 | `knsh-store` | Record store (system SQLite), retention, redaction at write time. | `knsh-core`, `knsh-platform` |
 | `knsh-checkpoint` | Shadows, capture, post-image identity, history tree, restore rules. | `knsh-core`, `knsh-json`, `knsh-platform` |
 | `knshd` | Daemon binary: endpoints, supervisor, event bus, wiring. Thin; logic lives in libraries. | all services |
-| `knsh` | Shell front end (integration mode, native mode for humans), agent client, shims and CLI. | `knsh-proto`, `knsh-json`, `knsh-core` (IDs, timestamps), `knsh-platform` (engine paths, launchd agent), `knsh-toml` (user settings), `knsh-interp` (native mode, KNSH-107) |
-| `knsh-interp` | Native bash interpreter (phase 4): walks the `knsh-bash` tree, shell state, exit statuses; runs commands through `knsh-platform` traits (`CommandSpawner`, `Fs`). | `knsh-bash`, `knsh-platform` |
+| `knsh` | Shell front end (integration mode, native mode for humans), agent client, shims and CLI; the sandboxed interpreter of native-mode agent lines (`--native-line`, KNSH-108). | `knsh-proto`, `knsh-json`, `knsh-core` (IDs, timestamps), `knsh-platform` (engine paths, launchd agent, supervision channel), `knsh-toml` (user settings), `knsh-interp` (native mode, KNSH-107), `knsh-bash` (native-mode lines, KNSH-108) |
+| `knsh-interp` | Native bash interpreter (phase 4): walks the `knsh-bash` tree, shell state, exit statuses; runs commands through `knsh-platform` traits (`CommandSpawner`, `Fs`); for agent lines, `knsh-platform`'s `SupervisedSpawner` asks the supervisor for each one (KNSH-108). | `knsh-bash`, `knsh-platform` |
 | `knsh-exec` | Trampoline: applies a profile with `sandbox-exec -f`, then execs. **std only**, single-threaded, no workspace deps. | — |
 
 The decision and enforcement path never leaves Rust. A Swift helper is allowed only for a macOS service that is

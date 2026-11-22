@@ -139,6 +139,41 @@ whole lifecycle is tested with fakes. How the steps combine:
   (FR-REC-03); an allowed line is recorded after it ends, then `command.finished` is published (FR-LC-19). The
   record's `decision` is the pipeline's decision with its latency.
 
+## Native mode (KNSH-108)
+
+In **native mode** a session's lines run in `knsh`'s own interpreter (phase 4) instead of a stock shell, and the
+supervisor decides on **every simple command** the interpreter is about to start, with its real argv after expansion:
+commands inside scripts, functions, loops, pipelines, substitutions, `eval`, `source` and aliases, and names built from
+variables. Dynamic code is then no longer decided as an opaque whole: `eval "git push"` asks for `git push`.
+
+| ID | Requirement |
+| --- | --- |
+| FR-LC-50 | **Selection.** A session runs in native mode exactly when its profile sets `exec.mode = "native"` ([policy profile](../05-models/policy-profile.md)). The default is `"line"` (phase 2: the whole line is decided, then run by a stock interpreter). Nothing the agent, the line, its interpreter (`sh`, `bash`, `zsh`, `knsh -c`) or its environment says changes the mode. Until the phase 4 gate (KNSH-109) is green, native mode is opt-in. |
+| FR-LC-51 | **The line.** A native-mode line is not decided as a whole. It is admitted when its session is runnable, its profile loads, its redactor can be built and it can be recorded (the same checks that deny a phase 2 line before its decision, NFR-REL-07), and it passes the checkpoint gate (FR-CKP-02). Its record is the **line record**: `decision` is `allow` with source `native` and no rule, `argv` is empty, and it carries the line's exit status, output, checkpoint and file changes as a phase 2 line's does. It publishes `command.started` and `command.finished` but no `command.proposed`: nothing about the line as a whole is asked. |
+| FR-LC-52 | **The interpreter.** The supervisor runs the line in `knsh` (the binary installed beside `knshd`) through `knsh-exec`, under the **interpreter profile**: the session's file rules (the per-command baseline without any class, grant or approval addition), no network, no `fork`, and `exec` of nothing but the `knsh` binary itself. Whatever the interpreter does itself (redirections, `cd`, builtins, `source` reading a file) is confined by that profile. It can start a program only by asking the supervisor over its **supervision channel**: one end of a socket pair the supervisor creates for the line and passes to it, bound to the line's session and record. |
+| FR-LC-53 | **One decision per simple command.** Before each external command starts, the interpreter sends the program it resolved, `argv[1..]`, the complete environment, the working directory, the `umask` and its whole descriptor table (as descriptors, `SCM_RIGHTS`). The supervisor canonicalises the program and decides the line `<canonical path> <argument>…` (each a quoted shell word) through the same pipeline as a phase 2 line (steps 2 to 8: `command.proposed`, hooks, policy, grants, the authority or standalone rules, rate limits), resolving names on the command's own `PATH` without the shims (FR-LC-16). A program the supervisor cannot canonicalise, a working directory that is not absolute, or a request it cannot read is denied. |
+| FR-LC-54 | **Records and events.** Every command decided gets its own **command record**, whose `parent_record_id` is the line record (null for every other record), whether it was denied or ran. Its `command.denied`, `command.started` and `command.finished` carry the same `parent_record_id`. Its `decision` is the pipeline's, as for a line. |
+| FR-LC-55 | **Denial inside the script.** A denied command never starts (FR-LC-30). The interpreter writes `knsh: <name>: <reason>` on the command's standard error (after its redirections, as bash reports a command it cannot execute) and the command's status is 126 (FR-LC-31); the script goes on as bash's semantics say: `$?` is 126, `set -e` ends the script, `||` runs its right side. |
+| FR-LC-56 | **The supervisor spawns.** An allowed command is started by the supervisor through `knsh-exec` in program mode, never by the interpreter (NFR-SEC-02): under a profile compiled for the command (tagged with its record) allowing exec of the trusted and system folders, the profile's bash and its own canonical binary, with proxy credentials of its own and the secrets its decision gives it (FR-SEC-01), on exactly the descriptors the interpreter passed, as a member of the line's process group. The line's `timeout_s`, `exec.kill` and a session pause therefore reach its commands. The interpreter is told the command started and asks the supervisor to wait for it. A rewrite of one command is denied, as for an exec seen through Endpoint Security (FR-AUTH-31): the interpreter has already expanded it. |
+| FR-LC-57 | **Fail closed.** If the channel is closed, broken or answers anything but a decision, the command is denied (126, with the reason) and so is every later one: no command runs without the supervisor (NFR-REL-01). The interpreter's profile lets it execute nothing else, so it cannot start a program by itself. A command the supervisor receives while its session is held (paused or under human control, FR-SES-10, FR-SES-12) waits until the session runs again; one whose session ended, or whose line's caller has gone, is denied. A panic while deciding a command denies it. |
+| FR-LC-58 | **End of the line.** The line ends when its interpreter exits. What remains of the line's process group (background commands) is then killed, so no command of a native line outlives it; a long-running service is started with `exec.start` and stopped with `exec.kill`. |
+
+What native mode does not change: lines of sessions in line mode, human sessions (never decided, FR-SES-22),
+and envelope execs seen by Endpoint Security (KNSH-094) behave exactly as before. Known limits: job control
+(`set -m`, `fg`, `bg`) is not available to a native-mode line, whose commands all run in the line's process group; a
+command runs with its canonical path as `argv[0]` (as a re-serialised phase 2 line does, FR-LC-13); a redirection
+into a directory only a command's grant or approval could write to fails, since the interpreter has only the
+baseline; a command that leaves the line's process group (`setsid`) and keeps running is not killed with the line,
+which is then answered only once that command ends; a program path, argument or environment entry that is not UTF-8
+is denied, as is a command holding more than 16 descriptors above 2 (`knsh-exec --keep-fd`).
+
+The channel's wire format (`knsh_platform::supervision`): one JSON object per frame behind a 4-byte big-endian length
+of at most 1 MiB; byte strings (program, arguments, environment, working directory) base64; a start request
+`{"op":"start","id","program","argv0","args","env","cwd","umask","descriptors"}` with one descriptor attached
+(`SCM_RIGHTS`) per number in `descriptors`, answered `running` (`child`, `pid`), `denied` (`reason`), `not_found`,
+`not_executable` or `failed`; a wait request `{"op":"wait","id","child"}`, answered `exited` (`code`), `signalled`
+(`signal`) or `failed`. Unknown keys and anything else are refused, and break the channel.
+
 ## Denial
 
 | ID | Requirement |

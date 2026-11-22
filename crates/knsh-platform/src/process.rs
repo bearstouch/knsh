@@ -58,6 +58,12 @@ impl AsRawFd for SharedFd {
     }
 }
 
+impl std::os::fd::AsFd for SharedFd {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
 impl fmt::Debug for SharedFd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SharedFd({})", self.as_raw_fd())

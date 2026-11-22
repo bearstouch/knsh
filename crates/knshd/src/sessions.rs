@@ -501,6 +501,7 @@ impl Sessions {
                 started_at,
                 ended_at,
                 exit_code: Some(i32::from(exit_code)),
+                parent_record_id: None,
             },
         );
         // A new command: the next idle prompt is reported again (FR-SES-24).

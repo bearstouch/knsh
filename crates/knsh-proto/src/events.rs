@@ -370,6 +370,7 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
             started_at,
             ended_at,
             exit_code,
+            parent_record_id,
         } => Object::new()
             .with("record_id", record_id.to_string())?
             // Redacted before it was published (FR-EVT-07); this is where it is emitted.
@@ -377,7 +378,8 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
             .with("cwd", path(cwd))?
             .with("started_at", started_at.to_string())?
             .with("ended_at", ended_at.to_string())?
-            .with("exit_code", exit_code.to_json()?),
+            .with("exit_code", exit_code.to_json()?)?
+            .with("parent_record_id", parent_record_id.map(|id| id.to_string()).to_json()?),
         EventData::CwdChanged { cwd } => Object::new().with("cwd", path(cwd)),
         // The violation's own object (`specs/05-models/event.md#phase-2-payloads`, KNSH-047).
         EventData::SandboxViolation(violation) => violation.to_object(),
@@ -397,13 +399,15 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
             source,
             rule_id,
             reason,
+            parent_record_id,
         } => Object::new()
             .with("record_id", record_id.map(|id| id.to_string()).to_json()?)?
             .with("command", command.expose().as_str())?
             .with("cwd", path(cwd))?
             .with("source", source.code())?
             .with("rule_id", redacted(rule_id.as_ref()).to_json()?)?
-            .with("reason", redacted(reason.as_ref()).to_json()?),
+            .with("reason", redacted(reason.as_ref()).to_json()?)?
+            .with("parent_record_id", parent_record_id.map(|id| id.to_string()).to_json()?),
         // KNSH-055; `command` was redacted before it was published.
         EventData::CommandDeniedRepeatedly { command, cwd, until } => Object::new()
             .with("command", command.expose().as_str())?
@@ -419,14 +423,21 @@ fn data(data: &EventData) -> Result<Object, JsonError> {
         EventData::DecisionCancelled { request_id, reason } => Object::new()
             .with("request_id", request_id.map(|id| id.to_string()).to_json()?)?
             .with("reason", reason.as_str()),
-        // KNSH-051: the same shape for both; `command` was redacted before it was published.
+        // KNSH-051; `command` was redacted before it was published. `command.started` also links a native-mode
+        // line's command to its line (KNSH-108).
         EventData::CommandStarted {
             record_id,
             command,
             cwd,
             started_at,
-        }
-        | EventData::CommandLongRunning {
+            parent_record_id,
+        } => Object::new()
+            .with("record_id", record_id.to_string())?
+            .with("command", command.expose().as_str())?
+            .with("cwd", path(cwd))?
+            .with("started_at", started_at.to_string())?
+            .with("parent_record_id", parent_record_id.map(|id| id.to_string()).to_json()?),
+        EventData::CommandLongRunning {
             record_id,
             command,
             cwd,
@@ -685,6 +696,7 @@ mod tests {
                         started_at: at,
                         ended_at: at,
                         exit_code: None,
+                        parent_record_id: None,
                     },
                     Actor::Human,
                 ),
@@ -694,7 +706,7 @@ mod tests {
         assert!(finished.contains(r#""actor":{"kind":"human"}"#), "{finished}");
         assert!(
             finished.contains(&format!(
-                r#""data":{{"record_id":"{record}","command":"curl -H 'Authorization: «redacted»'","cwd":"/Users/me/app","started_at":"1970-01-01T00:00:00.000000Z","ended_at":"1970-01-01T00:00:00.000000Z","exit_code":null}}"#
+                r#""data":{{"record_id":"{record}","command":"curl -H 'Authorization: «redacted»'","cwd":"/Users/me/app","started_at":"1970-01-01T00:00:00.000000Z","ended_at":"1970-01-01T00:00:00.000000Z","exit_code":null,"parent_record_id":null}}"#
             )),
             "{finished}"
         );
@@ -809,10 +821,11 @@ mod tests {
             source: knsh_core::DecisionSource::Rule,
             rule_id: Some(Redacted::new("exec.deny[0]".to_owned())),
             reason: None,
+            parent_record_id: None,
         });
         assert!(
             denied.contains(&format!(
-                r#""data":{{"record_id":"{record}","command":"rm -rf build","cwd":"/Users/me/app","source":"rule","rule_id":"exec.deny[0]","reason":null}}"#
+                r#""data":{{"record_id":"{record}","command":"rm -rf build","cwd":"/Users/me/app","source":"rule","rule_id":"exec.deny[0]","reason":null,"parent_record_id":null}}"#
             )),
             "{denied}"
         );
@@ -847,17 +860,21 @@ mod tests {
         });
         assert!(invalid.contains(r#""event":"policy.invalid""#), "{invalid}");
         assert!(invalid.contains(r#""data":{"profile":"web-app"}"#), "{invalid}");
-        // KNSH-051 (FR-LC-17): `command.started` and `command.long_running` share one shape.
+        // KNSH-051 (FR-LC-17): `command.started` and `command.long_running` share one shape; `command.started` also
+        // names the line record of a native-mode line's command (KNSH-108, FR-LC-54).
         let started_at = Timestamp::from_unix_micros(1_700_000_000_000_000).unwrap();
-        for (event, name) in [
+        let line = RecordId::from_ulid(Ulid::from_u128(0x0108));
+        for (event, name, parent) in [
             (
                 EventData::CommandStarted {
                     record_id: record,
                     command: Redacted::new("npm test".to_owned()),
                     cwd: cwd(),
                     started_at,
+                    parent_record_id: Some(line),
                 },
                 "command.started",
+                format!(r#","parent_record_id":"{line}""#),
             ),
             (
                 EventData::CommandLongRunning {
@@ -867,13 +884,14 @@ mod tests {
                     started_at,
                 },
                 "command.long_running",
+                String::new(),
             ),
         ] {
             let text = data(event);
             assert!(text.contains(&format!(r#""method":"{name}""#)), "{text}");
             assert!(
                 text.contains(&format!(
-                    r#""data":{{"record_id":"{record}","command":"npm test","cwd":"/Users/me/app","started_at":"{started_at}"}}"#
+                    r#""data":{{"record_id":"{record}","command":"npm test","cwd":"/Users/me/app","started_at":"{started_at}"{parent}}}"#
                 )),
                 "{text}"
             );

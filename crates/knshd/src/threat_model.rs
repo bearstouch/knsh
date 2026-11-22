@@ -32,4 +32,5 @@
 
 mod cases;
 pub(crate) mod harness;
+mod native;
 mod report;

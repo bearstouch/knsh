@@ -27,6 +27,10 @@ const NOT_RUN_STATUS: u8 = knsh::agent::forward::NOT_RUN_STATUS;
 /// script, never a `knsh` command.
 fn main() -> ExitCode {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // KNSH-108: the native interpreter of a native-mode agent line, as `knshd` starts it through `knsh-exec`.
+    if argv.get(1).is_some_and(|arg| arg == knsh::native_line::NATIVE_LINE) {
+        return ExitCode::from(knsh::native_line::run(&argv[2..]));
+    }
     let interpreter = interpreter(&argv);
     let parsed = if interpreter == knsh_proto::Interpreter::Knsh {
         args::parse(&KNSH, argv)

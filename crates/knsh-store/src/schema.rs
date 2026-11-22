@@ -87,8 +87,12 @@ CREATE TABLE outputs (
 /// protected, as JSON text; `NULL` (every record written before) reads as an empty list.
 const V2: Migration = "ALTER TABLE records ADD COLUMN unprotected TEXT;";
 
+/// Version 3: the record's `parent_record_id` (KNSH-108, FR-LC-54), the line record of a native-mode line's command,
+/// as the ULID text; `NULL` (every record written before, and every other record) reads as none.
+const V3: Migration = "ALTER TABLE records ADD COLUMN parent_record_id TEXT;";
+
 /// Every migration, in order: entry `n` takes the schema from version `n` to `n + 1`.
-pub(crate) const MIGRATIONS: &[Migration] = &[V1, V2];
+pub(crate) const MIGRATIONS: &[Migration] = &[V1, V2, V3];
 
 /// The schema version this build writes and understands.
 #[must_use]
@@ -237,9 +241,32 @@ mod tests {
             )
             .unwrap();
         migrate(&mut connection).unwrap();
-        assert_eq!(pragma(&connection, "user_version").unwrap(), 2);
+        assert_eq!(pragma(&connection, "user_version").unwrap(), current_version());
         let mut statement = connection
             .prepare("SELECT record_id, unprotected FROM records")
+            .unwrap();
+        assert_eq!(statement.step().unwrap(), Step::Row);
+        assert_eq!(statement.column_text(0).unwrap().as_deref(), Some("R"));
+        assert_eq!(statement.column_text(1).unwrap(), None);
+    }
+
+    // KNSH-108: a version-2 file with records gains the `parent_record_id` column, keeping its rows (read back as
+    // NULL).
+    #[test]
+    fn version_two_file_gains_the_parent_record_column() {
+        let dir = TempDir::new("v3");
+        let mut connection = open(&dir);
+        migrate_with(&mut connection, &MIGRATIONS[..2]).unwrap();
+        connection
+            .exec(
+                "INSERT INTO records (record_id, session_id, actor_kind, command, cwd, started_at) \
+                 VALUES ('R', 'S', 'agent', 'ls', x'2f', 1)",
+            )
+            .unwrap();
+        migrate(&mut connection).unwrap();
+        assert_eq!(pragma(&connection, "user_version").unwrap(), 3);
+        let mut statement = connection
+            .prepare("SELECT record_id, parent_record_id FROM records")
             .unwrap();
         assert_eq!(statement.step().unwrap(), Step::Row);
         assert_eq!(statement.column_text(0).unwrap().as_deref(), Some("R"));

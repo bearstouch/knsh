@@ -764,3 +764,37 @@ fn header_lists_known_gaps() {
     }
     assert!(lines.next().unwrap().starts_with("(deny default"));
 }
+
+// KNSH-108 (FR-LC-52): the native interpreter of a native-mode line may exec only the binaries the supervisor names
+// (its own), never fork, and reach no network: not the proxy, not a loopback port, not a Unix socket. Its file rules
+// and every fixed deny are the session's as for a command.
+#[test]
+fn interpreter_profile_runs_nothing_and_has_no_network() {
+    let profile = profile(
+        "[fs]\nwrite = [\"${PROJECT}\"]\n[exec]\nproject_executables = \"allow\"\n[network]\nloopback = [5432]",
+    );
+    let knsh = canonical("/opt/knsh/bin/knsh");
+    let text = compiled_with(
+        &profile,
+        CommandTag::Interpreter(record()),
+        std::slice::from_ref(&knsh),
+        Some(8080),
+    );
+    assert_eq!(
+        allowed_strings(&text, "process-exec"),
+        vec![b"/opt/knsh/bin/knsh".to_vec()]
+    );
+    assert!(allows_of(&text, "process-fork").is_empty(), "{text}");
+    assert!(allows_of(&text, "network-outbound").is_empty(), "{text}");
+    assert!(allows_of(&text, "network-bind").is_empty(), "{text}");
+    assert!(text.contains(";; knsh interpreter profile t"), "{text}");
+    // The same file rules and fixed denies as a command of the line.
+    let strings = |forms: Vec<Form>| forms.into_iter().map(|form| form.strings).collect::<Vec<_>>();
+    assert_eq!(strings(write_allows(&text)), strings(write_allows(&compiled(&profile))));
+    assert_eq!(
+        denies(&text).len(),
+        denies(&compiled_with(&profile, CommandTag::Line(record()), &[], Some(8080))).len()
+    );
+    // Tagged with the line's record, so a denial is attributed to the line.
+    assert!(text.contains(&tag()), "{text}");
+}

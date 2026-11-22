@@ -241,7 +241,9 @@ impl CommandSpawner for ScriptedCommands {
             .ok_or(PlatformError::UnknownProcessGroup)?;
         match child.planned.outcome {
             CommandOutcome::Finished(status) => Ok(ChildEvent::Exited(status)),
-            CommandOutcome::NotFound | CommandOutcome::NotExecutable => Err(PlatformError::NotScripted),
+            CommandOutcome::NotFound | CommandOutcome::NotExecutable | CommandOutcome::Denied => {
+                Err(PlatformError::NotScripted)
+            }
         }
     }
 

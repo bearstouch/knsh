@@ -59,7 +59,7 @@ impl RecordedOutput {
 /// The columns [`read_record`] expects, in order.
 const RECORD_COLUMNS: &str = "record_id, session_id, actor_kind, agent_id, command, rewritten_from, cwd, started_at, \
      ended_at, exit_code, pipestatus, signal, sandbox_profile, secrets_injected, checkpoint_id, sandbox_violations, \
-     decision, argv, network, unprotected, attribution, files_changed, irreversible";
+     decision, argv, network, unprotected, attribution, files_changed, irreversible, parent_record_id";
 
 /// The most distinct sandbox violations one record keeps (FR-SBX-08). Repeats of a kept one only add to its count;
 /// further distinct ones are dropped, so one noisy command cannot grow its record without bound.
@@ -147,7 +147,7 @@ impl Database {
         transaction.execute(
             &format!(
                 "INSERT INTO records ({RECORD_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)"
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)"
             ),
             &encoded.values(&record),
         )?;
@@ -490,6 +490,7 @@ struct Encoded {
     unprotected: Option<String>,
     files_changed: Option<String>,
     irreversible: Option<String>,
+    parent_record_id: Option<String>,
     started_at: i64,
     ended_at: Option<i64>,
 }
@@ -578,13 +579,15 @@ impl Encoded {
             unprotected,
             files_changed,
             irreversible,
+            // KNSH-108, schema version 3: the line record of a native-mode line's command.
+            parent_record_id: details.parent_record_id.map(|id| id.to_string()),
             started_at: micros(record.started_at)?,
             ended_at: record.ended_at.map(micros).transpose()?,
         })
     }
 
     /// The bound values, in [`RECORD_COLUMNS`] order.
-    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 23] {
+    fn values<'a>(&'a self, record: &'a ExecutionRecord) -> [Value<'a>; 24] {
         let details = &record.details;
         [
             Value::Text(&self.record_id),
@@ -613,6 +616,7 @@ impl Encoded {
             optional_text(details.attribution.map(Attribution::as_str)),
             optional_text(self.files_changed.as_deref()),
             optional_text(self.irreversible.as_deref()),
+            optional_text(self.parent_record_id.as_deref()),
         ]
     }
 }
@@ -657,6 +661,11 @@ fn read_record(statement: &Statement<'_>) -> Result<ExecutionRecord, StoreError>
             .transpose()
             .map_err(|_| StoreError::Corrupt)?,
         details: RecordDetails {
+            parent_record_id: statement
+                .column_text(23)?
+                .map(|id| id.parse::<RecordId>())
+                .transpose()
+                .map_err(corrupt)?,
             rewritten_from: statement.column_text(5)?.map(Redacted::new),
             pipestatus,
             signal: statement.column_text(11)?,

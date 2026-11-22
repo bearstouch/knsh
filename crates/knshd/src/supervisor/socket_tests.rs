@@ -114,6 +114,7 @@ impl Running {
             grants: crate::grants::GrantStore::new(),
             spawner: Arc::new(FakeSpawner::new(Arc::clone(&journal))),
             redactors: crate::redaction::Redactors::none(),
+            shim_dir: std::path::PathBuf::from("/Users/u/.knsh/shims"),
         });
         let shims = knsh_platform::EnginePaths::for_home(std::path::Path::new(HOME))
             .unwrap()

@@ -1169,6 +1169,9 @@ impl Attribution {
 /// [`RecordDetails::default`] before writing, whatever the caller supplied.
 #[derive(Debug, Clone, Default)]
 pub struct RecordDetails {
+    /// The line record of the native-mode line this record's command belongs to (FR-LC-54, KNSH-108); `None` for
+    /// every other record.
+    pub parent_record_id: Option<RecordId>,
     /// The original line when a rewrite was applied (FR-REC-04), already redacted.
     pub rewritten_from: Option<Redacted<String>>,
     /// Exit code of each command in the last pipeline.
@@ -1215,6 +1218,7 @@ impl RecordDetails {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         let Self {
+            parent_record_id,
             rewritten_from,
             pipestatus,
             signal,
@@ -1230,7 +1234,8 @@ impl RecordDetails {
             files_changed,
             irreversible,
         } = self;
-        rewritten_from.is_none()
+        parent_record_id.is_none()
+            && rewritten_from.is_none()
             && pipestatus.is_empty()
             && signal.is_none()
             && sandbox_profile.is_none()

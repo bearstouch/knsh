@@ -85,6 +85,7 @@ impl Rig {
             grants: crate::grants::GrantStore::new(),
             spawner: spawner(Arc::clone(&journal), file_events),
             redactors: crate::redaction::Redactors::none(),
+            shim_dir: std::path::PathBuf::from("/Users/u/.knsh/shims"),
         });
         Self {
             session_id: opened.session_id,

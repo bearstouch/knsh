@@ -29,6 +29,8 @@ knsh-toml = { path = "../knsh-toml" }
 # Native mode for humans (KNSH-107): the native interpreter and its line editor, opt-in with `[shell] hosted =
 # "native"`.
 knsh-interp = { path = "../knsh-interp" }
+# A native-mode agent line (KNSH-108) is parsed with the same parser the interpreter evaluates.
+knsh-bash = { path = "../knsh-bash" }
 
 [dev-dependencies]
 knsh-platform = { path = "../knsh-platform", features = ["testing"] }

@@ -1329,5 +1329,6 @@ mod interactive;
 mod jobs;
 mod posix;
 mod substitution;
+mod supervised;
 mod test_printf_read;
 mod traps_options;

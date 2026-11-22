@@ -109,11 +109,14 @@ pub enum DecisionSource {
     /// pipeline as a supervised line (FR-AGT-13, KNSH-094). The record's `rule_id` and `decided_by` still name the
     /// rule, hook, authority or user behind the verdict.
     EndpointSecurity,
+    /// The line record of a native-mode line (FR-LC-51, KNSH-108): admitted without a decision of its own, since each
+    /// command it starts is decided and recorded on its own. Never the source of a command's decision.
+    Native,
 }
 
 impl DecisionSource {
-    /// The record spelling: `rule`, `hook`, `authority`, `user`, `standalone`, `rate_limit`, `grant` or
-    /// `endpoint_security`.
+    /// The record spelling: `rule`, `hook`, `authority`, `user`, `standalone`, `rate_limit`, `grant`,
+    /// `endpoint_security` or `native`.
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
@@ -125,6 +128,7 @@ impl DecisionSource {
             Self::RateLimit => "rate_limit",
             Self::Grant => "grant",
             Self::EndpointSecurity => "endpoint_security",
+            Self::Native => "native",
         }
     }
 
@@ -140,6 +144,7 @@ impl DecisionSource {
             Self::RateLimit,
             Self::Grant,
             Self::EndpointSecurity,
+            Self::Native,
         ]
         .into_iter()
         .find(|source| source.code() == code)

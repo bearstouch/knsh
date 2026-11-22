@@ -254,6 +254,7 @@ mod regex;
 mod resolver;
 mod secret;
 mod signing;
+pub mod supervision;
 mod users;
 pub mod violation;
 mod volume;

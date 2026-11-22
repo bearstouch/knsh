@@ -12,6 +12,7 @@
 | Hooks registered | At most 32 | — | [hook](../05-models/hook.md) |
 | Hook stdout | At most 256 KiB; `reason` 1024 bytes; 16 labels of 64 bytes | — | [hook](../05-models/hook.md) |
 | Rate limit | 5 denials of the same normalised line in 60 s → denied for 10 minutes | — | [hooks](../03-functional-requirements/hooks.md) |
+| Native-mode supervision channel (KNSH-108) | Requests of at most 1 MiB (the frame limit); a command's descriptor table of at most 64 descriptors, numbers 0 to 255, at most 16 above 2 (`knsh-exec --keep-fd`); at most 256 commands of one line running at once, more are denied. A closed standard descriptor (`>&-`) is given to the command as `/dev/null`, since `knsh-exec` refuses closed stdio | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md#native-mode-knsh-108) |
 | `command.long_running` | 30 s | Yes (`Limits` in `knshd`; no configuration file key yet) | [command lifecycle](../03-functional-requirements/command-lifecycle.md) |
 | Timeout kill grace | At `timeout_s`, `SIGTERM` to the line's process group, then `SIGKILL` after 2 s if anything is left; the group is killed once more before its leader is reaped | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md#spawning-knsh-051) |
 | Supervised line watch | Checked every 1 ms at first, backing off to every 50 ms: timeouts and `command.long_running` fire at most 50 ms late | — | [command lifecycle](../03-functional-requirements/command-lifecycle.md#spawning-knsh-051) |

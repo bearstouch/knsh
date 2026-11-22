@@ -1468,6 +1468,8 @@ impl Interpreter {
                 self.report(span, run, format_args!("{name}: cannot execute"));
                 Status::NOT_EXECUTABLE
             }
+            // KNSH-108 (FR-LC-55): the supervisor denied it and the spawner already printed the reason.
+            CommandOutcome::Denied => Status::NOT_EXECUTABLE,
         }
     }
 }

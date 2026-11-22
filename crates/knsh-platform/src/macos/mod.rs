@@ -28,6 +28,7 @@ mod random;
 mod redirect;
 mod resolver;
 mod shell_host;
+mod supervision;
 mod thread;
 mod users;
 mod volumes;
@@ -37,7 +38,10 @@ pub use ancestry::SystemProcessTree;
 pub use clock::SystemClock;
 pub use collation::SystemCollation;
 pub use denials::UnifiedLogDenials;
-pub use descriptors::{MAX_PASSED_DESCRIPTORS, peer_closed, recv_with_descriptors, send_with_descriptors};
+pub use descriptors::{
+    MAX_COMMAND_DESCRIPTORS, MAX_PASSED_DESCRIPTORS, peer_closed, recv_with_descriptors, recv_with_descriptors_up_to,
+    send_with_descriptors, send_with_descriptors_up_to,
+};
 pub use digest::{SHA256_LEN, hmac_sha256, sha256, sha256_reader};
 pub use endpoint_security::SystemDescendantClients;
 pub use fs::RealFs;
@@ -60,6 +64,7 @@ pub use random::SystemRandom;
 pub use redirect::SystemDescriptors;
 pub use resolver::SystemResolver;
 pub use shell_host::{JobSignalsIgnored, TelemetryPipe, reraise_default};
+pub use supervision::{RequestReader, SocketLink, inherited_stream, write_frame};
 pub use thread::set_current_thread_utility_qos;
 pub use users::{SystemUserHomes, user_name};
 pub use volumes::SystemVolumes;
