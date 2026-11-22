@@ -7,7 +7,7 @@
 [package]
 name = "knsh-fuzz"
 description = "Fuzz targets for knsh parsers; test-only, never shipped"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 publish = false
 license = "MIT"

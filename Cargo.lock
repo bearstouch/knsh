@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "knsh"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-bash",
  "knsh-core",
@@ -17,11 +17,11 @@ dependencies = [
 
 [[package]]
 name = "knsh-bash"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "knsh-checkpoint"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-core",
  "knsh-json",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "knsh-conformance"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-bash",
  "knsh-corpus",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "knsh-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-bash",
  "knsh-json",
@@ -49,14 +49,14 @@ dependencies = [
 
 [[package]]
 name = "knsh-corpus"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-json",
 ]
 
 [[package]]
 name = "knsh-difftest"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-bash",
  "knsh-corpus",
@@ -64,11 +64,11 @@ dependencies = [
 
 [[package]]
 name = "knsh-exec"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "knsh-interp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-bash",
  "knsh-platform",
@@ -76,11 +76,11 @@ dependencies = [
 
 [[package]]
 name = "knsh-json"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "knsh-platform"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-core",
  "knsh-json",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "knsh-proto"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-bash",
  "knsh-core",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "knsh-proxy"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-core",
  "knsh-platform",
@@ -106,14 +106,14 @@ dependencies = [
 
 [[package]]
 name = "knsh-sandbox"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-core",
 ]
 
 [[package]]
 name = "knsh-store"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-core",
  "knsh-platform",
@@ -121,11 +121,11 @@ dependencies = [
 
 [[package]]
 name = "knsh-toml"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "knshd"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-bash",
  "knsh-checkpoint",
@@ -147,4 +147,4 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.1.0"

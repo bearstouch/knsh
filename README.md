@@ -5,37 +5,39 @@
 A bash/zsh-compatible shell that lets AI agents run commands under recording, policy, operating-system sandboxing and best-effort undo. The engine provides mechanisms only: it records, enforces and reports; an external, code-signed **authority** decides and presents. macOS first (14+), Linux later.
 
 > [!WARNING]
-> **Phase 1 is advisory.** This build gives **no security guarantees** and is **not for running agents unattended**. It observes and records human shell sessions; it enforces nothing. `knsh --version` and the `hello` handshake (`advisory: true`) say the same. The first release that is safe to give to agents is phase 2 ([roadmap](specs/01-overview/roadmap.md)).
+> **This build is advisory.** It gives **no security guarantees** and is **not for running agents unattended**. `knsh --version` and the `hello` handshake (`advisory: true`) say the same. The label goes when the phase 2 release gates in the [roadmap](specs/01-overview/roadmap.md) are met; see the [changelog](CHANGELOG.md) for what is still open.
 
 | Binary | Role |
 | --- | --- |
 | `knsh` | Human shell (integration mode around stock zsh or bash), in-envelope agent client and CLI |
 | `knshd` | Per-user daemon and supervisor, started on demand by launchd |
-| `knsh-exec` | Single-threaded sandbox trampoline: applies a Seatbelt profile, then execs (phase 2) |
+| `knsh-exec` | Single-threaded sandbox trampoline: applies a Seatbelt profile, then execs |
 
 ## Features
 
-What phase 1 (**Observe**) ships today:
+Phases 1 to 4 of the [roadmap](specs/01-overview/roadmap.md) are implemented on macOS; [CHANGELOG.md](CHANGELOG.md) lists what each version added.
 
-- **Integration mode:** `knsh` hosts your own zsh or bash unchanged, with no dotfile edits. It picks the shell named by `[shell] hosted`, else your `$SHELL` if it is bash, else zsh, and starts it as a login shell when invoked as one (`-l`, `--login`, `-knsh`).
-- **Shell integration marks:** OSC 7 (working directory) and OSC 133 (prompt and command boundaries), so terminals can track directories and jump between prompts.
-- **Opt-in recording:** with `[recording] human = true` in `~/.config/knsh/config.toml`, human command lines are recorded by `knshd`. The shell exports `KNSH_RECORDING=1` so your prompt can show it. With recording off, `knsh` never contacts `knshd`.
-- **Records and events:** `knshd` serves a local `user.sock` with a record store (system SQLite, redaction at write time, retention) and an event bus with per-session sequencing and replay.
-- **CLI:** `knsh history` queries records, `knsh events` streams events, `knsh forget` deletes records. Every command takes `--json`.
-- **launchd integration:** `knsh daemon install` installs the per-user `knshd` launch agent with socket activation and idle exit; `knsh shell install` adds `knsh` to `/etc/shells` so `chsh` accepts it.
+| Phase | Name | Status | Delivers |
+| --- | --- | --- | --- |
+| 1 | **Observe** | Done | Integration mode for your own zsh or bash, opt-in recording, records, events, `user.sock` and the CLI |
+| 2 | **Contain and decide** | Done; release gates open | Envelopes, the supervisor, `knsh-exec`, deny-by-default Seatbelt profiles, the network proxy, `agent.sock`, the XPC control service and authority, signed policy, approvals, rate limiting |
+| 3 | **Reverse and protect** | Done | APFS checkpoints with undo and redo, secrets and redaction, irreversible-action flags |
+| 4 | **Native interpreter** | Done; opt-in | `knsh`'s own bash 5.2 interpreter, with a decision per simple command, including inside scripts and functions |
+| 5 | **Linux** | Planned | Landlock and seccomp backends behind the same API |
+| 6 | **Later** | Planned | Command introspection, an MCP client, session replay, optional structured pipelines |
+
+Highlights:
+
+- **Integration mode:** `knsh` hosts your own zsh or bash unchanged, with no dotfile edits. It picks the shell named by `[shell] hosted`, else your `$SHELL` if it is bash, else zsh, and starts it as a login shell when invoked as one (`-l`, `--login`, `-knsh`). OSC 7 and OSC 133 marks let terminals track directories and prompts.
+- **Recording and records:** with `[recording] human = true`, human command lines are recorded by `knshd` (system SQLite, redaction at write time, retention), and `knsh history`, `knsh events` and `knsh forget` query, stream and delete them.
+- **Agents in envelopes:** `knsh agent` starts an agent CLI (presets for Claude Code and Codex CLI) in a Seatbelt envelope. Each line is parsed, checked against signed policy, decided by the authority or a local approval, and run by the supervisor through `knsh-exec`; network traffic goes through the proxy.
+- **Undo:** checkpoints capture what each agent line changes; `knsh undo`, `knsh redo` and `knsh checkpoints` move between states.
+- **Secrets:** from the Keychain or the authority, injected per command and redacted on every output path.
+- **Native mode:** `[shell] hosted = "native"` runs `knsh`'s own bash 5.2 interpreter; agent lines in native mode are decided per simple command. A conformance gate measures it against bash 5.2 (99.57% of the agent-command corpus).
 - **Fast start-up:** under 9 ms added to the first prompt at p95 on an M1 Pro, against a 50 ms target ([performance validation](specs/07-testing/performance-validation.md)).
 - **Minimal supply chain:** one third-party runtime crate (`libc`), vendored and exactly pinned. JSON, TOML, the frame codec, CLI parsing and the SQLite binding are written in-house, and every parser is fuzzed.
 
-What comes next, phase by phase ([roadmap](specs/01-overview/roadmap.md)):
-
-| Phase | Name | Delivers |
-| --- | --- | --- |
-| 2 | **Contain and decide** | Envelopes, the supervisor, `knsh-exec`, deny-by-default Seatbelt profiles, the network proxy, `agent.sock`, the XPC control service and authority, signed policy, approvals, rate limiting. The first release safe for agents |
-| 3 | **Reverse and protect** | Checkpoints with undo and redo, secrets, irreversible-action flags |
-| 4 | **Native interpreter** | Decisions per simple command, including inside scripts and functions |
-| 5 | **Linux** | Landlock and seccomp backends behind the same API |
-
-The CLI already lists the later commands (`agent`, `run`, `undo`, `policy`, `approve`, …); in phase 1 they report that they are not implemented yet.
+Not implemented yet: `knsh run` and `knsh policy check` report so.
 
 ## Quick start
 
@@ -43,7 +45,7 @@ The CLI already lists the later commands (`agent`, `run`, `undo`, `policy`, `app
 git clone https://github.com/bearstouch/knsh.git
 cd knsh
 cargo build --workspace --offline --locked
-target/debug/knsh --version        # prints the version and "advisory"
+target/debug/knsh --version        # knsh 0.1.0, then the advisory label
 target/debug/knsh                  # your zsh or bash, hosted by knsh
 ```
 
@@ -167,7 +169,7 @@ Each crate has one concern, and dependencies point downwards only (binaries → 
 
 [`ci.yml`](.github/workflows/ci.yml) runs on every push and pull request, on a pinned `macos-15` Apple silicon runner with Xcode 16.4. Each job step calls `scripts/check.sh <step>`, so CI and local runs cannot drift apart: format, clippy, an offline no-network build with `-D warnings`, docs, tests, and `cargo deny` (licences, advisories, duplicate versions). No step may fail.
 
-There are no releases yet. The project ships nothing before the phase 2 gates in the [roadmap](specs/01-overview/roadmap.md) are met.
+The current version is **0.1.0**; what each version changed is in the [changelog](CHANGELOG.md). Builds stay labelled advisory until the phase 2 gates in the [roadmap](specs/01-overview/roadmap.md) are met.
 
 ## Specification
 

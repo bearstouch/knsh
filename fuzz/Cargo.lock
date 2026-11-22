@@ -55,11 +55,11 @@ dependencies = [
 
 [[package]]
 name = "knsh-bash"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "knsh-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-bash",
  "knsh-json",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "knsh-fuzz"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-bash",
  "knsh-core",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "knsh-interp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-bash",
  "knsh-platform",
@@ -90,11 +90,11 @@ dependencies = [
 
 [[package]]
 name = "knsh-json"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "knsh-platform"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-core",
  "knsh-json",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "knsh-proxy"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "knsh-core",
  "knsh-platform",
@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "knsh-toml"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "libc"
