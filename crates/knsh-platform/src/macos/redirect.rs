@@ -344,6 +344,44 @@ impl Descriptors for SystemDescriptors {
         Ok(Some(TerminalSettings { saved: Some(saved) }))
     }
 
+    fn set_editor_input(&self, fd: &SharedFd) -> Result<Option<TerminalSettings>, PlatformError> {
+        if !self.is_terminal(fd) {
+            return Ok(None);
+        }
+        let terminal = |result: libc::c_int| {
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(PlatformError::from_io(
+                    Operation::Terminal,
+                    &std::io::Error::last_os_error(),
+                ))
+            }
+        };
+        // SAFETY: an all-zero `termios` is a valid value of the plain C struct; `tcgetattr` overwrites it.
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `saved` is a valid, writable `termios` for the duration of the call; `fd` is held open.
+        terminal(unsafe { libc::tcgetattr(fd.as_raw_fd(), &raw mut saved) })?;
+        let mut changed = saved;
+        // Readline's `prepare_terminal_settings`, with signals and flow control off (see the trait).
+        changed.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ECHOK | libc::ECHONL | libc::ISIG | libc::IEXTEN);
+        changed.c_iflag &= !(libc::ICRNL | libc::INLCR | libc::IXON);
+        changed.c_cc[libc::VMIN] = 1;
+        changed.c_cc[libc::VTIME] = 0;
+        // SAFETY: `changed` is a valid `termios` read for the duration of the call; `fd` is held open.
+        terminal(unsafe { libc::tcsetattr(fd.as_raw_fd(), libc::TCSADRAIN, &raw const changed) })?;
+        Ok(Some(TerminalSettings { saved: Some(saved) }))
+    }
+
+    fn terminal_columns(&self, fd: &SharedFd) -> Option<u16> {
+        // SAFETY: an all-zero `winsize` is a valid value of the plain C struct; `ioctl` overwrites it.
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: `TIOCGWINSZ` writes one `winsize` through the pointer, which is valid and writable for the call;
+        // `fd` is held open.
+        let result = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCGWINSZ, &raw mut size) };
+        (result == 0 && size.ws_col > 0).then_some(size.ws_col)
+    }
+
     fn restore_terminal(&self, fd: &SharedFd, saved: &TerminalSettings) -> Result<(), PlatformError> {
         let Some(termios) = saved.saved else {
             return Ok(());

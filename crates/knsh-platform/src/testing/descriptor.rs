@@ -44,6 +44,9 @@ pub enum FakeOpened {
 /// Largest file the fake reads back when appending, far above anything a test writes.
 const READ_LIMIT: u64 = 1 << 24;
 
+/// The width [`FakeDescriptors`] reports for a descriptor marked as a terminal (KNSH-107).
+pub const FAKE_TERMINAL_COLUMNS: u16 = 80;
+
 /// How long a read of an empty data pipe whose writer is still alive waits before failing with `EIO`: far above any
 /// test's own work, so a test that would wait forever fails instead of hanging.
 const PIPE_WAIT_LIMIT: Duration = Duration::from_secs(20);
@@ -418,6 +421,22 @@ impl Descriptors for FakeDescriptors {
         }
         lock(&self.terminal_changes).push(Some(input));
         Ok(Some(TerminalSettings::fake()))
+    }
+
+    fn set_editor_input(&self, fd: &SharedFd) -> Result<Option<TerminalSettings>, PlatformError> {
+        if !self.is_terminal(fd) {
+            return Ok(None);
+        }
+        // Recorded as the settings `read -s -n` would ask for: no echo, not canonical.
+        lock(&self.terminal_changes).push(Some(TerminalInput {
+            echo: false,
+            canonical: false,
+        }));
+        Ok(Some(TerminalSettings::fake()))
+    }
+
+    fn terminal_columns(&self, fd: &SharedFd) -> Option<u16> {
+        self.is_terminal(fd).then_some(FAKE_TERMINAL_COLUMNS)
     }
 
     fn restore_terminal(&self, _fd: &SharedFd, _saved: &TerminalSettings) -> Result<(), PlatformError> {

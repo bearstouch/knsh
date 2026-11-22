@@ -7,7 +7,8 @@
 //!
 //! Talks to `knshd` only through the protocol. Depends on `knsh-proto` and `knsh-json`, on `knsh-core` for the ID and
 //! timestamp types it validates before sending, on `knsh-platform` for engine paths and the launchd agent that
-//! `knsh daemon` installs (KNSH-012), and on `knsh-toml` for the user settings file (KNSH-021). Command-line parsing is
+//! `knsh daemon` installs (KNSH-012), on `knsh-toml` for the user settings file (KNSH-021), and on `knsh-interp` for
+//! native mode (KNSH-107). Command-line parsing is
 //! written in-house ([`cli::args`]): the dependency policy allows no CLI-parsing crate.
 //!
 //! # Specification
@@ -30,6 +31,9 @@
 //!   shims, FR-AGT-10, FR-LC-14, FR-LC-31, FR-OUT-04, FR-AGT-31, NFR-COMPAT-09, NFR-REL-01
 //! - `specs/06-api/cli.md` "Version and the advisory label", `specs/01-overview/roadmap.md` — [`cli::version`],
 //!   KNSH-024: `knsh --version` labels phase 1 builds advisory
+//! - `specs/08-integrations/terminals-and-shells.md#native-mode-knsh-107` — `native`, KNSH-107: the native interpreter
+//!   (`knsh-interp`) as a human's interactive shell with its line editor, opt-in with `[shell] hosted = "native"`,
+//!   NFR-COMPAT-06, NFR-COMPAT-10, NFR-PERF-04, FR-SES-22
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
@@ -39,3 +43,5 @@
 pub mod agent;
 pub mod cli;
 pub mod integration;
+#[cfg(target_os = "macos")]
+pub mod native;

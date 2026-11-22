@@ -169,13 +169,7 @@ impl Interpreter {
                         }
                     }
                     _ => {
-                        let listing = match options::set_o_listing(self.state.options(), interactive) {
-                            Ok(listing) => listing,
-                            Err(error) => {
-                                self.option_error(error, "set", "invalid option name", "", span, run)?;
-                                return Ok(Status::FAILURE);
-                            }
-                        };
+                        let listing = options::set_o_listing(self.state.options());
                         let text = set_o_text(&listing, !on);
                         if !self.print("set", text.as_bytes(), span, run).is_success() {
                             return Ok(Status::FAILURE);
@@ -215,7 +209,6 @@ impl Interpreter {
         } else {
             "invalid shell option name"
         };
-        let interactive = self.state.is_interactive();
         if (flags.set || flags.unset) && !names.is_empty() {
             let mut status = Status::SUCCESS;
             for name in names {
@@ -233,13 +226,7 @@ impl Interpreter {
         }
         let listing: Vec<(String, bool)> = if names.is_empty() {
             let all = if flags.set_o {
-                options::set_o_listing(self.state.options(), interactive).map_err(|error| {
-                    let feature = match error {
-                        OptionError::Refused(feature) => feature,
-                        OptionError::Unknown => Unsupported::ShellOption,
-                    };
-                    unsupported(feature, span)
-                })?
+                options::set_o_listing(self.state.options())
             } else {
                 options::shopt_listing(self.state.options())
             };
@@ -253,7 +240,7 @@ impl Interpreter {
             let mut status = Status::SUCCESS;
             for name in names {
                 let value = if flags.set_o {
-                    options::set_o(self.state.options(), interactive, name)
+                    options::set_o(self.state.options(), name)
                 } else {
                     options::shopt(self.state.options(), name)
                 };

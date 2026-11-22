@@ -49,9 +49,9 @@ enum Kind {
 }
 
 /// How bash reports a syntax error in nested text.
-struct SyntaxError {
+pub(super) struct SyntaxError {
     /// The message after `line n: `.
-    message: String,
+    pub(super) message: String,
     /// The line it is reported on, in the text (1 for the first).
     line: usize,
     /// The line echoed after it (`` `a )' ``), for an unexpected token.
@@ -324,7 +324,7 @@ impl Interpreter {
 }
 
 /// Bash's report of `error` in `text`, if it can be given exactly.
-fn describe(error: &ParseError, text: &str) -> Option<SyntaxError> {
+pub(super) fn describe(error: &ParseError, text: &str) -> Option<SyntaxError> {
     let line_of = |at: usize| text.get(..at).map_or(1, |before| before.matches('\n').count() + 1);
     let line_start = |at: usize| {
         text.get(..at)

@@ -191,6 +191,7 @@ impl Seed<'_> {
             usage_error: false,
             bad_assignment: false,
             command_depth: self.command_depth,
+            exited: false,
         }
     }
 }

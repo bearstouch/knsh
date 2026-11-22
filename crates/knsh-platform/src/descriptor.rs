@@ -157,6 +157,24 @@ pub trait Descriptors: Send + Sync {
         input: TerminalInput,
     ) -> Result<Option<TerminalSettings>, PlatformError>;
 
+    /// When `fd` is a terminal, sets it up for the interactive line editor (KNSH-107) and returns its settings
+    /// before, to put back with [`Descriptors::restore_terminal`]; `None` when it is not a terminal (nothing
+    /// changed). As readline's `prepare_terminal_settings`: no echo, characters one at a time, carriage return not
+    /// turned into newline, and the literal-next character off; unlike readline, the interrupt, quit and suspend
+    /// characters arrive as input instead of signals (the editor handles Ctrl-C itself, and a human shell must not
+    /// be stopped by a signal sent to itself while it reads), and output flow control is off so Ctrl-S and Ctrl-Q
+    /// reach the editor.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Os`] with [`Operation::Terminal`](crate::Operation::Terminal) if the settings could not be
+    /// read or changed.
+    fn set_editor_input(&self, fd: &SharedFd) -> Result<Option<TerminalSettings>, PlatformError>;
+
+    /// The width of terminal `fd` in columns (`TIOCGWINSZ`), read again each time so a resized window is followed
+    /// (bash's `checkwinsize`); `None` when `fd` is not a terminal or reports no width.
+    fn terminal_columns(&self, fd: &SharedFd) -> Option<u16>;
+
     /// Puts back `saved`, the settings [`Descriptors::set_terminal_input`] returned for `fd`.
     ///
     /// # Errors

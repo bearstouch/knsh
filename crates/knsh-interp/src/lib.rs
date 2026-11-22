@@ -125,6 +125,7 @@ mod error;
 mod eval;
 mod expand;
 mod glob;
+pub mod interactive;
 mod jobs;
 mod lookup;
 mod observer;
@@ -142,6 +143,7 @@ mod word;
 
 pub use arith::{Failure as ArithmeticError, MAX_ARITH_DEPTH, evaluate_arithmetic};
 pub use error::{InterpError, Unsupported};
+pub use eval::interactive::{Completion, LineStatus, continues_line, is_incomplete};
 pub use eval::{EVAL_STACK_SIZE, Interpreter, MAX_EVAL_DEPTH};
 pub use jobs::{JobSignals, MAX_REMEMBERED_JOBS};
 pub use observer::{DirectoryObserver, Osc7, osc7};
