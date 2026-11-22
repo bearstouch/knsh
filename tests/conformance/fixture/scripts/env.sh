@@ -1,0 +1,1 @@
+export FIXTURE_ENV=1

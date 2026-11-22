@@ -68,6 +68,12 @@ const LAYOUT: &[(&str, &[&str])] = &[
     ("knsh-corpus", &["knsh-json"]),
     // Dev-only differential harness (KNSH-034): parses corpus lines and compares with bash; nothing may depend on it.
     ("knsh-difftest", &["knsh-bash", "knsh-corpus"]),
+    // Dev-only conformance gate (KNSH-109): runs corpus lines and spec cases under the native interpreter and bash
+    // 5.2; nothing may depend on it.
+    (
+        "knsh-conformance",
+        &["knsh-bash", "knsh-corpus", "knsh-interp", "knsh-platform"],
+    ),
 ];
 
 /// One `[[package]]` entry of `Cargo.lock`.

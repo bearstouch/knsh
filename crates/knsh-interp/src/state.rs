@@ -984,7 +984,12 @@ impl ShellState {
             return self.bash_source_element(key);
         }
         let Some(value) = self.value(name).map_err(ElementError::Unsupported)? else {
-            return Ok(None);
+            // To bash an unset name is an empty indexed array: a negative index is before its first element
+            // (KNSH-109, corpus `echo "${arr[-1]}"`).
+            return match key {
+                Key::Index(index) if *index < 0 => Err(ElementError::BadSubscript),
+                Key::Index(_) | Key::Name(_) => Ok(None),
+            };
         };
         value
             .element(key)

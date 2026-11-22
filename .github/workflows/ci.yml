@@ -6,6 +6,8 @@ name: CI
 on:
   push:
   pull_request:
+  # KNSH-109: run the native-mode conformance gate on demand.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -144,6 +146,47 @@ jobs:
         with:
           name: threat-model-report-${{ matrix.runner }}
           path: target/threat-model/report.md
+          if-no-files-found: ignore
+
+  conformance:
+    # KNSH-109 (NFR-COMPAT-02, NFR-COMPAT-05, NFR-COMPAT-07, NFR-COMPAT-11): native mode against bash 5.2 over the
+    # agent-command corpus, the bash-compatible Oils subset and bash's own test suite. It builds bash 5.2.37 and fetches
+    # a pinned Oils commit (both checked against their SHA-256 in scripts/conformance.sh), so it runs on every release
+    # tag, where the 99% corpus gate is enforced, on pushes to master and on demand; the report is published each time.
+    name: native conformance (macOS, Apple silicon)
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustc --version
+
+      - name: Conformance gate (99% corpus gate enforced on v* tags)
+        run: scripts/conformance.sh
+
+      - name: Publish conformance report
+        if: always()
+        run: |
+          if [ -f target/conformance/report.md ]; then
+            cat target/conformance/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload conformance report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-conformance-report
+          path: target/conformance/report.md
           if-no-files-found: ignore
 
   fuzz:

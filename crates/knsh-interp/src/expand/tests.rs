@@ -650,3 +650,58 @@ fn deeply_nested_expansions_are_bounded() {
         );
     }
 }
+
+// ---- Unset names as arrays (KNSH-109: corpus lines that differed from bash 5.2) ----
+
+// NFR-COMPAT-11: `"${arr[@]}"` of a name never set is no word at all, as `"$@"` with no parameters; `[*]` is one
+// empty word; a default still sees the name as unset.
+#[test]
+fn quoted_all_elements_of_unset_name_is_no_word() {
+    assert_eq!(expand(&[], r#""${arr[@]}" "${#arr[@]}""#), ["0"]);
+    assert_eq!(expand(&[], r#""${arr[*]}" x"#), ["", "x"]);
+    assert_eq!(expand(&[], r#""a${arr[@]}b""#), ["ab"]);
+    assert_eq!(expand(&[], r#""${arr[@]-unset}""#), ["unset"]);
+    assert_eq!(expand(&[], r#""${arr[@]+set}" x"#), ["x"]);
+    assert_eq!(
+        expand(
+            &[],
+            r#""${arr[*]+set}" "${*+set}" "${@+set}" "${arr[@]:+set}" "${x+set}" x"#
+        ),
+        ["", "", "", "x"]
+    );
+    // A list that has elements, all empty, is null but set: `:+` leaves one empty word, as in bash 5.2.
+    assert_eq!(expand_with(&[""], &[], r#""${@:+set}" x"#), ["", "x"]);
+    assert_eq!(expand_with(&[], &[("b", "")], r#""${b[@]:+set}" x"#), ["", "x"]);
+    assert_eq!(expand_with(&[], &[], r#""${@:+set}" x"#), ["x"]);
+}
+
+// NFR-COMPAT-11: a negative index into a name never set is before its first element: bash reports
+// `name: bad array subscript` and reads it as unset.
+#[test]
+fn negative_index_of_unset_name_is_bad_subscript() {
+    let mut state = state(&[], &[]);
+    assert_eq!(expand_in(&mut state, r#""${arr[-1]}""#).unwrap(), [""]);
+    assert_eq!(state.take_notes(), ["arr: bad array subscript"]);
+    assert_eq!(expand_in(&mut state, r#""${arr[0]}""#).unwrap(), [""]);
+    assert_eq!(state.take_notes(), Vec::<String>::new());
+}
+
+// NFR-COMPAT-11: the length of an unset name's elements is 0 with no subscript message, and `set -u` still stops
+// on it with bash 5.2's `arr: unbound variable`.
+#[test]
+fn length_of_unset_name_elements_is_zero_or_unbound() {
+    let mut state = state(&[], &[]);
+    assert_eq!(
+        expand_in(&mut state, "${#arr[@]} ${#arr[*]} ${#arr[-1]} ${#arr[0]}").unwrap(),
+        ["0", "0", "0", "0"]
+    );
+    assert_eq!(state.take_notes(), Vec::<String>::new());
+    state.options_mut().nounset = true;
+    for words in ["${#arr[@]}", "${#arr[*]}", "${#arr[-1]}", "${#arr[0]}"] {
+        assert_eq!(
+            error_in(&mut state, words),
+            ExpandError::Fatal("arr: unbound variable".to_owned()),
+            "{words}"
+        );
+    }
+}

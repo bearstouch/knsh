@@ -645,8 +645,15 @@ impl<'a> Expander<'a> {
                 },
                 _ => None,
             },
-            Name::Element(array, Subscript::All { star }) => self.elements(array, span)?.map(|elements| Value::List {
-                items: elements.into_iter().map(|(_, value)| value).collect(),
+            // An unset name has no elements: `"${a[@]}"` is then no word at all, as `"$@"` with no parameters is
+            // (KNSH-109, corpus `echo "${arr[@]}" "${#arr[@]}"`). `${a[@]-word}` reads an empty list as unset.
+            Name::Element(array, Subscript::All { star }) => Some(Value::List {
+                items: self
+                    .elements(array, span)?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(_, value)| value)
+                    .collect(),
                 star: *star,
             }),
             Name::Element(array, subscript) => {
@@ -789,6 +796,16 @@ impl<'a> Expander<'a> {
             Parsed::Bad => Err(self.posix_fatal(ExpandError::Discard(format!("{whole}: bad substitution")))),
             Parsed::Unsupported(feature) => Err(InterpError::Unsupported { feature, span }.into()),
             Parsed::Length(name) => {
+                // `${#a[@]}` and `${#a[i]}` of a name never set: 0 with no subscript message, or `a: unbound
+                // variable` under `set -u` (bash 5.2). `lookup` reads `a[@]` of an unset name as an empty list
+                // and reports a negative index, so it is not asked (KNSH-109).
+                if let Name::Element(array, _) = &name
+                    && self.elements(array, span)?.is_none()
+                {
+                    self.require(None, &name, array)?;
+                    out.push_str("0", quoted, true);
+                    return Ok(());
+                }
                 let length = match self.lookup(&name, span)? {
                     Some(Value::List { items, .. }) => items.len(),
                     Some(Value::Str(value)) => value.chars().count(),
@@ -992,7 +1009,15 @@ impl<'a> Expander<'a> {
         match kind {
             DefaultKind::Use if missing => self.word(word, quoted, out),
             DefaultKind::Alternative if !missing => self.word(word, quoted, out),
-            DefaultKind::Alternative => Ok(()),
+            DefaultKind::Alternative => {
+                // `"${@+word}"` and `"${a[@]+word}"` with no elements are no word at all, as the list itself
+                // would be; a `*` list, a string, or a list of empty elements under `:+` (`set -- ""; "${@:+x}"`)
+                // leaves an empty word (bash 5.2, KNSH-109).
+                if matches!(&value, Some(Value::List { star: false, items }) if items.is_empty()) {
+                    out.vanished += 1;
+                }
+                Ok(())
+            }
             DefaultKind::Assign if missing => {
                 if let Name::Element(array, subscript) = target {
                     if matches!(subscript, Subscript::All { .. }) {

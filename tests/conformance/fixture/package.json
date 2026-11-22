@@ -1,0 +1,6 @@
+{
+  "name": "fixture",
+  "version": "1.0.0",
+  "scripts": { "test": "echo no tests" },
+  "dependencies": { "left-pad": "1.3.0", "react": "18.3.1" }
+}

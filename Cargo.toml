@@ -24,6 +24,8 @@ members = [
     "tools/corpus",
     # Dev-only differential parser harness against real bash (KNSH-034); never shipped.
     "tools/difftest",
+    # Dev-only phase 4 conformance gate: native mode against bash 5.2 (KNSH-109); never shipped.
+    "tools/conformance",
 ]
 # Test-only fuzz targets (KNSH-005, NFR-SUP-05): a separate workspace with its own lockfile, so the
 # fuzzing crates never enter the shipped dependency graph.

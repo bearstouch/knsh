@@ -1,0 +1,20 @@
+[package]
+name = "knsh-conformance"
+description = "Dev-only phase 4 conformance gate: native mode against bash 5.2 over the corpus, the Oils subset and the bash test suite (KNSH-109); never shipped"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+# Dev-only tool. It reads the corpus with knsh-corpus and runs lines with the native interpreter (knsh-interp over
+# knsh-platform's real system services), exactly as the parser parses them (knsh-bash). It adds no third-party crate,
+# and no shipped crate may depend on it (xtask/tests/dependency_policy.rs).
+[dependencies]
+knsh-bash = { path = "../../crates/knsh-bash" }
+knsh-corpus = { path = "../corpus" }
+knsh-interp = { path = "../../crates/knsh-interp" }
+knsh-platform = { path = "../../crates/knsh-platform" }
+
+[lints]
+workspace = true
