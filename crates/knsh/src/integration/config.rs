@@ -12,6 +12,7 @@
 //!
 //! [shell]
 //! hosted = "bash"     # "zsh", "bash", "native", or an absolute path to a program named zsh or bash
+//! banner = true       # the start and end messages of an interactive session; false silences them
 //! ```
 //!
 //! Each setting is read on its own: an unclear one never changes the other. [`read_settings`] reads the file once.
@@ -56,6 +57,9 @@ const SHELL_TABLE: &str = "shell";
 /// The key that names the hosted shell.
 const HOSTED_KEY: &str = "hosted";
 
+/// The key that turns the session start and end messages on or off.
+const BANNER_KEY: &str = "banner";
+
 /// Why the recording setting could not be read. Recording is then off. Messages name no value from the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
@@ -73,8 +77,10 @@ pub enum ConfigError {
     ShellNotATable,
     /// `shell.hosted` is not `"zsh"`, `"bash"`, or an absolute path to a program named `zsh` or `bash`.
     InvalidHostedShell,
-    /// `[shell]` has a key other than `hosted`.
+    /// `[shell]` has a key other than `hosted` and `banner`.
     UnknownShellKey,
+    /// `shell.banner` is not `true` or `false`.
+    BannerNotABoolean,
 }
 
 impl fmt::Display for ConfigError {
@@ -90,6 +96,7 @@ impl fmt::Display for ConfigError {
                 "'shell.hosted' must be \"zsh\", \"bash\", or an absolute path to a program named zsh or bash",
             ),
             Self::UnknownShellKey => f.write_str("unknown key in [shell]"),
+            Self::BannerNotABoolean => f.write_str("'shell.banner' must be true or false"),
         }
     }
 }
@@ -125,6 +132,9 @@ pub struct Settings {
     pub recording: Result<bool, ConfigError>,
     /// `[shell] hosted`: `Ok(None)` when not set.
     pub hosted_shell: Result<Option<HostedShell>, ConfigError>,
+    /// `[shell] banner`: the session start and end messages; on unless `Ok(false)`. An unclear value keeps them on:
+    /// they are only text on a terminal's standard error.
+    pub banner: Result<bool, ConfigError>,
 }
 
 /// Every setting at its default: recording off (FR-SES-04), no hosted shell chosen.
@@ -133,6 +143,7 @@ impl Default for Settings {
         Self {
             recording: Ok(false),
             hosted_shell: Ok(None),
+            banner: Ok(true),
         }
     }
 }
@@ -147,6 +158,7 @@ pub fn read_settings(fs: &dyn Fs, path: &Path) -> Settings {
         Err(_) => Settings {
             recording: Err(ConfigError::Unreadable),
             hosted_shell: Err(ConfigError::Unreadable),
+            banner: Err(ConfigError::Unreadable),
         },
     }
 }
@@ -158,10 +170,12 @@ pub fn parse_settings(bytes: &[u8]) -> Settings {
         Ok(root) => Settings {
             recording: recording_setting(&root),
             hosted_shell: hosted_shell_setting(&root),
+            banner: banner_setting(&root),
         },
         Err(error) => Settings {
             recording: Err(ConfigError::Toml(error)),
             hosted_shell: Err(ConfigError::Toml(error)),
+            banner: Err(ConfigError::Toml(error)),
         },
     }
 }
@@ -174,7 +188,7 @@ fn hosted_shell_setting(root: &Table) -> Result<Option<HostedShell>, ConfigError
     let Value::Table(shell) = shell.value() else {
         return Err(ConfigError::ShellNotATable);
     };
-    if shell.iter().any(|(key, _)| key != HOSTED_KEY) {
+    if shell.iter().any(|(key, _)| key != HOSTED_KEY && key != BANNER_KEY) {
         return Err(ConfigError::UnknownShellKey);
     }
     match shell.get(HOSTED_KEY).map(knsh_toml::Item::value) {
@@ -182,6 +196,23 @@ fn hosted_shell_setting(root: &Table) -> Result<Option<HostedShell>, ConfigError
         Some(Value::String(name)) => parse_hosted_shell(name).map(Some),
         Some(Value::Boolean(_) | Value::Integer(_) | Value::Array(_) | Value::Table(_)) => {
             Err(ConfigError::InvalidHostedShell)
+        }
+    }
+}
+
+/// `[shell] banner` in the parsed file: absent means on.
+fn banner_setting(root: &Table) -> Result<bool, ConfigError> {
+    let Some(shell) = root.get(SHELL_TABLE) else {
+        return Ok(true);
+    };
+    let Value::Table(shell) = shell.value() else {
+        return Err(ConfigError::ShellNotATable);
+    };
+    match shell.get(BANNER_KEY).map(knsh_toml::Item::value) {
+        None => Ok(true),
+        Some(Value::Boolean(on)) => Ok(*on),
+        Some(Value::String(_) | Value::Integer(_) | Value::Array(_) | Value::Table(_)) => {
+            Err(ConfigError::BannerNotABoolean)
         }
     }
 }
@@ -298,6 +329,21 @@ mod tests {
 
     // KNSH-022: `[shell] hosted` accepts the two system shells by name and absolute paths to programs named zsh or
     // bash; everything else is an invalid choice (which starts /bin/zsh, see `shells`).
+    #[test]
+    fn banner_setting_is_on_unless_false() {
+        let banner = |text: &str| parse_settings(text.as_bytes()).banner;
+        assert_eq!(banner(""), Ok(true));
+        assert_eq!(banner("[shell]\nbanner = true\n"), Ok(true));
+        assert_eq!(banner("[shell]\nbanner = false\n"), Ok(false));
+        assert_eq!(
+            banner("[shell]\nbanner = \"no\"\n"),
+            Err(ConfigError::BannerNotABoolean)
+        );
+        // The key does not disturb the hosted shell choice.
+        let settings = parse_settings(b"[shell]\nhosted = \"native\"\nbanner = false\n");
+        assert_eq!(settings.hosted_shell, Ok(Some(HostedShell::Native)));
+    }
+
     #[test]
     fn hosted_shell_setting_accepts_only_zsh_or_bash() {
         let hosted = |text: &str| parse_settings(text.as_bytes()).hosted_shell;

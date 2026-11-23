@@ -29,6 +29,7 @@ pub mod daemon;
 pub mod events;
 pub mod forget;
 pub mod grants;
+pub mod greeting;
 pub mod history;
 pub mod policy;
 pub mod profile;

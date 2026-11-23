@@ -958,6 +958,7 @@ fn human_shell(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
     use knsh::integration::config::HostedShell;
 
     let host = Host::new();
+    host.print_start();
     match &host.hosted {
         HostedShell::Bash(bash) => human_bash(&host, shell, bash),
         HostedShell::Zsh(zsh) => human_zsh(&host, shell, zsh),
@@ -979,7 +980,9 @@ fn human_native(host: &Host, shell: &knsh::cli::args::ShellInvocation) -> ExitCo
         login: shell.login,
         marks: host.marks,
     };
-    match native::run(start) {
+    let exit = native::run(start);
+    host.print_end();
+    match exit {
         NativeExit::Status(code) => ExitCode::from(code),
         NativeExit::Signal(signal) => {
             knsh_platform::macos::reraise_default(signal);
@@ -999,6 +1002,8 @@ struct Host {
     hosted: knsh::integration::config::HostedShell,
     /// OSC 7 and OSC 133 (KNSH-022): only when `knsh`'s standard output is a terminal.
     marks: bool,
+    /// `[shell] banner`: the start and end messages of the session. Printed only on a terminal's standard error.
+    banner: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -1049,6 +1054,37 @@ impl Host {
             recording: settings.recording.unwrap_or(false),
             hosted: choice.shell,
             marks: marks::wanted(std::io::stdout().is_terminal()),
+            // An unclear value keeps the messages on (they are only text); the file's error is already reported.
+            banner: settings.banner.unwrap_or(true),
+        }
+    }
+
+    /// Whether the messages are wanted, and in colour: `None` when they are off or standard error is not a terminal.
+    fn greeting_color(&self) -> Option<bool> {
+        use std::io::IsTerminal;
+
+        use knsh::cli::greeting::wants_color;
+
+        (self.banner && std::io::stderr().is_terminal()).then(|| {
+            wants_color(
+                std::env::var("NO_COLOR").ok().as_deref(),
+                std::env::var("TERM").ok().as_deref(),
+            )
+        })
+    }
+
+    /// Prints the start message (before the shell takes the terminal).
+    fn print_start(&self) {
+        if let Some(color) = self.greeting_color() {
+            report(&knsh::cli::greeting::start_text(color));
+        }
+    }
+
+    /// Prints the end message. Only called where `knsh` outlives the shell: native mode and a recorded child.
+    /// A shell `knsh` replaces itself with (`exec`) ends with no `knsh` left to speak.
+    fn print_end(&self) {
+        if let Some(color) = self.greeting_color() {
+            report(&knsh::cli::greeting::end_text(color));
         }
     }
 
@@ -1187,7 +1223,7 @@ fn recorded_bash(
         startup_dir: Some(&startup_dir),
         ..launch
     };
-    let code = match run_recorded(recording, launch) {
+    let code = match run_recorded(host, recording, launch) {
         Ok(code) => code,
         // This bash cannot run at all: zsh, as when it fails unrecorded.
         Err(HostError::Start(error)) => {
@@ -1266,7 +1302,7 @@ fn human_zsh(host: &Host, shell: &knsh::cli::args::ShellInvocation, zsh_path: &s
     if startup_dir.is_some()
         && let Some(recording) = host.start_recording()
     {
-        return match run_recorded(recording, launch) {
+        return match run_recorded(host, recording, launch) {
             Ok(code) => code,
             // The shell was never started: start it unrecorded rather than not at all (`launch` carries no telemetry
             // descriptor).
@@ -1323,6 +1359,7 @@ fn system_zsh_instead(
 /// [`knsh::integration::host::HostError`] if the shell could not be started or waited for.
 #[cfg(target_os = "macos")]
 fn run_recorded<'a>(
+    host: &Host,
     recording: knsh::integration::recorder::RecordingHandle,
     launch: impl Into<knsh::integration::host::HostedLaunch<'a>>,
 ) -> Result<ExitCode, knsh::integration::host::HostError> {
@@ -1330,6 +1367,9 @@ fn run_recorded<'a>(
 
     let outcome = host::run_recorded(launch, recording.sink(), None);
     recording.finish(TELEMETRY_FINISH);
+    if outcome.is_ok() {
+        host.print_end();
+    }
     outcome.map(|status| ExitCode::from(host::finish(status)))
 }
 

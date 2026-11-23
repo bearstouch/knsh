@@ -25,16 +25,25 @@ fn platform() -> String {
     format!("{arch}-{rest}")
 }
 
+/// The first line of `knsh --version`, without a newline: `Kinetic Shell (knsh), version 0.1.0 (arm64-apple-darwin)`.
+#[must_use]
+pub fn headline() -> String {
+    format!(
+        "Kinetic Shell (knsh), version {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        platform()
+    )
+}
+
 /// The text `knsh --version` prints, modelled on GNU bash: a banner with the version and platform, the copyright
 /// and licence, then the advisory notice when [`ADVISORY`] holds. Ends with a newline.
 #[must_use]
 pub fn text() -> String {
     let mut text = format!(
-        "Kinetic Shell (knsh), version {} ({})\n\
+        "{}\n\
          Copyright (C) 2026 bearstouch and Kinetic Shell contributors\n\
          License: MIT\n",
-        env!("CARGO_PKG_VERSION"),
-        platform(),
+        headline(),
     );
     if ADVISORY {
         text.push('\n');

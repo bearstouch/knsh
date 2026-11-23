@@ -223,7 +223,12 @@ stay in integration mode (NFR-COMPAT-06).
   [shell]
   hosted = "zsh"   # "zsh" (/bin/zsh), "bash" (/bin/bash), "native" (knsh's own interpreter, KNSH-107),
                    # or an absolute path to a program named zsh or bash
+  banner = true    # false silences the session start and end messages
   ```
+
+  The start message (the first line of `knsh --version`) goes to stderr, and
+  only when stderr is a terminal. The end message is printed only where `knsh` outlives the shell (native mode, a
+  recorded session); a shell `knsh` replaces itself with (`exec`) ends with no `knsh` left to print it.
 
   Without the setting, `knsh` hosts the bash `$SHELL` names, if it is one (KNSH-020), and `/bin/zsh` otherwise, so
   zsh by default. An invalid choice (another value or type, an unknown key inside `[shell]`, a file that cannot be
