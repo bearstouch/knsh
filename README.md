@@ -4,9 +4,6 @@
 
 A bash/zsh-compatible shell that lets AI agents run commands under recording, policy, operating-system sandboxing and best-effort undo. The engine provides mechanisms only: it records, enforces and reports; an external, code-signed **authority** decides and presents. macOS first (14+), Linux later.
 
-> [!WARNING]
-> **This build is advisory.** It gives **no security guarantees** and is **not for running agents unattended**. `knsh --version` and the `hello` handshake (`advisory: true`) say the same. The label goes when the phase 2 release gates in the [roadmap](specs/01-overview/roadmap.md) are met; see the [changelog](CHANGELOG.md) for what is still open.
-
 | Binary | Role |
 | --- | --- |
 | `knsh` | Human shell (integration mode around stock zsh or bash), in-envelope agent client and CLI |
