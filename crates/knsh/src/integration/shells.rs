@@ -29,7 +29,7 @@ pub struct Choice {
     pub warning: Option<String>,
 }
 
-/// The shell to host, from the `[shell] hosted` setting, then `$SHELL` (`login_shell`), then zsh.
+/// The shell to host: `force_native` (`--native`, FR-SES-26) first, else the `[shell] hosted` setting, then `$SHELL` (`login_shell`), then zsh.
 ///
 /// - A valid setting naming a program that `usable` accepts: that shell.
 /// - No setting: the bash `$SHELL` names, when it is one and `usable` accepts it (KNSH-020), otherwise `/bin/zsh`.
@@ -44,7 +44,15 @@ pub fn choose_hosted_shell(
     setting: &Result<Option<HostedShell>, ConfigError>,
     login_shell: Option<&OsStr>,
     usable: &dyn Fn(&Path) -> bool,
+    force_native: bool,
 ) -> Choice {
+    // FR-SES-26: `--native` beats every setting, so an unreadable or invalid file cannot get in its way.
+    if force_native {
+        return Choice {
+            shell: HostedShell::Native,
+            warning: None,
+        };
+    }
     let system_zsh = || HostedShell::Zsh(PathBuf::from(SYSTEM_ZSH));
     let fallback = |warning: String| Choice {
         shell: system_zsh(),
@@ -157,7 +165,7 @@ mod tests {
             ConfigError::UnknownShellKey,
             ConfigError::Unreadable,
         ] {
-            let choice = choose_hosted_shell(&Err(error), Some(OsStr::new("/bin/bash")), &any);
+            let choice = choose_hosted_shell(&Err(error), Some(OsStr::new("/bin/bash")), &any, false);
             assert_eq!(choice.shell, zsh());
             assert!(
                 choice
@@ -168,7 +176,7 @@ mod tests {
         }
         // A valid setting whose program cannot run (missing, not executable, or knsh itself).
         let missing = HostedShell::Bash(PathBuf::from("/opt/nowhere/bash"));
-        let choice = choose_hosted_shell(&Ok(Some(missing)), None, &none);
+        let choice = choose_hosted_shell(&Ok(Some(missing)), None, &none, false);
         assert_eq!(choice.shell, zsh());
         assert!(choice.warning.is_some_and(|w| w.contains("/opt/nowhere/bash")));
     }
@@ -177,7 +185,7 @@ mod tests {
     fn hosted_shell_follows_the_setting_then_shell_then_zsh() {
         let any = |_: &Path| true;
         let bash5 = HostedShell::Bash(PathBuf::from("/opt/homebrew/bin/bash"));
-        let choice = choose_hosted_shell(&Ok(Some(bash5.clone())), Some(OsStr::new("/bin/zsh")), &any);
+        let choice = choose_hosted_shell(&Ok(Some(bash5.clone())), Some(OsStr::new("/bin/zsh")), &any, false);
         assert_eq!(
             choice,
             Choice {
@@ -186,14 +194,14 @@ mod tests {
             }
         );
         // The setting wins over $SHELL.
-        let choice = choose_hosted_shell(&Ok(Some(zsh())), Some(OsStr::new("/bin/bash")), &any);
+        let choice = choose_hosted_shell(&Ok(Some(zsh())), Some(OsStr::new("/bin/bash")), &any, false);
         assert_eq!(choice.shell, zsh());
         // No setting: $SHELL's bash (KNSH-020) ...
-        let choice = choose_hosted_shell(&Ok(None), Some(OsStr::new("/bin/bash")), &any);
+        let choice = choose_hosted_shell(&Ok(None), Some(OsStr::new("/bin/bash")), &any, false);
         assert_eq!(choice.shell, HostedShell::Bash(PathBuf::from("/bin/bash")));
         // ... and zsh otherwise, which is the case when knsh is the login shell ($SHELL names knsh).
         for shell in [Some("/usr/local/bin/knsh"), Some("/bin/zsh"), None] {
-            let choice = choose_hosted_shell(&Ok(None), shell.map(OsStr::new), &any);
+            let choice = choose_hosted_shell(&Ok(None), shell.map(OsStr::new), &any, false);
             assert_eq!(
                 choice,
                 Choice {
@@ -204,7 +212,7 @@ mod tests {
             );
         }
         // A $SHELL bash that cannot run (or is knsh itself under that name): zsh, with a warning.
-        let choice = choose_hosted_shell(&Ok(None), Some(OsStr::new("/bin/bash")), &|_: &Path| false);
+        let choice = choose_hosted_shell(&Ok(None), Some(OsStr::new("/bin/bash")), &|_: &Path| false, false);
         assert_eq!(choice.shell, zsh());
         assert!(choice.warning.is_some());
     }
@@ -244,9 +252,20 @@ mod tests {
     }
 
     // KNSH-107: native mode needs no program, so it is always usable.
+    // FR-SES-26: `--native` beats the setting, whatever it holds, and never warns.
+    #[test]
+    fn native_flag_overrides_the_hosted_setting() {
+        let any = |_: &Path| true;
+        for setting in [Ok(Some(zsh())), Ok(None), Err(ConfigError::InvalidHostedShell)] {
+            let choice = choose_hosted_shell(&setting, Some(OsStr::new("/bin/bash")), &any, true);
+            assert_eq!(choice.shell, HostedShell::Native);
+            assert_eq!(choice.warning, None);
+        }
+    }
+
     #[test]
     fn native_mode_is_always_usable() {
-        let choice = choose_hosted_shell(&Ok(Some(HostedShell::Native)), None, &|_| false);
+        let choice = choose_hosted_shell(&Ok(Some(HostedShell::Native)), None, &|_| false, false);
         assert_eq!(choice.shell, HostedShell::Native);
         assert_eq!(choice.warning, None);
     }

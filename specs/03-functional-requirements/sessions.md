@@ -65,4 +65,5 @@ wait.
 | FR-SES-22 | Nothing in a human session may be decided, rewritten or blocked, and these hooks are never relied on for security. |
 | FR-SES-23 | Human sessions with recording off must not start `knshd`. |
 | FR-SES-24 | `session.idle` must be emitted when a human prompt has waited for input for 5 seconds. |
+| FR-SES-26 | `knsh --native` must host `knsh`'s own interpreter (native mode) for that human session, whatever `[shell] hosted` says, without changing the configuration file. It never affects an agent line or a session in an envelope: their mode comes from the profile (FR-LC-50). |
 | FR-SES-25 | A recording session must set `KNSH_RECORDING=1` and report `recording` in `session.info`, so prompts and clients can show it. |

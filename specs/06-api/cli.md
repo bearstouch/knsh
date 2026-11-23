@@ -262,6 +262,7 @@ KNSH-088):
 | Invocation | Behaviour |
 | --- | --- |
 | `knsh` interactive on a terminal, outside any envelope | Human session in integration mode |
+| `knsh --native` interactive on a terminal, outside any envelope | Human session in native mode, overriding `[shell] hosted` (FR-SES-26) |
 | `knsh -c '…'` inside an envelope | Agent client: forwards to the supervisor over `agent.sock` |
 | `knsh` interactive inside an envelope (session token set) | Agent client too: forwarded as an agent line reading the terminal, never a human session (FR-AGT-20) |
 | `knsh -c '…'` non-interactive outside any envelope | Supervised under the `unattended` profile |
@@ -269,7 +270,7 @@ KNSH-088):
 
 `knsh` first classifies its argv as a shell invocation, before any subcommand parsing (KNSH-009): no arguments;
 `argv[0]` starting with `-` (login shell, e.g. `-knsh`); or a first argument that is a short option cluster built from
-`-c`, `-i` and `-l`, or `--login`, `-` or `--`. These follow bash's invocation syntax: options end at the first operand,
+`-c`, `-i` and `-l`, `--login`, `--native`, `-` or `--`. These follow bash's invocation syntax: options end at the first operand,
 `-` or `--`; with `-c` the first operand is the command line and the rest become `$0`, `$1`, …. Any other short
 option is a usage error. So `knsh -c 'history'` runs a shell line, never `knsh history`.
 

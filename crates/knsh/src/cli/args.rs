@@ -142,6 +142,9 @@ pub const SHELL_OPTIONS: &[(char, ShellOption, &str)] = &[
     ),
 ];
 
+/// Help text of `--native`, which is a long-only shell option and so lives outside [`SHELL_OPTIONS`].
+const NATIVE_HELP: &str = "Run knsh's own shell, overriding [shell] hosted (interactive human sessions only)";
+
 /// What `knsh` was asked to do.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Invocation {
@@ -164,6 +167,9 @@ pub struct ShellInvocation {
     pub interactive: bool,
     /// `-l`, `--login` or an `argv[0]` starting with `-`.
     pub login: bool,
+    /// `--native`: host `knsh`'s own interpreter for this human session, whatever `[shell] hosted` says (FR-SES-26).
+    /// Never read for agent lines: the supervisor's profile alone picks their mode (FR-LC-50).
+    pub native: bool,
     /// The remaining operands, unchanged: with `-c` they become `$0`, `$1`, …; without it, bash would treat the
     /// first one as a script.
     pub operands: Vec<OsString>,
@@ -364,12 +370,12 @@ pub fn parse_shell_argv(argv: impl IntoIterator<Item = OsString>) -> Result<Shel
 /// Whether the first argument after `argv[0]` selects shell mode.
 ///
 /// No argument starts an interactive shell. A single-dash argument is always a bash option cluster (`-c`, `-lc`)
-/// or `-`, since commands take long options only; `--` ends bash's options; `--login` is bash's long login flag.
+/// or `-`, since commands take long options only; `--` ends bash's options; `--login` is bash's long login flag and `--native` is `knsh`'s own (FR-SES-26).
 /// Any other `--flag` (`--help`, typos) is left to command mode, which reports unknown ones.
 fn starts_shell_mode(first: Option<&OsString>) -> bool {
     let Some(first) = first else { return true };
     match first.as_encoded_bytes() {
-        b"--" | b"--login" => true,
+        b"--" | b"--login" | b"--native" => true,
         [b'-', b'-', ..] => false,
         [b'-', ..] => true,
         _ => false,
@@ -394,6 +400,7 @@ fn parse_shell(login_argv0: bool, args: Vec<OsString>) -> Result<ShellInvocation
                 break;
             }
             b"--login" => shell.login = true,
+            b"--native" => shell.native = true,
             [b'-', b'-', ..] => return Err(ArgsError::UnknownFlag { flag: lossy_flag(arg) }),
             [b'-', letters @ ..] => {
                 for &letter in letters {
@@ -635,6 +642,7 @@ impl fmt::Display for Help<'_> {
             writeln!(f, "       {name} <command> [options]")?;
             writeln!(f, "       {name} --version\n\nShell options:")?;
             write_rows(f, SHELL_OPTIONS.iter().map(|(c, _, help)| (format!("-{c}"), *help)))?;
+            write_rows(f, std::iter::once(("--native".to_owned(), NATIVE_HELP)))?;
             writeln!(f, "\nOptions:")?;
             write_rows(
                 f,
@@ -982,6 +990,22 @@ mod tests {
         assert_eq!(parse(&KNSH, args), Err(ArgsError::NotUtf8 { flag: None }));
     }
 
+    // FR-SES-26: `--native` is a shell-mode flag, alone or before other options and operands.
+    #[test]
+    fn native_flag_is_shell_mode() {
+        let parsed = shell(argv(&["--native"]));
+        assert!(parsed.native && !parsed.login && parsed.command.is_none());
+
+        let parsed = shell(argv(&["--native", "-i"]));
+        assert!(parsed.native && parsed.interactive);
+
+        let parsed = shell(argv(&["--native", "-c", "echo hi"]));
+        assert!(parsed.native);
+        assert_eq!(parsed.command, Some(OsString::from("echo hi")));
+
+        assert!(!shell(argv(&["-i"])).native);
+    }
+
     // KNSH-009 acceptance: shell-mode argv is classified before subcommand parsing.
     #[test]
     fn dash_c_is_shell_mode_not_subcommand() {
@@ -1074,6 +1098,7 @@ mod tests {
         for (letter, _, about) in SHELL_OPTIONS {
             assert!(top.contains(&format!("-{letter}")) && top.contains(about));
         }
+        assert!(top.contains("--native") && top.contains(NATIVE_HELP));
 
         for (path, leaf) in leaves() {
             let mut args = path.clone();

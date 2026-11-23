@@ -169,7 +169,9 @@ the system's host name (`gethostname`).
 ## Native mode (KNSH-107)
 
 `[shell] hosted = "native"` runs `knsh`'s own interpreter (`knsh-interp`) as the human's interactive shell instead
-of hosting zsh or bash. It is opt-in: until the phase 4 gate (KNSH-109) is green it is never the default, and zsh users
+of hosting zsh or bash. `knsh --native` selects it for one invocation instead, overriding `[shell] hosted` and any error in the file
+(FR-SES-26); the precedence is `--native`, then `[shell] hosted`, then the bash `$SHELL` names, then `/bin/zsh`. The flag
+has no effect on `-c` lines or inside an envelope, where the profile's `exec.mode` alone decides (FR-LC-50). It is opt-in: until the phase 4 gate (KNSH-109) is green it is never the default, and zsh users
 stay in integration mode (NFR-COMPAT-06).
 
 - **Process:** `knsh` itself is the shell. It takes the terminal for job control (its own process group, the terminal's
