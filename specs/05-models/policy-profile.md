@@ -161,7 +161,10 @@ never partially applied.
   their contents are KNSH-058's). A preset may only add to path and host lists (`fs.read` as a list, `fs.write`,
   `fs.deny`, `exec.trusted_folders`, `network.hosts`, `network.approval_hosts`, `network.loopback`,
   `checkpoints.roots`); its entries are appended to the profile's. It never changes any other setting, so it cannot
-  weaken a profile. An unknown preset is an error.
+  weaken a profile. An unknown preset is an error. A preset (never a profile) may also have an `[env]` table: each
+  entry names an environment variable of the agent CLI and a path, which must lie within the merged `fs.write` and
+  resolve with no symlink below its variable (FR-AGT-33). The resolved values are the profile's `env`; `knshd` sets
+  them in the envelope and creates each folder owner-only.
 - **Paths.** A path is absolute, or starts with `~`, `${PROJECT}`, `${HOME}` or `${TMPDIR}`, followed by nothing or
   `/`. Any other `$`, `~user`, a relative path and `..` are errors. After expansion every path is canonicalised with
   symlinks followed. A path that does not exist yet (`~/.aws` on a machine without it) keeps its deepest existing

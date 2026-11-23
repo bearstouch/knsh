@@ -1084,6 +1084,7 @@ impl Supervision<'_> {
             self.clock.clone(),
             self.paths.shim_dir(),
             knsh.into_path_buf(),
+            self.uid,
         );
         if let Some(layer) = exec_layer {
             starter.attach_exec_layer(layer);

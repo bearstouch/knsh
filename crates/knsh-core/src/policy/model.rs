@@ -37,6 +37,10 @@ pub struct Profile {
     pub extends: Vec<ProfileName>,
     /// `preset`: the preset applied on top, if any.
     pub preset: Option<String>,
+    /// The preset's `[env]`: environment variables of the agent CLI, each naming a folder within `fs.write` reached
+    /// from its variable with no symlink (FR-AGT-33). `knshd` creates each folder owner-only and sets the variables in
+    /// the envelope. Empty without a preset or when the preset sets none; a profile cannot set it.
+    pub env: BTreeMap<String, CanonicalPath>,
     /// `[fs]`.
     pub fs: FsPolicy,
     /// `[exec]`.

@@ -30,7 +30,7 @@ A preset grants what the CLI itself needs: its model API host (for example `api.
 
 | Preset | Writes (and reads) | Hosts (`network.hosts`) | Tool-specific settings | Read from |
 | --- | --- | --- | --- | --- |
-| `claude-code` | `${PROJECT}`, `~/.claude`, `~/.claude.json` | `api.anthropic.com` (model API), `platform.claude.com` (OAuth token refresh for claude.ai sign-in) | None: the native build reads `HTTPS_PROXY`/`HTTP_PROXY` itself | Claude Code 2.1.325 |
+| `claude-code` | `${PROJECT}`, `~/.claude`, `~/.claude.json`, `${TMPDIR}/knsh-claude-code` | `api.anthropic.com` (model API), `platform.claude.com` (OAuth token refresh for claude.ai sign-in) | `CLAUDE_CODE_TMPDIR=${TMPDIR}/knsh-claude-code` (FR-AGT-33): its Bash tool keeps its working folder at `$CLAUDE_CODE_TMPDIR/claude-<uid>/<project>`, else under `/tmp/claude-<uid>`, which no envelope may write. The native build reads `HTTPS_PROXY`/`HTTP_PROXY` itself | Claude Code 2.1.325; temporary folder read from 2.1.330 |
 | `codex-cli` | `${PROJECT}`, `~/.codex` | `api.openai.com` (model API with an API key), `chatgpt.com` (model API with ChatGPT sign-in), `auth.openai.com` (token refresh) | None: it reads `HTTPS_PROXY`/`HTTP_PROXY` itself | Codex CLI 0.165.0 |
 | `generic` | `${PROJECT}` | None. The profile must name the model host (`network.hosts` under `network.mode = "allowlist"`) or a local model's port (`network.loopback`); the loader refuses it otherwise (`MissingKey` at `network.hosts`) | None | — |
 
@@ -62,7 +62,7 @@ Run for each new release of a CLI with a preset, before the preset is marked as 
 
 1. **Shell.** The CLI's shell tool honours `SHELL` or calls `sh`, `bash` or `zsh` by name (FR-AGT-30). Inside an envelope `SHELL` is `knsh` and the shims come first on `PATH`. Claude Code 2.1.325 uses `CLAUDE_CODE_SHELL` or `SHELL` only when the path contains `bash` or `zsh`, so with `SHELL=knsh` it takes `zsh` from `PATH`, which is the shim; check that a command it runs arrives at the supervisor. Codex CLI's shell choice must be checked the same way.
 2. **Model host and sign-in.** Model traffic reaches only the preset's hosts and passes the TLS server-name check (FR-NET-06); a session survives a token refresh.
-3. **Configuration folder.** The CLI starts, resumes a session and saves its state with only the preset's paths writable (Claude Code also writes `~/.claude.json`; check it is saved when a temporary file beside it in `~` is refused).
+3. **Configuration and temporary folders.** The CLI starts, runs a shell command, resumes a session and saves its state with only the preset's paths writable (Claude Code: its Bash tool's folder lands under `CLAUDE_CODE_TMPDIR`, not `/tmp`; it also writes `~/.claude.json`: check it is saved when a temporary file beside it in `~` is refused).
 4. **Proxy.** The CLI's own HTTP client uses `HTTPS_PROXY` with Basic credentials; a CLI that needs a tool-specific setting gets it in its preset (FR-NET-12).
 5. **Sandbox switch.** The settings and flags in the table above still turn the CLI's sandbox off, and `knsh agent` warns when it is on.
 

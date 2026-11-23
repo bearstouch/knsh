@@ -86,7 +86,7 @@ use knsh_core::{
     Actor, AgentId, BinaryLookup, CanonicalPath, EqualProfileOnly, LoadedProfiles, Profile, ProfileErrorKind,
     ProfileName, ProfileOrder, ProfileOrigin, Redacted, SessionId,
 };
-use knsh_platform::{Clock, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest};
+use knsh_platform::{Clock, FileKind, Fs, ProcessGroupId, Processes, SharedFd, Signal, SpawnRequest};
 use knsh_proto::{
     ErrorCode, LineStatus, RpcError, SESSION_TOKEN_VAR, SessionStartAgentParams, SessionStartAgentResult,
 };
@@ -185,6 +185,8 @@ pub(crate) struct AgentStarter {
     shim_dir: PathBuf,
     /// The `knsh` binary: the envelope's `SHELL` (FR-AGT-03).
     knsh: PathBuf,
+    /// The user `knshd` runs as: the owner a preset's `[env]` folder must have (FR-AGT-33).
+    uid: u32,
     /// The Endpoint Security layer, attached when `hello` reports it (KNSH-094); unset, envelopes start without a
     /// descendant client.
     exec_layer: OnceLock<Arc<ExecLayer>>,
@@ -197,7 +199,8 @@ pub(crate) struct AgentStarter {
 
 impl AgentStarter {
     /// The service over `sessions`, loading profiles with `profiles`, starting envelopes with `launcher` and
-    /// getting their proxy credentials from `proxy`.
+    /// getting their proxy credentials from `proxy`, as the user `uid`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         sessions: Arc<Sessions>,
         profiles: ProfileLoader,
@@ -206,6 +209,7 @@ impl AgentStarter {
         clock: Arc<dyn Clock>,
         shim_dir: PathBuf,
         knsh: PathBuf,
+        uid: u32,
     ) -> Arc<Self> {
         Arc::new(Self {
             sessions,
@@ -215,6 +219,7 @@ impl AgentStarter {
             clock,
             shim_dir,
             knsh,
+            uid,
             exec_layer: OnceLock::new(),
             running: Mutex::new(BTreeMap::new()),
         })
@@ -376,6 +381,11 @@ impl AgentStarter {
         call: &Call<'_>,
     ) -> Result<LineStatus, RpcError> {
         let processes = self.launcher.processes();
+        // FR-AGT-33: the folders the preset points the CLI at exist, owner-only, before it starts; one that cannot be
+        // made safe stops the launch rather than leave the CLI failing on a folder it may not use.
+        if !env_folders_ready(self.profiles.fs(), profile, self.uid) {
+            return Err(internal_error());
+        }
         // A proxy that runs but cannot issue credentials stops the launch: no envelope runs untied to its session.
         let proxy = self
             .proxy
@@ -398,7 +408,14 @@ impl AgentStarter {
                 profile,
                 program,
                 args: &params.command[1..],
-                env: envelope_env(&params.env, token, &self.shim_dir, &self.knsh, proxy.as_ref()),
+                env: envelope_env(
+                    &params.env,
+                    token,
+                    &self.shim_dir,
+                    &self.knsh,
+                    &profile.env,
+                    proxy.as_ref(),
+                ),
                 proxy_port: proxy.as_ref().map(ProxyCredential::port),
                 cwd: &params.cwd,
                 stdio,
@@ -475,28 +492,19 @@ fn stdio(descriptors: Vec<OwnedFd>) -> Result<[OwnedFd; 3], RpcError> {
 
 /// The environment the CLI starts with (FR-AGT-03): the caller's, minus any session token it carried, its proxy
 /// settings ([`is_proxy_var`]) and the dynamic linker's variables (`knsh-exec` runs unsandboxed until it becomes
-/// `sandbox-exec`), with `SHELL` set to `knsh`, the shim directory first on `PATH` (once), the new session's token
-/// and, when a proxy serves the envelope, its proxy settings with the envelope's own credentials ([`proxy_env`]).
-/// Order is kept otherwise; the variables set here come last.
+/// `sandbox-exec`); then the preset's variables (`preset_env`, FR-AGT-33), each replacing the caller's of that name;
+/// then `SHELL` set to `knsh`, the shim directory first on `PATH` (once), the new session's token and, when a proxy
+/// serves the envelope, its proxy settings with the envelope's own credentials ([`proxy_env`]). A preset never sets a
+/// variable `knshd` sets itself or the dynamic linker reads. Each name appears once; order is kept otherwise.
 pub(crate) fn envelope_env(
     caller: &[(String, String)],
     token: &SessionToken,
     shim_dir: &Path,
     knsh: &Path,
+    preset_env: &BTreeMap<String, CanonicalPath>,
     proxy: Option<&ProxyCredential>,
 ) -> Vec<(String, String)> {
     let shims = shim_dir.to_string_lossy().into_owned();
-    let mut env: Vec<(String, String)> = caller
-        .iter()
-        .filter(|(name, _)| {
-            name != SESSION_TOKEN_VAR
-                && name != SHELL_VAR
-                && name != PATH_VAR
-                && !is_proxy_var(name)
-                && !read_by_dynamic_linker(name)
-        })
-        .cloned()
-        .collect();
     let caller_path = caller
         .iter()
         .find(|(name, _)| name == PATH_VAR)
@@ -505,11 +513,57 @@ pub(crate) fn envelope_env(
         Some("") | None => shims,
         Some(rest) => format!("{shims}:{rest}"),
     };
-    env.push((PATH_VAR.to_owned(), path));
-    env.push((SHELL_VAR.to_owned(), knsh.to_string_lossy().into_owned()));
-    env.push((SESSION_TOKEN_VAR.to_owned(), token.encode().expose().clone()));
-    env.extend(proxy_env(proxy));
+    let mut own = vec![
+        (PATH_VAR.to_owned(), path),
+        (SHELL_VAR.to_owned(), knsh.to_string_lossy().into_owned()),
+        (SESSION_TOKEN_VAR.to_owned(), token.encode().expose().clone()),
+    ];
+    own.extend(proxy_env(proxy));
+    let reserved = |name: &str| {
+        name == SESSION_TOKEN_VAR
+            || is_proxy_var(name)
+            || read_by_dynamic_linker(name)
+            || own.iter().any(|(own_name, _)| own_name == name)
+    };
+    let preset = preset_env
+        .iter()
+        .filter(|(name, _)| !reserved(name))
+        .map(|(name, folder)| (name.clone(), folder.as_path().to_string_lossy().into_owned()));
+    let mut env: Vec<(String, String)> = caller
+        .iter()
+        .filter(|(name, _)| !reserved(name) && !preset_env.contains_key(name))
+        .cloned()
+        .collect();
+    env.extend(preset);
+    env.extend(own);
     env
+}
+
+/// Permission bits of a preset's `[env]` folder: owner-only, as the CLIs ask of their temporary folders.
+const ENV_FOLDER_MODE: u32 = 0o700;
+
+/// Whether every folder of the profile's `env` (FR-AGT-33) is ready: created `0700` if missing, and otherwise a
+/// directory (not a symlink) owned by `uid`, its mode set to `0700`. Only the folder itself is created, never its
+/// parents: the loader already resolved it below an existing variable with no symlink on the way.
+fn env_folders_ready(fs: &dyn Fs, profile: &Profile, uid: u32) -> bool {
+    profile
+        .env
+        .values()
+        .all(|folder| env_folder_ready(fs, folder.as_path(), uid))
+}
+
+fn env_folder_ready(fs: &dyn Fs, folder: &Path, uid: u32) -> bool {
+    if matches!(fs.metadata(folder), Err(error) if error.is_not_found()) {
+        // A racing creator is fine: what is there is checked below either way.
+        let _ = fs.create_dir(folder, ENV_FOLDER_MODE);
+    }
+    match fs.metadata(folder) {
+        // `metadata` does not follow a final symlink, so a link put in the folder's place is refused here.
+        Ok(meta) if meta.kind == FileKind::Directory && meta.uid == uid => {
+            meta.mode == ENV_FOLDER_MODE || fs.set_mode(folder, ENV_FOLDER_MODE).is_ok()
+        }
+        Ok(_) | Err(_) => false,
+    }
 }
 
 /// The envelope profile (module documentation, "The envelope"): `profile`, as resolved with its preset, compiled for

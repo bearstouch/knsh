@@ -1,14 +1,22 @@
 # Preset `claude-code`: what Claude Code itself needs inside an envelope (FR-AGT-04, KNSH-058).
-# Read from Claude Code 2.1.325 (native build); checked again per release (agent-clis.md, per-release checklist).
+# Read from Claude Code 2.1.325 (native build; `[env]` from 2.1.330); checked again per release (agent-clis.md, per-release checklist).
 #
 # Proxy: the native build reads HTTPS_PROXY and HTTP_PROXY itself, so the envelope's proxy settings (decision 14)
 # are enough; it needs no setting of its own. Its own sandbox (`sandbox.enabled` in its settings) must stay off.
 [fs]
 # Added to `fs.read` only when the profile lists its reads (the default, "all", already covers them): a write
 # root that cannot be read is of no use to the CLI.
-read = ["${PROJECT}", "~/.claude", "~/.claude.json"]
-# The project, the configuration and session folder, and the user-level state file Claude Code keeps beside it.
-write = ["${PROJECT}", "~/.claude", "~/.claude.json"]
+read = ["${PROJECT}", "~/.claude", "~/.claude.json", "${TMPDIR}/knsh-claude-code"]
+# The project, the configuration and session folder, the user-level state file Claude Code keeps beside it, and the
+# temporary folder `[env]` points it at.
+write = ["${PROJECT}", "~/.claude", "~/.claude.json", "${TMPDIR}/knsh-claude-code"]
+
+[env]
+# FR-AGT-33. Claude Code's Bash tool keeps its working folder (cwd tracking, command output files) at
+# `$CLAUDE_CODE_TMPDIR/claude-<uid>/<project>`, else at `/tmp/claude-<uid>/<project>`, which no envelope may write:
+# every shell command then fails with EPERM on its mkdir. A folder of its own under `${TMPDIR}` keeps it apart from
+# other Claude Code sessions' files. Read from Claude Code 2.1.330.
+CLAUDE_CODE_TMPDIR = "${TMPDIR}/knsh-claude-code"
 
 [network]
 # api.anthropic.com: the model API. platform.claude.com: OAuth token refresh for claude.ai sign-in
