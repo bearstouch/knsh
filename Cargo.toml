@@ -54,3 +54,10 @@ pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+
+# macOS dev builds default to `split-debuginfo = "unpacked"`, which keeps every codegen-unit object file
+# (`*.rcgu.o`) next to the binaries so debug info can point at them. A rebuild adds a fresh set under new hash
+# names and nothing removes the old ones: one workspace accumulated about a million files, which slowed every
+# cargo launch and every test run. `packed` writes a `.dSYM` bundle and deletes the objects after the link.
+[profile.dev]
+split-debuginfo = "packed"
