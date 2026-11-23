@@ -90,7 +90,16 @@ fn loads_web_app_example_profile() {
             canonical("/private/var/folders/xy/T"),
             canonical("/Users/u/.claude"),
             canonical("/Users/u/.claude.json"),
+            canonical("/private/var/folders/xy/T/knsh-claude-code"),
         ]
+    );
+    // FR-AGT-33: the preset points Claude Code's temporary folder at its own write root.
+    assert_eq!(
+        profile.env,
+        BTreeMap::from([(
+            "CLAUDE_CODE_TMPDIR".to_owned(),
+            canonical("/private/var/folders/xy/T/knsh-claude-code")
+        )])
     );
     assert_eq!(profile.fs.deny[0], canonical("/Users/u/.ssh"));
     assert_eq!(profile.fs.deny.len(), 6);
@@ -562,8 +571,9 @@ fn unattended_profile_is_built_in_and_strict() {
     assert_ne!(load(&source, "unattended").unwrap(), profile);
 }
 
-// FR-AGT-04: the `claude-code` preset grants the model API host (and the OAuth refresh host), and read and write to
-// `~/.claude`, `~/.claude.json` and the project, even under a profile that lists its reads.
+// FR-AGT-04, FR-AGT-33: the `claude-code` preset grants the model API host (and the OAuth refresh host), and read
+// and write to `~/.claude`, `~/.claude.json`, its temporary folder and the project, even under a profile that lists
+// its reads.
 #[test]
 fn claude_code_preset_grants_api_host_and_config_folder() {
     let text = "name = \"p\"\npreset = \"claude-code\"\n[fs]\nread = [\"/usr\"]\nwrite = []\n";
@@ -572,6 +582,7 @@ fn claude_code_preset_grants_api_host_and_config_folder() {
         canonical("/Users/u/src/app"),
         canonical("/Users/u/.claude"),
         canonical("/Users/u/.claude.json"),
+        canonical("/private/var/folders/xy/T/knsh-claude-code"),
     ];
     assert_eq!(profile.fs.write, granted);
     let mut read = vec![canonical("/usr")];
@@ -716,4 +727,37 @@ fn checkpoint_exclude_replaces_the_defaults() {
 
     let source = Source::default().with("none", "name = \"none\"\n[checkpoints]\nexclude = []\n");
     assert_eq!(load(&source, "none").unwrap().checkpoints.exclude, Vec::<String>::new());
+}
+
+// FR-AGT-33: a preset folder replaced by a symlink (to `~/.ssh`, say) refuses the whole profile, so a link an agent
+// left behind never becomes a write root or the folder `knshd` prepares.
+#[test]
+fn preset_env_folder_through_a_symlink_refuses_the_profile() {
+    let mut fs = mac_fs();
+    fs.add("/Users/u/.ssh")
+        .link("/private/var/folders/xy/T/knsh-claude-code", "/Users/u/.ssh");
+    let source = Source::default().with("p", "name = \"p\"\npreset = \"claude-code\"\n");
+    let error = load_profile(&name("p"), &source, &context(), &fs).unwrap_err();
+    assert_eq!(error.key(), Some("env.CLAUDE_CODE_TMPDIR"));
+}
+
+// FR-AGT-33: a preset variable must name a folder the profile may write.
+#[test]
+fn preset_env_must_lie_within_fs_write() {
+    let fs = mac_fs();
+    let variables = Variables::resolve(&context(), &fs).unwrap();
+    let templates = BTreeMap::from([("X".to_owned(), PathTemplate::parse("~/elsewhere").unwrap())]);
+    let error = preset_env(templates.clone(), &[canonical("/Users/u/src/app")], &variables, &fs).unwrap_err();
+    assert_eq!(error.key(), Some("env.X"));
+    let env = preset_env(templates, &[canonical("/Users/u")], &variables, &fs).unwrap();
+    assert_eq!(env["X"], canonical("/Users/u/elsewhere"));
+}
+
+// FR-AGT-33: `[env]` belongs to presets; in a profile it is an unknown key.
+#[test]
+fn profiles_cannot_set_env() {
+    let source = Source::default().with("p", "name = \"p\"\n[env]\nX = \"~/x\"\n");
+    let error = load(&source, "p").unwrap_err();
+    assert_eq!(error.kind(), &ProfileErrorKind::UnknownKey);
+    assert_eq!(error.key(), Some("env"));
 }

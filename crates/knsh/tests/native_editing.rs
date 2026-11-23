@@ -341,7 +341,7 @@ mod macos {
         // The configuration file where `knsh` reads it, named only by `EnginePaths`.
         let config = knsh_platform::EnginePaths::for_home(&home).unwrap().config_file();
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-        std::fs::write(&config, "[shell]\nhosted = \"native\"\n").unwrap();
+        std::fs::write(&config, "[shell]\nhosted = \"native\"\nbanner = false\n").unwrap();
         std::fs::write(home.join(".bashrc"), "PS1='$ '\nHISTFILE=\n").unwrap();
         home
     }

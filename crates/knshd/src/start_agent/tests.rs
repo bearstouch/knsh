@@ -1,6 +1,7 @@
 //! `session.start_agent` tests (KNSH-056, KNSH-057), over a fake launcher and a fake proxy: scripted processes and a
 //! fake process table, so nothing is really started. The `platform` module launches real envelopes.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -166,6 +167,7 @@ fn harness_with(proxy: FakeProxy) -> Harness {
         Arc::new(FakeClock::new(knsh_core::Timestamp::UNIX_EPOCH)),
         shim_dir(),
         Path::new(KNSH).to_path_buf(),
+        knsh_platform::testing::DEFAULT_UID,
     );
     Harness {
         fixture,
@@ -489,6 +491,7 @@ fn program_lookup_skips_shim_links() {
         Arc::new(FakeClock::new(knsh_core::Timestamp::UNIX_EPOCH)),
         shim_dir(),
         Path::new(KNSH).to_path_buf(),
+        knsh_platform::testing::DEFAULT_UID,
     );
     let request = Request {
         id: RequestId::from(1u32),
@@ -656,14 +659,14 @@ fn envelope_env_replaces_token_shell_and_shims() {
         (SESSION_TOKEN_VAR.to_owned(), "parent".to_owned()),
         ("DYLD_LIBRARY_PATH".to_owned(), "/x".to_owned()),
     ];
-    let env = envelope_env(&caller, &token, &shim_dir(), Path::new(KNSH), None);
+    let env = envelope_env(&caller, &token, &shim_dir(), Path::new(KNSH), &BTreeMap::new(), None);
     let names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, ["A", "PATH", "SHELL", SESSION_TOKEN_VAR]);
     assert_eq!(env[1].1, format!("{shims}:/usr/bin"));
     assert_eq!(env[2].1, KNSH);
     assert_eq!(&env[3].1, token.encode().expose());
     // No PATH at all: the shims alone.
-    let env = envelope_env(&[], &token, &shim_dir(), Path::new(KNSH), None);
+    let env = envelope_env(&[], &token, &shim_dir(), Path::new(KNSH), &BTreeMap::new(), None);
     assert_eq!(env[0], ("PATH".to_owned(), shims));
 }
 
@@ -729,7 +732,7 @@ fn no_proxy_means_no_proxy_settings() {
         ("HTTPS_PROXY".to_owned(), "http://corp:8080".to_owned()),
         ("PIP_PROXY".to_owned(), "http://corp:8080".to_owned()),
     ];
-    let env = envelope_env(&caller, &token, &shim_dir(), Path::new(KNSH), None);
+    let env = envelope_env(&caller, &token, &shim_dir(), Path::new(KNSH), &BTreeMap::new(), None);
     let names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, ["PATH", "SHELL", SESSION_TOKEN_VAR]);
     let session = session_id(5);
@@ -862,6 +865,76 @@ fn envelope_profile_includes_preset_grants() {
     assert_eq!(rules(&without, "(allow file-write* (subpath"), Vec::<&str>::new());
 }
 
+// FR-AGT-33: under the `claude-code` preset the CLI starts with `CLAUDE_CODE_TMPDIR` at its own folder below
+// `${TMPDIR}` (replacing the caller's value), the folder exists owner-only before launch, and it is a write root.
+#[test]
+fn claude_code_preset_points_its_temporary_folder_inside_the_envelope() {
+    let harness = harness();
+    harness.launcher.processes.expect(ENVELOPE, Script::Exits(0));
+    let params = format!(
+        r#"{{"command":["claude"],"cwd":"{PROJECT}","stdio":"passed","profile":"claude",
+            "env":{{"HOME":"{HOME}","PATH":"/opt/bin:/bin","CLAUDE_CODE_TMPDIR":"/tmp"}}}}"#
+    );
+    start(&harness, &params).unwrap();
+
+    let launched = harness.launcher.launched.lock().unwrap()[0].clone();
+    let folder = Path::new("/tmp/knsh-claude-code");
+    let values: Vec<&str> = launched
+        .env
+        .iter()
+        .filter(|(name, _)| name == "CLAUDE_CODE_TMPDIR")
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(values, ["/tmp/knsh-claude-code"]);
+    assert!(launched.write.iter().any(|root| root.as_path() == folder));
+    let meta = harness.starter.profiles.fs().metadata(folder).unwrap();
+    assert_eq!(meta.kind, knsh_platform::FileKind::Directory);
+    assert_eq!(meta.mode, 0o700);
+}
+
+// FR-AGT-33: a preset variable never replaces one `knshd` sets itself or one the dynamic linker reads.
+#[test]
+fn envelope_env_keeps_its_own_variables_over_a_preset() {
+    let token = SessionToken::generate(&knsh_platform::testing::SeededRandom::new(4)).unwrap();
+    let folder = CanonicalPath::new("/tmp/knsh-x").unwrap();
+    let preset: BTreeMap<String, CanonicalPath> = ["SHELL", "PATH", "DYLD_INSERT_LIBRARIES", "HTTPS_PROXY", "X_TMP"]
+        .into_iter()
+        .map(|name| (name.to_owned(), folder.clone()))
+        .collect();
+    let env = envelope_env(&[], &token, &shim_dir(), Path::new(KNSH), &preset, None);
+    let names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["X_TMP", "PATH", "SHELL", SESSION_TOKEN_VAR]);
+    assert_eq!(env[0].1, "/tmp/knsh-x");
+    assert_eq!(env[2].1, KNSH);
+}
+
+// FR-AGT-33: the folder is created `0700` when missing and its mode tightened when present; a symlink, a file or a
+// folder another user owns is refused, so no envelope starts on a folder it cannot safely use.
+#[test]
+fn env_folder_must_be_an_owned_directory() {
+    let fs = MemFs::new();
+    let uid = fs.uid();
+    fs.add_dir_all(Path::new("/tmp")).unwrap();
+    assert!(env_folder_ready(&fs, Path::new("/tmp/new"), uid));
+    assert_eq!(fs.metadata(Path::new("/tmp/new")).unwrap().mode, 0o700);
+
+    fs.create_dir(Path::new("/tmp/open"), 0o777).unwrap();
+    assert!(env_folder_ready(&fs, Path::new("/tmp/open"), uid));
+    assert_eq!(fs.metadata(Path::new("/tmp/open")).unwrap().mode, 0o700);
+
+    fs.add_dir_all(Path::new("/Users/u/.ssh")).unwrap();
+    fs.add_symlink(Path::new("/tmp/link"), Path::new("/Users/u/.ssh"))
+        .unwrap();
+    assert!(!env_folder_ready(&fs, Path::new("/tmp/link"), uid));
+    fs.write(Path::new("/tmp/file"), b"", 0o600).unwrap();
+    assert!(!env_folder_ready(&fs, Path::new("/tmp/file"), uid));
+    fs.create_dir(Path::new("/tmp/theirs"), 0o700).unwrap();
+    fs.set_owner(Path::new("/tmp/theirs"), uid + 1).unwrap();
+    assert!(!env_folder_ready(&fs, Path::new("/tmp/theirs"), uid));
+    // No parent: only the folder itself is ever created.
+    assert!(!env_folder_ready(&fs, Path::new("/nowhere/x"), uid));
+}
+
 /// Against the real `knsh-exec`, `sandbox-exec` and process table on this machine.
 mod platform {
     use std::io::{Read, Write};
@@ -955,6 +1028,7 @@ mod platform {
                 Arc::new(SystemClock::new()),
                 home.join("shims"),
                 knsh.as_path().to_path_buf(),
+                effective_uid(),
             );
             Self { starter, fixture }
         }

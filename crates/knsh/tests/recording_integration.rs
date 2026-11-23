@@ -295,6 +295,43 @@ fn three_typed_commands_become_three_records() {
     }
 }
 
+// FR-SES-27 integration test: `knsh --native` records typed commands like the hosted shells (the same three records,
+// `cd` as `cwd.changed`, `KNSH_RECORDING=1` for the commands), and the session ends when the shell exits. A session
+// with recording off never connects and never has the variable, even when inherited (FR-SES-23, FR-SES-25).
+#[test]
+fn native_session_records_typed_commands() {
+    let home = Home::new(Some(true));
+    let daemon = FakeDaemon::start(&home, None);
+    let mut command = knsh(&home, None, &[]);
+    command.arg("--native");
+    let output = run(command, "echo one\ncd /\necho \"rec=$KNSH_RECORDING\"\nexit 0\n");
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert!(text(&output.stdout).contains("rec=1"), "{}", text(&output.stdout));
+    assert!(daemon.wait_for(|seen| seen.closed == 1), "session never ended");
+
+    let commands = daemon.calls("telemetry.command");
+    let typed: Vec<&str> = commands
+        .iter()
+        .map(|call| field(call, "command").as_str().expect("command"))
+        .collect();
+    assert_eq!(typed, ["echo one", "cd /", "echo \"rec=$KNSH_RECORDING\""]);
+    assert_eq!(field(&commands[2], "cwd").as_str(), Some("/"));
+    assert_eq!(daemon.calls("telemetry.cwd").len(), 1);
+    assert_eq!(daemon.connections(), 1);
+}
+
+#[test]
+fn native_session_with_recording_off_never_connects() {
+    let home = Home::new(Some(false));
+    let daemon = FakeDaemon::start(&home, None);
+    let mut command = knsh(&home, None, &[("KNSH_RECORDING", "1")]);
+    command.arg("--native");
+    let output = run(command, "echo \"rec=[$KNSH_RECORDING]\"\nexit 0\n");
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert!(text(&output.stdout).contains("rec=[]"), "{}", text(&output.stdout));
+    assert_eq!(daemon.connections(), 0);
+}
+
 // KNSH-021 integration test (NFR-REL-02): `knshd` stops mid-session; the shell keeps working, its exit status is
 // unchanged, and nothing is printed about it.
 #[test]

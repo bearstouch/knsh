@@ -186,15 +186,38 @@ impl PathTemplate {
         variables: &Variables,
         fs: &F,
     ) -> Result<CanonicalPath, ProfileErrorKind> {
-        let base = match self.base {
+        let mut path = self.base_path(variables).to_path_buf();
+        path.extend(&self.components);
+        canonicalise_allowing_missing(&path, fs).map_err(|_| ProfileErrorKind::PathUnresolvable)
+    }
+
+    /// Like [`expand`](Self::expand), but refuses the path unless its canonical form is the written one: no
+    /// component after the variable is a symlink (the variable itself is already canonical). For a folder the
+    /// engine creates and then grants (a preset's `[env]`, FR-AGT-33), where following a link would grant its target.
+    pub(crate) fn expand_without_links<F: PolicyFs + ?Sized>(
+        &self,
+        variables: &Variables,
+        fs: &F,
+    ) -> Result<CanonicalPath, ProfileErrorKind> {
+        let expanded = self.expand(variables, fs)?;
+        let mut written = self.base_path(variables).to_path_buf();
+        written.extend(&self.components);
+        if expanded.as_path() != written {
+            return Err(ProfileErrorKind::InvalidValue {
+                expected: "a path with no symlink after its variable",
+            });
+        }
+        Ok(expanded)
+    }
+
+    /// The canonical folder the template starts from.
+    fn base_path<'v>(&self, variables: &'v Variables) -> &'v Path {
+        match self.base {
             Base::Root => Path::new("/"),
             Base::Home => variables.home.as_path(),
             Base::Tmpdir => variables.tmpdir.as_path(),
             Base::Project => variables.project.as_path(),
-        };
-        let mut path = base.to_path_buf();
-        path.extend(&self.components);
-        canonicalise_allowing_missing(&path, fs).map_err(|_| ProfileErrorKind::PathUnresolvable)
+        }
     }
 }
 

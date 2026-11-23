@@ -24,6 +24,21 @@ const MAX_HOST_LEN: usize = 253;
 /// Longest environment variable name accepted under `secrets.env`.
 const MAX_ENV_NAME_LEN: usize = 255;
 
+/// The top-level keys of a profile; a preset may also have `env` (FR-AGT-33).
+const PROFILE_KEYS: &[&str] = &[
+    "name",
+    "extends",
+    "preset",
+    "fs",
+    "exec",
+    "network",
+    "approvals",
+    "checkpoints",
+    "recording",
+    "output",
+    "secrets",
+];
+
 /// Whether the file is a profile (which must have a `name`) or a preset shipped with the engine (which must not).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LayerKind {
@@ -89,6 +104,8 @@ pub(crate) struct Layer {
     pub(crate) output_mode: Option<OutputMode>,
     /// Per variable: a child's entry for a variable replaces its parent's entry for that variable.
     pub(crate) secrets_env: BTreeMap<String, SecretTemplate>,
+    /// `[env]`, presets only (FR-AGT-33): environment variables of the agent CLI pointed at folders of its own.
+    pub(crate) env: BTreeMap<String, PathTemplate>,
 }
 
 impl Layer {
@@ -96,19 +113,12 @@ impl Layer {
     pub(crate) fn parse(text: &[u8], kind: LayerKind) -> Result<Self, ProfileError> {
         let root = knsh_toml::parse(text).map_err(syntax_error)?;
         let root = Section::root(&root);
-        root.check_keys(&[
-            "name",
-            "extends",
-            "preset",
-            "fs",
-            "exec",
-            "network",
-            "approvals",
-            "checkpoints",
-            "recording",
-            "output",
-            "secrets",
-        ])?;
+        // `[env]` sets variables in the agent CLI's environment: what a CLI needs is the engine's to ship (FR-AGT-33),
+        // never a profile's to write, so in a profile it is an unknown key like any other.
+        match kind {
+            LayerKind::Profile => root.check_keys(PROFILE_KEYS)?,
+            LayerKind::Preset => root.check_keys(&[PROFILE_KEYS, &["env"]].concat())?,
+        }
         let mut layer = Self {
             name: root.optional("name", profile_name)?,
             extends: root.optional("extends", profile_name)?,
@@ -162,6 +172,9 @@ impl Layer {
             }
         }
         if kind == LayerKind::Preset {
+            if let Some(env) = root.section("env")? {
+                layer.read_env(&env)?;
+            }
             layer.check_preset_keys()?;
         }
         Ok(layer)
@@ -259,6 +272,21 @@ impl Layer {
                 hosts: entry.list("hosts", host)?.unwrap_or_default(),
             };
             self.secrets_env.insert(variable.to_owned(), template);
+        }
+        Ok(())
+    }
+
+    /// `[env]` of a preset: each key an environment variable name, each value a profile path (FR-AGT-33).
+    fn read_env(&mut self, env: &Section<'_>) -> Result<(), ProfileError> {
+        for (variable, item) in env.table {
+            // The table key becomes an environment variable name in the agent CLI's process, so it must be one.
+            if !is_env_name(variable) {
+                return Err(env.invalid(variable, item, "an environment variable name ([A-Za-z_][A-Za-z0-9_]*)"));
+            }
+            let Some(template) = env.optional(variable, path)? else {
+                return Err(error_at(&env.key(variable), item, ProfileErrorKind::MissingKey));
+            };
+            self.env.insert(variable.to_owned(), template);
         }
         Ok(())
     }
@@ -681,6 +709,21 @@ mod tests {
         let error = refused("name = \"p\"\nx = 1.5\n");
         assert!(matches!(error.kind(), ProfileErrorKind::Syntax(_)));
         assert_eq!(error.position().map(|p| p.line), Some(2));
+    }
+
+    // FR-AGT-33: a preset's `[env]` keys are environment variable names and its values profile paths.
+    #[test]
+    fn preset_env_is_read_and_checked() {
+        let layer = Layer::parse(b"[env]\nA_DIR = \"${TMPDIR}/a\"\n", LayerKind::Preset).unwrap();
+        assert_eq!(layer.env.len(), 1);
+        for (text, key) in [
+            ("[env]\n\"1X\" = \"/tmp\"", "env.1X"),
+            ("[env]\nX = \"relative\"", "env.X"),
+            ("[env]\nX = 1", "env.X"),
+        ] {
+            let error = Layer::parse(text.as_bytes(), LayerKind::Preset).unwrap_err();
+            assert_eq!(error.key(), Some(key), "{text}");
+        }
     }
 
     #[test]

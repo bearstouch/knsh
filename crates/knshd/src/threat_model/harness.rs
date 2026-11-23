@@ -287,6 +287,7 @@ impl Stack {
             clock.clone(),
             paths.shim_dir(),
             binaries.knsh.as_path().to_path_buf(),
+            effective_uid(),
         );
 
         // The dispatcher `knshd` serves, as `agents::endpoint_tests::dispatcher` builds it, with the real `exec.*`

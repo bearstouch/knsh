@@ -37,4 +37,4 @@ pub mod startup;
 pub mod width;
 
 pub use prompt::decode as decode_prompt;
-pub use session::{DescriptorTerminal, HostInfo, Session, SessionOptions, Terminal};
+pub use session::{DescriptorTerminal, HostInfo, LineObserver, Session, SessionOptions, Terminal};

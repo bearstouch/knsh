@@ -957,7 +957,7 @@ fn agent_line(_shell: &knsh::cli::args::ShellInvocation, _interpreter: knsh_prot
 fn human_shell(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
     use knsh::integration::config::HostedShell;
 
-    let host = Host::new();
+    let host = Host::new(shell.native);
     host.print_start();
     match &host.hosted {
         HostedShell::Bash(bash) => human_bash(&host, shell, bash),
@@ -972,15 +972,21 @@ fn human_shell(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
 fn human_native(host: &Host, shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
     use knsh::native::{self, NativeExit, NativeStart};
 
-    if host.recording {
-        // Said, never hidden: the setting asks for recording, which native mode does not do yet.
-        report("knsh: recording is not available in native mode yet; this session is not recorded\n");
-    }
+    // FR-SES-21: a recorded native session reports each command line to `knshd`, like the hosted shells' hooks.
+    let recording = host.start_recording();
     let start = NativeStart {
         login: shell.login,
         marks: host.marks,
     };
-    let exit = native::run(start);
+    let exit = native::run(
+        start,
+        recording
+            .as_ref()
+            .map(knsh::integration::recorder::RecordingHandle::sink),
+    );
+    if let Some(recording) = recording {
+        recording.finish(TELEMETRY_FINISH);
+    }
     host.print_end();
     match exit {
         NativeExit::Status(code) => ExitCode::from(code),
@@ -1010,7 +1016,7 @@ struct Host {
 impl Host {
     /// Resolves the engine paths from `HOME`, reads the settings once and chooses the shell. An unclear setting is
     /// reported once on stderr; the shell starts either way.
-    fn new() -> Self {
+    fn new(force_native: bool) -> Self {
         use std::io::IsTerminal;
         use std::path::Path;
 
@@ -1031,9 +1037,15 @@ impl Host {
             Err(_) => (Settings::default(), String::new()),
         };
         let login_shell = std::env::var_os(bash::SHELL_VAR);
-        let choice = shells::choose_hosted_shell(&settings.hosted_shell, login_shell.as_deref(), &is_usable_shell);
+        let choice = shells::choose_hosted_shell(
+            &settings.hosted_shell,
+            login_shell.as_deref(),
+            &is_usable_shell,
+            force_native,
+        );
         // A file that cannot be read or parsed spoils both settings with the same error: said once, with both effects.
-        let same_error = matches!((&settings.recording, &settings.hosted_shell), (Err(a), Err(b)) if a == b);
+        let same_error =
+            !force_native && matches!((&settings.recording, &settings.hosted_shell), (Err(a), Err(b)) if a == b);
         if let Err(error) = &settings.recording {
             // Unclear means off (privacy first).
             let also = if same_error { " and /bin/zsh starts" } else { "" };

@@ -169,7 +169,9 @@ the system's host name (`gethostname`).
 ## Native mode (KNSH-107)
 
 `[shell] hosted = "native"` runs `knsh`'s own interpreter (`knsh-interp`) as the human's interactive shell instead
-of hosting zsh or bash. It is opt-in: until the phase 4 gate (KNSH-109) is green it is never the default, and zsh users
+of hosting zsh or bash. `knsh --native` selects it for one invocation instead, overriding `[shell] hosted` and any error in the file
+(FR-SES-26); the precedence is `--native`, then `[shell] hosted`, then the bash `$SHELL` names, then `/bin/zsh`. The flag
+has no effect on `-c` lines or inside an envelope, where the profile's `exec.mode` alone decides (FR-LC-50). It is opt-in: until the phase 4 gate (KNSH-109) is green it is never the default, and zsh users
 stay in integration mode (NFR-COMPAT-06).
 
 - **Process:** `knsh` itself is the shell. It takes the terminal for job control (its own process group, the terminal's
@@ -204,9 +206,15 @@ stay in integration mode (NFR-COMPAT-06).
   after directories), or what `complete` specifies for the command (`-W`, `-F` with `COMP_WORDS`, `COMP_CWORD`,
   `COMP_LINE`, `COMP_POINT` and `COMPREPLY`, the actions, `-X`, `-P`, `-S`, `-o` options, `-D`, `-E`, `-I`).
   `compgen` prints the same matches. Not supported: `-C`, `-G`, and the user, group, host and service actions.
-- **Not yet:** `.inputrc` and `bind`, `fc`, `HISTIGNORE`, `HISTTIMEFORMAT`, `compopt`, `IGNOREEOF`; recording a native
-  session (with `[recording] human = true` native mode says once that the session is not recorded); Ctrl-C does not
+- **Not yet:** `.inputrc` and `bind`, `fc`, `HISTIGNORE`, `HISTTIMEFORMAT`, `compopt`, `IGNOREEOF`; Ctrl-C does not
   interrupt a loop the shell runs itself (its programs get it).
+- **Recording (FR-SES-27):** with `[recording] human = true`, a native session is recorded like a hosted one. The
+  interpreter reports each command line it runs to `knsh` (`knsh_interp::interactive::LineObserver`): when it starts,
+  with the working directory and the line as typed, and when it finishes, with `$?` and the working directory then.
+  These are the same two events as `preexec` and `precmd` and take the same path to `knshd` (`user.sock`, the
+  worker's bounded queue, a connection opened only once the shell is running). Lines typed in `PROMPT_COMMAND` or
+  start-up files are not recorded. A recorded session exports `KNSH_RECORDING=1` to its commands; any other never
+  has it, even when inherited (FR-SES-25). A slow or absent `knshd` never delays or blocks the shell (FR-SES-22).
 - **Start-up time (NFR-PERF-04):** measured in the story ([KNSH-107](../00-stories/KNSH-107-interactive-line-editor-and-history.md)).
 
 ## Login shell

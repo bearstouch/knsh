@@ -58,7 +58,7 @@ pub use fixed::{
 };
 pub use grant::{Grant, GrantScope, GrantSet, MAX_GRANTS, line_grant_rule};
 pub use irreversible::{BUILTIN_UPLOAD_HOSTS, classify_irreversible, mark_observed};
-use layer::{Layer, LayerKind, ReadTemplate};
+use layer::{Layer, LayerKind, ReadTemplate, SecretTemplate};
 pub use line::{
     DecisionSource, LineCapabilities, LineDecision, LineReason, MatchedRule, evaluate_line, evaluate_line_with_grants,
 };
@@ -74,6 +74,8 @@ pub use presets::PRESETS;
 pub use rules::{CommandVerdict, RuleId, evaluate_command};
 pub use strictness::{LoadedProfiles, at_least_as_strict};
 pub use unattended::{UNATTENDED_PROFILE, UNATTENDED_PROFILE_TEXT, load_unattended};
+
+use std::collections::BTreeMap;
 
 use crate::error::{ProfileError, ProfileErrorKind, ProfileOrigin};
 use crate::path::CanonicalPath;
@@ -225,6 +227,8 @@ fn override_layer(parent: Layer, child: Layer) -> Layer {
         name: child.name,
         extends: child.extends,
         preset: child.preset.or(parent.preset),
+        // Profiles never carry `[env]` (only a preset does, merged after the chain), so there is nothing to override.
+        env: BTreeMap::new(),
         fs_read: child.fs_read.or(parent.fs_read),
         fs_write: child.fs_write.or(parent.fs_write),
         fs_deny: child.fs_deny.or(parent.fs_deny),
@@ -290,6 +294,8 @@ fn merge_preset(layer: &mut Layer, preset: Layer) {
     );
     append(&mut layer.network_loopback, preset.network_loopback);
     append(&mut layer.checkpoints_roots, preset.checkpoints_roots);
+    // Only a preset has `[env]` (`Layer::parse` refuses it in a profile), so the preset's table is the whole of it.
+    layer.env = preset.env;
 }
 
 /// A preset that grants no model host (`generic`, FR-AGT-32) leaves naming it to the profile: refuses a merged
@@ -425,13 +431,17 @@ fn build<F: PolicyFs + ?Sized>(
         })?;
     }
 
+    let write = paths(layer.fs_write, "fs.write")?;
+    let env = preset_env(layer.env, &write, &variables, fs)?;
+
     Ok(Profile {
         name,
         extends,
         preset: layer.preset,
+        env,
         fs: FsPolicy {
             read,
-            write: paths(layer.fs_write, "fs.write")?,
+            write,
             deny: expand_all(layer.fs_deny, "fs.deny", &variables, fs, None)?,
         },
         exec: ExecPolicy {
@@ -470,19 +480,50 @@ fn build<F: PolicyFs + ?Sized>(
         output: OutputPolicy {
             mode: layer.output_mode.unwrap_or(OutputMode::Full),
         },
-        secrets: layer
-            .secrets_env
-            .into_iter()
-            .map(|(variable, entry)| {
-                let injection = SecretInjection {
-                    secret: entry.secret,
-                    inject_for: entry.inject_for,
-                    hosts: entry.hosts,
-                };
-                (variable, injection)
-            })
-            .collect(),
+        secrets: secret_injections(layer.secrets_env),
     })
+}
+
+/// `[secrets.env]` as resolved: one injection per variable, exactly as written.
+fn secret_injections(entries: BTreeMap<String, SecretTemplate>) -> BTreeMap<String, SecretInjection> {
+    entries
+        .into_iter()
+        .map(|(variable, entry)| {
+            let injection = SecretInjection {
+                secret: entry.secret,
+                inject_for: entry.inject_for,
+                hosts: entry.hosts,
+            };
+            (variable, injection)
+        })
+        .collect()
+}
+
+/// The preset's `[env]` folders, expanded (FR-AGT-33). Each must be reached from its variable with no symlink, so
+/// what `knshd` creates and the envelope may write is exactly the folder the preset names: an agent that swapped it
+/// for a link (to `~/.ssh`, say) between sessions makes the profile fail to load instead of moving a write root.
+/// Each must also lie within `write`, so a variable never points the CLI at a folder it cannot use.
+fn preset_env<F: PolicyFs + ?Sized>(
+    templates: BTreeMap<String, PathTemplate>,
+    write: &[CanonicalPath],
+    variables: &Variables,
+    fs: &F,
+) -> Result<BTreeMap<String, CanonicalPath>, ProfileError> {
+    let mut env = BTreeMap::new();
+    for (variable, template) in templates {
+        let key = format!("env.{variable}");
+        let path = template
+            .expand_without_links(variables, fs)
+            .map_err(|kind| ProfileError::new(kind).at_key(&key))?;
+        if !write.iter().any(|root| path.as_path().starts_with(root.as_path())) {
+            return Err(ProfileError::new(ProfileErrorKind::InvalidValue {
+                expected: "a folder within fs.write",
+            })
+            .at_key(&key));
+        }
+        env.insert(variable, path);
+    }
+    Ok(env)
 }
 
 /// Expands and canonicalises a path list, keeping the first copy of any path two entries resolve to. With `fixed`,
