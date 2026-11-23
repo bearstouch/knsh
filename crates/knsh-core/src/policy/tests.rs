@@ -7,6 +7,7 @@ use knsh_bash::NetworkClass;
 
 use super::paths::testing::FakeFs;
 use super::*;
+use crate::SessionId;
 
 /// The policy profile models page; its first TOML block is the example every release must load.
 const MODELS_PAGE: &str = include_str!("../../../../specs/05-models/policy-profile.md");
@@ -90,16 +91,12 @@ fn loads_web_app_example_profile() {
             canonical("/private/var/folders/xy/T"),
             canonical("/Users/u/.claude"),
             canonical("/Users/u/.claude.json"),
-            canonical("/private/var/folders/xy/T/knsh-claude-code"),
         ]
     );
-    // FR-AGT-33: the preset points Claude Code's temporary folder at its own write root.
+    // FR-AGT-33: the preset names `${TMPDIR}` as the parent of each session's own folder for Claude Code.
     assert_eq!(
         profile.env,
-        BTreeMap::from([(
-            "CLAUDE_CODE_TMPDIR".to_owned(),
-            canonical("/private/var/folders/xy/T/knsh-claude-code")
-        )])
+        BTreeMap::from([("CLAUDE_CODE_TMPDIR".to_owned(), canonical("/private/var/folders/xy/T"))])
     );
     assert_eq!(profile.fs.deny[0], canonical("/Users/u/.ssh"));
     assert_eq!(profile.fs.deny.len(), 6);
@@ -582,7 +579,6 @@ fn claude_code_preset_grants_api_host_and_config_folder() {
         canonical("/Users/u/src/app"),
         canonical("/Users/u/.claude"),
         canonical("/Users/u/.claude.json"),
-        canonical("/private/var/folders/xy/T/knsh-claude-code"),
     ];
     assert_eq!(profile.fs.write, granted);
     let mut read = vec![canonical("/usr")];
@@ -729,28 +725,44 @@ fn checkpoint_exclude_replaces_the_defaults() {
     assert_eq!(load(&source, "none").unwrap().checkpoints.exclude, Vec::<String>::new());
 }
 
-// FR-AGT-33: a preset folder replaced by a symlink (to `~/.ssh`, say) refuses the whole profile, so a link an agent
-// left behind never becomes a write root or the folder `knshd` prepares.
+// FR-AGT-33: a preset parent reached through a symlink is refused, so session folders are never created behind a
+// link someone left on the way.
 #[test]
-fn preset_env_folder_through_a_symlink_refuses_the_profile() {
+fn preset_env_parent_through_a_symlink_is_refused() {
     let mut fs = mac_fs();
     fs.add("/Users/u/.ssh")
-        .link("/private/var/folders/xy/T/knsh-claude-code", "/Users/u/.ssh");
-    let source = Source::default().with("p", "name = \"p\"\npreset = \"claude-code\"\n");
-    let error = load_profile(&name("p"), &source, &context(), &fs).unwrap_err();
-    assert_eq!(error.key(), Some("env.CLAUDE_CODE_TMPDIR"));
+        .link("/private/var/folders/xy/T/link", "/Users/u/.ssh");
+    let variables = Variables::resolve(&context(), &fs).unwrap();
+    let linked = BTreeMap::from([("X".to_owned(), PathTemplate::parse("${TMPDIR}/link").unwrap())]);
+    let error = preset_env(linked, &variables, &fs).unwrap_err();
+    assert_eq!(error.key(), Some("env.X"));
+    let plain = BTreeMap::from([("X".to_owned(), PathTemplate::parse("${TMPDIR}/plain").unwrap())]);
+    let env = preset_env(plain, &variables, &fs).unwrap();
+    assert_eq!(env["X"], canonical("/private/var/folders/xy/T/plain"));
 }
 
-// FR-AGT-33: a preset variable must name a folder the profile may write.
+// FR-AGT-33: each session gets its own folder below the parent, granted for writing (and reading, when the profile
+// lists its reads) only in that session's copy of the profile; the loaded profile itself grants none.
 #[test]
-fn preset_env_must_lie_within_fs_write() {
-    let fs = mac_fs();
-    let variables = Variables::resolve(&context(), &fs).unwrap();
-    let templates = BTreeMap::from([("X".to_owned(), PathTemplate::parse("~/elsewhere").unwrap())]);
-    let error = preset_env(templates.clone(), &[canonical("/Users/u/src/app")], &variables, &fs).unwrap_err();
-    assert_eq!(error.key(), Some("env.X"));
-    let env = preset_env(templates, &[canonical("/Users/u")], &variables, &fs).unwrap();
-    assert_eq!(env["X"], canonical("/Users/u/elsewhere"));
+fn session_folders_are_per_session_and_kept_out_of_the_profile() {
+    let text = "name = \"p\"\npreset = \"claude-code\"\n[fs]\nread = [\"/usr\"]\n";
+    let profile = load(&Source::default().with("p", text), "p").unwrap();
+    let one = SessionId::from_ulid(crate::Ulid::from_u128(1));
+    let two = SessionId::from_ulid(crate::Ulid::from_u128(2));
+    let folder = |session: SessionId| canonical(&format!("/private/var/folders/xy/T/knsh-session-{session}"));
+    assert_eq!(
+        profile.session_folders(one),
+        BTreeMap::from([("CLAUDE_CODE_TMPDIR".to_owned(), folder(one))])
+    );
+    let granted = profile.with_session_folders(one);
+    assert!(granted.fs.write.contains(&folder(one)) && !granted.fs.write.contains(&folder(two)));
+    assert!(matches!(&granted.fs.read, ReadScope::Paths(paths) if paths.contains(&folder(one))));
+    assert!(!profile.fs.write.contains(&folder(one)));
+    // Granting twice adds nothing more.
+    assert_eq!(granted.with_session_folders(one), granted);
+    // Without a preset `[env]` there is nothing to grant.
+    let plain = load(&Source::default().with("q", "name = \"q\"\n"), "q").unwrap();
+    assert_eq!(plain.with_session_folders(one), plain);
 }
 
 // FR-AGT-33: `[env]` belongs to presets; in a profile it is an unknown key.

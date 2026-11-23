@@ -475,6 +475,32 @@ fn nested_session_cannot_move_the_parents_project() {
     assert_eq!(harness.starter.running().len(), 1);
 }
 
+// FR-AGT-33, FR-SES-03: a nested session under the same preset profile is not looser than its parent because of the
+// per-session folders (strictness compares the profiles without them), and its envelope is granted its own folder,
+// never the parent's.
+#[test]
+fn nested_session_gets_its_own_folder_and_not_the_parents() {
+    let harness = harness();
+    let (parent, peer) = parent_session(&harness, "claude");
+    let binding = SessionBinding::for_peer(Some(peer));
+    harness.launcher.processes.expect(ENVELOPE, Script::Exits(0));
+    let answer = call(
+        &harness,
+        Endpoint::User,
+        &binding,
+        &params(r#"["claude"]"#, r#","profile":"claude""#),
+        &StillWaiting,
+    )
+    .unwrap();
+    let child = SessionStartAgentResult::from_json(&answer.result).unwrap().session_id;
+    assert_ne!(child, parent);
+    let launched = harness.launcher.launched.lock().unwrap()[0].clone();
+    let own = format!("/tmp/knsh-session-{child}");
+    let parents = format!("/tmp/knsh-session-{parent}");
+    assert!(launched.write.iter().any(|root| root.as_path() == Path::new(&own)));
+    assert!(!launched.write.iter().any(|root| root.as_path() == Path::new(&parents)));
+}
+
 // FR-AGT-03: the shims are links to `knsh`; a name found through them (here `bash`) is never `knsh`, but the next
 // match on `PATH`.
 #[test]
@@ -865,8 +891,9 @@ fn envelope_profile_includes_preset_grants() {
     assert_eq!(rules(&without, "(allow file-write* (subpath"), Vec::<&str>::new());
 }
 
-// FR-AGT-33: under the `claude-code` preset the CLI starts with `CLAUDE_CODE_TMPDIR` at its own folder below
-// `${TMPDIR}` (replacing the caller's value), the folder exists owner-only before launch, and it is a write root.
+// FR-AGT-33: under the `claude-code` preset the CLI starts with `CLAUDE_CODE_TMPDIR` at its session's own folder
+// below `${TMPDIR}` (replacing the caller's value), the folder exists owner-only before launch, and it is a write
+// root of that envelope; the profile kept for nested sessions' strictness checks is the one without it.
 #[test]
 fn claude_code_preset_points_its_temporary_folder_inside_the_envelope() {
     let harness = harness();
@@ -875,21 +902,49 @@ fn claude_code_preset_points_its_temporary_folder_inside_the_envelope() {
         r#"{{"command":["claude"],"cwd":"{PROJECT}","stdio":"passed","profile":"claude",
             "env":{{"HOME":"{HOME}","PATH":"/opt/bin:/bin","CLAUDE_CODE_TMPDIR":"/tmp"}}}}"#
     );
-    start(&harness, &params).unwrap();
+    let result = start(&harness, &params).unwrap();
 
     let launched = harness.launcher.launched.lock().unwrap()[0].clone();
-    let folder = Path::new("/tmp/knsh-claude-code");
+    let expected = format!("/tmp/knsh-session-{}", result.session_id);
+    let folder = Path::new(&expected);
     let values: Vec<&str> = launched
         .env
         .iter()
         .filter(|(name, _)| name == "CLAUDE_CODE_TMPDIR")
         .map(|(_, value)| value.as_str())
         .collect();
-    assert_eq!(values, ["/tmp/knsh-claude-code"]);
+    assert_eq!(values, [expected.as_str()]);
     assert!(launched.write.iter().any(|root| root.as_path() == folder));
     let meta = harness.starter.profiles.fs().metadata(folder).unwrap();
     assert_eq!(meta.kind, knsh_platform::FileKind::Directory);
     assert_eq!(meta.mode, 0o700);
+}
+
+// FR-AGT-33: when the session folder cannot be created, the envelope never starts and the session it opened ends
+// (fail closed).
+#[test]
+fn session_folder_that_cannot_be_made_refuses_the_launch() {
+    let fs = filesystem();
+    fs.inject_fault(knsh_platform::Operation::CreateDirectory, 13 /* EACCES */);
+    let mut harness = harness();
+    harness.starter = AgentStarter::new(
+        Arc::clone(&harness.fixture.sessions),
+        crate::policy::tests::loader(fs),
+        harness.launcher.clone(),
+        harness.proxy.clone(),
+        Arc::new(FakeClock::new(knsh_core::Timestamp::UNIX_EPOCH)),
+        shim_dir(),
+        Path::new(KNSH).to_path_buf(),
+        knsh_platform::testing::DEFAULT_UID,
+    );
+    let params = format!(
+        r#"{{"command":["claude"],"cwd":"{PROJECT}","stdio":"passed","profile":"claude",
+            "env":{{"HOME":"{HOME}","PATH":"/opt/bin:/bin"}}}}"#
+    );
+    let error = start(&harness, &params).unwrap_err();
+    assert_eq!(error.code, ErrorCode::InternalError);
+    assert!(harness.launcher.launched.lock().unwrap().is_empty());
+    assert_eq!(harness.fixture.sessions.live(), 0);
 }
 
 // FR-AGT-33: a preset variable never replaces one `knshd` sets itself or one the dynamic linker reads.
