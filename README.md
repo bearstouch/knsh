@@ -48,7 +48,7 @@ Writing rules for the guide are in [`docs-theme/README.md`](docs-theme/README.md
 git clone https://github.com/bearstouch/knsh.git
 cd knsh
 cargo build --workspace --offline --locked
-target/debug/knsh --version        # knsh 0.1.0, then the advisory label
+target/debug/knsh --version        # version banner, then the advisory label
 target/debug/knsh                  # your zsh or bash, hosted by knsh
 ```
 
