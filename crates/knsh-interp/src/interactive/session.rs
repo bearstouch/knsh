@@ -61,6 +61,17 @@ pub trait Terminal {
     fn stop_editing(&mut self);
 }
 
+/// Watches the command lines a [`Session`] runs, so the host can record them (FR-SES-21). The hooks only observe: a
+/// session never waits on them for a decision, and nothing they do changes how a line runs (FR-SES-22).
+pub trait LineObserver {
+    /// A command line typed at the prompt is about to run. `cwd` is the working directory (raw bytes) and `command`
+    /// the line as typed, without its final newline.
+    fn started(&mut self, cwd: &[u8], command: &[u8]);
+
+    /// The line has finished; `status` is its `$?` (0 to 255) and `cwd` the working directory now.
+    fn finished(&mut self, status: u8, cwd: &[u8]);
+}
+
 /// The shell's terminal through the platform's descriptors: input from one descriptor (the shell's standard input),
 /// prompts and the line drawn on another (its standard error, as bash's readline draws).
 pub struct DescriptorTerminal {
@@ -215,6 +226,8 @@ pub struct Session<T: Terminal> {
     command_number: usize,
     /// A line ran since the last prompt (its `D` mark is due).
     ran: bool,
+    /// Told about each line that runs (recording), if the host asked.
+    observer: Option<Box<dyn LineObserver>>,
 }
 
 impl<T: Terminal> std::fmt::Debug for Session<T> {
@@ -264,6 +277,7 @@ impl<T: Terminal> Session<T> {
             screen: Screen::new(),
             command_number: 1,
             ran: false,
+            observer: None,
         }
     }
 
@@ -271,6 +285,13 @@ impl<T: Terminal> Session<T> {
     #[must_use]
     pub fn with_local_time(mut self, time: Arc<dyn LocalTime>) -> Self {
         self.time = Some(time);
+        self
+    }
+
+    /// The same session telling `observer` about each command line it runs (FR-SES-21).
+    #[must_use]
+    pub fn with_observer(mut self, observer: Box<dyn LineObserver>) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -400,6 +421,13 @@ impl<T: Terminal> Session<T> {
         if self.options.marks {
             self.terminal.write(marks::OUTPUT_START.as_bytes());
         }
+        let command = entry.strip_suffix('\n').unwrap_or(entry);
+        // A blank line is no command: zsh's `preexec` does not run for it either.
+        let observed = !command.trim().is_empty();
+        let cwd = self.shell.state().cwd().as_os_str().as_bytes().to_vec();
+        if observed && let Some(observer) = self.observer.as_mut() {
+            observer.started(&cwd, command.as_bytes());
+        }
         match self.shell.run_line(text) {
             Ok(LineStatus::Ran(_) | LineStatus::Incomplete) => {}
             Err(error) => {
@@ -408,6 +436,16 @@ impl<T: Terminal> Session<T> {
             }
         }
         self.ran = true;
+        // Reported after the line, once `cd` has taken effect, as integration mode's `precmd` does.
+        let status = self.shell.state().last_status().code();
+        let cwd = self.shell.state().cwd().as_os_str().as_bytes().to_vec();
+        // After `exit` no prompt returns, so (as with `precmd`) no line finishes.
+        if observed
+            && !self.shell.has_exited()
+            && let Some(observer) = self.observer.as_mut()
+        {
+            observer.finished(status, &cwd);
+        }
     }
 
     /// What the prompt escapes show now.

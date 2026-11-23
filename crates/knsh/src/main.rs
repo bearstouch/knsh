@@ -972,15 +972,21 @@ fn human_shell(shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
 fn human_native(host: &Host, shell: &knsh::cli::args::ShellInvocation) -> ExitCode {
     use knsh::native::{self, NativeExit, NativeStart};
 
-    if host.recording {
-        // Said, never hidden: the setting asks for recording, which native mode does not do yet.
-        report("knsh: recording is not available in native mode yet; this session is not recorded\n");
-    }
+    // FR-SES-21: a recorded native session reports each command line to `knshd`, like the hosted shells' hooks.
+    let recording = host.start_recording();
     let start = NativeStart {
         login: shell.login,
         marks: host.marks,
     };
-    let exit = native::run(start);
+    let exit = native::run(
+        start,
+        recording
+            .as_ref()
+            .map(knsh::integration::recorder::RecordingHandle::sink),
+    );
+    if let Some(recording) = recording {
+        recording.finish(TELEMETRY_FINISH);
+    }
     host.print_end();
     match exit {
         NativeExit::Status(code) => ExitCode::from(code),

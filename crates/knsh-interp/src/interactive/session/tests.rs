@@ -151,6 +151,45 @@ impl Harness {
     }
 }
 
+/// Records what a session reports as events.
+#[derive(Clone, Default)]
+struct Events(Arc<Mutex<Vec<String>>>);
+
+impl LineObserver for Events {
+    fn started(&mut self, cwd: &[u8], command: &[u8]) {
+        let event = format!(
+            "start {} {}",
+            String::from_utf8_lossy(cwd),
+            String::from_utf8_lossy(command)
+        );
+        self.0.lock().unwrap().push(event);
+    }
+
+    fn finished(&mut self, status: u8, cwd: &[u8]) {
+        let event = format!("end {status} {}", String::from_utf8_lossy(cwd));
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+// FR-SES-27, FR-SES-21: each typed line is reported before and after it runs, with the working directory as it is at
+// that moment (`cd` shows in the end event) and the line's status; a blank line reports nothing.
+#[test]
+fn observer_sees_each_line_start_and_finish() {
+    let events = Events::default();
+    let mut h = harness(&[b"cd /home/ana\r", b"\r", b"false\r"], false, |_| {});
+    h.session = h.session.with_observer(Box::new(events.clone()));
+    h.run();
+    assert_eq!(
+        *events.0.lock().unwrap(),
+        [
+            "start /work cd /home/ana",
+            "end 0 /home/ana",
+            "start /home/ana false",
+            "end 1 /home/ana",
+        ]
+    );
+}
+
 // KNSH-107, NFR-COMPAT-10: OSC 133 `A` before the prompt, `B` after it, `C` before the command runs and `D;status`
 // before the next prompt; OSC 7 with the directory.
 #[test]
