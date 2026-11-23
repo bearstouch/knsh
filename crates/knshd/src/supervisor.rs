@@ -773,23 +773,24 @@ impl Lifecycle {
 
     /// The session's profile for `line`, or the reason to deny it. FR-POL-42: a policy file with a missing or bad
     /// signature is reported on the session, and the line is denied; the session never falls back to another
-    /// profile.
+    /// profile. FR-AGT-33: with the session's own folders granted, as its envelope was, and no other session's.
     fn load_profile(
         &self,
         line: &ForwardedLine,
         actor: &Actor,
         name: &knsh_core::ProfileName,
     ) -> Result<Profile, &'static str> {
-        self.parts.profiles.load(name, line.proposal.cwd.as_path()).map_err(
-            |error| match crate::policy::invalid_profile(&error) {
+        let loaded = self.parts.profiles.load(name, line.proposal.cwd.as_path());
+        loaded
+            .map(|profile| profile.with_session_folders(line.session_id))
+            .map_err(|error| match crate::policy::invalid_profile(&error) {
                 Some(invalid) => {
                     let data = EventData::PolicyInvalid { profile: invalid };
                     let _ = self.parts.events.publish(line.session_id, actor, data);
                     INVALID_PROFILE
                 }
                 None => NO_PROFILE,
-            },
-        )
+            })
     }
 
     /// Records an allowed line that may not be spawned as a deny, so its decision is not lost, and returns its answer

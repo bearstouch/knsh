@@ -6,17 +6,16 @@
 [fs]
 # Added to `fs.read` only when the profile lists its reads (the default, "all", already covers them): a write
 # root that cannot be read is of no use to the CLI.
-read = ["${PROJECT}", "~/.claude", "~/.claude.json", "${TMPDIR}/knsh-claude-code"]
-# The project, the configuration and session folder, the user-level state file Claude Code keeps beside it, and the
-# temporary folder `[env]` points it at.
-write = ["${PROJECT}", "~/.claude", "~/.claude.json", "${TMPDIR}/knsh-claude-code"]
+read = ["${PROJECT}", "~/.claude", "~/.claude.json"]
+# The project, the configuration and session folder, and the user-level state file Claude Code keeps beside it.
+write = ["${PROJECT}", "~/.claude", "~/.claude.json"]
 
 [env]
 # FR-AGT-33. Claude Code's Bash tool keeps its working folder (cwd tracking, command output files) at
 # `$CLAUDE_CODE_TMPDIR/claude-<uid>/<project>`, else at `/tmp/claude-<uid>/<project>`, which no envelope may write:
-# every shell command then fails with EPERM on its mkdir. A folder of its own under `${TMPDIR}` keeps it apart from
-# other Claude Code sessions' files. Read from Claude Code 2.1.330.
-CLAUDE_CODE_TMPDIR = "${TMPDIR}/knsh-claude-code"
+# every shell command then fails with EPERM on its mkdir. The value is a parent folder: `knshd` gives each session its
+# own `knsh-session-<id>` below it, granted to that session alone. Read from Claude Code 2.1.330.
+CLAUDE_CODE_TMPDIR = "${TMPDIR}"
 
 [network]
 # api.anthropic.com: the model API. platform.claude.com: OAuth token refresh for claude.ai sign-in

@@ -244,6 +244,13 @@ impl Spawner for FakeSpawner {
         ));
         // The line's sandbox rules are tagged with the record it is written to (FR-SBX-06).
         self.journal.push(format!("record {}", plan.record_id));
+        // FR-AGT-33: the session folders its profile was granted.
+        for root in &plan.profile.fs.write {
+            if root.as_path().to_string_lossy().contains("/knsh-session-") {
+                self.journal
+                    .push(format!("session folder {}", root.as_path().display()));
+            }
+        }
         // KNSH-092: what it is given, and the hosts its network is narrowed to.
         for secret in &plan.secrets {
             self.journal.push(format!(
@@ -2696,3 +2703,26 @@ fn absolute_path_bash_in_envelope_is_decided() {
 }
 
 mod native;
+
+// FR-AGT-33: a line of a session whose preset sets `[env]` is granted that session's own folder, as its envelope
+// was, and no other session's.
+#[test]
+fn line_profile_grants_its_own_session_folder() {
+    let daemon = Daemon::new();
+    let profile = "name = \"web\"\npreset = \"claude-code\"\n[exec]\nallow = [\"ls\"]\n";
+    let lifecycle = daemon.lifecycle(Setup {
+        profiles: Some(vec![("web", profile)]),
+        ..Setup::default()
+    });
+    lifecycle.run(daemon.line("ls"), &StillWaiting).unwrap();
+    let folders: Vec<String> = daemon
+        .journal
+        .entries()
+        .into_iter()
+        .filter(|entry| entry.starts_with("session folder"))
+        .collect();
+    assert_eq!(
+        folders,
+        [format!("session folder /tmp/knsh-session-{}", daemon.session_id)]
+    );
+}

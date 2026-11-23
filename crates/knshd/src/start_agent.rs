@@ -381,11 +381,14 @@ impl AgentStarter {
         call: &Call<'_>,
     ) -> Result<LineStatus, RpcError> {
         let processes = self.launcher.processes();
-        // FR-AGT-33: the folders the preset points the CLI at exist, owner-only, before it starts; one that cannot be
-        // made safe stops the launch rather than leave the CLI failing on a folder it may not use.
-        if !env_folders_ready(self.profiles.fs(), profile, self.uid) {
+        // FR-AGT-33: the session's own folders exist, owner-only, before the CLI starts, and only this session's
+        // envelope (and lines, `Supervisor::load_profile`) is granted them; one that cannot be made safe stops the
+        // launch rather than leave the CLI failing on a folder it may not use.
+        let folders = profile.session_folders(session_id);
+        if !env_folders_ready(self.profiles.fs(), &folders, self.uid) {
             return Err(internal_error());
         }
+        let profile = &profile.with_session_folders(session_id);
         // A proxy that runs but cannot issue credentials stops the launch: no envelope runs untied to its session.
         let proxy = self
             .proxy
@@ -408,14 +411,7 @@ impl AgentStarter {
                 profile,
                 program,
                 args: &params.command[1..],
-                env: envelope_env(
-                    &params.env,
-                    token,
-                    &self.shim_dir,
-                    &self.knsh,
-                    &profile.env,
-                    proxy.as_ref(),
-                ),
+                env: envelope_env(&params.env, token, &self.shim_dir, &self.knsh, &folders, proxy.as_ref()),
                 proxy_port: proxy.as_ref().map(ProxyCredential::port),
                 cwd: &params.cwd,
                 stdio,
@@ -492,8 +488,8 @@ fn stdio(descriptors: Vec<OwnedFd>) -> Result<[OwnedFd; 3], RpcError> {
 
 /// The environment the CLI starts with (FR-AGT-03): the caller's, minus any session token it carried, its proxy
 /// settings ([`is_proxy_var`]) and the dynamic linker's variables (`knsh-exec` runs unsandboxed until it becomes
-/// `sandbox-exec`); then the preset's variables (`preset_env`, FR-AGT-33), each replacing the caller's of that name;
-/// then `SHELL` set to `knsh`, the shim directory first on `PATH` (once), the new session's token and, when a proxy
+/// `sandbox-exec`); then the preset's variables (`session_folders`: the session's own folders, FR-AGT-33), each
+/// replacing the caller's of that name; then `SHELL` set to `knsh`, the shim directory first on `PATH` (once), the new session's token and, when a proxy
 /// serves the envelope, its proxy settings with the envelope's own credentials ([`proxy_env`]). A preset never sets a
 /// variable `knshd` sets itself or the dynamic linker reads. Each name appears once; order is kept otherwise.
 pub(crate) fn envelope_env(
@@ -501,7 +497,7 @@ pub(crate) fn envelope_env(
     token: &SessionToken,
     shim_dir: &Path,
     knsh: &Path,
-    preset_env: &BTreeMap<String, CanonicalPath>,
+    session_folders: &BTreeMap<String, CanonicalPath>,
     proxy: Option<&ProxyCredential>,
 ) -> Vec<(String, String)> {
     let shims = shim_dir.to_string_lossy().into_owned();
@@ -525,13 +521,13 @@ pub(crate) fn envelope_env(
             || read_by_dynamic_linker(name)
             || own.iter().any(|(own_name, _)| own_name == name)
     };
-    let preset = preset_env
+    let preset = session_folders
         .iter()
         .filter(|(name, _)| !reserved(name))
         .map(|(name, folder)| (name.clone(), folder.as_path().to_string_lossy().into_owned()));
     let mut env: Vec<(String, String)> = caller
         .iter()
-        .filter(|(name, _)| !reserved(name) && !preset_env.contains_key(name))
+        .filter(|(name, _)| !reserved(name) && !session_folders.contains_key(name))
         .cloned()
         .collect();
     env.extend(preset);
@@ -542,12 +538,11 @@ pub(crate) fn envelope_env(
 /// Permission bits of a preset's `[env]` folder: owner-only, as the CLIs ask of their temporary folders.
 const ENV_FOLDER_MODE: u32 = 0o700;
 
-/// Whether every folder of the profile's `env` (FR-AGT-33) is ready: created `0700` if missing, and otherwise a
-/// directory (not a symlink) owned by `uid`, its mode set to `0700`. Only the folder itself is created, never its
-/// parents: the loader already resolved it below an existing variable with no symlink on the way.
-fn env_folders_ready(fs: &dyn Fs, profile: &Profile, uid: u32) -> bool {
-    profile
-        .env
+/// Whether every session folder (FR-AGT-33, [`Profile::session_folders`]) is ready: created `0700` if missing, and
+/// otherwise a directory (not a symlink) owned by `uid`, its mode set to `0700`. Only the folder itself is created,
+/// never its parents: the loader already resolved the parent below an existing variable with no symlink on the way.
+fn env_folders_ready(fs: &dyn Fs, folders: &BTreeMap<String, CanonicalPath>, uid: u32) -> bool {
+    folders
         .values()
         .all(|folder| env_folder_ready(fs, folder.as_path(), uid))
 }

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use knsh_bash::{Interpreters, NetworkClass};
 
+use crate::id::SessionId;
 use crate::path::CanonicalPath;
 use crate::resolve::TrustedFolders;
 use crate::session::ProfileName;
@@ -37,9 +38,9 @@ pub struct Profile {
     pub extends: Vec<ProfileName>,
     /// `preset`: the preset applied on top, if any.
     pub preset: Option<String>,
-    /// The preset's `[env]`: environment variables of the agent CLI, each naming a folder within `fs.write` reached
-    /// from its variable with no symlink (FR-AGT-33). `knshd` creates each folder owner-only and sets the variables in
-    /// the envelope. Empty without a preset or when the preset sets none; a profile cannot set it.
+    /// The preset's `[env]`: environment variables of the agent CLI, each naming a parent folder reached from its
+    /// variable with no symlink (FR-AGT-33). Each agent session gets its own folder below each parent
+    /// ([`Profile::session_folders`]). Empty without a preset or when the preset sets none; a profile cannot set it.
     pub env: BTreeMap<String, CanonicalPath>,
     /// `[fs]`.
     pub fs: FsPolicy,
@@ -57,6 +58,46 @@ pub struct Profile {
     pub output: OutputPolicy,
     /// `[secrets.env]`: secret injections by environment variable name.
     pub secrets: BTreeMap<String, SecretInjection>,
+}
+
+/// Prefix of an agent session's own folder below each `env` parent (FR-AGT-33): `knsh-session-<session-id>`.
+const SESSION_FOLDER_PREFIX: &str = "knsh-session-";
+
+impl Profile {
+    /// The session's own folder for each `env` variable (FR-AGT-33): `<parent>/knsh-session-<session_id>`, by
+    /// variable name. Pure: the same profile and session give the same folders, so every line of the session is
+    /// granted the folder its envelope was given.
+    #[must_use]
+    pub fn session_folders(&self, session_id: SessionId) -> BTreeMap<String, CanonicalPath> {
+        self.env
+            .iter()
+            .filter_map(|(variable, parent)| {
+                // A canonical parent joined with one plain component is canonical; `filter_map` only keeps the type
+                // honest, and a folder that is not granted is one the CLI cannot use, never one it may misuse.
+                let folder = parent.as_path().join(format!("{SESSION_FOLDER_PREFIX}{session_id}"));
+                CanonicalPath::new(folder).ok().map(|folder| (variable.clone(), folder))
+            })
+            .collect()
+    }
+
+    /// This profile with the session's own folders ([`session_folders`](Self::session_folders)) added to
+    /// `fs.write`, and to `fs.read` when it lists its reads: what the session's envelope and lines are compiled from.
+    /// Kept out of the loaded profile, so strictness between nested sessions compares what their profiles say.
+    #[must_use]
+    pub fn with_session_folders(&self, session_id: SessionId) -> Self {
+        let mut granted = self.clone();
+        for folder in self.session_folders(session_id).into_values() {
+            if let ReadScope::Paths(paths) = &mut granted.fs.read
+                && !paths.contains(&folder)
+            {
+                paths.push(folder.clone());
+            }
+            if !granted.fs.write.contains(&folder) {
+                granted.fs.write.push(folder);
+            }
+        }
+        granted
+    }
 }
 
 /// What a rule or setting does with a matching command: run it, ask the authority, or refuse it.

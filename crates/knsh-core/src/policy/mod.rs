@@ -432,7 +432,7 @@ fn build<F: PolicyFs + ?Sized>(
     }
 
     let write = paths(layer.fs_write, "fs.write")?;
-    let env = preset_env(layer.env, &write, &variables, fs)?;
+    let env = preset_env(layer.env, &variables, fs)?;
 
     Ok(Profile {
         name,
@@ -499,13 +499,13 @@ fn secret_injections(entries: BTreeMap<String, SecretTemplate>) -> BTreeMap<Stri
         .collect()
 }
 
-/// The preset's `[env]` folders, expanded (FR-AGT-33). Each must be reached from its variable with no symlink, so
-/// what `knshd` creates and the envelope may write is exactly the folder the preset names: an agent that swapped it
-/// for a link (to `~/.ssh`, say) between sessions makes the profile fail to load instead of moving a write root.
-/// Each must also lie within `write`, so a variable never points the CLI at a folder it cannot use.
+/// The preset's `[env]` parent folders, expanded (FR-AGT-33). Each must be reached from its variable with no symlink,
+/// so the session folders `knshd` creates below it ([`Profile::session_folders`]) are where the preset says, never
+/// behind a link someone left on the way. The parent need not lie within `fs.write`: `knshd` grants only the
+/// session folder below it. Presets are compiled in, so a parent is reviewed with its preset; one as broad as `~`
+/// would put `knsh-session-*` folders in the home directory.
 fn preset_env<F: PolicyFs + ?Sized>(
     templates: BTreeMap<String, PathTemplate>,
-    write: &[CanonicalPath],
     variables: &Variables,
     fs: &F,
 ) -> Result<BTreeMap<String, CanonicalPath>, ProfileError> {
@@ -515,12 +515,6 @@ fn preset_env<F: PolicyFs + ?Sized>(
         let path = template
             .expand_without_links(variables, fs)
             .map_err(|kind| ProfileError::new(kind).at_key(&key))?;
-        if !write.iter().any(|root| path.as_path().starts_with(root.as_path())) {
-            return Err(ProfileError::new(ProfileErrorKind::InvalidValue {
-                expected: "a folder within fs.write",
-            })
-            .at_key(&key));
-        }
         env.insert(variable, path);
     }
     Ok(env)
